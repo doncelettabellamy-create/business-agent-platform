@@ -21,6 +21,13 @@ Both share the same gates and tail: tenant gate, structure check, masking declar
 6. **Every model failure requires human review.** If ANY model answer fails, in either skill, the item gets reason `model_failed`, status `needs-human`, and **no handoff envelope**. No configuration changes this (the old `fallback` option is deprecated and ignored). Deterministic values are attached only as reviewer suggestions. A post-condition refuses any failed run that is not a review item without an envelope.
 7. **No provider text is kept.** Failures are codes only; provider answers and error messages are never stored or returned.
 8. **Category conflict veto.** The local keyword classifier always runs as well. If it matched a category and the model returns a different one, the model answer is not trusted: the item gets category `unknown` with reason `ambiguous_category`, status `needs-human`, and no handoff envelope. If the local classifier found no match or a tie, the model's category is accepted without independent checking (see limitations).
+9. **Per-category required fields (optional `requires`).** A category in `skill_config` may list `requires: [field names]`. Those fields are required for that category in addition to every field with `required: true`.
+   - **Verified category** (the local keyword match found the final category): only that category's `requires` is added. On the model path this means the model returned the same category, or its classification failed; a failed classification keeps the local category, and the item is reviewed anyway for `model_failed`.
+   - **Model-only category** (the local match found nothing or tied, and the model picked one): the union of every category's `requires` is added, so a model-only pick cannot lower the bar.
+   - **`unknown` category:** only the global `required: true` fields apply; the item is reviewed anyway.
+   - **Validation:** each entry must be the exact, case-sensitive name of a configured field, with no duplicates. Anything else refuses the whole configuration (`INPUT_INVALID`, fixed paths, no echo of values).
+   - **Compatibility:** a configuration without `requires` behaves exactly as before, and `work_item.v1` and the envelope are unchanged. The model request still carries only each field's global `required` flag.
+   - **Examples:** `examples/skill-plumbing.json` (Emergency leak requires Address and Job description, Quote request requires Job description, Booking change requires Preferred date) and `examples/skill-dental.json` (New patient requires Insurance provider, Appointment change requires Preferred date; Patient reference is required for every category) demonstrate it. The older `skill-input.json` examples still use only global `required`.
 
 ## Claude adapter (`src/claude-provider.ts`)
 
@@ -92,7 +99,7 @@ Input is about 980 tokens for the two requests combined. The ceiling cannot be e
 
 ## Local deterministic skill (skill_config mode)
 
-No vocabulary of its own and no industry rules. Classification counts distinct configured keywords found as whole words or phrases (a tie becomes `ambiguous_category`, no match `unknown_category`); the `label` extractor reads `<label>: value` lines, the `token` extractor finds masked tokens such as `[ID_1]`; conflicting values are not extracted and are flagged `ambiguous_field`. It does not score confidence. On the model path its match is also used as a cross-check (rule 8); its keywords are never sent to the model.
+No vocabulary of its own and no industry rules. Classification counts distinct configured keywords found as whole words or phrases (a tie becomes `ambiguous_category`, no match `unknown_category`); the `label` extractor reads `<label>: value` lines, the `token` extractor finds masked tokens such as `[ID_1]`; conflicting values are not extracted and are flagged `ambiguous_field`. It does not score confidence. On the model path its match is also used as a cross-check (rule 8); its keywords are never sent to the model. A category may also list `requires` (rule 9).
 
 ## Not included (limitations)
 
@@ -102,8 +109,9 @@ No vocabulary of its own and no industry rules. Classification counts distinct c
 | No personal-data detector | The runner **trusts** `masking.applied`. Real customer text must never reach a provider until detection, masking, and the vault exist (INT-06 to INT-09). |
 | SDK exercised only in three live attempts | `@anthropic-ai/sdk` 1.3.0 was used for the three synthetic live attempts described above (two rejected with 401, one completed) and nowhere else. Type-checking has not been run (not re-verified). |
 | Draft prompts and schemas | The two instruction texts and answer schemas are unapproved and have been tried against a real model only once, on a fixture with meaningless category names. |
-| Model-only categories are unverified | When the local classifier finds no match or a tie, a valid in-list model category is accepted without independent checking (rule 8 vetoes only a conflict with a local match). `minConfidence` has no default and the live entry sets none. Category names must be self-describing because the model sees names only. Open options: a confidence floor (D-04), a tie-membership check, or a grounded evidence quote. |
-| Keywords can be gamed | The veto relies on the local keyword match, which text that plants keywords can influence. It guards against a model obeying injected instructions, not against keyword stuffing. |
+| Model-only categories are unverified | When the local classifier finds no match or a tie, a valid in-list model category is accepted without independent checking (rule 8 vetoes only a conflict with a local match). `minConfidence` has no default and the live entry sets none. With `requires`, such an item must satisfy the union of every category's requirements (rule 9), which adds reviews but keeps the bar from dropping. Category names must be self-describing because the model sees names only. Open options: a confidence floor (D-04), a tie-membership check, or a grounded evidence quote. |
+| Keywords can be gamed | The veto relies on the local keyword match, which text that plants keywords can influence. It guards against a model obeying injected instructions, not against keyword stuffing. A category confirmed this way (including by planted keywords) also gets only its own, possibly lighter, `requires`. |
+| Per-category requirements are not sent to the model | The extract request carries each field's global `required` flag only, so a field required by just some categories is sent as `required: false`. The instruction text does not use the flag today; a future prompt that does could mislead the model. |
 | No metering, caps, or kill switch in the product | Only the entry point's call counter and the token limits exist. No usage events, per-tenant caps, or alerts (FND-09). |
 | No backoff or rate-limit handling | Attempts are plain and bounded. |
 | No database, queue, vault, audit chain, authentication, or row-level security | Nothing is stored; the tenant check is code-level only. |
@@ -130,17 +138,17 @@ Requires Node 24 or later (built-in TypeScript type stripping). No installation 
 
 ```
 cd poc/intake-runner
-npm test                  # 138 tests
+npm test                  # 159 tests
 npm run demo              # 7 scenarios with the local scripted mock
 npm run live:dry-run      # request bodies and cost estimate; sends nothing
 node src/cli.ts examples/skill-input.json
-node src/cli.ts examples/skill-plumbing.json   # a second, unrelated synthetic business
-node src/cli.ts examples/skill-dental.json     # same engine, different categories and fields
+node src/cli.ts examples/skill-plumbing.json   # a second, unrelated synthetic business (per-category requires)
+node src/cli.ts examples/skill-dental.json     # same engine, different categories, fields, and requires
 ```
 
-## Tests (138)
+## Tests (159)
 
-`intake-runner` (18) and `classify-extract` (24): contract, gates, deterministic skill. `model-runner` (41): gateway behavior, the human-review regression matrix, null-field and null-category cases (including a locally tied text), the category conflict veto, and the plumbing and dental configurations run through the same engine. `skills` (6): definitions versus `SKILL.md` and `AGENT.md`. `claude-provider` (28): request shape, structured-output schema, good answers, 13 failure kinds under three fallback settings, error-text discarding, refusal and truncation blanking, timeouts, bounded retries, injection text, gates before any call. `live-dry-run` (5): the entry point run as a child process in a sanitized environment (no confirmation variable, no credentials), checking the dry run (Haiku default, two synthetic request bodies, call limit 2, readiness checklist, nothing sent) and every refusal path. `live-gate` (16): argument parsing and credential refusal, path and synthetic checks, the gate, cost arithmetic, and static guarantees (dry run first, SDK imported only after the gate and only once, no credential reads, no live-capable npm script, the only dependency is the exact-pinned official SDK and the lockfile agrees).
+`intake-runner` (18) and `classify-extract` (32): contract, gates, deterministic skill, and per-category `requires` (exact-name validation, local-path behavior, empty and redundant lists, conflicting values, `constructor` and `__proto__` names, and the plumbing example: a booking change is ready without an address, an emergency leak without one is flagged). `model-runner` (54): gateway behavior, the human-review regression matrix, null-field and null-category cases (including a locally tied text), the category conflict veto, the plumbing and dental configurations run through the same engine, and per-category `requires` on the model path (agreement, local none, tie, veto, null answer, failed classification, unsafe names, and a configuration without `requires`). `skills` (6): definitions versus `SKILL.md` and `AGENT.md`. `claude-provider` (28): request shape, structured-output schema, good answers, 13 failure kinds under three fallback settings, error-text discarding, refusal and truncation blanking, timeouts, bounded retries, injection text, gates before any call. `live-dry-run` (5): the entry point run as a child process in a sanitized environment (no confirmation variable, no credentials), checking the dry run (Haiku default, two synthetic request bodies, call limit 2, readiness checklist, nothing sent) and every refusal path. `live-gate` (16): argument parsing and credential refusal, path and synthetic checks, the gate, cost arithmetic, and static guarantees (dry run first, SDK imported only after the gate and only once, no credential reads, no live-capable npm script, the only dependency is the exact-pinned official SDK and the lockfile agrees).
 
 ## Mapping to the register
 
