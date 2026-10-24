@@ -7,7 +7,7 @@ import { runIntake } from '../src/intake-runner.ts';
 import type { RunResult } from '../src/intake-runner.ts';
 import { classifyAndExtract, classifyRequest, validateSkillConfig } from '../src/classify-extract.ts';
 import { validateEnvelope, validateWorkItem } from '../src/contracts.ts';
-import { skillConfig, skillInput } from './skill-fixtures.ts';
+import { requiresConfig, requiresInput, skillConfig, skillInput } from './skill-fixtures.ts';
 
 function ok(r: RunResult) {
   assert.equal(r.ok, true, 'expected ok result');
@@ -179,6 +179,89 @@ test('safe fallback: invalid configuration is refused with fixed paths and no ec
   assert.ok(!JSON.stringify(e).includes('CANARY-VALUE-4417'));
   assert.ok(!JSON.stringify(e).includes('CANARY-KEY-8820'));
   assert.ok(!JSON.stringify(e).includes('bad-type'));
+});
+
+test('per-category requires: exact field names only; unknown, case-different, duplicate, and malformed entries are refused without echo', () => {
+  const bad = (requires: unknown) => {
+    const cfg = requiresConfig() as unknown as { categories: Array<Record<string, unknown>> };
+    cfg.categories[0].requires = requires;
+    return validateSkillConfig(cfg);
+  };
+  assert.deepEqual(validateSkillConfig(requiresConfig()), []);
+  assert.ok(bad(['F9-CANARY-5521']).length === 1, 'unknown field name');
+  assert.ok(bad(['f1']).length === 1, 'case-different name');
+  assert.ok(bad(['F1', 'F1']).some((e) => e.includes('duplicate')));
+  assert.ok(bad('F1').length === 1, 'not an array');
+  assert.ok(bad([1]).length === 1, 'not a string');
+  assert.ok(!JSON.stringify(bad(['F9-CANARY-5521'])).includes('CANARY'), 'no echo of configured values');
+  const x = requiresInput('pword', ['F0']);
+  (x.skill_config as unknown as { categories: Array<Record<string, unknown>> }).categories[0].requires = ['Nope'];
+  err(runIntake(x), 'INPUT_INVALID');
+});
+
+test('per-category requires (local path): a matched category adds its requirement; none or a tie uses the base set only', () => {
+  const p = ok(runIntake(requiresInput('pword', ['F0'])));
+  assert.deepEqual([p.workItem.category, p.workItem.missing_fields, p.workItem.reasons, p.handoff], ['Cat P', ['F1'], ['missing_fields'], null]);
+  const r = ok(runIntake(requiresInput('rword', ['F0'])));
+  assert.deepEqual([r.workItem.category, r.workItem.missing_fields, r.outcome], ['Cat R', [], 'handed-off']);
+  const tie = ok(runIntake(requiresInput('pword qword', ['F0'])));
+  assert.deepEqual([tie.workItem.category, tie.workItem.missing_fields, tie.workItem.reasons], ['unknown', [], ['ambiguous_category']]);
+  const none = ok(runIntake(requiresInput('nothing here', ['F0'])));
+  assert.deepEqual([none.workItem.category, none.workItem.missing_fields, none.workItem.reasons], ['unknown', [], ['unknown_category']]);
+});
+
+test('per-category requires (edge): an empty list is accepted and adds nothing', () => {
+  const cfg = requiresConfig();
+  cfg.categories[0].requires = [];
+  assert.deepEqual(validateSkillConfig(cfg), []);
+  const r = ok(runIntake(requiresInput('pword', ['F0'], cfg)));
+  assert.deepEqual([r.workItem.category, r.workItem.missing_fields, r.outcome], ['Cat P', [], 'handed-off']);
+});
+
+test('per-category requires (edge): naming a field that is already required: true is accepted and is reported once', () => {
+  const cfg = requiresConfig();
+  cfg.categories[0].requires = ['F0', 'F1'];
+  assert.deepEqual(validateSkillConfig(cfg), []);
+  const r = ok(runIntake(requiresInput('pword', [], cfg)));
+  assert.deepEqual(r.workItem.missing_fields, ['F0', 'F1']);
+  assert.equal(r.workItem.fields.filter((f) => f.name === 'F0').length, 1, 'no duplicate field entry');
+  assert.deepEqual(r.workItem.reasons, ['missing_fields']);
+});
+
+test('per-category requires (edge): conflicting values for a category-required field are missing and flagged ambiguous', () => {
+  const x = requiresInput('pword', ['F0', 'F1']);
+  x.masked_text += '\nf1: other';                    // a1 vs other: two different values
+  const r = ok(runIntake(x));
+  assert.deepEqual(r.workItem.missing_fields, ['F1']);
+  assert.deepEqual(r.workItem.reasons, ['missing_fields', 'ambiguous_field']);
+  assert.equal(r.handoff, null);
+});
+
+test('per-category requires (edge): category names constructor and __proto__ are safe on the local path too', () => {
+  const cfg = requiresConfig();
+  cfg.categories = [
+    { name: 'constructor', keywords: ['cword'], requires: ['F1'] },
+    { name: '__proto__', keywords: ['dword'], requires: ['F2'] },
+  ];
+  assert.deepEqual(ok(runIntake(requiresInput('cword', ['F0'], cfg))).workItem.missing_fields, ['F1']);
+  assert.deepEqual(ok(runIntake(requiresInput('dword', ['F0'], cfg))).workItem.missing_fields, ['F2']);
+  const none = ok(runIntake(requiresInput('nothing here', ['F0'], cfg)));
+  assert.deepEqual([none.workItem.category, none.workItem.reasons], ['unknown', ['unknown_category']]);
+});
+
+test('per-category requires (plumbing fixture): a booking change needs only a preferred date and is ready without an address', () => {
+  const x = JSON.parse(readFileSync(new URL('../examples/skill-plumbing.json', import.meta.url), 'utf8'));
+  x.masked_text = 'Hello, this is [PERSON_1]. Please reschedule my visit.\nPreferred date: Friday afternoon';
+  const r = ok(runIntake(x));
+  assert.deepEqual([r.workItem.category, r.workItem.missing_fields, r.workItem.reasons, r.outcome], ['Booking change', [], [], 'handed-off']);
+  assert.ok(r.handoff && validateEnvelope(r.handoff).length === 0);
+});
+
+test('per-category requires (plumbing fixture): an emergency leak without an address is flagged and not handed off', () => {
+  const x = JSON.parse(readFileSync(new URL('../examples/skill-plumbing.json', import.meta.url), 'utf8'));
+  x.masked_text = 'Hello, this is [PERSON_1]. There is a burst pipe and a leak in the kitchen.\nJob description: Burst pipe repair';
+  const r = ok(runIntake(x));
+  assert.deepEqual([r.workItem.category, r.workItem.missing_fields, r.workItem.reasons, r.outcome, r.handoff], ['Emergency leak', ['Address'], ['missing_fields'], 'needs-human', null]);
 });
 
 test('safe fallback: exactly one source of categories and fields is allowed', () => {

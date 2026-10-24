@@ -18,6 +18,34 @@ export function skillConfig(): SkillConfig {
   };
 }
 
+/** F0 is always required; F1 and F2 are optional. Cat P requires F1, Cat Q requires F2, Cat R requires nothing extra. */
+export function requiresConfig(): SkillConfig {
+  return {
+    categories: [
+      { name: 'Cat P', keywords: ['pword'], requires: ['F1'] },
+      { name: 'Cat Q', keywords: ['qword'], requires: ['F2'] },
+      { name: 'Cat R', keywords: ['rword'] },
+    ],
+    fields: [
+      { name: 'F0', required: true, extractor: { kind: 'label', labels: ['f0'] } },
+      { name: 'F1', required: false, extractor: { kind: 'label', labels: ['f1'] } },
+      { name: 'F2', required: false, extractor: { kind: 'label', labels: ['f2'] } },
+    ],
+  };
+}
+
+/** Text with a keyword line plus "fN: aN" lines for the listed fields (so every extracted value is in the text). */
+export function requiresText(keywords: string, present: string[]): string {
+  return [keywords, ...present.map((n) => `${n.toLowerCase()}: a${n.slice(1)}`)].join('\n');
+}
+
+export function requiresInput(keywords: string, present: string[], config: SkillConfig = requiresConfig()): IntakeInput {
+  const x = skillInput();
+  x.masked_text = requiresText(keywords, present);
+  x.skill_config = config;
+  return x;
+}
+
 /** A valid skill-mode input whose text clearly matches Category A and contains both required fields. */
 export function skillInput(): IntakeInput {
   return {

@@ -12,13 +12,13 @@
   ],
   "skill_config": {
     "categories": [
-      { "name": "Emergency leak", "keywords": ["burst pipe", "leak", "flooding"] },
-      { "name": "Quote request", "keywords": ["quote", "estimate"] },
-      { "name": "Booking change", "keywords": ["reschedule", "cancel"] }
+      { "name": "Emergency leak", "keywords": ["burst pipe", "leak", "flooding"], "requires": ["Address", "Job description"] },
+      { "name": "Quote request", "keywords": ["quote", "estimate"], "requires": ["Job description"] },
+      { "name": "Booking change", "keywords": ["reschedule", "cancel"], "requires": ["Preferred date"] }
     ],
     "fields": [
-      { "name": "Address", "required": true, "extractor": { "kind": "label", "labels": ["address", "location"] } },
-      { "name": "Job description", "required": true, "extractor": { "kind": "label", "labels": ["job description"] } },
+      { "name": "Address", "required": false, "extractor": { "kind": "label", "labels": ["address", "location"] } },
+      { "name": "Job description", "required": false, "extractor": { "kind": "label", "labels": ["job description"] } },
       { "name": "Preferred date", "required": false, "extractor": { "kind": "label", "labels": ["preferred date"] } }
     ]
   }

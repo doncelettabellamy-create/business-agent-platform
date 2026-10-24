@@ -9,7 +9,7 @@ import { callModel, buildClassifyRequest, parseClassifyOutput, parseExtractOutpu
 import { INTAKE_SKILLS } from '../src/skills.ts';
 import { classifyAnswer, createMockProvider, extractAnswer, hangs } from '../src/mock-provider.ts';
 import { validateEnvelope, validateWorkItem } from '../src/contracts.ts';
-import { skillInput } from './skill-fixtures.ts';
+import { requiresConfig, requiresInput, skillInput } from './skill-fixtures.ts';
 
 // skillInput() text: "...follow up on my earlier request.\nTopic: Change of details\nReference: [ID_1]. SENTINEL-SKILL-TEXT-5512"
 const GOOD_FIELDS = [
@@ -121,7 +121,7 @@ test('two unrelated businesses (plumbing, dental) run through the same engine wi
     { file: 'skill-plumbing.json', category: 'Emergency leak', other: 'Quote request', required: 'Address', otherBusiness: ['New patient', 'Patient reference'],
       fields: [{ name: 'Address', value: '[ADDRESS_1]', confidence: 0.9 }, { name: 'Job description', value: 'Burst pipe repair', confidence: 0.9 }, { name: 'Preferred date', value: null, confidence: null }] },
     { file: 'skill-dental.json', category: 'New patient', other: 'Billing question', required: 'Patient reference', otherBusiness: ['Emergency leak', 'Job description'],
-      fields: [{ name: 'Patient reference', value: '[ID_1]', confidence: 0.9 }, { name: 'Preferred date', value: null, confidence: null }, { name: 'Insurance provider', value: null, confidence: null }] },
+      fields: [{ name: 'Patient reference', value: '[ID_1]', confidence: 0.9 }, { name: 'Preferred date', value: null, confidence: null }, { name: 'Insurance provider', value: 'Example Health', confidence: 0.9 }] },
   ];
   for (const c of cases) {
     const input = load(c.file);
@@ -153,6 +153,76 @@ test('two unrelated businesses (plumbing, dental) run through the same engine wi
   const swapped = load('skill-plumbing.json');
   swapped.skill_config = load('skill-dental.json').skill_config;
   assert.deepEqual(ok(runIntake(swapped)).workItem.reasons.includes('unknown_category'), true);
+});
+
+// ---------------------------------------------------------------- per-category requires
+// Local classifier states: matched (one keyword), none, tie. The category's `requires` relaxes the check only when the
+// local classifier confirms it; a model-only category must satisfy every category's `requires` (the union).
+const requiresCases: Array<[string, string, string[], string | null, { category: string; reasons: string[]; missing: string[] }]> = [
+  ['agree, relaxed (R requires nothing extra)',     'rword',        ['F0'],             'Cat R', { category: 'Cat R',   reasons: [],                     missing: [] }],
+  ['agree, strict (P requires F1)',                 'pword',        ['F0'],             'Cat P', { category: 'Cat P',   reasons: ['missing_fields'],     missing: ['F1'] }],
+  ['agree, strict and satisfied',                   'pword',        ['F0', 'F1'],       'Cat P', { category: 'Cat P',   reasons: [],                     missing: [] }],
+  ['local none, lightest model pick -> union',      'nothing here', ['F0'],             'Cat R', { category: 'Cat R',   reasons: ['missing_fields'],     missing: ['F1', 'F2'] }],
+  ['local none, partial data -> union',             'nothing here', ['F0', 'F1'],       'Cat P', { category: 'Cat P',   reasons: ['missing_fields'],     missing: ['F2'] }],
+  ['local none, complete data -> ready',            'nothing here', ['F0', 'F1', 'F2'], 'Cat P', { category: 'Cat P',   reasons: [],                     missing: [] }],
+  ['local tie, unrelated model pick -> union',      'pword qword',  ['F0'],             'Cat R', { category: 'Cat R',   reasons: ['missing_fields'],     missing: ['F1', 'F2'] }],
+  ['local tie, tied model pick -> union',           'pword qword',  ['F0', 'F1'],       'Cat P', { category: 'Cat P',   reasons: ['missing_fields'],     missing: ['F2'] }],
+  ['veto (local P, model R) -> base only',          'pword',        ['F0'],             'Cat R', { category: 'unknown', reasons: ['ambiguous_category'], missing: [] }],
+  ['model null -> base only',                       'nothing here', ['F0'],             null,    { category: 'unknown', reasons: ['unknown_category'],   missing: [] }],
+];
+for (const [name, keywords, present, modelCategory, want] of requiresCases) {
+  test(`per-category requires (model path): ${name}`, async () => {
+    const p = createMockProvider({
+      classify_request: () => classifyAnswer(modelCategory, modelCategory === null ? null : 0.9),
+      extract_fields: () => extractAnswer(present.map((n) => ({ name: n, value: `a${n.slice(1)}`, confidence: 0.9 }))),
+    });
+    const r = ok(await runIntakeWithModel(requiresInput(keywords, present), withProvider(p)));
+    assert.deepEqual([r.workItem.category, r.workItem.reasons, r.workItem.missing_fields], [want.category, want.reasons, want.missing]);
+    assert.equal(r.outcome, want.reasons.length ? 'needs-human' : 'handed-off');
+    assert.equal(r.handoff === null, want.reasons.length > 0);
+    assert.deepEqual(validateWorkItem(r.workItem), []);
+  });
+}
+
+test('per-category requires (model path): a configuration without requires behaves as before for a model-only category', async () => {
+  const x = skillInput();
+  x.masked_text = 'Nothing relevant here.\nTopic: Something\nReference: [ID_1]';   // no configured keyword matches locally
+  const p = createMockProvider({
+    classify_request: () => classifyAnswer('Category B', 0.9),
+    extract_fields: () => extractAnswer([{ name: 'Field 1', value: 'Something', confidence: 0.9 }, { name: 'Field 2', value: '[ID_1]', confidence: 0.9 }]),
+  });
+  const r = ok(await runIntakeWithModel(x, withProvider(p)));
+  assert.equal(r.outcome, 'handed-off');
+  assert.equal(r.workItem.category, 'Category B');
+});
+
+test('per-category requires (model path): category names such as constructor and __proto__ are safe lookup keys', async () => {
+  const cfg = requiresConfig();
+  cfg.categories = [
+    { name: 'constructor', keywords: ['cword'], requires: ['F1'] },
+    { name: '__proto__', keywords: ['dword'], requires: ['F2'] },
+  ];
+  for (const [kw, pick, missing] of [['cword', 'constructor', ['F1']], ['dword', '__proto__', ['F2']], ['nothing here', 'constructor', ['F1', 'F2']]] as const) {
+    const p = createMockProvider({
+      classify_request: () => classifyAnswer(pick, 0.9),
+      extract_fields: () => extractAnswer([{ name: 'F0', value: 'a0', confidence: 0.9 }]),
+    });
+    const r = ok(await runIntakeWithModel(requiresInput(kw, ['F0'], cfg), withProvider(p)));
+    assert.deepEqual(r.workItem.missing_fields, missing, kw);
+    assert.equal(r.handoff, null, kw);
+  }
+});
+
+test('per-category requires (model path, edge): a failed classification with a locally matched category is model_failed plus the matched requirement, never ready', async () => {
+  const garbage = () => 'not json';
+  for (const [present, reasons, missing] of [[['F0'], ['missing_fields', 'model_failed'], ['F1']], [['F0', 'F1'], ['model_failed'], []]] as const) {
+    const p = createMockProvider({
+      classify_request: garbage,
+      extract_fields: () => extractAnswer(present.map((n) => ({ name: n, value: `a${n.slice(1)}`, confidence: 0.9 }))),
+    });
+    const r = ok(await runIntakeWithModel(requiresInput('pword', [...present]), withProvider(p)));
+    assert.deepEqual([r.workItem.reasons, r.workItem.missing_fields, r.outcome, r.handoff], [reasons, missing, 'needs-human', null], present.join());
+  }
 });
 
 test('model path: a null required field is missing_fields, sent to a person, with no envelope', async () => {

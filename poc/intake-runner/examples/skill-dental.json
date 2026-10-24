@@ -12,8 +12,8 @@
   ],
   "skill_config": {
     "categories": [
-      { "name": "New patient", "keywords": ["new patient", "first visit"] },
-      { "name": "Appointment change", "keywords": ["reschedule", "cancel"] },
+      { "name": "New patient", "keywords": ["new patient", "first visit"], "requires": ["Insurance provider"] },
+      { "name": "Appointment change", "keywords": ["reschedule", "cancel"], "requires": ["Preferred date"] },
       { "name": "Billing question", "keywords": ["invoice", "bill"] }
     ],
     "fields": [

@@ -99,6 +99,12 @@ interface Resolved {
   fieldAmbiguous: boolean;
   /** Extra confidence values (for example the model's category confidence) that count toward the overall minimum. */
   extraConfidences: number[];
+  /** Skill mode only: per-category extra required field names (a Map, so a category named "constructor" cannot hit a prototype key). */
+  categoryRequires?: Map<string, string[]>;
+  /** Skill mode only: every field named by any category's `requires`. Applied to a category that the local classifier did not confirm. */
+  unionRequires?: string[];
+  /** Skill mode only: true when the final category is the one the local keyword match found. */
+  categoryVerified?: boolean;
 }
 interface Meta {
   modelLabel: string;
@@ -226,6 +232,9 @@ function resolveDeterministic(input: IntakeInput): Resolved {
       categoryAmbiguous: sr.categoryOutcome === 'ambiguous',
       fieldAmbiguous: sr.ambiguousFields.length > 0,
       extraConfidences: [],
+      categoryRequires: new Map(input.skill_config.categories.map((c) => [c.name, c.requires ?? []])),
+      unionRequires: [...new Set(input.skill_config.categories.flatMap((c) => c.requires ?? []))],
+      categoryVerified: true,   // the local result is its own confirmation; the model path recomputes this
     };
   }
   return {
@@ -238,7 +247,24 @@ function resolveDeterministic(input: IntakeInput): Resolved {
   };
 }
 
+/**
+ * Required field names for the final category. The global `required: true` fields always apply. A category's `requires`
+ * adds fields only when the local classifier confirmed that category; a category that came from the model alone (local
+ * match absent or tied) must satisfy every category's `requires`, so a model-only pick cannot lower the bar. A category
+ * the local keyword match confirmed can still be wrong (for example through planted keywords); see the README limitations.
+ */
+function requiredFor(input: IntakeInput, src: Resolved, category: string): string[] {
+  if (!input.skill_config || !src.categoryRequires || category === 'unknown') return src.requiredFields;
+  const extra = new Set(src.categoryVerified === false ? src.unionRequires ?? [] : src.categoryRequires.get(category) ?? []);
+  const base = new Set(src.requiredFields);
+  return input.skill_config.fields.map((f) => f.name).filter((n) => base.has(n) || extra.has(n));
+}
+
 function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions, meta: Meta): { item: WorkItemV1; overallConfidence: number | null } {
+  const cand = src.candidate.category;
+  const category = cand !== null && src.categoryList.includes(cand) ? cand : 'unknown';
+  const requiredFields = requiredFor(input, src, category);
+
   // Fields: the candidate or skill values as they are, plus any required field that was not mentioned at all.
   const fields: FieldEntry[] = src.candidate.fields.map((f) => ({
     name: f.name,
@@ -246,14 +272,11 @@ function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions, m
     confidence: f.value === null ? null : f.confidence,
     found: f.value !== null,
   }));
-  for (const name of src.requiredFields) {
+  for (const name of requiredFields) {
     if (!fields.some((f) => f.name === name)) fields.push({ name, value: null, confidence: null, found: false });
   }
 
-  const missing = src.requiredFields.filter((n) => !fields.some((f) => f.name === n && f.found));
-
-  const cand = src.candidate.category;
-  const category = cand !== null && src.categoryList.includes(cand) ? cand : 'unknown';
+  const missing = requiredFields.filter((n) => !fields.some((f) => f.name === n && f.found));
 
   const confidences = fields.filter((f) => f.found && f.confidence !== null).map((f) => f.confidence as number).concat(src.extraConfidences);
   const overall = confidences.length ? Math.min(...confidences) : null;
@@ -391,6 +414,9 @@ export async function runIntakeWithModel(input: unknown, options: ModelRunOption
     categoryAmbiguous,
     fieldAmbiguous,
     extraConfidences,
+    categoryRequires: det.categoryRequires,
+    unionRequires: det.unionRequires,
+    categoryVerified: category !== null && det.candidate.category === category,
   };
   // Any model failure ALWAYS requires human review. There is no configuration that turns this off.
   const result = finish(typed, src, options, {

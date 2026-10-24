@@ -13,12 +13,16 @@
 //   Zero matches -> not found. Several matches with the same value -> found. Several different values -> ambiguous
 //   (treated as not found, and flagged). Values longer than the limit are treated as not found.
 //
+//   Required fields: a field with `required: true` is always required. A category may also list `requires` (exact field
+//     names); the runner (not this file) adds those for the final category. This file only validates the names.
+//
 // Deterministic confidence scoring is not attempted: extracted values carry confidence null.
 // Error strings from validateSkillConfig contain fixed paths only, never configured values.
 
 import { checkKeys, isNonEmptyString, isRecord } from './contracts.ts';
 
-export interface CategoryConfig { name: string; keywords: string[] }
+/** `requires` (optional) names fields that are required for this category in addition to every field with `required: true`. */
+export interface CategoryConfig { name: string; keywords: string[]; requires?: string[] }
 export type ExtractorConfig =
   | { kind: 'label'; labels: string[] }
   | { kind: 'token'; token_type: string };
@@ -66,7 +70,7 @@ export function validateSkillConfig(x: unknown, path = 'skill_config'): string[]
     x.categories.forEach((c: unknown, i: number) => {
       const cp = `${path}.categories[${i}]`;
       if (!isRecord(c)) { errors.push(`${cp}: expected object`); return; }
-      checkKeys(c, ['name', 'keywords'], cp, errors);
+      checkKeys(c, ['name', 'keywords'], cp, errors, ['requires']);
       if (!shortText(c.name)) errors.push(`${cp}.name: expected short single-line string`);
       else if (c.name === 'unknown') errors.push(`${cp}.name: "unknown" is reserved`);
       else if (names.includes(c.name.toLowerCase())) errors.push(`${cp}.name: duplicate`);
@@ -114,6 +118,23 @@ export function validateSkillConfig(x: unknown, path = 'skill_config'): string[]
       } else {
         errors.push(`${ep}.kind: expected label or token`);
       }
+    });
+  }
+
+  // `requires`: exact, case-sensitive field names, so a typo can never silently drop a requirement.
+  if (Array.isArray(x.categories) && x.categories.length <= LIMITS.categories) {
+    const fieldNames = Array.isArray(x.fields) ? x.fields.filter(isRecord).map((f) => f.name).filter((n): n is string => typeof n === 'string') : [];
+    x.categories.forEach((c: unknown, i: number) => {
+      if (!isRecord(c) || !Object.hasOwn(c, 'requires')) return;
+      const rp = `${path}.categories[${i}].requires`;
+      const r = c.requires;
+      if (!Array.isArray(r) || r.length > LIMITS.fields) { errors.push(`${rp}: expected an array of at most ${LIMITS.fields} field names`); return; }
+      const seen: string[] = [];
+      r.forEach((n: unknown, j: number) => {
+        if (typeof n !== 'string' || !fieldNames.includes(n)) errors.push(`${rp}[${j}]: expected the exact name of a configured field`);
+        else if (seen.includes(n)) errors.push(`${rp}[${j}]: duplicate`);
+        else seen.push(n);
+      });
     });
   }
   return errors;
