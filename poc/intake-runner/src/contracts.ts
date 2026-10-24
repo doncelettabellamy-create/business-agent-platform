@@ -5,9 +5,10 @@
 
 export const WORK_ITEM_CONTRACT = 'work_item.v1';
 
-// ambiguous_category and ambiguous_field were added with the local classify-extract skill (draft proposal, unapproved).
+// ambiguous_category and ambiguous_field were added with the local classify-extract skill, and model_failed with the
+// model gateway (draft proposals, unapproved).
 export const REASON_CODES = [
-  'missing_fields', 'unknown_category', 'ambiguous_category', 'ambiguous_field', 'low_confidence',
+  'missing_fields', 'unknown_category', 'ambiguous_category', 'ambiguous_field', 'low_confidence', 'model_failed',
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 

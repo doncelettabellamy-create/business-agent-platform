@@ -10,7 +10,7 @@ handoff_to: processing using work_item.v1 inside handoff-envelope.v1
 
 # Intake
 
-> **Status: DRAFT specification. Not approved. Not implemented.** No runtime code, skill, tool, or channel exists. Implementation gates are on HOLD (`ARCHITECTURAL_ESSENTIALS.md` section 9).
+> **Status: DRAFT specification. Not approved. Not production.** No production runtime, real model connection, tool, or channel exists. A synthetic-only proof of concept lives in `poc/intake-runner/` (deterministic runner, provider-independent model gateway with a local mock, and executable skill definitions); it calls no real model. Draft `SKILL.md` files exist under `agents/intake/skills/`. Implementation gates are on HOLD (`ARCHITECTURAL_ESSENTIALS.md` section 9).
 > Sources: `docs/blueprint/AGENT_SPECS.md`, `PRD.md`, `TEMPLATES.md`, `ARCHITECTURAL_ESSENTIALS.md`, `docs/MASTER_BUILD_REGISTER.md` (rows INT-01 to INT-09, INT-12, INT-13; build steps S-17 to S-24).
 > **TBD** = unresolved founder decision. Do not guess it. Skill names are placeholders until D-01. The agent name `intake` and this folder layout are founder-fixed (FC-01, FC-02).
 
@@ -58,7 +58,7 @@ Steps 1 to 5 are platform code (not skills) and happen before any Intake skill r
 
 ## Skills (placeholders until D-01)
 
-Each skill lives in `agents/intake/skills/<skill-name>/SKILL.md` with a sidecar contract (format **TBD, D-07**). None exists yet.
+Each skill lives in `agents/intake/skills/<skill-name>/SKILL.md` with a sidecar contract (format **TBD, D-07**). Draft `SKILL.md` files now exist for all four; their enforced definitions (tools, permissions, limits) are provisionally held in `poc/intake-runner/src/skills.ts` until the sidecar format is decided.
 
 | Skill | Inputs | Outputs | Tools | Data permissions | Tier |
 |---|---|---|---|---|---|

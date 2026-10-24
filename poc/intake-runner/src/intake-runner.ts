@@ -1,18 +1,20 @@
-// Deterministic Intake runner (proof of concept).
+// Intake runner (proof of concept).
 //
-// Takes ONE already-masked synthetic input record and builds a work_item.v1 deterministically. The category
-// and field values come from ONE of two sources (never both):
-//   - "candidate": values supplied in the record (the original PoC mode), or
-//   - "skill_config": explicitly configured categories and fields, applied by the local deterministic
-//     classify-extract skill to the masked text.
-// The work item is validated and, only for status "ready", wrapped in a handoff envelope for Processing.
+// ONE pipeline, two ways to obtain the category and field values:
+//   runIntake(input, options)               synchronous and fully deterministic. Values come from a supplied
+//                                           "candidate" or from the local classify-extract skill ("skill_config").
+//   runIntakeWithModel(input, options)      asynchronous. The classify-request and extract-fields skills ask a
+//                                           ModelProvider (today only a local mock) through the model gateway.
+//                                           If a model answer fails, the deterministic skill supplies the values
+//                                           and, by default, the item is sent to a person (reason model_failed).
+// Both then share the same steps: tenant gate, structure check, masking declaration, contract support,
+// work_item.v1 build and validation, and the Processing handoff envelope for ready items only.
 //
-// Not included, by design: model calls, personal-data detection, database, network, queue, audit chain,
-// vault, approvals, outbound actions. Imports: node:crypto and local files only.
+// Not included, by design: any real provider, API key, network call, personal-data detector, database, queue,
+// audit chain, vault, approvals, or outbound action. Imports: node:crypto and local files only.
 //
-// Register mapping (docs/MASTER_BUILD_REGISTER.md): FND-26 (contract skeleton), INT-12 (work_item.v1 and
-// a deterministic stand-in for the Intake skills), PRC-06 (handoff envelope only). All three rows remain
-// Founder-PENDING; this PoC does not mark any of them complete.
+// Register mapping (docs/MASTER_BUILD_REGISTER.md): FND-26 (contract skeleton), FND-17 (model gateway shape only),
+// INT-12 (work_item.v1 and the Intake skills), PRC-06 (handoff envelope only). All remain Founder-PENDING.
 
 import { createHash } from 'node:crypto';
 import {
@@ -21,8 +23,13 @@ import {
 import type { FieldEntry, HandoffEnvelopeV1, PiiSummaryEntry, ReasonCode, WorkItemV1 } from './contracts.ts';
 import { classifyAndExtract, validateSkillConfig } from './classify-extract.ts';
 import type { SkillConfig } from './classify-extract.ts';
+import {
+  PROMPT_VERSION, buildClassifyRequest, buildExtractRequest, callModel, normalizeCallOptions, parseClassifyOutput, parseExtractOutput,
+} from './model-gateway.ts';
+import type { ModelCallOptions, ModelFailureCode, ModelProvider } from './model-gateway.ts';
+import { INTAKE_SKILLS } from './skills.ts';
 
-export const RUNNER_VERSION = 'intake-runner-poc@0.1.0';
+export const RUNNER_VERSION = 'intake-runner-poc@0.2.0';
 const MAX_MASKED_TEXT = 20000;
 const ID_LIKE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -43,14 +50,21 @@ export interface IntakeInput {
   category_list?: string[];
   required_fields?: string[];
   candidate?: Candidate;
-  /** Skill mode: replaces category_list, required_fields, and candidate (all three must be absent). */
+  /** Skill mode (deterministic) and model mode: replaces category_list, required_fields, and candidate. */
   skill_config?: SkillConfig;
 }
 
 export interface RunOptions {
   /** Minimum overall confidence. Threshold is a founder decision (D-04); there is NO default. If omitted, the check is off.
-   *  The local skill does not score confidence, so with skill_config every item is flagged when this is set. */
+   *  The local deterministic skill does not score confidence, so with it every item is flagged when this is set. */
   minConfidence?: number;
+}
+
+export interface ModelRunOptions extends RunOptions, ModelCallOptions {
+  provider: ModelProvider;
+  /** What to do when a model answer fails. "needs-human" (default): use deterministic values but flag the item with
+   *  reason model_failed. "deterministic": use deterministic values as if the model had not been tried. */
+  fallback?: 'needs-human' | 'deterministic';
 }
 
 export type ErrorCode =
@@ -60,8 +74,17 @@ export type ErrorCode =
   | 'CONTRACT_UNSUPPORTED'
   | 'CONTRACT_INVALID';
 
+/** Per-skill record of where the values came from. Codes and counts only; never provider text. */
+export interface SkillTrace {
+  skill: string;
+  source: 'model' | 'deterministic' | 'deterministic-fallback';
+  provider_id?: string;
+  attempts?: number;
+  failure?: ModelFailureCode;
+}
+
 export type RunResult =
-  | { ok: true; outcome: 'handed-off' | 'needs-human'; workItem: WorkItemV1; handoff: HandoffEnvelopeV1 | null }
+  | { ok: true; outcome: 'handed-off' | 'needs-human'; workItem: WorkItemV1; handoff: HandoffEnvelopeV1 | null; trace?: SkillTrace[] }
   | { ok: false; error: { code: ErrorCode; message: string; paths?: string[] } };
 
 interface Resolved {
@@ -70,6 +93,14 @@ interface Resolved {
   candidate: Candidate;
   categoryAmbiguous: boolean;
   fieldAmbiguous: boolean;
+  /** Extra confidence values (for example the model's category confidence) that count toward the overall minimum. */
+  extraConfidences: number[];
+}
+interface Meta {
+  modelLabel: string;
+  promptLabel: string;
+  extraReasons: ReasonCode[];
+  trace?: SkillTrace[];
 }
 
 function fail(code: ErrorCode, message: string, paths?: string[]): RunResult {
@@ -145,7 +176,7 @@ export function validateInput(x: unknown): string[] {
     });
   }
 
-  // Exactly one source for categories and fields.
+  // Exactly one source of categories and fields.
   const hasSkill = Object.hasOwn(x, 'skill_config');
   const hasCandidateKeys = ['category_list', 'required_fields', 'candidate'].some((k) => Object.hasOwn(x, k));
   if (hasSkill && hasCandidateKeys) {
@@ -162,7 +193,26 @@ function itemIdFor(workspaceId: string, eventId: string): string {
   return 'wi-' + createHash('sha256').update(`${workspaceId}\n${eventId}`).digest('hex').slice(0, 12);
 }
 
-function resolveSource(input: IntakeInput): Resolved {
+/** Shared gates: tenant, structure, masking declaration, contract support. */
+function prepare(input: unknown): { ok: true; typed: IntakeInput } | { ok: false; result: RunResult } {
+  // 1. Tenant first: without a tenant nothing else is examined (fail closed).
+  if (!isRecord(input) || !isNonEmptyString(input.workspace_id)) {
+    return { ok: false, result: fail('TENANT_CONTEXT_MISSING', 'No tenant (workspace) was provided; nothing was processed.') };
+  }
+  // 2. Structure.
+  const problems = validateInput(input);
+  if (problems.length) return { ok: false, result: fail('INPUT_INVALID', 'The input record does not match the expected structure.', problems) };
+  const typed = input as unknown as IntakeInput;
+  // 3. The runner trusts a masking declaration; it cannot detect personal data (see README limitations).
+  if (typed.masking.applied !== true) return { ok: false, result: fail('MASKING_NOT_DECLARED', 'The input is not declared as masked; it was refused.') };
+  // 4. Only work_item.v1 is supported.
+  if ((typed.requested_contract ?? WORK_ITEM_CONTRACT) !== WORK_ITEM_CONTRACT) {
+    return { ok: false, result: fail('CONTRACT_UNSUPPORTED', 'The requested contract or version is not supported.') };
+  }
+  return { ok: true, typed };
+}
+
+function resolveDeterministic(input: IntakeInput): Resolved {
   if (input.skill_config) {
     const sr = classifyAndExtract(input.masked_text, input.skill_config);
     return {
@@ -171,6 +221,7 @@ function resolveSource(input: IntakeInput): Resolved {
       candidate: { category: sr.category, fields: sr.fields },
       categoryAmbiguous: sr.categoryOutcome === 'ambiguous',
       fieldAmbiguous: sr.ambiguousFields.length > 0,
+      extraConfidences: [],
     };
   }
   return {
@@ -179,10 +230,11 @@ function resolveSource(input: IntakeInput): Resolved {
     candidate: input.candidate as Candidate,
     categoryAmbiguous: false,
     fieldAmbiguous: false,
+    extraConfidences: [],
   };
 }
 
-function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions): { item: WorkItemV1; overallConfidence: number | null } {
+function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions, meta: Meta): { item: WorkItemV1; overallConfidence: number | null } {
   // Fields: the candidate or skill values as they are, plus any required field that was not mentioned at all.
   const fields: FieldEntry[] = src.candidate.fields.map((f) => ({
     name: f.name,
@@ -199,7 +251,7 @@ function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions): 
   const cand = src.candidate.category;
   const category = cand !== null && src.categoryList.includes(cand) ? cand : 'unknown';
 
-  const confidences = fields.filter((f) => f.found && f.confidence !== null).map((f) => f.confidence as number);
+  const confidences = fields.filter((f) => f.found && f.confidence !== null).map((f) => f.confidence as number).concat(src.extraConfidences);
   const overall = confidences.length ? Math.min(...confidences) : null;
 
   const reasons: ReasonCode[] = [];
@@ -207,6 +259,7 @@ function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions): 
   if (category === 'unknown') reasons.push(src.categoryAmbiguous ? 'ambiguous_category' : 'unknown_category');
   if (src.fieldAmbiguous) reasons.push('ambiguous_field');
   if (options.minConfidence !== undefined && (overall === null || overall < options.minConfidence)) reasons.push('low_confidence');
+  for (const r of meta.extraReasons) if (!reasons.includes(r)) reasons.push(r);
 
   const item: WorkItemV1 = {
     item_id: itemIdFor(input.workspace_id, input.event_id),
@@ -219,44 +272,20 @@ function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions): 
     pii_summary: (input.pii_summary ?? []).map((p) => ({ type: p.type, count: p.count })),
     status: reasons.length ? 'needs-human' : 'ready',
     reasons,
-    versions: { skill: RUNNER_VERSION, model: 'none (deterministic)', prompt: 'none' },
+    versions: { skill: RUNNER_VERSION, model: meta.modelLabel, prompt: meta.promptLabel },
   };
   return { item, overallConfidence: overall };
 }
 
-export function runIntake(input: unknown, options: RunOptions = {}): RunResult {
-  if (options.minConfidence !== undefined && !isUnitNumber(options.minConfidence)) {
-    throw new RangeError('minConfidence must be a number from 0 to 1');
-  }
-
-  // 1. Tenant first: without a tenant nothing else is examined (fail closed).
-  if (!isRecord(input) || !isNonEmptyString(input.workspace_id)) {
-    return fail('TENANT_CONTEXT_MISSING', 'No tenant (workspace) was provided; nothing was processed.');
-  }
-
-  // 2. Structure.
-  const problems = validateInput(input);
-  if (problems.length) return fail('INPUT_INVALID', 'The input record does not match the expected structure.', problems);
-  const typed = input as unknown as IntakeInput;
-
-  // 3. The runner trusts a masking declaration; it cannot detect personal data (see README limitations).
-  if (typed.masking.applied !== true) {
-    return fail('MASKING_NOT_DECLARED', 'The input is not declared as masked; it was refused.');
-  }
-
-  // 4. Only work_item.v1 is supported.
-  const requested = typed.requested_contract ?? WORK_ITEM_CONTRACT;
-  if (requested !== WORK_ITEM_CONTRACT) {
-    return fail('CONTRACT_UNSUPPORTED', 'The requested contract or version is not supported.');
-  }
-
-  // 5. Classify and extract (skill mode) or take the supplied candidate; build and validate the work item.
-  const { item, overallConfidence } = buildWorkItem(typed, resolveSource(typed), options);
+/** Shared tail: build, validate, and (for ready items only) wrap in the handoff envelope. */
+function finish(typed: IntakeInput, src: Resolved, options: RunOptions, meta: Meta): RunResult {
+  const { item, overallConfidence } = buildWorkItem(typed, src, options, meta);
   const itemProblems = validateWorkItem(item);
   if (itemProblems.length) return fail('CONTRACT_INVALID', 'The work item did not satisfy work_item.v1.', itemProblems);
 
-  // 6. Needs-human items are NOT handed off (they wait for review; review is out of scope for this PoC).
-  if (item.status === 'needs-human') return { ok: true, outcome: 'needs-human', workItem: item, handoff: null };
+  const withTrace = meta.trace ? { trace: meta.trace } : {};
+  // Needs-human items are NOT handed off (they wait for review; review is out of scope for this PoC).
+  if (item.status === 'needs-human') return { ok: true, outcome: 'needs-human', workItem: item, handoff: null, ...withTrace };
 
   const envelope: HandoffEnvelopeV1 = {
     contract: WORK_ITEM_CONTRACT,
@@ -271,5 +300,94 @@ export function runIntake(input: unknown, options: RunOptions = {}): RunResult {
   };
   const envelopeProblems = validateEnvelope(envelope);
   if (envelopeProblems.length) return fail('CONTRACT_INVALID', 'The handoff envelope did not satisfy its contract.', envelopeProblems);
-  return { ok: true, outcome: 'handed-off', workItem: item, handoff: envelope };
+  return { ok: true, outcome: 'handed-off', workItem: item, handoff: envelope, ...withTrace };
+}
+
+function checkMinConfidence(options: RunOptions): void {
+  if (options.minConfidence !== undefined && !isUnitNumber(options.minConfidence)) {
+    throw new RangeError('minConfidence must be a number from 0 to 1');
+  }
+}
+
+/** Deterministic runner (no model). This stays the default and the fallback path. */
+export function runIntake(input: unknown, options: RunOptions = {}): RunResult {
+  checkMinConfidence(options);
+  const p = prepare(input);
+  if (!p.ok) return p.result;
+  return finish(p.typed, resolveDeterministic(p.typed), options, { modelLabel: 'none (deterministic)', promptLabel: 'none' , extraReasons: [] });
+}
+
+/** Model-ready runner. Same gates and the same work_item.v1 / handoff path; values come from the provider when it answers well. */
+export async function runIntakeWithModel(input: unknown, options: ModelRunOptions): Promise<RunResult> {
+  checkMinConfidence(options);
+  const call = normalizeCallOptions(options);           // throws RangeError on bad limits before anything runs
+  const fallback = options.fallback ?? 'needs-human';
+
+  const p = prepare(input);                             // tenant, structure, masking, and contract gates run BEFORE any provider call
+  if (!p.ok) return p.result;
+  const typed = p.typed;
+  if (!typed.skill_config) {
+    return fail('INPUT_INVALID', 'Model mode needs skill_config (the configured categories and fields).', ['input.skill_config: required for model mode']);
+  }
+  const cfg = typed.skill_config;
+  const det = resolveDeterministic(typed);              // always computed locally: the fallback values
+  const categories = cfg.categories.map((c) => c.name);
+  const fieldDefs = cfg.fields.map((f) => ({ name: f.name, required: f.required }));
+  const provider = options.provider;
+  const trace: SkillTrace[] = [];
+  let failed = false;
+  let modelUsed = 0;
+
+  // classify-request
+  let category = det.candidate.category;
+  let categoryAmbiguous = det.categoryAmbiguous;
+  const extraConfidences: number[] = [];
+  const cls = await callModel(provider, INTAKE_SKILLS['classify-request'],
+    buildClassifyRequest(typed.masked_text, categories, call.maxOutputTokens),
+    (t) => parseClassifyOutput(t, categories), call);
+  if (cls.ok) {
+    modelUsed++;
+    category = cls.value.category;
+    categoryAmbiguous = false;
+    if (cls.value.confidence !== null) extraConfidences.push(cls.value.confidence);
+    trace.push({ skill: 'classify-request', source: 'model', provider_id: provider.id, attempts: cls.attempts });
+  } else {
+    failed = true;
+    trace.push({ skill: 'classify-request', source: 'deterministic-fallback', provider_id: provider.id, attempts: cls.attempts, failure: cls.code });
+  }
+
+  // extract-fields
+  let fields = det.candidate.fields;
+  let fieldAmbiguous = det.fieldAmbiguous;
+  const ext = await callModel(provider, INTAKE_SKILLS['extract-fields'],
+    buildExtractRequest(typed.masked_text, fieldDefs, call.maxOutputTokens),
+    (t) => parseExtractOutput(t, fieldDefs.map((f) => f.name), typed.masked_text), call);
+  if (ext.ok) {
+    modelUsed++;
+    fields = cfg.fields.map((f) => {
+      const hit = ext.value.fields.find((x) => x.name === f.name);
+      return { name: f.name, value: hit ? hit.value : null, confidence: hit && hit.value !== null ? hit.confidence : null };
+    });
+    fieldAmbiguous = false;
+    trace.push({ skill: 'extract-fields', source: 'model', provider_id: provider.id, attempts: ext.attempts });
+  } else {
+    failed = true;
+    trace.push({ skill: 'extract-fields', source: 'deterministic-fallback', provider_id: provider.id, attempts: ext.attempts, failure: ext.code });
+  }
+
+  const modelLabel = modelUsed === 2 ? provider.id : modelUsed === 0 ? 'none (deterministic fallback)' : `${provider.id} + deterministic fallback`;
+  const src: Resolved = {
+    categoryList: det.categoryList,
+    requiredFields: det.requiredFields,
+    candidate: { category, fields },
+    categoryAmbiguous,
+    fieldAmbiguous,
+    extraConfidences,
+  };
+  return finish(typed, src, options, {
+    modelLabel,
+    promptLabel: modelUsed > 0 ? PROMPT_VERSION : 'none',
+    extraReasons: failed && fallback === 'needs-human' ? ['model_failed'] : [],
+    trace,
+  });
 }

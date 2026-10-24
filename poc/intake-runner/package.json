@@ -6,7 +6,8 @@
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
-    "test": "node --test tests/intake-runner.test.ts tests/classify-extract.test.ts",
+    "test": "node --test tests/intake-runner.test.ts tests/classify-extract.test.ts tests/model-runner.test.ts tests/skills.test.ts",
+    "demo": "node src/demo.ts",
     "example:valid": "node src/cli.ts examples/valid-input.json",
     "example:needs-human": "node src/cli.ts examples/needs-human-input.json",
     "example:skill": "node src/cli.ts examples/skill-input.json",
