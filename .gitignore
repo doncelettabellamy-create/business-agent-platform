@@ -1,0 +1,16 @@
+# Never commit dependencies, credentials, or local environment files.
+node_modules/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+*secret*
+.claude/settings.local.json
+
+# Local scratch and logs
+*.log
+.DS_Store
+Thumbs.db

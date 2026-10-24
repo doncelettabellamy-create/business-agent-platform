@@ -1,104 +1,131 @@
 # Intake runner proof of concept (synthetic only)
 
-**This is NOT the production Intake agent, and it cannot call a real AI model.** It is a small proof of concept that exercises the `work_item.v1` contract, a local deterministic classify-extract skill, a **provider-independent model gateway with a local scripted mock**, executable skill definitions, and a Processing handoff envelope, all on invented, already-masked data. Register rows FND-26, FND-17, INT-12, and PRC-06 stay Founder-PENDING and NOT COMPLETE.
+**This is NOT the production Intake agent. It has never called a real AI model.** It contains a Claude API adapter that has only been exercised against a fake client in tests. A gated, synthetic-only live test entry point exists, but it defaults to a dry run, and no credential, SDK, or network access is part of this repository. Register rows FND-26, FND-17, INT-12, and PRC-06 stay Founder-PENDING and NOT COMPLETE.
 
 ## One pipeline, two ways to get values
 
 | Entry point | Values come from | Use |
 |---|---|---|
-| `runIntake(input, options)` (synchronous) | A supplied `candidate`, or the local deterministic skill (`skill_config`) | Default path and the **fallback** |
-| `runIntakeWithModel(input, options)` (asynchronous) | A `ModelProvider` through the gateway, one call per skill (`classify-request`, `extract-fields`). Needs `skill_config`. | Model-ready path; today only the local mock exists |
+| `runIntake(input, options)` (synchronous) | A supplied `candidate`, or the local deterministic skill (`skill_config`) | Default path; supplies reviewer suggestions after a model failure |
+| `runIntakeWithModel(input, options)` (asynchronous) | A `ModelProvider` through the gateway, one call per skill (`classify-request`, `extract-fields`). Needs `skill_config`. | Model-ready path. Providers today: the local scripted mock, and the Claude adapter (tested with a fake client only) |
 
 Both share the same gates and tail: tenant gate, structure check, masking declaration, contract support, `work_item.v1` build and validation, and a handoff envelope **only for `ready` items**. There is no second Intake engine.
 
-### Model path behavior
+### Model path rules (unchanged by the Claude adapter)
 
 1. **Gates first.** Missing tenant, bad structure, undeclared masking, or an unsupported contract are refused before any provider call.
-2. **Minimal data to the provider.** A provider receives only a fixed instruction, the masked text, category names, and field names. No tenant, event, correlation, channel, or personal-data summary.
-3. **Permissions enforced.** The gateway refuses a call unless the calling skill's definition allows the `model-gateway` tool and names that task (`src/skills.ts`).
-4. **Strict answers.** Only strict JSON in the expected shape is accepted. Categories must be from the configured list. Extracted values must be copied from the masked text (an invented or rewritten value rejects the whole answer). Confidences must be from 0 to 1.
-5. **Bounded.** Attempts (1 to 3, default 1), output tokens, time limit, and output size are capped. These numbers are placeholders, not decisions (D-04).
-6. **Failure always means a person.** If ANY model answer fails (error, timeout, oversize, invalid, ungrounded), in either skill, the item gets reason `model_failed`, status `needs-human`, and **no handoff envelope**. No configuration changes this. The deterministic skill still runs, but only to give the reviewer suggested values; those suggestions can never make a failed run `ready`. The per-skill trace records the failure code, and a post-condition in the runner refuses any failed run that is not a review item without an envelope.
-7. **No provider text is kept.** Failures are reported as codes only; provider answers and error messages are never stored or returned.
+2. **Minimal data to the provider.** Only a fixed instruction, the masked text, category names, and field names. No tenant, event, correlation, channel, or personal-data summary.
+3. **Permissions enforced.** The gateway refuses a call unless the skill's definition allows the `model-gateway` tool for that task (`src/skills.ts`).
+4. **Strict answers.** Bare JSON in the expected shape; categories from the configured list; extracted values copied from the masked text (an invented or rewritten value rejects the whole answer); confidences from 0 to 1.
+5. **Bounded.** Attempts (1 to 3, default 1), output tokens, time limit, and output size are capped. The numbers are placeholders, not decisions (D-04).
+6. **Every model failure requires human review.** If ANY model answer fails, in either skill, the item gets reason `model_failed`, status `needs-human`, and **no handoff envelope**. No configuration changes this (the old `fallback` option is deprecated and ignored). Deterministic values are attached only as reviewer suggestions. A post-condition refuses any failed run that is not a review item without an envelope.
+7. **No provider text is kept.** Failures are codes only; provider answers and error messages are never stored or returned.
 
-## Skill definitions
+## Claude adapter (`src/claude-provider.ts`)
 
-`src/skills.ts` holds executable definitions for `classify-request`, `extract-fields`, `validate-completeness`, and `create-work-item` (tools, permissions, tier, contracts, model task). The sidecar file format is undecided (D-07), so this TypeScript file is the provisional sidecar. The matching spec-clean `agents/intake/skills/<name>/SKILL.md` files exist, and tests check that they agree with the definitions and with `AGENT.md`. Names are placeholders until the vertical is decided (D-01).
+Implements the existing `ModelProvider` interface and nothing else.
+
+- **No SDK import, no environment access, no credentials, no network.** It is handed a client object with the official SDK's `client.messages.create(params, { signal })` shape. Tests pass a fake.
+- **Request:** the fixed instruction as `system`; the masked data as one `user` message; answer shape enforced with structured outputs (`output_config.format = { type: "json_schema", schema }`, using only supported schema features) and `output_config.effort` (default `low`). It sends **none** of `temperature`, `top_p`, `top_k`, `thinking`, `tool_choice`, tools, or an assistant prefill (current models reject or manage these).
+- **Refused or truncated answers** (`stop_reason` `refusal` or `max_tokens`) are returned as empty text so they can never be used; the gateway then fails them and the item goes to a person.
+- **Provider errors** are reduced to a class name and HTTP status in `stats`, and replaced by a generic error with no cause attached.
+- **Models:** exact ids only (for example `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`); date-suffixed ids are rejected. Current models think by default, and thinking tokens count toward `max_tokens` and are billed as output, so output budgets need headroom (the live entry defaults to 2048).
+
+## Live test entry point (`src/live-entry.ts`): DRY RUN BY DEFAULT
+
+`npm run live:dry-run` prints the exact request bodies and a cost estimate, and **sends nothing**. A real call needs all of the following, each checked in `src/live-gate.ts` (and covered by tests):
+
+1. the `--live` flag,
+2. the environment variable `INTAKE_ALLOW_LIVE_CALLS=yes`,
+3. an input file directly under `examples/`,
+4. a plainly synthetic record (`ws-synthetic-*`, `evt-synthetic-*`, `corr-synthetic-*`, masking source `synthetic-fixture`, with `skill_config`),
+5. a call count within `--max-calls` (default 2, hard maximum 10), enforced by a counter around the client,
+6. the official SDK installed locally (it is imported only after every check above, and is not a declared dependency).
+
+Credentials are never accepted as arguments and never read by this repository's code: the SDK resolves them itself from the environment or a stored login profile. SDK retries are turned off (`maxRetries: 0`) so the gateway owns attempts and the call count is exact. No npm script contains `--live`.
+
+## Setup before the first live call (founder steps; nothing here has been run)
+
+1. **Decide the model and accept the data terms.** The entry defaults to `claude-opus-5-5`; `claude-sonnet-5-5` and `claude-haiku-5-5` are cheaper (see the cost table). Only synthetic data may be used. Decide D-03 (cloud model calls) and review the provider's data-retention terms first.
+2. **Create a dedicated API key for this test only**, outside GitHub: in the Anthropic Console, preferably in its own workspace with a small spend limit if the Console offers one. Do not reuse a production key.
+3. **Install the SDK locally** (this repository does not declare it): `cd poc/intake-runner` then `npm install --save-exact @anthropic-ai/sdk`. This records an exact version in `package.json` and `package-lock.json`; review the diff and the package's license before committing. `node_modules/` is git-ignored.
+4. **Provide the key without writing it to any file in the repository.** Either use the CLI login profile (`ant auth login`), or set it for the current terminal only. PowerShell example:
+   ```
+   $k = Read-Host "Anthropic API key" -AsSecureString
+   $env:ANTHROPIC_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($k))
+   ```
+   Never paste a key into a chat, an issue, or a file; remove it afterwards with `Remove-Item Env:ANTHROPIC_API_KEY`.
+5. **Run the dry run and read it:** `npm run live:dry-run`. Check the request bodies contain only synthetic masked text, and note the estimate.
+6. **Only when you are ready to spend:** `$env:INTAKE_ALLOW_LIVE_CALLS = 'yes'` then `node src/live-entry.ts --live --max-calls 2`. It makes at most 2 calls (one item: classify and extract), prints a result summary and token usage, and shows no prompts or provider text.
+7. **Afterwards:** unset both variables, and delete or rotate the test key.
+
+## Estimated test cost (one item = 2 calls)
+
+List prices (USD per million tokens) from the Claude API skill's cached table dated 2026-10-06; check the pricing page before spending. The estimator assumes about 3 characters per token (conservative) and cannot know how many thinking tokens a model will use, so it gives a low estimate (about 150 output tokens per call) and a **hard ceiling** (every call uses its entire output budget).
+
+| Model | Input / output per MTok | One item, low estimate | One item, ceiling at 2048 output tokens per call | Ceiling at 1024 |
+|---|---|---|---|---|
+| `claude-opus-5-5` | $4 / $20 | about $0.010 | about $0.086 | about $0.045 |
+| `claude-sonnet-5-5` | $2 / $10 | about $0.005 | about $0.043 | about $0.022 |
+| `claude-haiku-5-5` | $0.10 / $0.50 | about $0.0002 | about $0.0021 | about $0.0011 |
+
+Input is about 980 tokens for the two requests combined. The ceiling cannot be exceeded: output per call is capped by `max_tokens`, and calls by `--max-calls`. Running both skill examples is double these figures. These are estimates, not quotes.
 
 ## Local deterministic skill (skill_config mode)
 
-No vocabulary of its own and no industry rules: with a different configuration the same text gets a different result.
-
-| Aspect | Behavior |
-|---|---|
-| Configuration | `skill_config.categories[]` (`name`, `keywords[]`) and `skill_config.fields[]` (`name`, `required`, `extractor`). `unknown` is reserved. |
-| Classification | One point per distinct configured keyword found as a whole word or phrase, case-insensitive. Highest score wins. No hit: `unknown_category`. Tie: `ambiguous_category` (never guessed). |
-| `label` extractor | `<label>: value` or `<label>= value`; value ends at a line break or `;`. An empty value never borrows the next line. |
-| `token` extractor | Masked tokens of one configured type, for example `[ID_1]`. |
-| Ambiguity | Same value repeated: accepted. Different values: not extracted, flagged `ambiguous_field`. |
-| Confidence | Not scored (`null`). With `minConfidence` set, every deterministic item is flagged `low_confidence`. |
-
-## Run it
-
-Requires Node 24 or later (built-in TypeScript type stripping). No installation is needed; there are no dependencies.
-
-```
-cd poc/intake-runner
-npm test                                              # 85 tests
-npm run demo                                          # model path with the local mock: 7 scenarios
-node src/cli.ts examples/skill-input.json             # deterministic runner
-node src/cli.ts examples/skill-ambiguous-input.json   # needs-human, no envelope
-```
-
-The demo shows: deterministic run; a mock model that answers well; a mock that invents a value; a mock that returns non-JSON; a mock that never answers (timeout), both without and with the old `fallback: 'deterministic'` setting (which is now ignored: either way the item goes to a person); and a missing tenant refused before any model call. It uses `src/mock-provider.ts`, which returns exactly what it is scripted to return and understands no text.
+No vocabulary of its own and no industry rules. Classification counts distinct configured keywords found as whole words or phrases (a tie becomes `ambiguous_category`, no match `unknown_category`); the `label` extractor reads `<label>: value` lines, the `token` extractor finds masked tokens such as `[ID_1]`; conflicting values are not extracted and are flagged `ambiguous_field`. It does not score confidence.
 
 ## Not included (limitations)
 
 | Not included | Consequence |
 |---|---|
-| **No real provider, no API key, no network** | `ModelProvider` has one implementation: the local scripted mock. The runner imports no SDK and reads no environment variables. It cannot call Claude or any real model. |
-| No personal-data detector | The runner **trusts** `masking.applied`. It cannot tell whether text is really masked. Sending real text to a real provider would be unsafe until detection, masking, and the vault exist. |
-| Mock is not a model | It proves the plumbing (validation, grounding, bounds, fallback), not model quality. There is no accuracy measurement and no evaluation set (INT-13). |
-| Prompts are drafts | The two instruction texts are untested against any real model and unapproved. |
-| JSON must be bare | Answers wrapped in text or code fences are rejected; a real adapter must guarantee bare JSON (for example via structured output). |
-| Plain retries | No backoff, rate-limit handling, or provider-specific error mapping. |
-| No metering | `usage` from a provider is ignored; no cost counters, caps, or kill switch. |
+| **No live call has ever been made** | The adapter is verified only against a fake client. Real API behavior (schema acceptance, latency, refusals, thinking-token use, actual cost) is unverified. |
+| No personal-data detector | The runner **trusts** `masking.applied`. Real customer text must never reach a provider until detection, masking, and the vault exist (INT-06 to INT-09). |
+| No SDK dependency declared | Installing it is a founder step (see setup). Type-checking has not been run. |
+| Draft prompts and schemas | The two instruction texts and answer schemas are unapproved and untested against a real model. |
+| No metering, caps, or kill switch in the product | Only the entry point's call counter and the token limits exist. No usage events, per-tenant caps, or alerts (FND-09). |
+| No backoff or rate-limit handling | Attempts are plain and bounded. |
 | No database, queue, vault, audit chain, authentication, or row-level security | Nothing is stored; the tenant check is code-level only. |
 | No Processing receiver | Only the envelope is produced (AT-20 not covered). |
-| Contracts are proposals | `work_item.v1` fields follow the unapproved `docs/blueprint/TEMPLATES.md`. This PoC added reason codes `ambiguous_category`, `ambiguous_field`, and `model_failed`; the envelope has no version field. |
-| No type checking was run | TypeScript (D-14 unapproved) run by Node's type stripping; the compiler was not installed or run. |
+| Contracts are proposals | Reason codes `ambiguous_category`, `ambiguous_field`, and `model_failed` were added to the draft `work_item.v1`; the envelope has no version field. |
+| No accuracy measurement | No labelled evaluation set (INT-13); correctness is tested only on invented examples. |
 
-## What remains before a real Claude connection
+## What remains before a real Claude connection to real data
 
-1. **Founder decisions:** D-03 (cloud model calls allowed at all), provider and model choice, provider data terms and retention (D-11, legal review), D-04 (retry, token, time limits, confidence thresholds, accuracy targets), D-12 (spend caps), D-14 (stack).
-2. **Real masking first (blocking):** personal-data detector service (INT-06), masking with stable tokens (INT-07), encrypted vault (INT-08), fail-closed policy (INT-09), and a measured recall (AT-08). Today masking is only a declaration.
-3. **A provider adapter** that implements `ModelProvider` for Claude, guarantees bare structured JSON, honors the abort signal, and maps provider errors to codes without leaking messages. The library or plain-HTTPS choice is open (FND-17, PENDING).
-4. **Secret handling:** the API key in a secrets service (FND-10), injected by a composition root; never in the repo, logs, or the runner (a test bans environment access in the core modules).
-5. **Metering and limits:** record token usage, per-run and per-tenant caps, kill switch, and spend alerts (FND-09, AT-18).
-6. **Tenant wall, audit, and duplicate protection** around every model call (FND-02 to FND-04), so a retry cannot double-process or double-bill.
-7. **Safe logging and tracing** with a correlation id and no content (FND-19, AT-11).
-8. **Evaluation:** a labelled synthetic set, accuracy gate, and injection fixtures run against the real model (INT-13, AT-17, AT-19), plus prompt review and versioning.
-9. **Engineering hygiene:** type-checking, pinned and license-checked dependencies, CI secret scan.
-10. **Approvals:** founder approval of the register rows (FND-17, INT-12, FND-26) and of the draft contract changes.
+1. Founder decisions: D-03, provider and model choice, data terms and retention (D-11, legal review), D-04 limits and thresholds, D-12 spend caps, D-14 stack.
+2. Real masking before any real text: detector (INT-06), stable-token masking (INT-07), encrypted vault (INT-08), fail-closed policy (INT-09), measured recall (AT-08).
+3. A first synthetic live run to verify the adapter against the real API, then review of any differences it reveals.
+4. Production key handling in a secrets service (FND-10) and a composition root that is not this test entry.
+5. Metering, per-tenant caps, kill switch, and spend alerts (FND-09, AT-18).
+6. Tenant wall, audit, and duplicate protection around every model call (FND-02 to FND-04).
+7. Safe logging with a correlation id and no content (FND-19).
+8. Evaluation: labelled set, accuracy gate, injection tests against the real model, prompt review (INT-13, AT-17, AT-19).
+9. Engineering hygiene: type-checking, pinned and license-checked dependencies, CI secret scan.
+10. Founder approval of the register rows (FND-17, INT-12, FND-26) and of the draft contract changes.
+
+## Run the tests and demo (no network, no key)
+
+Requires Node 24 or later (built-in TypeScript type stripping). No installation is needed.
+
+```
+cd poc/intake-runner
+npm test                  # 128 tests
+npm run demo              # 7 scenarios with the local scripted mock
+npm run live:dry-run      # request bodies and cost estimate; sends nothing
+node src/cli.ts examples/skill-input.json
+```
+
+## Tests (128)
+
+`intake-runner` (18) and `classify-extract` (24): contract, gates, deterministic skill. `model-runner` (37): gateway behavior and the human-review regression matrix. `skills` (6): definitions versus `SKILL.md` and `AGENT.md`. `claude-provider` (28): request shape, structured-output schema, good answers, 13 failure kinds under three fallback settings, error-text discarding, refusal and truncation blanking, timeouts, bounded retries, injection text, gates before any call. `live-gate` (15): argument parsing and credential refusal, path and synthetic checks, the gate, cost arithmetic, and static guarantees (dry run first, SDK imported only after the gate and only once, no credential reads, no live-capable npm script, no declared dependency).
 
 ## Mapping to the register
 
 | Row | Covered here | Remains |
 |---|---|---|
-| FND-17 | The shape of a provider-independent gateway: interface, limits, strict parsing, permissions | Real provider, metering, library choice, approval |
-| FND-26 | Executable `work_item.v1` and envelope validators; Intake skill folders | Other agents' folders, remaining contracts |
-| INT-12 | The four Intake skills as definitions plus `SKILL.md` drafts; deterministic and mock-model execution | Real model, sidecar format (D-07), vertical content (D-01) |
+| FND-17 | Provider-independent gateway; Claude adapter shape; gated test entry | A real, verified call; metering; library decision; approval |
+| FND-26 | Executable `work_item.v1` and envelope validators; Intake skill folders | Other agents, remaining contracts |
+| INT-12 | Four Intake skills as definitions plus `SKILL.md` drafts; deterministic, mock, and (untested live) Claude execution | Real model verification, sidecar format (D-07), vertical content (D-01) |
 | PRC-06 | The envelope Processing would receive | A receiver, version negotiation, audit event per handoff |
 
 No acceptance test AT-01 to AT-22 is claimed as passed.
-
-## Tests (85)
-
-`tests/intake-runner.test.ts` (18, core contract and fallbacks), `tests/classify-extract.test.ts` (24, deterministic skill), `tests/model-runner.test.ts` (37: good answers, provider data minimization, invalid classify and extract outputs, ungrounded values, errors, timeouts, bounded retries, limits, **human-review regression tests** (6 failure kinds x 3 skill combinations x 4 fallback settings = 72 runs, all must need review with no envelope; perfect deterministic suggestions still not ready; success unaffected; contracts refuse promotion; the option is never read), gates before any call, skill permissions, injection text, static guard), and `tests/skills.test.ts` (6: definitions, tool allow-lists, `SKILL.md` and `AGENT.md` agreement).
-
-## Compatibility changes
-
-- **Model failures now always require human review** (previous commit `ad177ed` let `fallback: 'deterministic'` treat deterministic values as normal and hand off).
-- `ModelRunOptions.fallback` is **deprecated and ignored**. It is still accepted so existing callers compile and run, but `'deterministic'`, `'needs-human'`, absent, or any other value now behave identically. Callers that relied on `'deterministic'` to get an envelope after a model failure will now receive `needs-human` with no envelope.
-- Unchanged: `runIntake` (the synchronous deterministic runner), the `work_item.v1` reason code `model_failed`, trace `source` values (`deterministic-fallback` now means "deterministic suggestions for review"), and the `versions.model` labels.
-- New in the runner: a post-condition that refuses (`CONTRACT_INVALID`) any failed model run that is not a `needs-human` item without an envelope. It should be unreachable and exists as defense in depth.
