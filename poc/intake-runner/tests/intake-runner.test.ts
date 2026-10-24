@@ -236,7 +236,7 @@ test('needs-human fallback: no required fields and no found values still flags w
 
 // ---------------------------------------------------------------- guard on the claims in the README
 test('static guard: runner and contracts import only node:crypto and local files, and use no network or process APIs', () => {
-  for (const name of ['../src/intake-runner.ts', '../src/contracts.ts']) {
+  for (const name of ['../src/intake-runner.ts', '../src/contracts.ts', '../src/classify-extract.ts']) {
     const src = readFileSync(new URL(name, import.meta.url), 'utf8');
     const imports = [...src.matchAll(/^import[^;]*?from\s+'([^']+)'/gms)].map((m) => m[1]);
     for (const spec of imports) {

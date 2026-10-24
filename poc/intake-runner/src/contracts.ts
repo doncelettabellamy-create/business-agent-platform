@@ -5,7 +5,10 @@
 
 export const WORK_ITEM_CONTRACT = 'work_item.v1';
 
-export const REASON_CODES = ['missing_fields', 'unknown_category', 'low_confidence'] as const;
+// ambiguous_category and ambiguous_field were added with the local classify-extract skill (draft proposal, unapproved).
+export const REASON_CODES = [
+  'missing_fields', 'unknown_category', 'ambiguous_category', 'ambiguous_field', 'low_confidence',
+] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
 export const ITEM_STATUSES = ['ready', 'needs-human'] as const;
@@ -177,8 +180,13 @@ export function validateWorkItem(x: unknown, path = 'work_item'): string[] {
     if ((x.missing_fields.length > 0) !== reasons.includes('missing_fields')) {
       errors.push(`${path}.reasons: missing_fields reason must match missing_fields list`);
     }
-    if ((x.category === 'unknown') !== reasons.includes('unknown_category')) {
-      errors.push(`${path}.reasons: unknown_category reason must match category`);
+    // An unknown category needs exactly one explanation (nothing matched, or a tie); a known category needs none.
+    const categoryReasons = ['unknown_category', 'ambiguous_category'].filter((r) => reasons.includes(r)).length;
+    if (x.category === 'unknown' && categoryReasons !== 1) {
+      errors.push(`${path}.reasons: unknown category needs exactly one of unknown_category or ambiguous_category`);
+    }
+    if (x.category !== 'unknown' && categoryReasons !== 0) {
+      errors.push(`${path}.reasons: category reasons are only allowed when the category is unknown`);
     }
   }
   return errors;

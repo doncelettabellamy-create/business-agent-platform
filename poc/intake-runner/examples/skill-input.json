@@ -1,0 +1,25 @@
+{
+  "workspace_id": "ws-synthetic-a",
+  "correlation_id": "corr-synthetic-0200",
+  "event_id": "evt-synthetic-0200",
+  "received_at": "2026-10-24T10:30:00Z",
+  "channel_ref": "channel-tbd",
+  "masking": { "applied": true, "source": "synthetic-fixture" },
+  "masked_text": "Hello, this is [PERSON_1]. We would like a quote for option B.\nTopic: Quote request\nReference: [ID_1]",
+  "pii_summary": [
+    { "type": "Person", "count": 1 },
+    { "type": "Identifier", "count": 1 }
+  ],
+  "skill_config": {
+    "categories": [
+      { "name": "Category A", "keywords": ["alpha", "follow up"] },
+      { "name": "Category B", "keywords": ["bravo", "quote", "option b"] },
+      { "name": "Category C", "keywords": ["charlie", "call back"] }
+    ],
+    "fields": [
+      { "name": "Field 1", "required": true, "extractor": { "kind": "label", "labels": ["topic", "subject"] } },
+      { "name": "Field 2", "required": true, "extractor": { "kind": "token", "token_type": "ID" } },
+      { "name": "Field 3", "required": false, "extractor": { "kind": "label", "labels": ["note"] } }
+    ]
+  }
+}
