@@ -4,7 +4,9 @@
   "private": true,
   "description": "Synthetic-only, deterministic Intake runner proof of concept. Not the production Intake agent.",
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "test": "node --test tests/intake-runner.test.ts tests/classify-extract.test.ts tests/model-runner.test.ts tests/skills.test.ts tests/claude-provider.test.ts tests/live-gate.test.ts tests/live-dry-run.test.ts",
     "demo": "node src/demo.ts",
@@ -13,5 +15,8 @@
     "example:needs-human": "node src/cli.ts examples/needs-human-input.json",
     "example:skill": "node src/cli.ts examples/skill-input.json",
     "example:skill-ambiguous": "node src/cli.ts examples/skill-ambiguous-input.json"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "1.3.0"
   }
 }
