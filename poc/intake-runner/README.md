@@ -18,7 +18,7 @@ Both share the same gates and tail: tenant gate, structure check, masking declar
 3. **Permissions enforced.** The gateway refuses a call unless the calling skill's definition allows the `model-gateway` tool and names that task (`src/skills.ts`).
 4. **Strict answers.** Only strict JSON in the expected shape is accepted. Categories must be from the configured list. Extracted values must be copied from the masked text (an invented or rewritten value rejects the whole answer). Confidences must be from 0 to 1.
 5. **Bounded.** Attempts (1 to 3, default 1), output tokens, time limit, and output size are capped. These numbers are placeholders, not decisions (D-04).
-6. **Failure means a person.** If a model answer fails (error, timeout, oversize, invalid, ungrounded), the deterministic skill supplies the values and, by default, the item gets reason `model_failed`, status `needs-human`, and no envelope. `fallback: 'deterministic'` instead uses the local values as normal. Either way the per-skill trace records the failure code.
+6. **Failure always means a person.** If ANY model answer fails (error, timeout, oversize, invalid, ungrounded), in either skill, the item gets reason `model_failed`, status `needs-human`, and **no handoff envelope**. No configuration changes this. The deterministic skill still runs, but only to give the reviewer suggested values; those suggestions can never make a failed run `ready`. The per-skill trace records the failure code, and a post-condition in the runner refuses any failed run that is not a review item without an envelope.
 7. **No provider text is kept.** Failures are reported as codes only; provider answers and error messages are never stored or returned.
 
 ## Skill definitions
@@ -44,13 +44,13 @@ Requires Node 24 or later (built-in TypeScript type stripping). No installation 
 
 ```
 cd poc/intake-runner
-npm test                                              # 81 tests
+npm test                                              # 85 tests
 npm run demo                                          # model path with the local mock: 7 scenarios
 node src/cli.ts examples/skill-input.json             # deterministic runner
 node src/cli.ts examples/skill-ambiguous-input.json   # needs-human, no envelope
 ```
 
-The demo shows: deterministic run; a mock model that answers well; a mock that invents a value; a mock that returns non-JSON; a mock that never answers (timeout), with the default fallback and with `fallback: 'deterministic'`; and a missing tenant refused before any model call. It uses `src/mock-provider.ts`, which returns exactly what it is scripted to return and understands no text.
+The demo shows: deterministic run; a mock model that answers well; a mock that invents a value; a mock that returns non-JSON; a mock that never answers (timeout), both without and with the old `fallback: 'deterministic'` setting (which is now ignored: either way the item goes to a person); and a missing tenant refused before any model call. It uses `src/mock-provider.ts`, which returns exactly what it is scripted to return and understands no text.
 
 ## Not included (limitations)
 
@@ -92,6 +92,13 @@ The demo shows: deterministic run; a mock model that answers well; a mock that i
 
 No acceptance test AT-01 to AT-22 is claimed as passed.
 
-## Tests (81)
+## Tests (85)
 
-`tests/intake-runner.test.ts` (18, core contract and fallbacks), `tests/classify-extract.test.ts` (24, deterministic skill), `tests/model-runner.test.ts` (33: good answers, provider data minimization, invalid classify and extract outputs, ungrounded values, errors, timeouts, bounded retries, limits, human-review fallback, gates before any call, skill permissions, injection text, static guard), and `tests/skills.test.ts` (6: definitions, tool allow-lists, `SKILL.md` and `AGENT.md` agreement).
+`tests/intake-runner.test.ts` (18, core contract and fallbacks), `tests/classify-extract.test.ts` (24, deterministic skill), `tests/model-runner.test.ts` (37: good answers, provider data minimization, invalid classify and extract outputs, ungrounded values, errors, timeouts, bounded retries, limits, **human-review regression tests** (6 failure kinds x 3 skill combinations x 4 fallback settings = 72 runs, all must need review with no envelope; perfect deterministic suggestions still not ready; success unaffected; contracts refuse promotion; the option is never read), gates before any call, skill permissions, injection text, static guard), and `tests/skills.test.ts` (6: definitions, tool allow-lists, `SKILL.md` and `AGENT.md` agreement).
+
+## Compatibility changes
+
+- **Model failures now always require human review** (previous commit `ad177ed` let `fallback: 'deterministic'` treat deterministic values as normal and hand off).
+- `ModelRunOptions.fallback` is **deprecated and ignored**. It is still accepted so existing callers compile and run, but `'deterministic'`, `'needs-human'`, absent, or any other value now behave identically. Callers that relied on `'deterministic'` to get an envelope after a model failure will now receive `needs-human` with no envelope.
+- Unchanged: `runIntake` (the synchronous deterministic runner), the `work_item.v1` reason code `model_failed`, trace `source` values (`deterministic-fallback` now means "deterministic suggestions for review"), and the `versions.model` labels.
+- New in the runner: a post-condition that refuses (`CONTRACT_INVALID`) any failed model run that is not a `needs-human` item without an envelope. It should be unreachable and exists as defense in depth.

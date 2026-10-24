@@ -60,9 +60,9 @@ show('4. Model path, mock returns text that is not JSON -> rejected, sent to a p
     classify_request: () => 'Sure! The category is B.',
     extract_fields: () => extractAnswer([{ name: 'Field 1', value: 'Quote request', confidence: 0.9 }, { name: 'Field 2', value: '[ID_1]', confidence: 0.9 }]),
   }) }));
-show('5. Model path, mock never answers (timeout 50 ms) -> deterministic fallback, sent to a person',
+show('5. Model path, mock never answers (timeout 50 ms) -> deterministic suggestions only, sent to a person',
   await runIntakeWithModel(input(), { provider: createMockProvider({ classify_request: hangs, extract_fields: hangs }), timeoutMs: 50 }));
-show('6. Same failure, but fallback "deterministic" chosen -> deterministic values used as normal',
+show('6. Same failure with the old fallback "deterministic" setting -> setting is ignored, still sent to a person',
   await runIntakeWithModel(input(), { provider: createMockProvider({ classify_request: hangs, extract_fields: hangs }), timeoutMs: 50, fallback: 'deterministic' }));
 const missing = input() as unknown as Record<string, unknown>; delete missing.workspace_id;
 show('7. Missing tenant -> refused before any model is called', await runIntakeWithModel(missing, { provider: good() }));

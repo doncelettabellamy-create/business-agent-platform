@@ -214,17 +214,96 @@ test('the output token cap is passed to the provider and cannot be exceeded by a
 });
 
 // ---------------------------------------------------------------- human-review fallback
-test('human-review fallback: default flags the item; "deterministic" uses the local result as if no model had been tried', async () => {
-  const slow = () => createMockProvider({ classify_request: hangs, extract_fields: hangs });
-  const flagged = ok(await runIntakeWithModel(skillInput(), withProvider(slow(), { timeoutMs: 30 })));
-  assert.equal(flagged.outcome, 'needs-human');
-  assert.equal(flagged.handoff, null);
-  assert.deepEqual(flagged.workItem.reasons, ['model_failed']);
+// REGRESSION: every model failure requires human review and never yields a Processing envelope, whatever the
+// (deprecated) `fallback` option says. Deterministic values are kept as reviewer suggestions only.
+type FailKind = 'throws' | 'times out' | 'not JSON' | 'wrong shape' | 'oversized' | 'invalid content';
+const FAIL_KINDS: FailKind[] = ['throws', 'times out', 'not JSON', 'wrong shape', 'oversized', 'invalid content'];
+const FALLBACK_SETTINGS: Array<ModelRunOptions['fallback'] | 'bogus'> = [undefined, 'needs-human', 'deterministic', 'bogus'];
 
-  const quiet = ok(await runIntakeWithModel(skillInput(), withProvider(slow(), { timeoutMs: 30, fallback: 'deterministic' })));
-  assert.equal(quiet.outcome, 'handed-off');
-  assert.deepEqual(quiet.workItem.reasons, []);
-  assert.equal(quiet.trace?.every((t) => t.source === 'deterministic-fallback'), true, 'the trace still records that the model failed');
+function failingHandler(task: 'classify' | 'extract', kind: FailKind) {
+  switch (kind) {
+    case 'throws': return () => { throw new Error(`provider failure ${CANARY}`); };
+    case 'times out': return hangs;
+    case 'not JSON': return () => `plain prose ${CANARY}`;
+    case 'wrong shape': return () => JSON.stringify({ unexpected: CANARY });
+    case 'oversized': return () => 'x'.repeat(8001);
+    case 'invalid content': return task === 'classify'
+      ? () => classifyAnswer(`Category ${CANARY}`, 0.9)                                           // outside the configured list
+      : () => extractAnswer([{ name: 'Field 1', value: `Invented ${CANARY}`, confidence: 0.99 }]); // not in the text
+  }
+}
+
+test('REGRESSION: every failure kind, in either or both skills, under every fallback setting -> human review, no envelope', async () => {
+  const deterministic = ok(runIntake(skillInput()));
+  assert.equal(deterministic.outcome, 'handed-off', 'precondition: the deterministic result alone WOULD be ready');
+  let runs = 0;
+  for (const kind of FAIL_KINDS) {
+    for (const which of ['classify', 'extract', 'both'] as const) {
+      for (const setting of FALLBACK_SETTINGS) {
+        const p = createMockProvider({
+          classify_request: which === 'extract' ? () => classifyAnswer('Category A', 0.9) : failingHandler('classify', kind),
+          extract_fields: which === 'classify' ? () => extractAnswer(GOOD_FIELDS) : failingHandler('extract', kind),
+        });
+        const opts = withProvider(p, { timeoutMs: 25 });
+        if (setting !== undefined) (opts as { fallback?: unknown }).fallback = setting;
+        const label = `${kind} / ${which} / fallback=${String(setting)}`;
+        const r = ok(await runIntakeWithModel(skillInput(), opts));
+        runs++;
+        assert.equal(r.outcome, 'needs-human', label);
+        assert.equal(r.handoff, null, `no envelope: ${label}`);
+        assert.equal(r.workItem.status, 'needs-human', label);
+        assert.ok(r.workItem.reasons.includes('model_failed'), `model_failed reason: ${label}`);
+        assert.ok(r.trace?.some((t) => t.failure !== undefined), `failure recorded in the trace: ${label}`);
+        assert.deepEqual(validateWorkItem(r.workItem), [], label);
+        assert.ok(!JSON.stringify(r).includes(CANARY), `no provider text kept: ${label}`);
+        // Deterministic assistance is preserved for the reviewer.
+        assert.equal(r.workItem.category, 'Category A', `suggested category: ${label}`);
+        assert.equal(r.workItem.fields.find((f) => f.name === 'Field 1')?.value, 'Change of details', `suggested value: ${label}`);
+      }
+    }
+  }
+  assert.equal(runs, 72);
+});
+
+test('REGRESSION: even when the deterministic values are perfect, a failed model run is not ready; only the status and envelope differ', async () => {
+  const deterministic = ok(runIntake(skillInput()));
+  const slow = createMockProvider({ classify_request: hangs, extract_fields: hangs });
+  const r = ok(await runIntakeWithModel(skillInput(), withProvider(slow, { timeoutMs: 25, fallback: 'deterministic' })));
+  assert.deepEqual(r.workItem.fields, deterministic.workItem.fields, 'same suggested values as the deterministic run');
+  assert.equal(r.workItem.category, deterministic.workItem.category);
+  assert.equal(deterministic.workItem.status, 'ready');
+  assert.equal(r.workItem.status, 'needs-human');
+  assert.equal(r.handoff, null);
+  assert.ok(deterministic.handoff);
+});
+
+test('REGRESSION: successful model runs are unaffected by the deprecated option', async () => {
+  for (const setting of FALLBACK_SETTINGS) {
+    const opts = withProvider(goodProvider());
+    if (setting !== undefined) (opts as { fallback?: unknown }).fallback = setting;
+    const r = ok(await runIntakeWithModel(skillInput(), opts));
+    assert.equal(r.outcome, 'handed-off', `fallback=${String(setting)}`);
+    assert.deepEqual(r.workItem.reasons, []);
+    assert.ok(r.handoff);
+  }
+});
+
+test('REGRESSION: contracts refuse to promote a failed item (status flip, and envelope for a review item)', async () => {
+  const slow = createMockProvider({ classify_request: hangs, extract_fields: hangs });
+  const r = ok(await runIntakeWithModel(skillInput(), withProvider(slow, { timeoutMs: 25 })));
+  const flipped = { ...structuredClone(r.workItem), status: 'ready' };
+  assert.ok(validateWorkItem(flipped).some((e) => e.includes('reasons')), 'a ready item cannot carry reasons');
+  const forged = {
+    contract: 'work_item.v1', workspace_id: r.workItem.workspace_id, correlation_id: 'corr-x', item_id: r.workItem.item_id,
+    payload: r.workItem, evidence_refs: [r.workItem.message_ref], confidence: null, produced_by: 'x', created_at: '2026-10-24T10:00:00Z',
+  };
+  assert.ok(validateEnvelope(forged).some((e) => e.includes('only ready items')));
+});
+
+test('REGRESSION: the runner no longer reads the fallback option at all', () => {
+  const src = readFileSync(new URL('../src/intake-runner.ts', import.meta.url), 'utf8');
+  assert.ok(!/options\.fallback|fallback\s*===|fallback\s*!==/.test(src), 'no code may branch on the fallback option');
+  assert.ok(/failed \? \['model_failed'\]/.test(src), 'failure always adds model_failed');
 });
 
 test('human-review fallback: reasons combine with other review reasons and stay in a fixed order', async () => {

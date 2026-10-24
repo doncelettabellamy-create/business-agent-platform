@@ -23,7 +23,7 @@ After the platform has verified the request, protected personal data, and produc
 
 ## Failure modes
 
-- Provider error, timeout, oversized or non-JSON answer, or a category outside the list: the gateway reports a code only. The runner falls back to the deterministic keyword skill and, by default, flags the item for a person (reason `model_failed`).
+- Provider error, timeout, oversized or non-JSON answer, or a category outside the list: the gateway reports a code only. The runner still computes the deterministic keyword result, but only as a suggestion for the reviewer: the item always goes to a person (reason `model_failed`, no handoff envelope), whatever the configuration.
 - Two equally good categories: report unknown (ambiguous), never pick one.
 
 ## Do not

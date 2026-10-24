@@ -23,7 +23,7 @@ After classification, on masked text only. Required and optional fields are defi
 
 ## Failure modes
 
-- Provider error, timeout, oversized, non-JSON, wrong-shape, or ungrounded answer: the gateway reports a code only. The runner falls back to the deterministic label and token extractor and, by default, flags the item for a person (reason `model_failed`).
+- Provider error, timeout, oversized, non-JSON, wrong-shape, or ungrounded answer: the gateway reports a code only. The runner still computes the deterministic label and token extraction, but only as a suggestion for the reviewer: the item always goes to a person (reason `model_failed`, no handoff envelope), whatever the configuration.
 - Conflicting values for one field in the deterministic fallback: not extracted, flagged `ambiguous_field`.
 
 ## Do not

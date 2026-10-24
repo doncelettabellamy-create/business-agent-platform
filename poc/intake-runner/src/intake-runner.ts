@@ -5,8 +5,9 @@
 //                                           "candidate" or from the local classify-extract skill ("skill_config").
 //   runIntakeWithModel(input, options)      asynchronous. The classify-request and extract-fields skills ask a
 //                                           ModelProvider (today only a local mock) through the model gateway.
-//                                           If a model answer fails, the deterministic skill supplies the values
-//                                           and, by default, the item is sent to a person (reason model_failed).
+//                                           If ANY model answer fails, the item ALWAYS goes to a person (reason
+//                                           model_failed, status needs-human, no handoff envelope). The deterministic
+//                                           skill still fills in values, but only as suggestions for the reviewer.
 // Both then share the same steps: tenant gate, structure check, masking declaration, contract support,
 // work_item.v1 build and validation, and the Processing handoff envelope for ready items only.
 //
@@ -62,8 +63,11 @@ export interface RunOptions {
 
 export interface ModelRunOptions extends RunOptions, ModelCallOptions {
   provider: ModelProvider;
-  /** What to do when a model answer fails. "needs-human" (default): use deterministic values but flag the item with
-   *  reason model_failed. "deterministic": use deterministic values as if the model had not been tried. */
+  /**
+   * @deprecated Ignored. Kept only so existing callers still compile. Every model failure now requires human review
+   * (reason model_failed, status needs-human, no handoff envelope) whatever this value is. Deterministic values are
+   * attached for the reviewer's assistance only and can never make a failed model run "ready".
+   */
   fallback?: 'needs-human' | 'deterministic';
 }
 
@@ -321,7 +325,6 @@ export function runIntake(input: unknown, options: RunOptions = {}): RunResult {
 export async function runIntakeWithModel(input: unknown, options: ModelRunOptions): Promise<RunResult> {
   checkMinConfidence(options);
   const call = normalizeCallOptions(options);           // throws RangeError on bad limits before anything runs
-  const fallback = options.fallback ?? 'needs-human';
 
   const p = prepare(input);                             // tenant, structure, masking, and contract gates run BEFORE any provider call
   if (!p.ok) return p.result;
@@ -384,10 +387,17 @@ export async function runIntakeWithModel(input: unknown, options: ModelRunOption
     fieldAmbiguous,
     extraConfidences,
   };
-  return finish(typed, src, options, {
+  // Any model failure ALWAYS requires human review. There is no configuration that turns this off.
+  const result = finish(typed, src, options, {
     modelLabel,
     promptLabel: modelUsed > 0 ? PROMPT_VERSION : 'none',
-    extraReasons: failed && fallback === 'needs-human' ? ['model_failed'] : [],
+    extraReasons: failed ? ['model_failed'] : [],
     trace,
   });
+
+  // Post-condition (defense in depth): a run with a failed model answer must never leave with a ready item or an envelope.
+  if (failed && result.ok && (result.outcome !== 'needs-human' || result.handoff !== null || result.workItem.status !== 'needs-human')) {
+    return fail('CONTRACT_INVALID', 'A failed model run must be reviewed by a person; refused.');
+  }
+  return result;
 }

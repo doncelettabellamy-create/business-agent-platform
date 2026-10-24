@@ -19,7 +19,7 @@ After the category and field values are known, whether they came from the model 
 1. List required fields that were not found (`missing_fields`).
 2. Check the category: unknown (nothing matched), ambiguous (a tie), or known.
 3. If a minimum confidence is configured, compare the lowest confidence found. There is no default threshold.
-4. Add `model_failed` when a model answer was rejected and the configured fallback is human review.
+4. Always add `model_failed` when any model answer was rejected or unavailable. There is no setting that skips this; the item cannot be `ready`.
 5. Status is `ready` only when there are no reasons; otherwise `needs-human`.
 
 ## Failure modes
