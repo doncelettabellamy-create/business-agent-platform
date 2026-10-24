@@ -1,0 +1,13 @@
+{
+  "name": "intake-runner-poc",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Synthetic-only, deterministic Intake runner proof of concept. Not the production Intake agent.",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test tests/intake-runner.test.ts",
+    "example:valid": "node src/cli.ts examples/valid-input.json",
+    "example:needs-human": "node src/cli.ts examples/needs-human-input.json"
+  }
+}

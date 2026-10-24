@@ -1,0 +1,22 @@
+{
+  "workspace_id": "ws-synthetic-a",
+  "correlation_id": "corr-synthetic-0002",
+  "event_id": "evt-synthetic-0002",
+  "received_at": "2026-10-24T09:31:00Z",
+  "channel_ref": "channel-tbd",
+  "masking": { "applied": true, "source": "synthetic-fixture" },
+  "masked_text": "[PERSON_1] writing on behalf of [PERSON_2]. We would like a quote for option B. Please reply to [CONTACT_1].",
+  "pii_summary": [
+    { "type": "Person", "count": 2 },
+    { "type": "Contact detail", "count": 1 }
+  ],
+  "category_list": ["Category A", "Category B", "Category C"],
+  "required_fields": ["Field 1", "Field 2", "Field 3"],
+  "candidate": {
+    "category": "Category B",
+    "fields": [
+      { "name": "Field 1", "value": "Option B", "confidence": 0.66 },
+      { "name": "Field 2", "value": null, "confidence": null }
+    ]
+  }
+}
