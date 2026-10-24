@@ -352,6 +352,11 @@ export async function runIntakeWithModel(input: unknown, options: ModelRunOption
     modelUsed++;
     category = cls.value.category;
     categoryAmbiguous = false;
+    // Veto: a model category that conflicts with a clear local keyword match is not trusted; a person decides.
+    if (category !== null && det.candidate.category !== null && category !== det.candidate.category) {
+      category = null;
+      categoryAmbiguous = true;
+    }
     if (cls.value.confidence !== null) extraConfidences.push(cls.value.confidence);
     trace.push({ skill: 'classify-request', source: 'model', provider_id: provider.id, attempts: cls.attempts });
   } else {
