@@ -7,13 +7,13 @@
 //
 // Run (dry run):   node src/live-entry.ts [--input examples/skill-input.json] [--model claude-haiku-5-5] [--effort low]
 // Real call:       see README "Setup before the first live call". No npm script runs --live on purpose.
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { runIntakeWithModel } from './intake-runner.ts';
 import { buildClassifyRequest, buildExtractRequest } from './model-gateway.ts';
 import { buildClaudeParams, createClaudeProvider } from './claude-provider.ts';
 import type { ClaudeClient, ClaudeParams, ClaudeMessage } from './claude-provider.ts';
 import { PRICES_AS_OF, costFromUsage, estimateCall, estimateRun, formatUsd } from './cost-estimate.ts';
-import { isAllowedInputPath, liveGateProblems, parseLiveArgs } from './live-gate.ts';
+import { DEFAULT_LIVE_MODEL, LIVE_LIMITS, isAllowedInputPath, liveGateProblems, parseLiveArgs, syntheticProblems } from './live-gate.ts';
 import type { IntakeInput } from './intake-runner.ts';
 
 const { args, problems } = parseLiveArgs(process.argv.slice(2));
@@ -57,6 +57,22 @@ const first = estimateCall(planned[0]);
 console.log(`\nEstimated cost for ${est.calls} calls (list prices as of ${PRICES_AS_OF}; verify before spending):`);
 if (!est.priced || !first) console.log('  no price on file for this model; cannot estimate');
 else console.log(`  low ${formatUsd(est.costLow)}   hard ceiling ${formatUsd(est.costCeiling)} (every call using its whole output budget)`);
+
+// Readiness report: what a --live run would check, shown without making any call or reading any credential.
+// (Whether a credential exists is deliberately NOT checked here: this file never looks at credentials.)
+const sdkPresent = existsSync(['node_modules', '@anthropic-ai', 'sdk', 'package.json'].join('/'));
+const syntheticIssues = syntheticProblems(input);
+const readiness: [boolean, string][] = [
+  [args.model === DEFAULT_LIVE_MODEL, `model is the default ${DEFAULT_LIVE_MODEL} (this run: ${args.model})`],
+  [isAllowedInputPath(args.inputPath) && syntheticIssues.length === 0, `input is a synthetic example under examples/ (${args.inputPath})${syntheticIssues.length ? ': ' + syntheticIssues.join('; ') : ''}`],
+  [planned.length === LIVE_LIMITS.defaultMaxCalls && args.maxCalls === LIVE_LIMITS.defaultMaxCalls, `planned calls ${planned.length}, call limit ${args.maxCalls} (default limit ${LIVE_LIMITS.defaultMaxCalls})`],
+  [args.maxCalls >= planned.length, 'call limit covers the planned calls'],
+  [sdkPresent, 'official SDK is installed locally (needed only for a live call)'],
+  [process.env.INTAKE_ALLOW_LIVE_CALLS === 'yes', 'INTAKE_ALLOW_LIVE_CALLS=yes is set (set it only at go time)'],
+  [args.live, '--live flag given (add it only at go time)'],
+];
+console.log('\nReadiness for a live call (nothing is sent in a dry run):');
+for (const [ok, text] of readiness) console.log(`  [${ok ? 'ok' : '--'}] ${text}`);
 
 if (!args.live) {
   console.log('\nNo call was made.');

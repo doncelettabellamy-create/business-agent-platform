@@ -48,16 +48,24 @@ Credentials are never accepted as arguments and never read by this repository's 
 
 1. **Decide the model and accept the data terms.** The entry defaults to **`claude-haiku-5-5`** (Claude Haiku 5.5). Anthropic's models overview, checked on 2026-10-24, lists this exact API id as an active current model, described as suited to classification and extraction, with retirement not sooner than 2027-10-07, a 1M-token context window, and adaptive thinking (default effort `medium`; the adapter sends `low`). Pass `--model claude-sonnet-5-5` or `--model claude-opus-5-5` only if you deliberately want a more capable and costlier model. Only synthetic data may be used. Decide D-03 (cloud model calls) and review the provider's data-retention terms first.
 2. **Create a dedicated API key for this test only**, outside GitHub: in the Anthropic Console, preferably in its own workspace with a small spend limit if the Console offers one. Do not reuse a production key.
-3. **Install the SDK locally** (this repository does not declare it): `cd poc/intake-runner` then `npm install --save-exact @anthropic-ai/sdk`. This records an exact version in `package.json` and `package-lock.json`; review the diff and the package's license before committing. `node_modules/` is git-ignored.
-4. **Provide the key without writing it to any file in the repository.** Either use the CLI login profile (`ant auth login`), or set it for the current terminal only. PowerShell example:
+3. **Install the SDK locally** (this repository does not declare it, and as of the last check it is NOT installed): `cd poc/intake-runner` then `npm install --save-exact --ignore-scripts @anthropic-ai/sdk`. `--ignore-scripts` stops any package from running install-time code. This records an exact version in `package.json` and `package-lock.json`; review that diff and the package's license before committing it. `node_modules/` is git-ignored. Installing contacts the npm registry (it is not an API call and needs no key).
+4. **Put the key in this terminal window only, without displaying or saving it.** Use Windows PowerShell or PowerShell 7 in the folder `poc/intake-runner`. (The `ant auth login` profile option needs the `ant` CLI, which is not installed on this machine.) Paste these lines one block at a time; when `Read-Host` asks, paste the key (nothing is shown as you type or paste):
    ```
-   $k = Read-Host "Anthropic API key" -AsSecureString
-   $env:ANTHROPIC_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($k))
+   $secure = Read-Host "Anthropic API key (hidden)" -AsSecureString
+   $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+   try { $env:ANTHROPIC_API_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+   finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr); $secure.Dispose(); Remove-Variable secure, bstr }
+   if ($env:ANTHROPIC_API_KEY) { "Key is set in this window only." }
    ```
-   Never paste a key into a chat, an issue, or a file; remove it afterwards with `Remove-Item Env:ANTHROPIC_API_KEY`.
-5. **Run the dry run and read it:** `npm run live:dry-run`. Check the request bodies contain only synthetic masked text, and note the estimate.
-6. **Only when you are ready to spend:** `$env:INTAKE_ALLOW_LIVE_CALLS = 'yes'` then `node src/live-entry.ts --live --max-calls 2`. It makes at most 2 calls (one item: classify and extract), prints a result summary and token usage, and shows no prompts or provider text.
-7. **Afterwards:** unset both variables, and delete or rotate the test key.
+   Why this is safe: the key is typed into a hidden prompt, so it never appears on screen and is not part of any command line; PowerShell's history stores commands, not prompt answers; the temporary variables are wiped; the only copy is this window's environment variable, which the SDK reads itself. Do **not** run `Get-ChildItem Env:` or `$env:ANTHROPIC_API_KEY` alone (they would print it), do not echo it, do not save it in a `.env` file or script, and do not paste it into a chat. Any program started from this window can read it while it is set, so use a window you control, and end the session with: `Remove-Item Env:ANTHROPIC_API_KEY`.
+5. **Run the dry run and read it:** `npm run live:dry-run`. It sends nothing. Check: the model line says `claude-haiku-5-5`; both request bodies contain only the synthetic masked text; the call limit is 2 with 2 calls planned; and the readiness checklist shows `[ok]` for model, input, and call limits. The three `[--]` items (SDK installed, confirmation variable, `--live` flag) are the only things left, and they are meant to be switched on only at go time.
+6. **Only when you decide to spend** (about $0.0002 expected, a hard ceiling of about $0.0021 for the two calls, at list prices dated 2026-10-06): in the same window with the key set, run
+   ```
+   $env:INTAKE_ALLOW_LIVE_CALLS = 'yes'
+   node src/live-entry.ts --live --max-calls 2
+   ```
+   It makes at most 2 calls (one item: classify, then extract) with `claude-haiku-5-5`, then prints a result summary, token usage, and an approximate actual cost. It shows no prompts or provider text and never prints the key. If anything fails, the item ends as `needs-human` with no handoff.
+7. **Afterwards:** `Remove-Item Env:ANTHROPIC_API_KEY` and `Remove-Item Env:INTAKE_ALLOW_LIVE_CALLS`, close the window, and delete or rotate the test key in the Console.
 
 ## Estimated test cost (one item = 2 calls)
 
@@ -109,15 +117,15 @@ Requires Node 24 or later (built-in TypeScript type stripping). No installation 
 
 ```
 cd poc/intake-runner
-npm test                  # 128 tests
+npm test                  # 134 tests
 npm run demo              # 7 scenarios with the local scripted mock
 npm run live:dry-run      # request bodies and cost estimate; sends nothing
 node src/cli.ts examples/skill-input.json
 ```
 
-## Tests (128)
+## Tests (134)
 
-`intake-runner` (18) and `classify-extract` (24): contract, gates, deterministic skill. `model-runner` (37): gateway behavior and the human-review regression matrix. `skills` (6): definitions versus `SKILL.md` and `AGENT.md`. `claude-provider` (28): request shape, structured-output schema, good answers, 13 failure kinds under three fallback settings, error-text discarding, refusal and truncation blanking, timeouts, bounded retries, injection text, gates before any call. `live-gate` (15): argument parsing and credential refusal, path and synthetic checks, the gate, cost arithmetic, and static guarantees (dry run first, SDK imported only after the gate and only once, no credential reads, no live-capable npm script, no declared dependency).
+`intake-runner` (18) and `classify-extract` (24): contract, gates, deterministic skill. `model-runner` (37): gateway behavior and the human-review regression matrix. `skills` (6): definitions versus `SKILL.md` and `AGENT.md`. `claude-provider` (28): request shape, structured-output schema, good answers, 13 failure kinds under three fallback settings, error-text discarding, refusal and truncation blanking, timeouts, bounded retries, injection text, gates before any call. `live-dry-run` (5): the entry point run as a child process in a sanitized environment (no confirmation variable, no credentials), checking the dry run (Haiku default, two synthetic request bodies, call limit 2, readiness checklist, nothing sent) and every refusal path. `live-gate` (15): argument parsing and credential refusal, path and synthetic checks, the gate, cost arithmetic, and static guarantees (dry run first, SDK imported only after the gate and only once, no credential reads, no live-capable npm script, no declared dependency).
 
 ## Mapping to the register
 
