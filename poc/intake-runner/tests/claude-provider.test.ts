@@ -13,7 +13,7 @@ import { validateEnvelope, validateWorkItem } from '../src/contracts.ts';
 import { skillInput } from './skill-fixtures.ts';
 
 const CANARY = 'API-ERROR-CANARY-3318';
-const MODEL = 'claude-opus-5-5';
+const MODEL = 'claude-haiku-5-5';
 
 const GOOD_CLASSIFY = JSON.stringify({ category: 'Category A', confidence: 0.9 });
 const GOOD_EXTRACT = JSON.stringify({ fields: [

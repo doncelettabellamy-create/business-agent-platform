@@ -5,7 +5,7 @@
 //   is plainly synthetic (see live-gate.ts). The API credential is NEVER read or accepted by this file: the official
 //   SDK resolves it from the environment or a stored login profile at construction time, outside this repository.
 //
-// Run (dry run):   node src/live-entry.ts [--input examples/skill-input.json] [--model claude-opus-5-5] [--effort low]
+// Run (dry run):   node src/live-entry.ts [--input examples/skill-input.json] [--model claude-haiku-5-5] [--effort low]
 // Real call:       see README "Setup before the first live call". No npm script runs --live on purpose.
 import { readFileSync } from 'node:fs';
 import { runIntakeWithModel } from './intake-runner.ts';

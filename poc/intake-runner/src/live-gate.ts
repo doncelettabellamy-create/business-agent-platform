@@ -9,7 +9,9 @@ import { isClaudeModelId } from './claude-provider.ts';
 import type { Effort } from './claude-provider.ts';
 import { isRecord } from './contracts.ts';
 
-export const DEFAULT_LIVE_MODEL = 'claude-opus-5-5';
+// Default for the synthetic live test: Claude Haiku 5.5. Anthropic's models overview (checked 2026-10-24) lists it as an
+// active current model with API id claude-haiku-5-5, aimed at classification and extraction, and the cheapest current model.
+export const DEFAULT_LIVE_MODEL = 'claude-haiku-5-5';
 export const LIVE_LIMITS = { maxCalls: 10, maxOutputTokens: 4096, defaultOutputTokens: 2048, defaultMaxCalls: 2 } as const;
 
 export interface LiveArgs {
@@ -45,7 +47,7 @@ export function parseLiveArgs(argv: string[]): { args: LiveArgs; problems: strin
     else if (a === '--max-output-tokens') args.maxOutputTokens = Number(v);
     else if (a === '--max-calls') args.maxCalls = Number(v);
   }
-  if (!isClaudeModelId(args.model)) problems.push('--model must be an exact Claude model id such as claude-opus-5-5');
+  if (!isClaudeModelId(args.model)) problems.push('--model must be an exact Claude model id such as claude-haiku-5-5');
   if (!Number.isInteger(args.maxOutputTokens) || args.maxOutputTokens < 1 || args.maxOutputTokens > LIVE_LIMITS.maxOutputTokens) {
     problems.push(`--max-output-tokens must be an integer from 1 to ${LIVE_LIMITS.maxOutputTokens}`);
   }

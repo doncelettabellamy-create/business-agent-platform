@@ -57,7 +57,7 @@ const MODEL_ID = /^claude-[a-z0-9]+(-[a-z0-9]+)*$/;
 const DATE_SUFFIX = /-\d{8}$/;
 const EFFORTS: readonly string[] = ['low', 'medium', 'high'];
 
-/** Exact model strings only (for example claude-opus-5-5); date-suffixed ids are not accepted. */
+/** Exact model strings only (for example claude-haiku-5-5); date-suffixed ids are not accepted. */
 export function isClaudeModelId(id: unknown): id is string {
   return typeof id === 'string' && id.length <= 64 && MODEL_ID.test(id) && !DATE_SUFFIX.test(id);
 }
@@ -103,7 +103,7 @@ export function answerSchema(request: ModelRequest): Record<string, unknown> {
 
 /** Pure: the exact request body that would be sent. Used by the adapter, the dry run, and the cost estimate. */
 export function buildClaudeParams(request: ModelRequest, model: string, effort: Effort = 'low'): ClaudeParams {
-  if (!isClaudeModelId(model)) throw new RangeError('model must be an exact Claude model id such as claude-opus-5-5');
+  if (!isClaudeModelId(model)) throw new RangeError('model must be an exact Claude model id such as claude-haiku-5-5');
   if (!EFFORTS.includes(effort)) throw new RangeError('effort must be low, medium, or high');
   if (!Number.isInteger(request.max_output_tokens) || request.max_output_tokens < 1) throw new RangeError('max_output_tokens must be a positive integer');
   return {

@@ -46,6 +46,21 @@ test('args: unknown flags, missing values, bad models, bad efforts, and out-of-r
   for (const argv of bad) assert.ok(parseLiveArgs(argv).problems.length > 0, argv.join(' '));
 });
 
+test('default model: claude-haiku-5-5 (checked against the models overview), priced, and no Opus default in any source file', () => {
+  assert.equal(DEFAULT_LIVE_MODEL, 'claude-haiku-5-5');
+  assert.equal(parseLiveArgs([]).args.model, 'claude-haiku-5-5');
+  assert.equal(parseLiveArgs(['--live']).args.model, 'claude-haiku-5-5');
+  assert.ok(PRICES_PER_MILLION[DEFAULT_LIVE_MODEL], 'the default model has a price on file');
+  assert.ok(PRICES_PER_MILLION[DEFAULT_LIVE_MODEL].input <= PRICES_PER_MILLION['claude-sonnet-5-5'].input, 'default is the cheapest tier');
+  for (const file of ['src/live-gate.ts', 'src/live-entry.ts', 'src/claude-provider.ts']) {
+    assert.ok(!/claude-opus/i.test(read(file)), `${file} must not name Opus (it may remain only in the price table and explicit --model choices)`);
+  }
+  assert.ok(/\[--model claude-haiku-5-5\]/.test(read('src/live-entry.ts')), 'usage line shows the default');
+  // An explicit choice still works, so Opus stays available when deliberately selected.
+  assert.equal(parseLiveArgs(['--model', 'claude-opus-5-5']).args.model, 'claude-opus-5-5');
+  assert.deepEqual(parseLiveArgs(['--model', 'claude-opus-5-5']).problems, []);
+});
+
 // ---------------------------------------------------------------- input path and synthetic checks
 test('input path: only plain .json files directly under examples/ are allowed', () => {
   for (const good of ['examples/skill-input.json', 'examples/valid-input.json']) assert.equal(isAllowedInputPath(good), true, good);

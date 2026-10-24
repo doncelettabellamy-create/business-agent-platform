@@ -29,7 +29,7 @@ Implements the existing `ModelProvider` interface and nothing else.
 - **Request:** the fixed instruction as `system`; the masked data as one `user` message; answer shape enforced with structured outputs (`output_config.format = { type: "json_schema", schema }`, using only supported schema features) and `output_config.effort` (default `low`). It sends **none** of `temperature`, `top_p`, `top_k`, `thinking`, `tool_choice`, tools, or an assistant prefill (current models reject or manage these).
 - **Refused or truncated answers** (`stop_reason` `refusal` or `max_tokens`) are returned as empty text so they can never be used; the gateway then fails them and the item goes to a person.
 - **Provider errors** are reduced to a class name and HTTP status in `stats`, and replaced by a generic error with no cause attached.
-- **Models:** exact ids only (for example `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`); date-suffixed ids are rejected. Current models think by default, and thinking tokens count toward `max_tokens` and are billed as output, so output budgets need headroom (the live entry defaults to 2048).
+- **Models:** exact ids only (for example `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`); date-suffixed ids are rejected. Current models think by default, and thinking tokens count toward `max_tokens` and are billed as output, so output budgets need headroom (the live entry defaults to 2048).
 
 ## Live test entry point (`src/live-entry.ts`): DRY RUN BY DEFAULT
 
@@ -46,7 +46,7 @@ Credentials are never accepted as arguments and never read by this repository's 
 
 ## Setup before the first live call (founder steps; nothing here has been run)
 
-1. **Decide the model and accept the data terms.** The entry defaults to `claude-opus-5-5`; `claude-sonnet-5-5` and `claude-haiku-5-5` are cheaper (see the cost table). Only synthetic data may be used. Decide D-03 (cloud model calls) and review the provider's data-retention terms first.
+1. **Decide the model and accept the data terms.** The entry defaults to **`claude-haiku-5-5`** (Claude Haiku 5.5). Anthropic's models overview, checked on 2026-10-24, lists this exact API id as an active current model, described as suited to classification and extraction, with retirement not sooner than 2027-10-07, a 1M-token context window, and adaptive thinking (default effort `medium`; the adapter sends `low`). Pass `--model claude-sonnet-5-5` or `--model claude-opus-5-5` only if you deliberately want a more capable and costlier model. Only synthetic data may be used. Decide D-03 (cloud model calls) and review the provider's data-retention terms first.
 2. **Create a dedicated API key for this test only**, outside GitHub: in the Anthropic Console, preferably in its own workspace with a small spend limit if the Console offers one. Do not reuse a production key.
 3. **Install the SDK locally** (this repository does not declare it): `cd poc/intake-runner` then `npm install --save-exact @anthropic-ai/sdk`. This records an exact version in `package.json` and `package-lock.json`; review the diff and the package's license before committing. `node_modules/` is git-ignored.
 4. **Provide the key without writing it to any file in the repository.** Either use the CLI login profile (`ant auth login`), or set it for the current terminal only. PowerShell example:
@@ -65,9 +65,9 @@ List prices (USD per million tokens) from the Claude API skill's cached table da
 
 | Model | Input / output per MTok | One item, low estimate | One item, ceiling at 2048 output tokens per call | Ceiling at 1024 |
 |---|---|---|---|---|
-| `claude-opus-5-5` | $4 / $20 | about $0.010 | about $0.086 | about $0.045 |
+| **`claude-haiku-5-5` (default)** | $0.10 / $0.50 (prompts up to 100K tokens) | about $0.0002 | about $0.0021 | about $0.0011 |
 | `claude-sonnet-5-5` | $2 / $10 | about $0.005 | about $0.043 | about $0.022 |
-| `claude-haiku-5-5` | $0.10 / $0.50 | about $0.0002 | about $0.0021 | about $0.0011 |
+| `claude-opus-5-5` | $4 / $20 | about $0.010 | about $0.086 | about $0.045 |
 
 Input is about 980 tokens for the two requests combined. The ceiling cannot be exceeded: output per call is capped by `max_tokens`, and calls by `--max-calls`. Running both skill examples is double these figures. These are estimates, not quotes.
 
