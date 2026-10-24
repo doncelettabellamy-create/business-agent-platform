@@ -115,6 +115,46 @@ test('model path: an in-list category that conflicts with a local match is unkno
   assert.equal(r.handoff, null);
 });
 
+test('two unrelated businesses (plumbing, dental) run through the same engine with the same safe outcomes', async () => {
+  const load = (n: string) => JSON.parse(readFileSync(new URL(`../examples/${n}`, import.meta.url), 'utf8'));
+  const cases = [
+    { file: 'skill-plumbing.json', category: 'Emergency leak', other: 'Quote request', required: 'Address', otherBusiness: ['New patient', 'Patient reference'],
+      fields: [{ name: 'Address', value: '[ADDRESS_1]', confidence: 0.9 }, { name: 'Job description', value: 'Burst pipe repair', confidence: 0.9 }, { name: 'Preferred date', value: null, confidence: null }] },
+    { file: 'skill-dental.json', category: 'New patient', other: 'Billing question', required: 'Patient reference', otherBusiness: ['Emergency leak', 'Job description'],
+      fields: [{ name: 'Patient reference', value: '[ID_1]', confidence: 0.9 }, { name: 'Preferred date', value: null, confidence: null }, { name: 'Insurance provider', value: null, confidence: null }] },
+  ];
+  for (const c of cases) {
+    const input = load(c.file);
+    // Local skill: ready, valid, handed off.
+    const local = ok(runIntake(input));
+    assert.equal(local.outcome, 'handed-off', c.file);
+    assert.equal(local.workItem.category, c.category, c.file);
+    assert.deepEqual(validateWorkItem(local.workItem), [], c.file);
+    // Model path: agreeing answers are handed off, and only this business's names reach the provider.
+    const good = createMockProvider({ classify_request: () => classifyAnswer(c.category, 0.9), extract_fields: () => extractAnswer(c.fields) });
+    const m = ok(await runIntakeWithModel(input, withProvider(good)));
+    assert.equal(m.outcome, 'handed-off', c.file);
+    assert.equal(m.workItem.category, c.category, c.file);
+    assert.ok(m.handoff && validateEnvelope(m.handoff).length === 0, c.file);
+    const sent = JSON.stringify(good.calls);
+    for (const foreign of c.otherBusiness) assert.ok(!sent.includes(foreign), `${c.file} must not send ${foreign}`);
+    // Same safeguards: a conflicting in-list answer and a null required field both go to a person with no envelope.
+    const conflict = createMockProvider({ classify_request: () => classifyAnswer(c.other, 0.99), extract_fields: () => extractAnswer(c.fields) });
+    const v = ok(await runIntakeWithModel(input, withProvider(conflict)));
+    assert.deepEqual([v.workItem.category, v.workItem.reasons, v.outcome, v.handoff], ['unknown', ['ambiguous_category'], 'needs-human', null], c.file);
+    const nullRequired = createMockProvider({
+      classify_request: () => classifyAnswer(c.category, 0.9),
+      extract_fields: () => extractAnswer(c.fields.map((f) => (f.name === c.required ? { ...f, value: null, confidence: null } : f))),
+    });
+    const n = ok(await runIntakeWithModel(input, withProvider(nullRequired)));
+    assert.deepEqual([n.workItem.missing_fields, n.workItem.reasons, n.outcome, n.handoff], [[c.required], ['missing_fields'], 'needs-human', null], c.file);
+  }
+  // No built-in vocabulary: each business's text under the other's configuration is not guessed.
+  const swapped = load('skill-plumbing.json');
+  swapped.skill_config = load('skill-dental.json').skill_config;
+  assert.deepEqual(ok(runIntake(swapped)).workItem.reasons.includes('unknown_category'), true);
+});
+
 test('model path: a null required field is missing_fields, sent to a person, with no envelope', async () => {
   const p = createMockProvider({
     classify_request: () => classifyAnswer('Category A', 0.9),

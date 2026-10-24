@@ -1,0 +1,25 @@
+{
+  "workspace_id": "ws-synthetic-plumbing",
+  "correlation_id": "corr-synthetic-0301",
+  "event_id": "evt-synthetic-0301",
+  "received_at": "2026-10-24T11:00:00Z",
+  "channel_ref": "channel-tbd",
+  "masking": { "applied": true, "source": "synthetic-fixture" },
+  "masked_text": "Hello, this is [PERSON_1]. There is a burst pipe and a leak in the kitchen.\nAddress: [ADDRESS_1]\nJob description: Burst pipe repair\nPreferred date: tomorrow morning",
+  "pii_summary": [
+    { "type": "Person", "count": 1 },
+    { "type": "Address", "count": 1 }
+  ],
+  "skill_config": {
+    "categories": [
+      { "name": "Emergency leak", "keywords": ["burst pipe", "leak", "flooding"] },
+      { "name": "Quote request", "keywords": ["quote", "estimate"] },
+      { "name": "Booking change", "keywords": ["reschedule", "cancel"] }
+    ],
+    "fields": [
+      { "name": "Address", "required": true, "extractor": { "kind": "label", "labels": ["address", "location"] } },
+      { "name": "Job description", "required": true, "extractor": { "kind": "label", "labels": ["job description"] } },
+      { "name": "Preferred date", "required": false, "extractor": { "kind": "label", "labels": ["preferred date"] } }
+    ]
+  }
+}

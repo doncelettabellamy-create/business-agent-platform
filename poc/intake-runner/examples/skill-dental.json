@@ -1,0 +1,25 @@
+{
+  "workspace_id": "ws-synthetic-dental",
+  "correlation_id": "corr-synthetic-0302",
+  "event_id": "evt-synthetic-0302",
+  "received_at": "2026-10-24T11:30:00Z",
+  "channel_ref": "channel-tbd",
+  "masking": { "applied": true, "source": "synthetic-fixture" },
+  "masked_text": "Hello, I am [PERSON_1] and this is my first visit. I would like to book as a new patient.\nPatient reference: [ID_1]\nPreferred date: next Monday\nInsurance provider: Example Health",
+  "pii_summary": [
+    { "type": "Person", "count": 1 },
+    { "type": "Identifier", "count": 1 }
+  ],
+  "skill_config": {
+    "categories": [
+      { "name": "New patient", "keywords": ["new patient", "first visit"] },
+      { "name": "Appointment change", "keywords": ["reschedule", "cancel"] },
+      { "name": "Billing question", "keywords": ["invoice", "bill"] }
+    ],
+    "fields": [
+      { "name": "Patient reference", "required": true, "extractor": { "kind": "token", "token_type": "ID" } },
+      { "name": "Preferred date", "required": false, "extractor": { "kind": "label", "labels": ["preferred date"] } },
+      { "name": "Insurance provider", "required": false, "extractor": { "kind": "label", "labels": ["insurance provider"] } }
+    ]
+  }
+}
