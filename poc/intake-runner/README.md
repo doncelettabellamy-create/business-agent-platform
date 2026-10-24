@@ -40,7 +40,7 @@ Implements the existing `ModelProvider` interface and nothing else.
 3. an input file directly under `examples/`,
 4. a plainly synthetic record (`ws-synthetic-*`, `evt-synthetic-*`, `corr-synthetic-*`, masking source `synthetic-fixture`, with `skill_config`),
 5. a call count within `--max-calls` (default 2, hard maximum 10), enforced by a counter around the client,
-6. the official SDK installed locally (it is imported only after every check above, and is not a declared dependency).
+6. the official SDK installed locally (it is imported only after every check above; it is the only declared dependency, pinned to an exact version).
 
 Credentials are never accepted as arguments and never read by this repository's code: the SDK resolves them itself from the environment or a stored login profile. SDK retries are turned off (`maxRetries: 0`) so the gateway owns attempts and the call count is exact. No npm script contains `--live`.
 
@@ -48,7 +48,7 @@ Credentials are never accepted as arguments and never read by this repository's 
 
 1. **Decide the model and accept the data terms.** The entry defaults to **`claude-haiku-5-5`** (Claude Haiku 5.5). Anthropic's models overview, checked on 2026-10-24, lists this exact API id as an active current model, described as suited to classification and extraction, with retirement not sooner than 2027-10-07, a 1M-token context window, and adaptive thinking (default effort `medium`; the adapter sends `low`). Pass `--model claude-sonnet-5-5` or `--model claude-opus-5-5` only if you deliberately want a more capable and costlier model. Only synthetic data may be used. Decide D-03 (cloud model calls) and review the provider's data-retention terms first.
 2. **Create a dedicated API key for this test only**, outside GitHub: in the Anthropic Console, preferably in its own workspace with a small spend limit if the Console offers one. Do not reuse a production key.
-3. **Install the SDK locally** (this repository does not declare it, and as of the last check it is NOT installed): `cd poc/intake-runner` then `npm install --save-exact --ignore-scripts @anthropic-ai/sdk`. `--ignore-scripts` stops any package from running install-time code. This records an exact version in `package.json` and `package-lock.json`; review that diff and the package's license before committing it. `node_modules/` is git-ignored. Installing contacts the npm registry (it is not an API call and needs no key).
+3. **Install the SDK locally** (done on 2026-10-24: `@anthropic-ai/sdk` is pinned to exact version `1.3.0` in `package.json` and `package-lock.json`, installed with `npm install --save-exact --ignore-scripts @anthropic-ai/sdk`; to reproduce on another machine run `npm ci --ignore-scripts` in `poc/intake-runner`, which installs exactly the locked versions). Verified at install time: license Apache-2.0 (the 7 transitive packages are MIT, Apache-2.0, or Unlicense), 0 vulnerabilities from `npm audit`, registry signatures verified for all 8 packages, provenance attestation present for the SDK, no install scripts, every package resolved from registry.npmjs.org with an integrity hash. Caution: version 1.3.0 was published only a day before installation (the whole 1.x line is days old), so re-check `npm audit` and the release notes before relying on it. `node_modules/` is git-ignored.
 4. **Put the key in this terminal window only, without displaying or saving it.** Use Windows PowerShell or PowerShell 7 in the folder `poc/intake-runner`. (The `ant auth login` profile option needs the `ant` CLI, which is not installed on this machine.) Paste these lines one block at a time; when `Read-Host` asks, paste the key (nothing is shown as you type or paste):
    ```
    $secure = Read-Host "Anthropic API key (hidden)" -AsSecureString
@@ -89,7 +89,7 @@ No vocabulary of its own and no industry rules. Classification counts distinct c
 |---|---|
 | **No live call has ever been made** | The adapter is verified only against a fake client. Real API behavior (schema acceptance, latency, refusals, thinking-token use, actual cost) is unverified. |
 | No personal-data detector | The runner **trusts** `masking.applied`. Real customer text must never reach a provider until detection, masking, and the vault exist (INT-06 to INT-09). |
-| No SDK dependency declared | Installing it is a founder step (see setup). Type-checking has not been run. |
+| SDK pinned but never exercised | `@anthropic-ai/sdk` 1.3.0 is installed and only its typings and exports were inspected; no client was constructed and no request made. Type-checking has not been run. |
 | Draft prompts and schemas | The two instruction texts and answer schemas are unapproved and untested against a real model. |
 | No metering, caps, or kill switch in the product | Only the entry point's call counter and the token limits exist. No usage events, per-tenant caps, or alerts (FND-09). |
 | No backoff or rate-limit handling | Attempts are plain and bounded. |

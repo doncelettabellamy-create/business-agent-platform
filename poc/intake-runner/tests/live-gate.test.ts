@@ -169,10 +169,25 @@ test('live entry: it never reads or prints credentials, files other than the inp
   assert.ok(/call limit/.test(src) && /sent\s*>=\s*args\.maxCalls/.test(src), 'a hard per-run call limit wraps the client');
 });
 
-test('package scripts: no npm script can trigger a live call, and no SDK or other dependency is declared', () => {
-  const pkg = JSON.parse(read('package.json')) as { scripts: Record<string, string>; dependencies?: unknown; devDependencies?: unknown; optionalDependencies?: unknown };
+test('package manifest: no npm script can trigger a live call; the only dependency is the exact-pinned official SDK, and the lockfile agrees', () => {
+  const pkg = JSON.parse(read('package.json')) as {
+    scripts: Record<string, string>; dependencies?: Record<string, string>;
+    devDependencies?: unknown; optionalDependencies?: unknown; peerDependencies?: unknown;
+  };
   for (const [name, cmd] of Object.entries(pkg.scripts)) assert.ok(!cmd.includes('--live'), `script ${name} must not contain --live`);
-  assert.ok(!('dependencies' in pkg) && !('devDependencies' in pkg) && !('optionalDependencies' in pkg));
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk'], 'exactly one dependency');
+  assert.match(pkg.dependencies!['@anthropic-ai/sdk'], /^\d+\.\d+\.\d+$/, 'exact version: no range operators');
+  assert.ok(!('devDependencies' in pkg) && !('optionalDependencies' in pkg) && !('peerDependencies' in pkg));
+
+  const lock = JSON.parse(read('package-lock.json')) as { lockfileVersion: number; packages: Record<string, { version?: string; resolved?: string; integrity?: string; hasInstallScript?: boolean; dependencies?: Record<string, string> }> };
+  assert.deepEqual(lock.packages[''].dependencies, pkg.dependencies, 'the lockfile root matches the manifest');
+  assert.equal(lock.packages['node_modules/@anthropic-ai/sdk'].version, pkg.dependencies!['@anthropic-ai/sdk'], 'the locked SDK version equals the pinned one');
+  for (const [path, entry] of Object.entries(lock.packages)) {
+    if (path === '') continue;
+    assert.ok(entry.resolved?.startsWith('https://registry.npmjs.org/'), `${path} must resolve from the npm registry over https`);
+    assert.ok(entry.integrity?.startsWith('sha512-'), `${path} must carry an integrity hash`);
+    assert.ok(!entry.hasInstallScript, `${path} must not run install scripts`);
+  }
 });
 
 test('static guard: live-gate imports only local files and has no network, process, or I/O access', () => {
