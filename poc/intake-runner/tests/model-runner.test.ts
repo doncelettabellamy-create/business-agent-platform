@@ -86,6 +86,35 @@ test('model path: a model answer of null category is a normal "unknown", not a f
   assert.equal(r.handoff, null);
 });
 
+test('model path: a null category on a locally tied text is unknown_category (not ambiguous), sent to a person, with no envelope', async () => {
+  const x = skillInput();
+  x.masked_text = 'alpha and bravo\nTopic: Something\n[ID_1]';   // a tie for the local classifier (see classify-extract tests)
+  const p = createMockProvider({
+    classify_request: () => classifyAnswer(null, null),
+    extract_fields: () => extractAnswer([{ name: 'Field 1', value: 'Something', confidence: 0.9 }, { name: 'Field 2', value: '[ID_1]', confidence: 0.9 }]),
+  });
+  const r = ok(await runIntakeWithModel(x, withProvider(p)));
+  assert.equal(r.workItem.category, 'unknown');
+  assert.deepEqual(r.workItem.reasons, ['unknown_category']);
+  assert.equal(r.outcome, 'needs-human');
+  assert.equal(r.handoff, null);
+  assert.deepEqual(validateWorkItem(r.workItem), []);
+});
+
+test('model path: a null required field is missing_fields, sent to a person, with no envelope', async () => {
+  const p = createMockProvider({
+    classify_request: () => classifyAnswer('Category A', 0.9),
+    extract_fields: () => extractAnswer([{ name: 'Field 1', value: 'Change of details', confidence: 0.9 }, { name: 'Field 2', value: null, confidence: null }]),
+  });
+  const r = ok(await runIntakeWithModel(skillInput(), withProvider(p)));
+  assert.equal(r.outcome, 'needs-human');
+  assert.equal(r.workItem.status, 'needs-human');
+  assert.deepEqual(r.workItem.missing_fields, ['Field 2']);
+  assert.deepEqual(r.workItem.reasons, ['missing_fields']);
+  assert.equal(r.handoff, null);
+  assert.deepEqual(validateWorkItem(r.workItem), []);
+});
+
 test('model path: a configured threshold applies to the model confidences', async () => {
   const p = createMockProvider({ classify_request: () => classifyAnswer('Category A', 0.6), extract_fields: () => extractAnswer(GOOD_FIELDS) });
   const low = ok(await runIntakeWithModel(skillInput(), withProvider(p, { minConfidence: 0.8 })));   // test value only
