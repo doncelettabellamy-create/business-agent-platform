@@ -85,9 +85,9 @@ Model calls in CI use recorded responses; a small scheduled run against the real
 
 All pilot test data is synthetic and labelled. It contains no real person's data. Its content (categories, fields, entity types) is **TBD (D-01, D-11)**. Each case records the expected category, expected fields, and expected personal-data findings. Raw synthetic values are tracked so leak tests can search for them exactly.
 
-## 6. Acceptance tests for the Intake MVP (AT-01 to AT-22)
+## 6. Acceptance tests for the R1 Intake pilot (AT-01 to AT-22)
 
-A test with a **TBD** threshold cannot pass until the founder sets the threshold. **MVP exit: all 22 tests pass.**
+A test with a **TBD** threshold cannot pass until the founder sets the threshold. **R1 exit: all 22 tests pass.** The R1 exit is necessary but not sufficient for the working MVP, which also needs the R2 and R3 exits and verified four-agent end-to-end operation (register FC-05). The 22 tests and their thresholds are unchanged.
 
 | ID | Test | Procedure | Pass criterion |
 |---|---|---|---|
@@ -114,7 +114,7 @@ A test with a **TBD** threshold cannot pass until the founder sets the threshold
 | AT-21 | Read-only list | Log in as staff of A and of B | Each sees only own items, masked; no unmask control exists |
 | AT-22 | Restart | Stop the process during processing and restart | Item completes once or retries without creating a duplicate |
 
-## 7. Proposed additional tests (not yet numbered into the MVP exit)
+## 7. Proposed additional tests (not yet numbered into the R1 exit)
 
 | ID | Source document | Check |
 |---|---|---|
@@ -130,7 +130,7 @@ A test with a **TBD** threshold cannot pass until the founder sets the threshold
 | LOG-T1 to LOG-T4 | `DIAGNOSTIC_LOGGING.md` | Correlation, error codes without content, library defaults, diagnostic-mode expiry |
 | SEC-T1 to SEC-T4 | `SECURITY_PII.md` | Detector auth, secret scan, key rotation, widget body cap and origin check |
 
-The founder decides whether these join the MVP exit.
+The founder decides whether these join the R1 exit.
 
 ## 8. Test traceability
 

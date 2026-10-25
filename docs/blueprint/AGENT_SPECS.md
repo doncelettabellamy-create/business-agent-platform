@@ -74,7 +74,7 @@ Pre-processing steps that are platform code, not skills: signature verification,
 
 ## 3. Processing (`agents/processing/`)
 
-**MVP status: stub receiver only.** The rest is design for later.
+**R1 status: stub receiver only.** The rest is design for later (R2 and R3 must make it a functioning agent for the working MVP, register FC-05).
 
 | Item | Specification |
 |---|---|
@@ -99,7 +99,7 @@ Component ownership (all undecided): workflow engine = Orchester `lib/flows/*` (
 
 ## 4. Quality Control (`agents/quality-control/`)
 
-**MVP status: not built.**
+**R1 status: not built** (required for the working MVP, register FC-05).
 
 | Item | Specification |
 |---|---|
@@ -123,7 +123,7 @@ Human override uses the approval record (FND-07).
 
 ## 5. Reporting (`agents/reporting/`)
 
-**MVP status: not built.**
+**R1 status: not built** (required for the working MVP, register FC-05).
 
 | Item | Specification |
 |---|---|
@@ -176,7 +176,7 @@ A receiver advertises accepted contract versions; the runtime refuses a handoff 
 
 | Part | Status |
 |---|---|
-| Intake specification | Complete for the proposed MVP; skill names and category/field lists TBD (D-01) |
+| Intake specification | Complete for the proposed R1 pilot; skill names and category/field lists TBD (D-01) |
 | Processing | **Partial: design outline; tools and knowledge TBD (D-01, D-02); no acceptance tests** |
 | Quality Control | **Partial: design outline; policy TBD (D-06); no acceptance tests** |
 | Reporting | **Partial: design outline; thresholds and delivery channel TBD; no acceptance tests** |

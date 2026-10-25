@@ -1,11 +1,12 @@
 # Architectural Essentials (quick reference)
 
 Read this before touching the repo. It is a summary. If it disagrees with `docs/MASTER_BUILD_REGISTER.md`, **the register wins**.
-Sources: `docs/MASTER_BUILD_REGISTER.md`, `docs/blueprint/{ARCHITECTURE,PRD,AGENT_SPECS}.md`. Last updated 2026-10-24.
+Sources: `docs/MASTER_BUILD_REGISTER.md`, `docs/blueprint/{ARCHITECTURE,PRD,AGENT_SPECS}.md`. Last updated 2026-10-25.
 
 ## 1. Current status (read first)
 
-- **Nothing is built.** No application code, schema, tests, or deployment exist. The repo holds documents only.
+- **No platform component is built.** No schema or deployment exists. The only code is a synthetic, mock-based proof of concept at `poc/intake-runner` (not a component; no register row is IMPLEMENTED). The rest of the repo holds documents.
+- **The working MVP is defined by register FC-05:** four functioning agents; complete only when the R1, R2 and R3 exits pass and end-to-end operation is verified. "MVP" in older text means the R1 Intake pilot.
 - **No component is founder-approved.** Every register row is Founder-PENDING and Build-NOT STARTED.
 - **All implementation gates are on HOLD.** Do not start a row until the founder sets it APPROVED in the register.
 - Research is not approval, and approval is not implementation. Never record research as built or approved.
@@ -18,10 +19,11 @@ Sources: `docs/MASTER_BUILD_REGISTER.md`, `docs/blueprint/{ARCHITECTURE,PRD,AGEN
 2. Per-agent folder with `AGENT.md` and `skills/<skill-name>/SKILL.md` per skill. Proposed folders: `agents/intake`, `agents/processing`, `agents/quality-control`, `agents/reporting`; shared `contracts/`.
 3. Claude Code development skills (`.claude/`) are never loaded as production skills.
 4. No vertical, customers, pricing, or integrations may be invented. Unknowns stay **TBD**.
+5. FC-05 (register section 0.2): the working MVP is four functioning agents and needs the R1, R2 and R3 exits plus verified end-to-end operation. R1 keeps its definition.
 
 ## 3. Agent structure
 
-| Agent | Job | Output contract | MVP |
+| Agent | Job | Output contract | R1 pilot |
 |---|---|---|---|
 | Intake | Verify, mask, classify, extract inbound requests | `work_item.v1` | Yes (shadow mode, proposed) |
 | Processing | Plan and do the work; build candidate with evidence | `candidate_result.v1` | Stub receiver only |
@@ -131,4 +133,4 @@ S-01 decisions → S-02 agent folders → S-03 tenant wall → S-04 secrets → 
 
 ## 12. Where things live
 
-`docs/MASTER_BUILD_REGISTER.md` (source of truth, section 16 = build order) · `docs/BUSINESS_BLUEPRINT.md` (index) · `docs/blueprint/` (14 design documents) · this file.
+`docs/MASTER_BUILD_REGISTER.md` (source of truth, section 16 = build order) · `docs/BUSINESS_BLUEPRINT.md` (index) · `docs/blueprint/` (design documents, including `PLATFORM_MASTER_PLAN.md`) · this file.

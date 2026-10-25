@@ -6,7 +6,7 @@
 
 ## 1. Purpose and scope
 
-Defines what the platform must do, split into the first Intake pilot (MVP) and later releases. Requirement IDs (PRD-nn) are traced to register rows and build steps (S-nn). Behavior that depends on the vertical is written generically ("request", "category", "field") until D-01 is decided.
+Defines what the platform must do, split into the first Intake pilot (MVP) and later releases. **Terminology (register FC-05, 2026-10-25): "MVP" in this document means the R1 Intake pilot.** The *working MVP* (four functioning agents, complete only when the R1, R2 and R3 exits pass and end-to-end operation is verified) is defined in `MASTER_BUILD_REGISTER.md` FC-05 and section 6 below. Requirement IDs (PRD-nn) are traced to register rows and build steps (S-nn). Behavior that depends on the vertical is written generically ("request", "category", "field") until D-01 is decided.
 
 ## 2. Users and roles (proposed; confirm under D-08)
 
@@ -19,7 +19,7 @@ Defines what the platform must do, split into the first Intake pilot (MVP) and l
 
 ## 3. Functional requirements
 
-Phase: **MVP** = the smallest Intake pilot (see `DEPLOYMENT_TESTING.md` for tests). **Later** = after the pilot.
+Phase: **MVP** = the smallest Intake pilot, i.e. R1 (see `DEPLOYMENT_TESTING.md` for tests). **Later** = after the pilot. "MVP" here is not the FC-05 working MVP.
 
 ### 3.1 Platform and structure
 
@@ -103,8 +103,9 @@ All numeric targets are **TBD** until the founder sets them.
 | R2 Processing + QC | PRD-16 to PRD-19 | Acceptance tests to be written |
 | R3 Reporting + billing + deletion | PRD-20 to PRD-22 | Acceptance tests to be written |
 | R4 Scale | PRD-23 to PRD-25 | TBD |
+| **Working MVP (FC-05)** | R1 + R2 + R3, and verified four-agent end-to-end operation | R1, R2 and R3 exits all pass, and the items in register section 0.2 are verified. The R1 exit is unchanged. R2 and R3 tests must be written and approved first. R4 is not part of this gate unless the founder adds it. |
 
-## 7. Out of scope (MVP)
+## 7. Out of scope (R1 pilot)
 
 Customer replies and outbound actions, approvals, pause/resume, Processing/QC/Reporting logic, billing, plans, non-English, deletion and export, dashboards, any integration beyond the single TBD channel.
 
@@ -119,7 +120,7 @@ Customer replies and outbound actions, approvals, pause/resume, Processing/QC/Re
 
 | Part | Status |
 |---|---|
-| MVP requirements PRD-01 to PRD-15 with criteria and tests | Complete for the proposed MVP |
+| MVP (R1 pilot) requirements PRD-01 to PRD-15 with criteria and tests | Complete for the proposed R1 pilot |
 | Later requirements PRD-16 to PRD-25 | **Incomplete: no acceptance criteria; depend on D-01, D-05, D-06, D-08, D-12** |
 | Numeric NFR targets | **Incomplete: TBD** |
 | Vertical-specific requirements | **Not started (D-01)** |
