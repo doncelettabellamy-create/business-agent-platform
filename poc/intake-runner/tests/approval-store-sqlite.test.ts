@@ -386,7 +386,7 @@ test('sqlite: only this store imports node:sqlite, nothing imports the store, an
   const strip = (x: string) => x.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const files = readdirSync(dirSrc).filter((f) => f.endsWith('.ts'));
   const text = (f: string) => strip(readFileSync(new URL(f, dirSrc), 'utf8'));
-  assert.deepEqual(files.filter((f) => /node:sqlite/.test(text(f))).sort(), ['approval-store-sqlite.ts', 'reporting-ledger-sqlite.ts']);   // the Reporting ledger is the only other SQLite module
+  assert.deepEqual(files.filter((f) => /node:sqlite/.test(text(f))).sort(), ['approval-store-sqlite.ts', 'intake-record-store.ts', 'reporting-ledger-sqlite.ts']);   // the Reporting ledger and the founder-test record store are the other SQLite modules
   assert.deepEqual(files.filter((f) => f !== 'approval-store-sqlite.ts' && /\.\/approval-store-sqlite\.ts/.test(text(f))), []);
   const code_ = text('approval-store-sqlite.ts');
   for (const m of code_.matchAll(/from\s+'([^']+)'/g)) assert.ok(m[1].startsWith('./') || ['node:sqlite', 'node:crypto'].includes(m[1]), `imports ${m[1]}`);

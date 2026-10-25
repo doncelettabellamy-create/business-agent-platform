@@ -408,7 +408,7 @@ test('inventory: only the two SQLite modules import node:sqlite, nothing but tes
   const strip = (x: string) => x.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const files = readdirSync(dirSrc).filter((f) => f.endsWith('.ts'));
   const text = (f: string) => strip(readFileSync(new URL(f, dirSrc), 'utf8'));
-  assert.deepEqual(files.filter((f) => /node:sqlite/.test(text(f))).sort(), ['approval-store-sqlite.ts', 'reporting-ledger-sqlite.ts']);
+  assert.deepEqual(files.filter((f) => /node:sqlite/.test(text(f))).sort(), ['approval-store-sqlite.ts', 'intake-record-store.ts', 'reporting-ledger-sqlite.ts']);
   assert.deepEqual(files.filter((f) => f !== 'reporting-ledger-sqlite.ts' && /\.\/reporting-ledger-sqlite\.ts/.test(text(f))), []);
   const code_ = text('reporting-ledger-sqlite.ts');
   const imports = [...code_.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]).sort();

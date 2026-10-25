@@ -14,3 +14,10 @@ credentials*.json
 *.log
 .DS_Store
 Thumbs.db
+
+# Founder phone test: local config, record database and kill-switch file are never committed.
+founder-call.config.json
+founder-call.stop
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

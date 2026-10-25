@@ -276,7 +276,7 @@ test('single path: only this entry imports the boundary runners; nobody in src m
   const files = readdirSync(dir).filter((n) => n.endsWith('.ts'));
   const importers = (re: RegExp) => files.filter((f) => re.test(readFileSync(new URL(f, dir), 'utf8'))).sort();
   assert.deepEqual(importers(/import\s*(?:type\s*)?\{[^}]*\b(runIntakeForTenant|runIntakeWithModelForTenant)\b[^}]*\}\s*from\s*'\.\/tenant-boundary\.ts'/), ['intake-entry.ts']);
-  assert.deepEqual(importers(/import\s*(?:type\s*)?\{[^}]*\bmintExecutionContext\b[^}]*\}\s*from\s*'\.\/execution-context\.ts'/), ['live-run.ts', 'pipeline.ts'], 'the composition roots are the synthetic developer path and the controlled pipeline');
+  assert.deepEqual(importers(/import\s*(?:type\s*)?\{[^}]*\bmintExecutionContext\b[^}]*\}\s*from\s*'\.\/execution-context\.ts'/), ['founder-call-entry.ts', 'live-run.ts', 'pipeline.ts'], 'the composition roots are the founder phone test, the synthetic developer path and the controlled pipeline');
   // the raw runners: only the two local scripts and the boundary; neither intake-entry.ts nor live-entry.ts may appear
   assert.deepEqual(importers(/import\s*(?:type\s*)?\{[^}]*\b(runIntake|runIntakeWithModel)\b[^}]*\}\s*from\s*'\.\/intake-runner\.ts'/), ['cli.ts', 'demo.ts', 'tenant-boundary.ts']);
   const own = readFileSync(new URL('intake-entry.ts', dir), 'utf8').replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');

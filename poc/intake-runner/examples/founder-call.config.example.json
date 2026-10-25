@@ -1,0 +1,90 @@
+{
+  "approval_id": "founder-test-001",
+  "tenant": "ws-founder-plumbing",
+  "numbers": [
+    "+15555550100"
+  ],
+  "model": "claude-haiku-5-5",
+  "max_minutes": 8,
+  "max_turns": 30,
+  "max_claude_calls": 150,
+  "expires": "2026-11-20T00:00:00Z",
+  "persona_names": [
+    "Sam Example"
+  ],
+  "kill_file": "founder-call.stop",
+  "public_wss_url": "wss://YOUR-TUNNEL-HOST.example/relay",
+  "db_path": "founder-call.sqlite",
+  "relay_port": 8788,
+  "dashboard_port": 8787,
+  "after_speech_ms": 4000,
+  "skill_config": {
+    "categories": [
+      {
+        "name": "Emergency leak",
+        "keywords": [
+          "burst pipe",
+          "leak",
+          "flooding"
+        ],
+        "requires": [
+          "Address",
+          "Job description"
+        ]
+      },
+      {
+        "name": "Quote request",
+        "keywords": [
+          "quote",
+          "estimate"
+        ],
+        "requires": [
+          "Job description"
+        ]
+      },
+      {
+        "name": "Booking change",
+        "keywords": [
+          "reschedule",
+          "cancel"
+        ],
+        "requires": [
+          "Preferred date"
+        ]
+      }
+    ],
+    "fields": [
+      {
+        "name": "Address",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "address",
+            "location"
+          ]
+        }
+      },
+      {
+        "name": "Job description",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "job description"
+          ]
+        }
+      },
+      {
+        "name": "Preferred date",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "preferred date"
+          ]
+        }
+      }
+    ]
+  }
+}
