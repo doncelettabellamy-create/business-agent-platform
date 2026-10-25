@@ -33,11 +33,11 @@ credential -> mint context -> Intake -> Processing -> Quality Control -> Reporti
 
 Optional recovery in the pipeline (`recoverUncertain: true`): after an escalation caused by an uncertain human-approved step, QC reconciles once, and if something settled, one fresh verification is filed as a repeat attempt. The first outcome is never changed.
 
-## 4. Baseline: 764 tests
+## 4. Baseline: 774 tests
 
-`npm test` in `poc/intake-runner` on 2026-10-25: **764 tests, 764 pass, 0 fail** (about 8 seconds). The register's "Test figure: 764 passed" matches. About 605 of the 764 are in test files that are not yet committed.
+`npm test` in `poc/intake-runner` on 2026-10-25: **774 tests, 774 pass, 0 fail** (about 8 seconds), run 2026-10-26 after Option A. The register's "Test figure: 774 passed" matches. The 764 baseline was committed in c7af9de; the 10 new tests and the `pipeline.ts` change are not yet committed.
 
-Newest files: `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains).
+Newest files: `pipeline-recovery` (30, includes the strictly-later tests), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains).
 
 Checklist roll-up (plan section 11): 73 rows - 11 BUILT, 23 PARTIAL, 21 NOT STARTED, 18 BLOCKED. Of 17 requirements: 0 BUILT, 10 PARTIAL, 1 NOT STARTED, 6 BLOCKED.
 
@@ -59,12 +59,12 @@ Limits: no database-level tenant isolation (FND-02 / R03), single host and file,
 - Processing with tool registry, uncertain-outcome rules, human-approved tools and approval store (in-memory and SQLite).
 - QC with read-back evidence, human-approval checks, reconcile.
 - Reporting: report contract, observation history, duplicate protection, verified current-status derivation, atomic ledger `record`, injectable and untrusted-checked ledger, SQLite ledger.
-- Pipeline with optional recovery, end-to-end tests over SQLite with restarts, startup and runtime failures.
+- Pipeline with optional recovery that requires a strictly later fresh verdict (Option A), end-to-end tests over SQLite with restarts, startup and runtime failures.
 - Observability allow-list with error-class coverage (77 codes).
 
 ## 7. Risks and open findings
 
-1. **Same-second tie.** Verdict times have one-second resolution and an equal time never promotes, so a recovery's fresh pass in the same second leaves current status at `escalate` (fail-safe, first outcome and counts unaffected). Proposed fix: A (pipeline waits for a strictly later verdict, bounded retry, new stop reason) now; B (an attested `follows` link in the QC verdict, compare-and-set at ties) with the D-14 schema work. Not implemented.
+1. **Same-second tie (Option A built, B proposed).** Verdict times have one-second resolution and an equal time never promotes. Recovery now waits once (injected `sleep`, 1 s) and has QC judge the same candidate again when the fresh verdict is not strictly later; if it still is not (frozen or backward clock, replayed verdict), it stops with `FRESH_NOT_LATER`, files nothing and leaves the escalation. Never repeats the action. Residual: depends on QC's clock moving forward; adds up to about 1 s to a recovery. Option B (an attested `follows` link in the QC verdict, compare-and-set at ties) is for the D-14 schema work.
 2. No composition root: only tests build entries.
 3. Seals do not persist, so a request after restart is a new attempt, not a replay.
 4. No database-level tenant isolation, no encryption, no retention; production database undecided.
@@ -107,7 +107,7 @@ Branch `main`, remote `origin` = `https://github.com/doncelettabellamy-create/bu
 ## 11. Next steps
 
 1. Back up to GitHub (founder's call): commit and push the work in section 9.
-2. Implement tie fix A, then plan B with D-14.
+2. Plan tie fix B (causal `follows` link) together with D-14. Option A is done (uncommitted until the founder asks).
 3. Composition root that builds entries from configuration.
 4. Decide D-14 (production database) and FND-02 (tenant isolation).
 5. Decide D-05 and C14, then start the memory work.

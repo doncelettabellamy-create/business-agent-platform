@@ -20,6 +20,9 @@
 //   again, where the fresh result is a repeat attempt that cannot replace the first outcome. Unresolved, ambiguous or failed recovery leaves
 //   the escalation exactly as it was. Recovery never calls a tool, never loops, and never rewrites a report: the report as it stood before
 //   recovery is returned beside the final one.
+//   The fresh verdict must be STRICTLY later than the first one (Reporting never lets an equal time promote an item). If it is not, the pipeline
+//   waits (injected `sleep`, 1 s) and has QC judge the same candidate once more; judging changes nothing and Processing is not run again, so the
+//   approved action is never repeated. Still not later (frozen or backward clock, unreadable time): stop with FRESH_NOT_LATER and file nothing.
 //   Never throws at request time; bad setup throws a RangeError. Results hold ids, fixed words and counts only.
 //   This file is a mint importer (with live-run.ts); it calls no raw runner and imports no network, file, or process APIs.
 
@@ -47,7 +50,7 @@ export interface RecoverySummary {
   /** The one fresh verification, when something was settled. */
   readonly fresh?: { readonly verdict: 'pass' | 'rework' | 'escalate'; readonly counted: 'accepted' | 'duplicate' | 'repeat' };
   /** Why recovery stopped without a fresh verification, as a fixed word. */
-  readonly stopped?: 'RECONCILE_FAILED' | 'NOTHING_SETTLED' | 'FRESH_FAILED';
+  readonly stopped?: 'RECONCILE_FAILED' | 'NOTHING_SETTLED' | 'FRESH_FAILED' | 'FRESH_NOT_LATER';
 }
 export type PipelineResult =
   | { ok: true; outcome: 'reported'; item_id: string; verdict: 'pass' | 'rework' | 'escalate'; counted: 'accepted' | 'duplicate' | 'repeat'; stages: StageRecord[]; correlation_ids: CorrelationIds; report: Readonly<ReportV1>; recovery?: RecoverySummary; prior_report?: Readonly<ReportV1> }
@@ -76,6 +79,8 @@ export interface PipelineConfig {
   stageTimeoutMs?: number;
   /** Opt in to one bounded recovery of an escalated uncertain human-approved action (see the header). Needs `qc.reconcile`. Default false. */
   recoverUncertain?: boolean;
+  /** Waits `ms` milliseconds (default: a real timer). Used only by recovery, to let QC's clock pass the first verdict's second. Tests inject it. */
+  sleep?: (ms: number) => unknown;
 }
 export interface Pipeline { run(credential: unknown, message: unknown): Promise<PipelineResult> }
 
@@ -120,6 +125,8 @@ export function createPipeline(config: PipelineConfig): Pipeline {
   const limit = stageTimeoutMs ?? 10_000;
   if (recoverUncertain !== undefined && typeof recoverUncertain !== 'boolean') throw new RangeError('recoverUncertain must be true or false');
   const recover = recoverUncertain === true;
+  if (config.sleep !== undefined && typeof config.sleep !== 'function') throw new RangeError('sleep must be a function');
+  const sleep = config.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
   if (recover && typeof (qc as { reconcile?: unknown }).reconcile !== 'function') throw new RangeError('recovery needs a QC entry that can reconcile');
 
   // Fixed per-agent scope allow-lists. The grants source can only narrow these.
@@ -258,13 +265,22 @@ export function createPipeline(config: PipelineConfig): Pipeline {
     }
 
     // One fresh verification. Processing finds the recorded outcome and calls no tool; QC judges the new candidate; Reporting files it as a repeat.
-    const stopFresh = (): PipelineResult => ({ ...base, stages: fill(stages), recovery: deepFreezeSummary({ attempted: true, settled: true, steps: summarySteps, first, stopped: 'FRESH_FAILED' }), prior_report: out.report });
+    const stopFresh = (stopped: 'FRESH_FAILED' | 'FRESH_NOT_LATER' = 'FRESH_FAILED'): PipelineResult => ({ ...base, stages: fill(stages), recovery: deepFreezeSummary({ attempted: true, settled: true, steps: summarySteps, first, stopped }), prior_report: out.report });
     const again = (await attempt(() => stageProcessing.run(cp, envelope))) as Record<string, unknown> | undefined;
     if (!isRecord(again) || again.ok !== true || !isRecord(again.candidate) || tenantOf(again.candidate) !== tenant) return stopFresh();
     const candidate2 = again.candidate as Record<string, unknown>;
     const qr2 = (await attempt(() => stageQc.run(cq, candidate2, envelope))) as Record<string, unknown> | undefined;
     if (!isRecord(qr2) || qr2.ok !== true || !isRecord(qr2.verdict) || tenantOf(qr2.verdict) !== tenant) return stopFresh();
-    const verdict2 = qr2.verdict as Record<string, unknown>;
+    let verdict2 = qr2.verdict as Record<string, unknown>;
+    const laterThanFirst = (v: Record<string, unknown>): boolean => typeof v.created_at === 'string' && typeof verdict.created_at === 'string' && Date.parse(v.created_at) > Date.parse(verdict.created_at);
+    if (!laterThanFirst(verdict2)) {
+      // Same second (or worse): wait once, then let QC judge the SAME candidate again. Processing is not run, so no tool is called.
+      await attempt(async () => { await sleep(1000); });
+      const qr3 = (await attempt(() => stageQc.run(cq, candidate2, envelope))) as Record<string, unknown> | undefined;
+      if (!isRecord(qr3) || qr3.ok !== true || !isRecord(qr3.verdict) || tenantOf(qr3.verdict) !== tenant) return stopFresh();
+      verdict2 = qr3.verdict as Record<string, unknown>;
+      if (!laterThanFirst(verdict2)) return stopFresh('FRESH_NOT_LATER');
+    }
     const filed = (await attempt(async () => {
       const s = await stageReporting.submit(cr, [{ envelope, candidate: candidate2, verdict: verdict2 }]);
       if (!isRecord(s) || s.ok !== true || s.refused !== 0) return undefined;

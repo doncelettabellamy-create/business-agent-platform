@@ -87,7 +87,7 @@ function open(durable: Durable, o: { unrecordedSuccess?: boolean; ticking?: bool
   const reporting = createReportingEntry({ now: nowIso, ledger });          // the injected ledger; omit it for the in-memory default
   let n = 0;
   const pipeline = createPipeline({
-    intake, processing, qc, reporting, processingToolScopes: [MOCK_NOTE_SCOPE], qcReaderScopes: [MOCK_NOTE_READ_SCOPE], stageTimeoutMs: 500, recoverUncertain: true,
+    intake, processing, qc, reporting, processingToolScopes: [MOCK_NOTE_SCOPE], qcReaderScopes: [MOCK_NOTE_READ_SCOPE], stageTimeoutMs: 500, recoverUncertain: true, sleep: async () => { advance(1); },
     sources: {
       verify: (c: unknown) => (c === 'cred-plumbing' ? { kind: 'user', id: 'user-plumbing' } : c === 'cred-dental' ? { kind: 'user', id: 'user-dental' } : undefined),
       selectTenant: (id: { id: string }) => (id.id === 'user-plumbing' ? PW : DW),
@@ -198,7 +198,7 @@ t('restart: two tenants share one ledger file and keep separate reports before a
 
 // ---------------------------------------------------------------- recovery, reported
 for (const ticking of [false, true]) {
-  t(`recovery across a restart (${ticking ? 'distinct verdict times' : 'same-second verdict times'}): the first escalation is kept, the settled item is freshly verified, and the current status follows the verdict times`, async () => {
+  t(`recovery across a restart (${ticking ? 'distinct verdict times' : 'same-second verdict times, retried after one sleep'}): the first escalation is kept, the settled item is freshly verified, and the current status follows the verdict times`, async () => {
     let g = open(fresh('sqlite'), { unrecordedSuccess: true, ticking });
     const a = await attempted(g);                                          // the tool ran; its success could not be recorded
     assert.deepEqual([a.second.verdict, a.second.counted], ['escalate', 'accepted']);
@@ -214,8 +214,8 @@ for (const ticking of [false, true]) {
     assert.deepEqual([rep.history.observations, rep.history.verified, rep.counts.counted_items, rep.counts.repeat_attempts], [3, true, 1, 2]);
     assert.equal(rep.counts.escalate, 1, 'the first outcome is still the one that counts');
     assert.equal(rep.chains[0].outcome, 'escalate');
-    assert.deepEqual(rep.statuses, [{ item_id: a.second.item_id, first: 'escalate', current: ticking ? 'pass' : 'escalate', attempts: 3 }]);
-    assert.deepEqual(rep.current, ticking ? { pass: 1, rework: 0, escalate: 0, chain_conflict: 0 } : { pass: 0, rework: 0, escalate: 1, chain_conflict: 0 });
+    assert.deepEqual(rep.statuses, [{ item_id: a.second.item_id, first: 'escalate', current: 'pass', attempts: 3 }]);
+    assert.deepEqual(rep.current, { pass: 1, rework: 0, escalate: 0, chain_conflict: 0 });   // same-second times are retried after one sleep, so the fresh pass is strictly later either way
     assert.deepEqual(third.prior_report.counts.repeat_attempts, 1);
     assert.deepEqual(validateReport(third.prior_report), []);
     // A later restart changes nothing and recovery is not needed again.

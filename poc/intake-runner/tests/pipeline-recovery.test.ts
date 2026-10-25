@@ -77,7 +77,7 @@ const failingComplete = (real: ApprovalStore): ApprovalStore => {
   w.complete = () => { throw new Error(CANARY); };
   return Object.freeze(w);
 };
-interface Opts { kind: Kind; delayed?: boolean; idempotent?: boolean; unrecordedSuccess?: boolean; recover?: boolean | undefined; settle?: boolean; readerWrap?: (reader: any) => any; qcWrap?: (c: Counts, qc: any) => any; processingWrap?: (c: Counts, p: any) => any; reportingWrap?: (c: Counts, r: any) => any; stageTimeoutMs?: number }
+interface Opts { kind: Kind; delayed?: boolean; idempotent?: boolean; unrecordedSuccess?: boolean; recover?: boolean | undefined; settle?: boolean; readerWrap?: (reader: any) => any; qcWrap?: (c: Counts, qc: any) => any; processingWrap?: (c: Counts, p: any) => any; reportingWrap?: (c: Counts, r: any) => any; stageTimeoutMs?: number; sleep?: (ms: number) => unknown }
 interface Counts { processing: number; qcRun: number; reconcile: number; submit: number }
 interface Rig {
   pipeline: ReturnType<typeof createPipeline>; store: ApprovalStore; counts: Counts; note: ReturnType<typeof createMockNoteTool>; delayed: DelayedNoteTool | null; tool: { calls(): number; writes: readonly unknown[] };
@@ -106,6 +106,7 @@ function build(o: Opts, keep?: { file: string; note: ReturnType<typeof createMoc
   const pipeline = createPipeline({
     intake, processing: o.processingWrap ? o.processingWrap(counts, pw) : pw, qc: o.qcWrap ? o.qcWrap(counts, qw) : qw, reporting: o.reportingWrap ? o.reportingWrap(counts, rw) : rw,
     processingToolScopes: [MOCK_NOTE_SCOPE], qcReaderScopes: [MOCK_NOTE_READ_SCOPE], stageTimeoutMs: o.stageTimeoutMs ?? 500,
+    sleep: o.sleep ?? (async () => { advance(1); }),   // recovery waits for QC's clock to pass the first verdict's second
     ...(o.recover === undefined ? {} : { recoverUncertain: o.recover }),
     sources: {
       verify: (c: unknown) => (c === 'cred-plumbing' ? { kind: 'user', id: 'user-plumbing' } : c === 'cred-dental' ? { kind: 'user', id: 'user-dental' } : undefined),
@@ -161,7 +162,7 @@ each('a lapsed, unrecorded success is escalated first, then reconciled and fresh
   const third: any = await g.pipeline.run('cred-plumbing', pmsg);
   assert.equal(third.outcome, 'reported');
   // The pipeline made exactly one recovery round: one reconcile, and one fresh Processing, QC and Reporting step on top of the normal run.
-  assert.deepEqual([g.counts.reconcile - before.reconcile, g.counts.processing - before.processing, g.counts.qcRun - before.qcRun, g.counts.submit - before.submit], [1, 2, 2, 2]);
+  assert.deepEqual([g.counts.reconcile - before.reconcile, g.counts.processing - before.processing, g.counts.qcRun - before.qcRun, g.counts.submit - before.submit], [1, 2, 3, 2]);   // QC ran a third time: the fresh verdict fell in the first one's second, so QC judged the same candidate again after the sleep
   assert.deepEqual([third.recovery.settled, third.recovery.first, third.recovery.fresh, third.recovery.stopped], [true, { verdict: 'escalate', counted: 'repeat' }, { verdict: 'pass', counted: 'repeat' }, undefined]);
   assert.deepEqual(third.recovery.steps.map((s: any) => s.outcome), ['resolved']);
   assert.deepEqual([third.verdict, third.counted], ['pass', 'repeat'], 'the final state is the fresh verification, labelled as a repeat');
@@ -183,6 +184,91 @@ each('a lapsed, unrecorded success is escalated first, then reconciled and fresh
   assert.ok(!JSON.stringify([third.recovery, third.prior_report]).match(/CANARY|Emergency|Address|Burst|mock-note/));
 });
 
+// ---------------------------------------------------------------- the fresh verdict must be strictly later (Option A)
+/** Runs the lapsed-success scenario up to the recovery run and returns the recovery run's result with what changed in it. */
+async function recoveryRun(g: ReturnType<typeof build>) {
+  const a = await attempted(g);
+  advance(120);
+  const before = { reconcile: g.counts.reconcile, processing: g.counts.processing, qcRun: g.counts.qcRun, submit: g.counts.submit };
+  const third: any = await g.pipeline.run('cred-plumbing', pmsg);
+  const d = { reconcile: g.counts.reconcile - before.reconcile, processing: g.counts.processing - before.processing, qcRun: g.counts.qcRun - before.qcRun, submit: g.counts.submit - before.submit };
+  return { a, third, d };
+}
+/** After a stop, nothing from the fresh pass is filed, the first escalation stands, and the action ran exactly once. */
+function assertStoppedSafely(g: ReturnType<typeof build>, r: Awaited<ReturnType<typeof recoveryRun>>) {
+  assert.equal(r.third.outcome, 'reported');
+  assert.deepEqual([r.third.recovery.settled, r.third.recovery.stopped, r.third.recovery.fresh], [true, 'FRESH_NOT_LATER', undefined]);
+  assert.deepEqual([r.third.verdict, r.third.counted], ['escalate', 'repeat'], 'the result is still the escalation that was already reported');
+  assert.equal(r.d.reconcile, 1);
+  assert.equal(r.d.submit, 1, 'only the normal run was filed; the fresh verdict was not');
+  assert.equal(g.tool.calls(), 1, 'the approved action was never repeated');
+  assert.equal(g.note.writes.length, 1);
+  assert.equal(r.third.report.statuses[0].current, 'escalate');
+  assert.equal(r.third.report.counts.repeat_attempts, 1);
+  assert.deepEqual(validateReport(r.third.report), []);
+  assert.ok(!JSON.stringify(r.third).includes(CANARY));
+}
+
+each('same second: QC judges the same candidate once more after one injected sleep, then the later verdict is filed', async (kind) => {
+  const slept: unknown[] = [];
+  const g = build({ kind, unrecordedSuccess: true, recover: true, sleep: async (ms) => { slept.push(ms); advance(1); } });
+  const r = await recoveryRun(g);
+  assert.deepEqual(slept, [1000], 'one sleep of one second, no more');
+  assert.deepEqual([r.d.processing, r.d.qcRun, r.d.submit], [2, 3, 2], 'Processing is not run again for the retry; QC is');
+  assert.deepEqual([r.third.recovery.stopped, r.third.recovery.fresh], [undefined, { verdict: 'pass', counted: 'repeat' }]);
+  assert.equal(r.third.report.statuses[0].current, 'pass', 'the later verdict now promotes the item');
+  assert.equal(g.tool.calls(), 1);
+});
+each('a QC clock that already moved on needs no sleep and no retry', async (kind) => {
+  let slept = 0;
+  const g = build({
+    kind, unrecordedSuccess: true, recover: true, sleep: async () => { slept++; },
+    qcWrap: (_c, qc) => ({ run: async (...a: any[]) => { advance(1); return (qc.run as any)(...a); }, reconcile: (...a: any[]) => qc.reconcile(...a) }),
+  });
+  const r = await recoveryRun(g);
+  assert.equal(slept, 0);
+  assert.deepEqual([r.d.qcRun, r.third.recovery.stopped, r.third.report.statuses[0].current], [2, undefined, 'pass']);
+});
+each('frozen clock: after one sleep and one retry the pipeline stops with FRESH_NOT_LATER and files nothing more', async (kind) => {
+  let slept = 0;
+  const g = build({ kind, unrecordedSuccess: true, recover: true, sleep: async () => { slept++; } });
+  const r = await recoveryRun(g);
+  assert.equal(slept, 1);
+  assert.equal(r.d.qcRun, 3, 'one retry, never a loop');
+  assertStoppedSafely(g, r);
+});
+each('backward clock: a verdict that is earlier than the first is not accepted either', async (kind) => {
+  const g = build({ kind, unrecordedSuccess: true, recover: true, sleep: async () => { advance(-30); } });
+  const r = await recoveryRun(g);
+  assert.equal(r.d.qcRun, 3);
+  assertStoppedSafely(g, r);
+});
+each('stale result: a replayed copy of the first verdict, or a sleep that throws or hangs, cannot get a fresh verdict filed', async (kind) => {
+  let armed = false; let n = 0; let firstResult: any;
+  const g = build({
+    kind, unrecordedSuccess: true, recover: true, sleep: async () => { advance(1); },
+    qcWrap: (_c, qc) => ({
+      run: async (...a: any[]) => { const res = await (qc.run as any)(...a); if (!armed) return res; n++; if (n === 1) firstResult = res; return n === 3 ? firstResult : res; },
+      reconcile: (...a: any[]) => qc.reconcile(...a),
+    }),
+  });
+  const first = await attempted(g);
+  assert.equal(first.second.verdict, 'escalate');
+  advance(120);
+  armed = true;
+  const before = { submit: g.counts.submit, qcRun: g.counts.qcRun };
+  const third: any = await g.pipeline.run('cred-plumbing', pmsg);
+  assert.equal(g.counts.qcRun - before.qcRun, 3);
+  assert.deepEqual([third.recovery.stopped, third.recovery.fresh, g.counts.submit - before.submit], ['FRESH_NOT_LATER', undefined, 1]);
+  assert.equal(third.report.statuses[0].current, 'escalate');
+  assert.equal(g.tool.calls(), 1);
+
+  for (const bad of [async () => { throw new Error(CANARY); }, () => { throw new Error(CANARY); }, () => new Promise(() => {})] as ((ms: number) => unknown)[]) {
+    at(T0);
+    const h = build({ kind, unrecordedSuccess: true, recover: true, sleep: bad, stageTimeoutMs: 80 });
+    assertStoppedSafely(h, await recoveryRun(h));   // a sleep that throws or hangs only ends the wait; the retry still sees the same second and stops
+  }
+});
 // ---------------------------------------------------------------- unresolved recovery keeps the escalation
 each('with no record the escalation stays, no fresh round runs, and a non-idempotent action is never repeated', async (kind) => {
   const g = build({ kind, delayed: true, unrecordedSuccess: true, recover: true });
@@ -326,7 +412,7 @@ t('an uncertain step of an assisted tool is not recovered: only human-approved s
   const qw = { run: (...a: any[]) => (qc.run as any)(...a), reconcile: (...a: any[]) => { reconciles++; return (qc.reconcile as any)(...a); } };
   let n = 0;
   const pipeline = createPipeline({
-    intake, processing, qc: qw as never, reporting: createReportingEntry({ now: nowIso }), processingToolScopes: [MOCK_NOTE_SCOPE], qcReaderScopes: [MOCK_NOTE_READ_SCOPE], recoverUncertain: true,
+    intake, processing, qc: qw as never, reporting: createReportingEntry({ now: nowIso }), processingToolScopes: [MOCK_NOTE_SCOPE], qcReaderScopes: [MOCK_NOTE_READ_SCOPE], recoverUncertain: true, sleep: async () => { advance(1); },
     sources: { verify: () => ({ kind: 'user', id: 'user-plumbing' }), selectTenant: () => PW, grants: () => ['intake:run', 'processing:run', MOCK_NOTE_SCOPE, 'quality-control:run', MOCK_NOTE_READ_SCOPE, 'reporting:run'], newCorrelationId: () => `corr-asst-${++n}` },
   });
   const r: any = await pipeline.run('cred', pmsg);
@@ -405,6 +491,8 @@ t('setup: recovery must be a boolean and needs a QC that can reconcile', () => {
   assert.throws(() => createPipeline({ ...b, qc: { run: b.qc.run }, recoverUncertain: true }), RangeError);
   assert.doesNotThrow(() => createPipeline({ ...b, qc: { run: b.qc.run }, recoverUncertain: false }));
   assert.doesNotThrow(() => createPipeline({ ...b, recoverUncertain: true }));
+  for (const bad of ['x', 1, null, {}]) assert.throws(() => createPipeline({ ...b, sleep: bad as never }), (e: Error) => e instanceof RangeError && !e.message.includes('CANARY'));
+  assert.doesNotThrow(() => createPipeline({ ...b, sleep: () => undefined }));
 });
 
 t('inventory: the pipeline reconciles in one place, never touches a store or a tool, and recovery is opt-in', () => {
@@ -415,6 +503,8 @@ t('inventory: the pipeline reconciles in one place, never touches a store or a t
   assert.ok(!/approval-store|approver-context|mock-tools|handoff-seal/.test(code), 'no store, approver, tool or seal');
   assert.ok(!/\.(?:resolve|claim|complete|putProposal|recordDecision|findByStep)\(/.test(code.replace(/Promise\.resolve\(/g, '')), 'the pipeline never touches a store');
   assert.ok(/const recover = recoverUncertain === true/.test(code), 'off unless asked for');
+  assert.equal((code.match(/await sleep\(/g) ?? []).length, 1, 'the injected sleep has one call site, inside recovery');
+  assert.ok(/stopFresh\('FRESH_NOT_LATER'\)/.test(code) && code.indexOf('await sleep(') > code.indexOf('const recover ='), 'a fresh verdict that is not later stops recovery');
   const files = readdirSync(dirSrc).filter((f) => f.endsWith('.ts'));
   const callers = files.filter((f) => /\.reconcile\(/.test(strip(readFileSync(new URL(f, dirSrc), 'utf8'))));
   assert.deepEqual(callers, ['pipeline.ts'], 'only the pipeline asks QC to reconcile');
