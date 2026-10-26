@@ -19,6 +19,7 @@ The Intake agent is the existing one, unchanged except for an opt-in founder tie
 
 - Speak an **invented persona** and invented details only. The masker cannot recognise an unfamiliar spoken name, and rule-based masking is not the platform masking stage (INT-07 is not started).
 - The caller's number is never read, stored or sent to a model.
+- Treat the secret path like a password: do not paste it into chat, tickets or screenshots. If it leaks, make a new one and approve the new config.
 - One call at a time; at most the minutes, turns and Claude calls in the approved config.
 - Create the file named by `kill_file` (default `founder-call.stop`) to end any call within one turn. Ctrl+C stops everything.
 
@@ -43,7 +44,7 @@ The Intake agent is the existing one, unchanged except for an opt-in founder tie
 5. A tunnel account and tool (for example ngrok or Cloudflare Tunnel): **a new install**, needed because Twilio must reach a `wss://` address. Forward the public address to `127.0.0.1:8788` only, never the dashboard port.
 
 ### C. Provider setup (exact steps)
-1. Copy `examples/founder-call.config.example.json` to `founder-call.config.json` (git-ignored) and set: the real number, the tunnel's `wss://.../relay` address, the invented persona names, caps, and an `expires` date no more than 30 days away.
+1. Copy `examples/founder-call.config.example.json` to `founder-call.config.json` (git-ignored) and set: the real number, the tunnel's address as `wss://<tunnel host>/relay/<your own random secret of 32 to 64 letters, digits, - or _>` (the dry run prints a fresh random value you can use; the secret is a second factor, because Twilio's handshake signature is the same for every call), the invented persona names, `max_calls` (how many calls one run will accept, 1 to 10), caps, and an `expires` date no more than 30 days away. The example's placeholder number, host and secret can never be approved.
 2. Run `npm run founder:check -- --config founder-call.config.json`. It prints the config digest, the cost ceiling, the gate result and the TwiML. It opens nothing.
 3. In Twilio: create a **TwiML Bin** with the printed XML; set the number's "A call comes in" to that TwiML Bin. (A TwiML Bin means this machine exposes no HTTP webhook, only the WebSocket.)
 4. Approve the exact config by setting `FOUNDER_CALL_APPROVED_DIGEST` to the printed digest, plus `INTAKE_ALLOW_LIVE_CALLS=yes`. Any edit to the config changes the digest and un-approves it.
@@ -51,7 +52,7 @@ The Intake agent is the existing one, unchanged except for an opt-in founder tie
 6. Call the number from the verified phone and follow the acceptance checks below.
 
 ### D. Things the local tests cannot prove (check on the first call; fix in code if they differ)
-1. **Which URL form Twilio signs** for the WebSocket handshake (`wss://` or `https://`). The server accepts both; if every handshake is refused (log code in the Twilio debugger, HTTP 403), this is the first suspect.
+1. **Which URL form Twilio signs** (it includes the secret path) for the WebSocket handshake (`wss://` or `https://`). The server accepts both; if every handshake is refused (log code in the Twilio debugger, HTTP 403), this is the first suspect.
 2. The Claude request shapes as the live API sees them: `output_config: { effort: "low" }` on the streaming dialogue request, and the SDK's streaming event shape (`content_block_delta` / `text_delta`). They follow the SDK and the existing structured-output request but have not been sent.
 3. ConversationRelay's message fields and TwiML attributes (`welcomeGreeting`, `welcomeGreetingInterruptible="none"`) were taken from Twilio's documentation, not exercised.
 4. The default text-to-speech provider (ElevenLabs) may be billed differently from basic voices; confirm in the Twilio console before the call. Whether the $0.07 per minute includes speech-to-text and text-to-speech is not stated on Twilio's pricing page.

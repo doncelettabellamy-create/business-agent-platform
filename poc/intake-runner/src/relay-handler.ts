@@ -42,6 +42,8 @@ export interface RelayDeps {
   store: IntakeRecordStore;
   limits: SessionLimits;
   names: readonly string[];
+  /** Calls this handler will accept in its lifetime. Setups after that are refused, which bounds what a leaked path and signature could do. */
+  maxCalls: number;
   now(): number;
   nowIso(): string;
   killed(): boolean;
@@ -60,10 +62,11 @@ export interface RelayHandler {
 export function createRelayHandler(deps: RelayDeps): RelayHandler {
   const fns = ['fieldNames', 'intakeContext', 'now', 'nowIso', 'killed', 'log'] as const;
   if (!isRecord(deps) || !(deps.numbers instanceof Map) || !isRecord(deps.intake) || !isRecord(deps.dialogue) || !isRecord(deps.store) || !isRecord(deps.limits)
-    || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
+    || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1 || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
     throw new RangeError('the relay handler needs every dependency');
   }
   let active = 0;
+  let accepted = 0;
   const seen = new Set<string>();
   const work = new Set<Promise<unknown>>();
   const track = <T>(p: Promise<T>): Promise<T> => { work.add(p); void p.finally(() => work.delete(p)).catch(() => {}); return p; };
@@ -185,11 +188,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const t = typeof to === 'string' && E164.test(to) ? deps.numbers.get(to) : undefined;
       if (t === undefined || typeof sid !== 'string' || !CALL_SID.test(sid)) { deps.log('SETUP_REFUSED'); done = true; return await hangUp(); }
       if (deps.killed()) { deps.log('KILLED'); done = true; say(SAY.unavailable); return await hangUp(); }
+      if (accepted >= deps.maxCalls) { deps.log('CALL_BUDGET'); done = true; return await hangUp(); }
       const r = callRefFor(t, sid);
       if (active >= 1 || seen.has(r)) { deps.log(active >= 1 ? 'BUSY' : 'REPLAY'); done = true; return await hangUp(); }
       try { if (deps.store.list(t).some((x) => x.call_ref === r)) { deps.log('REPLAY'); done = true; return await hangUp(); } }
       catch { deps.log('STORE_UNAVAILABLE'); done = true; return await hangUp(); }
-      seen.add(r); active++; counted = true;
+      seen.add(r); accepted++; active++; counted = true;
       tenant = t; callId = sid; ref = r;
       try { ctx = await deps.intakeContext(t, r); } catch { deps.log('CONTEXT_FAILED'); done = true; release(); return await hangUp(); }
       session = createCallSession({ limits: deps.limits, names: deps.names, now: deps.now, killed: deps.killed });

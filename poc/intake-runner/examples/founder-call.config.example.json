@@ -13,7 +13,7 @@
     "Sam Example"
   ],
   "kill_file": "founder-call.stop",
-  "public_wss_url": "wss://YOUR-TUNNEL-HOST.example/relay",
+  "public_wss_url": "wss://YOUR-TUNNEL-HOST.example/relay/REPLACE_WITH_YOUR_OWN_RANDOM_SECRET_32_PLUS_CHARS",
   "db_path": "founder-call.sqlite",
   "relay_port": 8788,
   "dashboard_port": 8787,
@@ -86,5 +86,6 @@
         }
       }
     ]
-  }
+  },
+  "max_calls": 3
 }

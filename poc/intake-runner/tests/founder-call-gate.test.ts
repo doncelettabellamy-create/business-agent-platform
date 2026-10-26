@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { claudeCeilingUsd, founderConfigDigest, founderConfigProblems, founderGateProblems, signedUrlCandidates } from '../src/founder-call-gate.ts';
+import { claudeCeilingUsd, founderConfigDigest, founderConfigProblems, founderGateProblems, relayPathFor, signedUrlCandidates } from '../src/founder-call-gate.ts';
 import { createIntakeEntry } from '../src/intake-entry.ts';
 import { createTenantRegistry } from '../src/tenant-boundary.ts';
 import { mintExecutionContext } from '../src/execution-context.ts';
@@ -10,15 +10,50 @@ import { classifyAnswer, createMockProvider, extractAnswer } from '../src/mock-p
 
 const example = () => JSON.parse(readFileSync(new URL('../examples/founder-call.config.example.json', import.meta.url), 'utf8'));
 const NOW = '2026-10-26T12:00:00Z';
-const env = (over: Record<string, unknown> = {}) => ({ allowLive: 'yes', approvedDigest: founderConfigDigest(example()), twilioTokenPresent: true, ...over }) as never;
+/** The example with the placeholders replaced by plausible real-looking values, as a founder would. */
+const SECRET = 'k3Zr2KfX9mWc4TbV8nHs1LpD6yGe3AuJ5oRi0NxE';
+const real = () => ({ ...example(), numbers: ['+12025551234'], public_wss_url: `wss://calls.mytunnel.dev/relay/${SECRET}` });
+const env = (over: Record<string, unknown> = {}) => ({ allowLive: 'yes', approvedDigest: founderConfigDigest(real()), twilioTokenPresent: true, ...over }) as never;
 
 // ---------------------------------------------------------------- config
 test('config: the shipped example is valid and shows no real number, key or host', () => {
   const c = example();
   assert.deepEqual(founderConfigProblems(c), []);
   assert.deepEqual(c.numbers, ['+15555550100']);
-  assert.ok(c.public_wss_url.includes('YOUR-TUNNEL-HOST'));
+  assert.ok(c.public_wss_url.includes('YOUR-TUNNEL-HOST') && c.public_wss_url.includes('REPLACE'));
   assert.ok(!/sk-|api[_-]?key|token/i.test(JSON.stringify(c)));
+});
+
+test('config: the public address must carry a long random secret path (Twilio\'s handshake signature is the same for every call)', () => {
+  const bad = ['/relay', '/relay/', '/relay/short', `/relay/${'a'.repeat(31)}`, `/relay/${'a'.repeat(65)}`, `/relay/${SECRET}/`, `/relay/${SECRET}?x=1`, `/relay/${SECRET}/more`, `/other/${SECRET}`, `/relay/${'a'.repeat(20)} ${'b'.repeat(20)}`, `/relay/${'a'.repeat(20)}.${'b'.repeat(20)}`];
+  for (const path of bad) {
+    const c = real(); c.public_wss_url = `wss://calls.mytunnel.dev${path}`;
+    assert.ok(founderConfigProblems(c).length > 0, path);
+  }
+  for (const ok of [SECRET, 'a'.repeat(32), 'A_b-C'.repeat(12) + 'abcd']) {
+    const c = real(); c.public_wss_url = `wss://calls.mytunnel.dev:8443/relay/${ok}`;
+    assert.deepEqual(founderConfigProblems(c), [], ok);
+    assert.equal(relayPathFor(c.public_wss_url), `/relay/${ok}`);
+  }
+  assert.throws(() => relayPathFor('wss://calls.mytunnel.dev/relay'), RangeError);
+  assert.throws(() => relayPathFor('https://calls.mytunnel.dev/relay/' + SECRET), RangeError);
+});
+
+test('config: max_calls bounds how many calls one serve run accepts', () => {
+  for (const v of [0, 11, 1.5, '3', null, undefined]) { const c = real(); c.max_calls = v; assert.ok(founderConfigProblems(c).some((x) => x.includes('max_calls')), String(v)); }
+  const c = real(); delete c.max_calls; assert.ok(founderConfigProblems(c).length > 0);
+  assert.deepEqual(founderConfigProblems(real()), []);
+});
+
+test('gate: placeholder values from the example can never be approved, even with a matching digest', () => {
+  const ex = example();
+  const p = founderGateProblems({ config: ex, env: env({ approvedDigest: founderConfigDigest(ex) }), nowIso: NOW });
+  assert.ok(p.some((x) => x.includes('placeholder')), JSON.stringify(p));
+  for (const edit of [{ numbers: ['+15555550142'] }, { public_wss_url: `wss://YOUR-TUNNEL-HOST.mytunnel.dev/relay/${SECRET}` }, { public_wss_url: 'wss://calls.example.com/relay/' + SECRET }, { public_wss_url: `wss://calls.mytunnel.dev/relay/REPLACE_${SECRET}` }]) {
+    const c = { ...real(), ...edit };
+    assert.ok(founderGateProblems({ config: c, env: env({ approvedDigest: founderConfigDigest(c) }), nowIso: NOW }).some((x) => x.includes('placeholder')), JSON.stringify(edit));
+  }
+  assert.deepEqual(founderGateProblems({ config: real(), env: env(), nowIso: NOW }), []);
 });
 
 test('config: every field is checked, and no value from the file is echoed back', () => {
@@ -31,7 +66,7 @@ test('config: every field is checked, and no value from the file is echoed back'
     ['minutes high', (c) => { c.max_minutes = 11; }], ['turns high', (c) => { c.max_turns = 31; }], ['calls high', (c) => { c.max_claude_calls = 301; }],
     ['expires junk', (c) => { c.expires = CANARY; }], ['names junk', (c) => { c.persona_names = [3]; }], ['kill file', (c) => { c.kill_file = ''; }],
     ['url not wss', (c) => { c.public_wss_url = `https://${CANARY}.example/relay`; }], ['url wrong path', (c) => { c.public_wss_url = `wss://${CANARY}.example/other`; }],
-    ['db path', (c) => { c.db_path = 7; }], ['same ports', (c) => { c.dashboard_port = c.relay_port; }], ['low port', (c) => { c.relay_port = 80; }],
+    ['db path', (c) => { c.db_path = 7; }], ['no secret path', (c) => { c.public_wss_url = `wss://${CANARY}.example/relay`; }], ['max calls', (c) => { c.max_calls = 99; }], ['same ports', (c) => { c.dashboard_port = c.relay_port; }], ['low port', (c) => { c.relay_port = 80; }],
     ['after speech', (c) => { c.after_speech_ms = 60_000; }], ['skill config', (c) => { c.skill_config = { categories: [] }; }],
   ];
   for (const [name, mutate] of bad) {
@@ -55,7 +90,7 @@ test('digest: any change to the config changes it, and key order does not', () =
 
 // ---------------------------------------------------------------- gate
 test('gate: a call is allowed only with the switch, the token, the matching digest and an unexpired approval', () => {
-  const c = example();
+  const c = real();
   assert.deepEqual(founderGateProblems({ config: c, env: env(), nowIso: NOW }), []);
   const cases: Array<[string, Record<string, unknown>, string]> = [
     ['switch off', { allowLive: undefined }, 'INTAKE_ALLOW_LIVE_CALLS'], ['switch wrong', { allowLive: 'true' }, 'INTAKE_ALLOW_LIVE_CALLS'],
@@ -70,13 +105,13 @@ test('gate: a call is allowed only with the switch, the token, the matching dige
 });
 
 test('gate: an edited config is not approved until it is approved again', () => {
-  const c = example(); c.max_turns = 29;
+  const c = real(); c.max_turns = 29;
   assert.ok(founderGateProblems({ config: c, env: env(), nowIso: NOW }).some((x) => x.includes('DIGEST')));
   assert.deepEqual(founderGateProblems({ config: c, env: env({ approvedDigest: founderConfigDigest(c) }), nowIso: NOW }), []);
 });
 
 test('gate: an invalid config is reported before the environment is looked at', () => {
-  const c = example(); c.tenant = 'ws-synthetic-x';
+  const c = real(); c.tenant = 'ws-synthetic-x';
   const p = founderGateProblems({ config: c, env: env(), nowIso: NOW });
   assert.ok(p.length > 0 && !p.some((x) => x.includes('INTAKE_ALLOW_LIVE_CALLS')));
 });
@@ -85,7 +120,7 @@ test('cost: the Claude ceiling is a small, finite number and unknown models have
   const c = claudeCeilingUsd('claude-haiku-5-5', 150) as number;
   assert.ok(c > 0 && c < 1, String(c));
   assert.equal(claudeCeilingUsd('claude-unknown-9', 10), null);
-  assert.deepEqual(signedUrlCandidates('wss://h.example.test/relay'), ['wss://h.example.test/relay', 'https://h.example.test/relay']);
+  assert.deepEqual(signedUrlCandidates(`wss://h.example.test/relay/${SECRET}`), [`wss://h.example.test/relay/${SECRET}`, `https://h.example.test/relay/${SECRET}`]);
 });
 
 // ---------------------------------------------------------------- the Intake entry's founder tier

@@ -66,6 +66,101 @@ test('piiProblems: names what looks personal, ignores placeholders', () => {
   assert.ok(piiProblems('five five five oh one oh oh').includes('spoken_digits'));
 });
 
+// ---------------------------------------------------------------- spoken personal data (how speech-to-text writes it)
+/** Each phrase hides something an invented caller might say. After masking, none of the `secrets` may remain, or the utterance must be refused. */
+const SPOKEN: Array<[string, string[]]> = [
+  ['I live on Elm Street near the park', ['Elm']],
+  ['we are at 12 Oak Lane', ['Oak', '12']],
+  ['it is on Maple Avenue', ['Maple']],
+  ['my email is sam at example dot com', ['sam at', 'example', 'dot com']],
+  ['email is sam underscore jones at gmail', ['jones', 'gmail', 'underscore']],
+  ['you can write to jo at work dot co dot uk', ['jo at', 'work dot', 'dot uk']],
+  ['send it to pat at the office dot net', ['pat at', 'dot net']],
+  ['the postcode is SW1A 1AA', ['SW1A', '1AA']],
+  ['the postcode is sw1a 1aa', ['sw1a', '1aa']],
+  ["it's M5V 2T6", ['M5V', '2T6']],
+  ['Mrs Jones lives next door', ['Jones']],
+  ['ask for Dr Patel please', ['Patel']],
+  ['a plumber named bob came last week', ['bob']],
+  ['the lady is called Priya Raman', ['Priya', 'Raman']],
+  ['I am in Springfield Illinois', ['Springfield', 'Illinois']],
+  ['we moved from Portland, Oregon', ['Portland', 'Oregon']],
+  ['Hello, Sam Jones here', ['Sam', 'Jones']],
+  ['my cell is five five five zero one nine nine', ['five five']],
+  ['phone number is 555-0199 call after six', ['555-0199', '0199']],
+  ['my number is two oh one', ['two oh one']],
+  ['reach me on 5 5 5 0 1 0 0 1 9 9', ['5 5 5']],
+  ['my address is the old mill house', ['old mill']],
+  ['I live at the old mill', ['old mill']],
+  ['we are located in Riverside Heights', ['Riverside', 'Heights']],
+  ['reference AB12CD34EF', ['AB12CD34EF']],
+  ['the account is 12345678', ['12345678']],
+  ['PO box 77 please', ['77']],
+  ['visit www dot example dot com', ['dot com']],
+  ['it is http://example.test/a', ['example.test']],
+  ['forty-two elm st', ['elm st', 'forty']],
+];
+test('spoken personal data: each phrase is masked or refused, never passed on as written', () => {
+  for (const [text, secrets] of SPOKEN) {
+    const m = createMasker({ names: [] });
+    const r = m.mask(text);
+    if (!r.ok) continue;                         // refusing is the safe answer to anything uncertain
+    for (const s of secrets) assert.ok(!r.text.toLowerCase().includes(s.toLowerCase()), `${JSON.stringify(text)} -> ${JSON.stringify(r.text)} still has "${s}"`);
+    assert.deepEqual(piiProblems(r.text), [], text);
+    assert.ok(/\[(PERSON|ADDRESS|CONTACT|ID)_\d+\]/.test(r.text), `${text} -> ${r.text} should contain a placeholder`);
+  }
+});
+
+test('spoken personal data: the result always passes the same screen the record store applies', () => {
+  const noisy = [...SPOKEN.map(([s]) => s), 'I have a burst pipe in the kitchen', 'Sam Example, 42 Elm Street, 555 010 0199, sam@example.test'];
+  for (const text of noisy) {
+    const r = createMasker({ names: ['Sam Example'] }).mask(text);
+    if (r.ok) assert.deepEqual(piiProblems(r.text), [], text);
+  }
+});
+
+test('spoken personal data: ordinary speech about the job is left exactly as it was', () => {
+  const plain = [
+    'I have a burst pipe in the kitchen, it is flooding', 'the road is flooded', 'it started on Saturday morning', 'Thanks, that is all', 'Yes please come tomorrow',
+    'water is coming through the ceiling', 'I need someone as soon as possible', 'it is about two feet of water', 'the tap has been dripping for 3 days', 'Hello',
+    'Okay, and how much will it cost', 'No, there is nobody else here', 'it happened at about 10 in the morning', 'I tried to turn the water off at the stop tap',
+  ];
+  for (const text of plain) assert.deepEqual(createMasker().mask(text), { ok: true, text }, text);
+});
+
+test('spoken personal data: a capitalised word in the middle of a sentence is treated as a name or place, a lone sentence-start word is not', () => {
+  const m = createMasker();
+  assert.equal((m.mask('Please send someone to Riverside') as { text: string }).text, 'Please send someone to [PERSON_1]');
+  assert.equal((m.mask('Riverside is the area') as { text: string }).text, '[PERSON_1] is the area', 'the same word is recognised again, even at a sentence start');
+  assert.equal((m.mask('Tomorrow is fine, and Saturday too') as { text: string }).text, 'Tomorrow is fine, and Saturday too');
+  assert.equal((m.mask('Water everywhere') as { text: string }).text, 'Water everywhere');
+  assert.equal((m.mask('Maple Grove is the estate') as { text: string }).text, '[PERSON_2] is the estate', 'a capitalised pair at the start is a name');
+});
+
+test('spoken personal data: a street name needs a name before it, so "the road" is not an address', () => {
+  assert.equal((createMasker().mask('the road is flooded') as { text: string }).text, 'the road is flooded');
+  assert.equal((createMasker().mask('on the street outside') as { text: string }).text, 'on the street outside');
+  assert.equal((createMasker().mask('Elm Street') as { text: string }).text, '[ADDRESS_1]');
+  assert.equal((createMasker().mask('it is on Elm Street, near us') as { text: string }).text, 'it is on [ADDRESS_1], near us');
+});
+
+test('spoken personal data: the screen the record store uses also recognises these forms', () => {
+  for (const [text, code] of [['sam at example dot com', 'spoken_email'], ['visit dot com', 'spoken_email'], ['write to me at gmail', 'spoken_email'], ['SW1A 1AA', 'postcode'], ['M5V 2T6', 'postcode'],
+    ['Elm Street', 'address'], ['near Oak Lane', 'address']] as const) {
+    assert.ok(piiProblems(text).includes(code), `${text} -> ${piiProblems(text).join(',')}`);
+  }
+  for (const text of ['Emergency leak', 'Job description', 'Preferred date', 'burst pipe', 'the road', '[ADDRESS_1]', 'Address']) assert.deepEqual(piiProblems(text), [], text);
+});
+
+test('spoken personal data: a name listed in the config is masked in any case and in any position, and a value masked once stays masked', () => {
+  const m = createMasker({ names: ['Priya Raman'] });
+  assert.equal((m.mask('this is priya raman speaking') as { text: string }).text, 'this is [PERSON_1] speaking');
+  assert.equal((m.mask('PRIYA RAMAN is the owner') as { text: string }).text, '[PERSON_1] is the owner');
+  assert.equal((m.mask('tell Priya  Raman thanks') as { text: string }).text, 'tell [PERSON_1] thanks');
+  assert.equal((m.mask('I live on Elm Street') as { text: string }).text, 'I live on [ADDRESS_1]');
+  assert.equal((m.mask('yes elm street') as { text: string }).text, 'yes [ADDRESS_1]');
+});
+
 // ---------------------------------------------------------------- the call session
 const cfg = (over: Partial<{ maxTurns: number; maxMinutes: number; maxChars: number }> = {}, clock = { t: 0 }, killed = { v: false }) => ({
   limits: { maxTurns: 3, maxMinutes: 2, maxChars: 400, ...over }, names: ['Sam Example'], now: () => clock.t, killed: () => killed.v,

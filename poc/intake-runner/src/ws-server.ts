@@ -1,9 +1,10 @@
 // Minimal WebSocket server for Twilio ConversationRelay (proof of concept). Built on node:http's `upgrade` event and node:crypto only, so
 // it adds NO npm dependency. It implements just enough of RFC 6455 for one peer that sends small JSON text frames, and refuses the rest:
 //
-//   handshake  GET on one exact path; WebSocket version 13; a well-formed key; a valid X-Twilio-Signature (HMAC-SHA1 of the public URL
+//   handshake  GET on one exact path, which is a long random SECRET (the signature below is the same for every call, so on its own it is a
+//              fixed password that a tunnel provider could read; the secret path is a second factor, compared in constant time); WebSocket version 13; a well-formed key; a valid X-Twilio-Signature (HMAC-SHA1 of the public URL
 //              with the account's auth token, compared in constant time); a connection cap. Anything else gets a fixed refusal and the
-//              socket is closed. Plain HTTP requests (not upgrades) get a fixed 404, so this port serves nothing else.
+//              socket is closed. After too many refused handshakes in a short window every upgrade is refused for a while. Plain HTTP requests (not upgrades) get a fixed 404, so this port serves nothing else.
 //   frames     client frames must be masked; text, ping, pong and close only; no fragmentation, no extensions, no compression; payload
 //              capped (default 64 KB, checked from the length field BEFORE buffering); text must be valid UTF-8; an idle timeout.
 //   output     unmasked text frames and close frames; a queue limit closes a stuck peer.
@@ -53,6 +54,8 @@ export interface RelayWsConfig {
   maxPayload?: number;
   idleMs?: number;
   maxConnections?: number;
+  /** After `failures` refused handshakes within `windowMs`, every upgrade is refused (503) until the window clears. Default 8 in 60 s. */
+  lockout?: { failures: number; windowMs: number };
   onConnection(conn: RelayConnection): void;
 }
 export interface RelayWsServer {
@@ -63,6 +66,11 @@ export interface RelayWsServer {
 }
 
 const REFUSALS: Record<number, string> = { 400: 'Bad Request', 403: 'Forbidden', 404: 'Not Found', 426: 'Upgrade Required', 503: 'Service Unavailable' };
+/** Equal-length byte comparison in constant time; different lengths are simply not equal. */
+function sameText(a: string, b: string): boolean {
+  const x = Buffer.from(a, 'utf8'); const y = Buffer.from(b, 'utf8');
+  return x.length === y.length && timingSafeEqual(x, y);
+}
 function refuseSocket(socket: Duplex, status: number): void {
   try { socket.end(`HTTP/1.1 ${status} ${REFUSALS[status] ?? 'Error'}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`); } catch { /* gone */ }
   socket.destroy();
@@ -79,13 +87,19 @@ export function encodeFrame(opcode: number, payload: Buffer): Buffer {
 
 export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
   const { path, authToken, urls, onConnection } = config;
-  if (typeof path !== 'string' || !/^\/[A-Za-z0-9_./-]{0,63}$/.test(path)) throw new RangeError('path must be an absolute path');
+  if (typeof path !== 'string' || !/^\/[A-Za-z0-9_./-]{0,127}$/.test(path)) throw new RangeError('path must be an absolute path');
   if (typeof authToken !== 'string' || authToken.length < 8) throw new RangeError('authToken is required');
   if (!Array.isArray(urls) || urls.length === 0 || !urls.every((u) => typeof u === 'string' && /^(wss|https):\/\//.test(u))) throw new RangeError('urls must be wss:// or https:// addresses');
   if (typeof onConnection !== 'function') throw new RangeError('onConnection is required');
   const maxPayload = config.maxPayload ?? 65_536;
   const idleMs = config.idleMs ?? 60_000;
   const maxConnections = config.maxConnections ?? 2;
+  const lockFailures = config.lockout?.failures ?? 8;
+  const lockWindow = config.lockout?.windowMs ?? 60_000;
+  if (!Number.isInteger(lockFailures) || lockFailures < 1 || lockFailures > 100) throw new RangeError('lockout.failures must be 1 to 100');
+  if (!Number.isInteger(lockWindow) || lockWindow < 50 || lockWindow > 3_600_000) throw new RangeError('lockout.windowMs must be 50 to 3600000');
+  const refusals: number[] = [];
+  const locked = (): boolean => { const now = Date.now(); while (refusals.length > 0 && now - refusals[0] > lockWindow) refusals.shift(); return refusals.length >= lockFailures; };
   if (!Number.isInteger(maxPayload) || maxPayload < 1024 || maxPayload > 1_048_576) throw new RangeError('maxPayload must be 1024 to 1048576');
   if (!Number.isInteger(idleMs) || idleMs < 100 || idleMs > 600_000) throw new RangeError('idleMs must be 100 to 600000');
   if (!Number.isInteger(maxConnections) || maxConnections < 1 || maxConnections > 10) throw new RangeError('maxConnections must be 1 to 10');
@@ -98,11 +112,13 @@ export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     try {
       const h = req.headers;
+      if (locked()) return refuseSocket(socket, 503);
+      const refuse = (status: number): void => { refusals.push(Date.now()); if (refusals.length > 1000) refusals.shift(); refuseSocket(socket, status); };
       const pathOnly = String(req.url ?? '');
-      if (req.method !== 'GET' || pathOnly !== path) return refuseSocket(socket, 404);
-      if (String(h.upgrade ?? '').toLowerCase() !== 'websocket' || !String(h.connection ?? '').toLowerCase().split(',').map((s) => s.trim()).includes('upgrade')) return refuseSocket(socket, 426);
-      if (h['sec-websocket-version'] !== '13' || typeof h['sec-websocket-key'] !== 'string' || !KEY.test(h['sec-websocket-key'])) return refuseSocket(socket, 400);
-      if (!signatureMatches(authToken, h['x-twilio-signature'], urls)) return refuseSocket(socket, 403);
+      if (req.method !== 'GET' || !sameText(pathOnly, path)) return refuse(404);
+      if (String(h.upgrade ?? '').toLowerCase() !== 'websocket' || !String(h.connection ?? '').toLowerCase().split(',').map((s) => s.trim()).includes('upgrade')) return refuse(426);
+      if (h['sec-websocket-version'] !== '13' || typeof h['sec-websocket-key'] !== 'string' || !KEY.test(h['sec-websocket-key'])) return refuse(400);
+      if (!signatureMatches(authToken, h['x-twilio-signature'], urls)) return refuse(403);
       if (sockets.size >= maxConnections) return refuseSocket(socket, 503);
       const accept = createHash('sha1').update(h['sec-websocket-key'] + GUID).digest('base64');
       socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);

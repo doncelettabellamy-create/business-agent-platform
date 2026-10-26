@@ -18,7 +18,10 @@ import { PRICES_PER_MILLION } from './cost-estimate.ts';
 
 export const MAX_APPROVAL_DAYS = 30;
 const E164 = /^\+[1-9][0-9]{6,14}$/;
-const WSS = /^wss:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?\/relay$/;
+/** The public address ends in /relay/ plus a long random secret. Twilio's handshake signature is the same for every call, so the secret path is the second factor. */
+const WSS = /^wss:\/\/[A-Za-z0-9.-]+(?::[0-9]{1,5})?(\/relay\/[A-Za-z0-9_-]{32,64})$/;
+const PLACEHOLDER_VALUE = /YOUR-TUNNEL-HOST|REPLACE|example\.(?:com|test|org)|\.example(?:[:/]|$)/i;
+const PLACEHOLDER_NUMBER = /^\+1\d{3}555(?:01\d{2})$/;
 const TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
 export interface FounderCallConfig {
@@ -29,6 +32,8 @@ export interface FounderCallConfig {
   max_minutes: number;
   max_turns: number;
   max_claude_calls: number;
+  /** How many calls may be accepted in one serve run; after that every setup is refused. Bounds what a leaked path and signature could do. */
+  max_calls: number;
   expires: string;
   persona_names: string[];
   kill_file: string;
@@ -39,7 +44,7 @@ export interface FounderCallConfig {
   after_speech_ms: number;
   skill_config: unknown;
 }
-const KEYS = 'after_speech_ms,approval_id,dashboard_port,db_path,expires,kill_file,max_claude_calls,max_minutes,max_turns,model,numbers,persona_names,public_wss_url,relay_port,skill_config,tenant';
+const KEYS = 'after_speech_ms,approval_id,dashboard_port,db_path,expires,kill_file,max_calls,max_claude_calls,max_minutes,max_turns,model,numbers,persona_names,public_wss_url,relay_port,skill_config,tenant';
 
 const int = (v: unknown, lo: number, hi: number): v is number => Number.isInteger(v) && (v as number) >= lo && (v as number) <= hi;
 const plainPath = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 260 && !v.includes('\0');
@@ -60,7 +65,8 @@ export function founderConfigProblems(cfg: unknown): string[] {
   if (typeof c.expires !== 'string' || !TIME.test(c.expires) || Number.isNaN(Date.parse(c.expires))) p.push('expires must be a UTC timestamp');
   if (!Array.isArray(c.persona_names) || c.persona_names.length > 20 || !c.persona_names.every((n) => typeof n === 'string' && n.trim().length >= 2 && n.length <= 60)) p.push('persona_names must be a list of up to 20 names');
   if (!plainPath(c.kill_file)) p.push('kill_file must be a path');
-  if (typeof c.public_wss_url !== 'string' || !WSS.test(c.public_wss_url)) p.push('public_wss_url must be a wss:// address ending /relay');
+  if (typeof c.public_wss_url !== 'string' || !WSS.test(c.public_wss_url)) p.push('public_wss_url must be a wss:// address ending /relay/ and a random secret of 32 to 64 letters, digits, - or _');
+  if (!int(c.max_calls, 1, 10)) p.push('max_calls must be 1 to 10');
   if (!plainPath(c.db_path)) p.push('db_path must be a path');
   if (!int(c.relay_port, 1024, 65535) || !int(c.dashboard_port, 1024, 65535) || c.relay_port === c.dashboard_port) p.push('relay_port and dashboard_port must be different ports from 1024 to 65535');
   if (!int(c.after_speech_ms, 0, 10_000)) p.push('after_speech_ms must be 0 to 10000');
@@ -81,6 +87,7 @@ export function founderGateProblems(input: GateInput): string[] {
   const p = founderConfigProblems(input.config);
   if (p.length > 0) return p;
   const c = input.config as FounderCallConfig;
+  if (PLACEHOLDER_VALUE.test(c.public_wss_url) || c.numbers.some((n) => PLACEHOLDER_NUMBER.test(n))) p.push('the config still has placeholder values (number, address or secret path)');
   if (input.env.allowLive !== 'yes') p.push('INTAKE_ALLOW_LIVE_CALLS=yes is not set');
   if (!input.env.twilioTokenPresent) p.push('the Twilio auth token is not set');
   if (input.env.approvedDigest !== founderConfigDigest(c)) p.push('FOUNDER_CALL_APPROVED_DIGEST does not match this config');
@@ -95,6 +102,13 @@ export function claudeCeilingUsd(model: string, maxCalls: number): number | null
   const price = PRICES_PER_MILLION[model];
   if (price === undefined) return null;
   return maxCalls * ((3000 * price.input + 4096 * price.output) / 1_000_000);
+}
+
+/** The secret request path the WebSocket server answers on (the part of the public address after the host). Call only with a valid config. */
+export function relayPathFor(publicWssUrl: string): string {
+  const m = WSS.exec(publicWssUrl);
+  if (m === null) throw new RangeError('public_wss_url is not valid');
+  return m[1];
 }
 
 /** The URL forms Twilio may have signed for the WebSocket handshake (see ws-server.ts). */

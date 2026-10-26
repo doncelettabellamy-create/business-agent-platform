@@ -33,9 +33,9 @@ credential -> mint context -> Intake -> Processing -> Quality Control -> Reporti
 
 Optional recovery in the pipeline (`recoverUncertain: true`): after an escalation caused by an uncertain human-approved step, QC reconciles once, and if something settled, one fresh verification is filed as a repeat attempt. The first outcome is never changed.
 
-## 4. Baseline: 848 tests
+## 4. Baseline: 867 tests
 
-`npm test` in `poc/intake-runner` on 2026-10-25: **848 tests, 848 pass, 0 fail** (about 9 seconds), run 2026-10-26 after the founder phone test code. The register's "Test figure: 848 passed" matches. 774 of them are committed (b0647e9); the 74 new tests and the code they cover are not yet committed.
+`npm test` in `poc/intake-runner` on 2026-10-25: **867 tests, 867 pass, 0 fail** (about 9 seconds), run 2026-10-26 after the call-authentication and masking hardening. The register's "Test figure: 867 passed" matches. 848 of them are committed (f8fdbf7); the 19 new tests and the changes they cover are not yet committed.
 
 Newest files: `founder-call` (20), `founder-dashboard` (17), `founder-call-gate` (13), `pii-screen` (13), `ws-server` (11), `pipeline-recovery` (30, includes the strictly-later tests), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains).
 
@@ -120,5 +120,6 @@ A real phone-to-dashboard test: dial a Twilio number, talk naturally to an AI as
 - **Code** (`poc/intake-runner/src/`): `pii-screen.ts` (rule-based masker, fails closed), `call-session.ts` (consent, masked lines, caps), `dialogue-model.ts` (streaming Claude reply, masked text only; it never writes the record), `call-intake.ts` and the existing Intake agent (classify, extract, ground, validate: previews steer the conversation, one final run makes the record), `ws-server.ts` (minimal WebSocket server on `node:http` and `node:crypto`, signature-checked, 127.0.0.1), `relay-handler.ts`, `intake-record-store.ts` (SQLite), `dashboard-server.ts` (loopback, read-only, feeds the unchanged prototype), `founder-call-gate.ts`, `founder-call-entry.ts` (composition root; `npm run founder:check` is the dry run).
 - **Gate:** an opt-in founder tier in `intake-entry.ts` (one `ws-founder-` tenant); a digest-pinned approval (`FOUNDER_CALL_APPROVED_DIGEST`) plus `INTAKE_ALLOW_LIVE_CALLS=yes`; 30-day expiry; caps; kill-switch file. The synthetic-only gate and the reviewed-fixture path are unchanged.
 - **Not done / blockers to the first call:** founder decisions (gate tier, invented-persona rule, consent wording, Twilio retention, legal check, Anthropic terms, spend cap, Twilio AI addendum); accounts and keys (Twilio, `ANTHROPIC_API_KEY`, `TWILIO_AUTH_TOKEN`); a tunnel install; Twilio TwiML Bin and number setup. Unverified until the first call: which URL form Twilio signs, live Claude request shapes, voice billing, latency.
-- **Risks:** the masker cannot recognise an unfamiliar spoken name (use an invented persona); the store and dashboard have no login, tenant isolation, encryption or retention; Twilio keeps its own logs (up to 30 days).
+- **Hardened after review (uncommitted):** the WebSocket needs a secret path as well as the signature, locks out repeated refusals, accepts at most `max_calls` calls per run and refuses repeated call ids; the masker handles spoken e-mail, number-less streets, post codes, honorifics and mid-sentence capitalised words, and fails closed on uncertainty.
+- **Risks:** a lower-case name or place that nothing introduces is still not masked (use an invented persona); the store and dashboard have no login, tenant isolation, encryption or retention; Twilio keeps its own logs (up to 30 days).
 - **Next step:** founder reads the runbook, decides section A, creates the accounts in section B; then the dry run and the first call.

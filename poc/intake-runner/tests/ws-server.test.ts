@@ -7,22 +7,23 @@ import type { RelayConnection } from '../src/ws-server.ts';
 import { clientFrame, connectRelay } from './helpers/twilio-sim.ts';
 
 const TOKEN = 'test-auth-token-0123456789';
-const URL_WSS = 'wss://tunnel.example.test/relay';
-const URL_HTTPS = 'https://tunnel.example.test/relay';
+const PATH = '/relay/q7Zr2KfX9mWc4TbV8nHs1LpD6yGe3AuJ5oRi0NxE';
+const URL_WSS = `wss://tunnel.example.test${PATH}`;
+const URL_HTTPS = `https://tunnel.example.test${PATH}`;
 const servers: Array<{ close(): Promise<void> }> = [];
 after(async () => { for (const s of servers) await s.close(); });
 
 async function start(over: Record<string, unknown> = {}) {
   const got: string[] = []; const conns: RelayConnection[] = []; let closes = 0;
   const server = createRelayWsServer({
-    path: '/relay', authToken: TOKEN, urls: [URL_WSS, URL_HTTPS], maxPayload: 2048, idleMs: 5000, maxConnections: 2,
+    path: PATH, authToken: TOKEN, urls: [URL_WSS, URL_HTTPS], maxPayload: 2048, idleMs: 5000, maxConnections: 2,
     onConnection: (c) => { conns.push(c); c.onMessage = (t) => got.push(t); c.onClose = () => { closes++; }; }, ...over,
   } as never);
   const port = await server.listen(0);
   servers.push(server);
   return { server, port, got, conns, closes: () => closes };
 }
-const open = (port: number, o: Record<string, unknown> = {}) => connectRelay({ port, token: TOKEN, url: URL_WSS, ...o } as never);
+const open = (port: number, o: Record<string, unknown> = {}) => connectRelay({ port, token: TOKEN, url: URL_WSS, path: PATH, ...o } as never);
 
 test('signature: HMAC-SHA1 of the URL, accepted for either URL form, rejected for anything else, in constant time', () => {
   assert.equal(twilioSignature(TOKEN, URL_WSS), createHmac('sha1', TOKEN).update(URL_WSS).digest('base64'));
@@ -44,10 +45,11 @@ test('handshake: a valid, signed upgrade is accepted; the server listens on loop
 });
 
 test('handshake: wrong signature, missing signature, wrong path, bad key, bad version, no upgrade are all refused with fixed statuses', async () => {
-  const s = await start();
+  const s = await start({ lockout: { failures: 100, windowMs: 60_000 } });
   assert.equal((await open(s.port, { signature: 'AAAA' })).status, 403);
   assert.equal((await open(s.port, { signature: null })).status, 403);
   assert.equal((await open(s.port, { path: '/other' })).status, 404);
+  for (const near of ['/relay', `${PATH}/`, `${PATH}x`, PATH.slice(0, -1), PATH.toUpperCase()]) assert.equal((await open(s.port, { path: near })).status, 404, near);
   assert.equal((await open(s.port, { key: 'not-a-key' })).status, 400);
   assert.equal((await open(s.port, { version: '8' })).status, 400);
   assert.equal(s.conns.length, 0, 'no connection reached the handler');
@@ -137,10 +139,25 @@ test('handler errors never break the server: a throwing onMessage is contained',
   assert.equal(again.status, 101);
 });
 
+test('lockout: repeated refused handshakes lock the door for a while, even to the right caller, then it reopens', async () => {
+  const s = await start({ lockout: { failures: 3, windowMs: 400 } });
+  assert.equal((await open(s.port)).status, 101, 'before the lockout');
+  for (let i = 0; i < 3; i++) assert.equal((await open(s.port, { signature: 'AAAA' })).status, 403);
+  assert.equal((await open(s.port)).status, 503, 'locked, even with the right credentials');
+  assert.equal((await open(s.port, { signature: 'AAAA' })).status, 503, 'and locked-out attempts are not counted again');
+  await new Promise((r) => setTimeout(r, 450));
+  assert.equal((await open(s.port)).status, 101, 'reopened after the window');
+});
+
+test('lockout: successful handshakes never count against the caller', async () => {
+  const s = await start({ lockout: { failures: 2, windowMs: 5000 }, maxConnections: 10 });
+  for (let i = 0; i < 6; i++) assert.equal((await open(s.port)).status, 101);
+});
+
 test('setup is validated', () => {
-  const ok = { path: '/relay', authToken: TOKEN, urls: [URL_WSS], onConnection: () => {} };
+  const ok = { path: PATH, authToken: TOKEN, urls: [URL_WSS], onConnection: () => {} };
   assert.doesNotThrow(() => createRelayWsServer(ok));
-  for (const bad of [{ path: 'relay' }, { authToken: 'short' }, { urls: [] }, { urls: ['http://x'] }, { onConnection: 1 }, { maxPayload: 10 }, { idleMs: 1 }, { maxConnections: 0 }]) {
+  for (const bad of [{ path: 'relay' }, { authToken: 'short' }, { urls: [] }, { urls: ['http://x'] }, { onConnection: 1 }, { maxPayload: 10 }, { idleMs: 1 }, { maxConnections: 0 }, { lockout: { failures: 0, windowMs: 1000 } }, { lockout: { failures: 3, windowMs: 1 } }]) {
     assert.throws(() => createRelayWsServer({ ...ok, ...bad } as never), RangeError);
   }
 });

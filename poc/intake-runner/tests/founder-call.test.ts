@@ -21,7 +21,8 @@ import { createRelayHandler, SAY } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 
 const TOKEN = 'test-auth-token-0123456789';
-const URL_WSS = 'wss://tunnel.example.test/relay';
+const SECRET_PATH = '/relay/q7Zr2KfX9mWc4TbV8nHs1LpD6yGe3AuJ5oRi0NxE';   // invented; a real one is random and private
+const URL_WSS = `wss://tunnel.example.test${SECRET_PATH}`;
 const T = 'ws-founder-plumbing';
 const OTHER = 'ws-founder-other';
 const N1 = '+15555550100'; const N2 = '+15555550111';
@@ -64,7 +65,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -86,16 +87,16 @@ async function rig(o: RigOptions = {}) {
       return r.context;
     },
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
-    limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
+    limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
     killed: () => killed.v, afterSpeechMs: 0, log: (code, detail) => { logs.push({ code, detail }); },
   });
-  const ws = createRelayWsServer({ path: '/relay', authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, onConnection: (c) => handler.handle(c) });
+  const ws = createRelayWsServer({ path: SECRET_PATH, authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, lockout: { failures: 100, windowMs: 60_000 }, onConnection: (c) => handler.handle(c) });
   const port = await ws.listen(0);
   closers.push(() => ws.close());
   const dash = createDashboardServer({ store: realStore, tenant: T, staticDir });
   const dport = await dash.listen(0);
   closers.push(() => dash.close());
-  const connect = () => connectRelay({ port, token: TOKEN, url: URL_WSS });
+  const connect = () => connectRelay({ port, token: TOKEN, url: URL_WSS, path: SECRET_PATH });
   return { claude, store: realStore, logs, killed, handler, ws, connect, path, dashGet: (p: string) => fetch(`http://127.0.0.1:${dport}${p}`) };
 }
 type Rig = Awaited<ReturnType<typeof rig>>;
@@ -206,7 +207,7 @@ test('tenant: the founder tenant\'s record is invisible to another tenant\'s vie
 
 test('bad signature: the connection never reaches the handler', async () => {
   const r = await rig();
-  const bad = await connectRelay({ port: (r.ws.server.address() as { port: number }).port, token: TOKEN, url: URL_WSS, signature: 'AAAA' });
+  const bad = await connectRelay({ port: (r.ws.server.address() as { port: number }).port, token: TOKEN, url: URL_WSS, path: SECRET_PATH, signature: 'AAAA' });
   assert.equal(bad.status, 403);
   assert.equal(r.handler.active(), 0);
   assert.deepEqual(r.claude.counts, { intake: 0, dialogue: 0 });
@@ -393,6 +394,98 @@ test('malformed traffic: junk before setup, bad JSON and a bad call id are survi
   assert.equal(r.claude.sent.filter((p) => !p.stream).length, 0, 'nothing was judged');
   sim.end(); await sim.closed; await r.handler.idle();
   assert.ok(!JSON.stringify(r.logs).includes('CANARY'));
+});
+
+test('spoken details in the way speech-to-text writes them (spoken e-mail, a street without a number, a post code, a name, a city) never reach Claude, the logs, the file or the dashboard', async () => {
+  const r = await rig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'There is a burst pipe in the kitchen. I live on Willow Street in Riverside and the post code is SW1A 1AA'); await reply(r, sim);
+  say(sim, 'My email is priya at example dot com and Mrs Raman next door can let you in'); await reply(r, sim);
+  // Intake already had what it needed after the first turn, so this second turn is the closing one and the call ends by itself.
+  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  const spoken = ['Willow', 'Riverside', 'SW1A', '1AA', 'priya', 'example dot com', 'Raman'];
+  const everywhere = JSON.stringify(r.claude.sent) + allText(sim) + JSON.stringify(r.logs) + readFileSync(r.path).toString('latin1')
+    + (await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/items')).json());
+  for (const s of spoken) assert.ok(!everywhere.toLowerCase().includes(s.toLowerCase()), `"${s}" must not appear anywhere`);
+  const [rec] = r.store.list(T);
+  assert.ok(rec, JSON.stringify(r.logs));
+  assert.ok(rec.pii_summary.some((p) => p.type === 'Address') && rec.pii_summary.some((p) => p.type === 'Contact detail') && rec.pii_summary.some((p) => p.type === 'Person'));
+});
+
+test('an utterance that the masker cannot make safe ends the call and is never sent on', async () => {
+  const r = await rig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe'); await reply(r, sim);
+  say(sim, 'x'.repeat(1001));
+  assert.equal((await sim.next((m) => m.type === 'text' && m.token === SAY.trouble)).last, true);
+  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  assert.ok(!JSON.stringify(r.claude.sent).includes('xxxxxxxxxx'));
+  assert.ok(r.logs.some((l) => l.code === 'UTTERANCE_REFUSED' && l.detail?.code === 'TOO_LONG'));
+});
+
+// ---------------------------------------------------------------- authentication and replay
+test('authentication: the signature alone is not enough; the secret path is a second factor, and the path alone is not enough either', async () => {
+  const r = await rig();
+  const port = (r.ws.server.address() as { port: number }).port;
+  // A captured signature for the right URL, but sent to the old fixed path or a near miss of the secret path: refused, handler never reached.
+  for (const path of ['/relay', `${SECRET_PATH}/`, SECRET_PATH.slice(0, -1), `${SECRET_PATH}x`, SECRET_PATH.toLowerCase(), '/']) {
+    const sim = await connectRelay({ port, token: TOKEN, url: URL_WSS, path });
+    assert.equal(sim.status, 404, path);
+  }
+  // The right path without a valid signature: refused.
+  assert.equal((await connectRelay({ port, token: TOKEN, url: URL_WSS, path: SECRET_PATH, signature: null })).status, 403);
+  assert.equal((await connectRelay({ port, token: TOKEN, url: URL_WSS, path: SECRET_PATH, signature: 'AAAA' })).status, 403);
+  // A signature made for a different URL or with another token: refused.
+  assert.equal((await connectRelay({ port, token: TOKEN, url: 'wss://tunnel.example.test/relay', path: SECRET_PATH })).status, 403);
+  assert.equal((await connectRelay({ port, token: 'another-auth-token-xyz', url: URL_WSS, path: SECRET_PATH })).status, 403);
+  assert.equal(r.handler.active(), 0);
+  assert.deepEqual(r.claude.counts, { intake: 0, dialogue: 0 });
+  assert.equal((await r.connect()).status, 101, 'the real thing still works');
+});
+
+test('replay: a call id that already ran (even one that was declined) cannot be started again, on any connection', async () => {
+  const r = await rig();
+  let sim = await r.connect(); setup(sim, { sid: SID(5) }); say(sim, 'no'); await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  const before = { ...r.claude.counts };
+  for (let i = 0; i < 2; i++) {
+    sim = await r.connect(); setup(sim, { sid: SID(5) }); await sim.next((m) => m.type === 'end'); await sim.closed;
+  }
+  assert.deepEqual(r.claude.counts, before);
+  assert.equal(r.logs.filter((l) => l.code === 'REPLAY').length, 2);
+  assert.equal(r.handler.active(), 0);
+});
+
+test('replay: a second connection claiming the same call id while it is running is hung up on and does not disturb the first', async () => {
+  const r = await rig();
+  const a = await r.connect(); setup(a, { sid: SID(6) }); say(a, 'yes'); await reply(r, a);
+  const b = await r.connect(); setup(b, { sid: SID(6) });
+  await b.next((m) => m.type === 'end'); await b.closed;
+  say(a, 'there is a burst pipe in the kitchen'); await reply(r, a);
+  assert.equal(r.handler.active(), 1);
+  a.end(); await a.closed; await r.handler.idle();
+});
+
+test('call budget: after the approved number of calls every further setup is refused, so a leaked path and signature can do only a bounded amount', async () => {
+  const r = await rig({ maxCalls: 2 });
+  for (const sid of [SID(11), SID(12)]) {
+    const sim = await r.connect(); setup(sim, { sid }); say(sim, 'yes'); await reply(r, sim);
+    say(sim, 'burst pipe in the kitchen'); await reply(r, sim); sim.end(); await sim.closed; await r.handler.idle();
+  }
+  const before = { ...r.claude.counts };
+  const third = await r.connect(); setup(third, { sid: SID(13) });
+  await third.next((m) => m.type === 'end'); await third.closed;
+  assert.deepEqual(r.claude.counts, before);
+  assert.ok(r.logs.some((l) => l.code === 'CALL_BUDGET'));
+  assert.equal(r.store.list(T).length, 2);
+});
+
+test('refused setups do not use up the call budget', async () => {
+  const r = await rig({ maxCalls: 1 });
+  let sim = await r.connect(); setup(sim, { to: '+15555550999', sid: SID(21) }); await sim.next((m) => m.type === 'end'); await sim.closed;
+  sim = await r.connect(); setup(sim, { sid: 'bad id' }); await sim.next((m) => m.type === 'end'); await sim.closed;
+  sim = await r.connect(); setup(sim, { sid: SID(22) }); say(sim, 'yes');
+  assert.equal((await sim.next((m) => m.type === 'text' && m.last === true)).type, 'text', 'the one real call was accepted');
+  sim.end(); await sim.closed; await r.handler.idle();
 });
 
 test('setup validation: the handler needs every dependency', () => {
