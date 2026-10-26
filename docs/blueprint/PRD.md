@@ -3,6 +3,7 @@
 > **Status: DRAFT design document. Not approved. Not implemented.** All implementation gates are on HOLD.
 > Sources: `docs/BUSINESS_BLUEPRINT.md` (section 2), `docs/MASTER_BUILD_REGISTER.md`.
 > **TBD** = unresolved founder decision. No vertical, customers, pricing, or integrations are assumed.
+> **Dashboard decision (founder, 2026-10-26):** the existing Intake dashboard is kept and evolved into the production customer dashboard after testing and founder approval; it is not to be replaced without explicit founder authorization (`docs/PRODUCT_CONTINUITY.md`). Statements below about dashboards, "staff" and a "read-only list" are read in that light.
 
 ## 1. Purpose and scope
 
@@ -48,7 +49,7 @@ Phase: **MVP** = the smallest Intake pilot, i.e. R1 (see `DEPLOYMENT_TESTING.md`
 | PRD-11 | Prompt-injection attempts in inbound text do not trigger tools or vault access | Injection fixtures cause no tool call and no vault access; item is flagged | MVP | INT-12, INT-09 | S-23 | AT-17 |
 | PRD-12 | Each run has a token cap; a global kill switch stops all model calls | Run stops at the cap; with the switch on, no model call occurs | MVP | FND-17 | S-09 | AT-18 |
 | PRD-13 | Pilot mode sends nothing outbound and writes to no outside system (shadow mode) | Egress monitoring shows only the model provider, detector, and database | MVP (if D-13 approved) | FND-26, INT-12 | S-23 | AT-16 |
-| PRD-14 | Staff see a read-only list of their tenant's masked work items | Staff of tenants A and B see only their own items; no unmask control exists | MVP | UI-01 (reduced) | part of S-27 | AT-21 |
+| PRD-14 | Staff and the business owner see a read-only list of their tenant's masked work items, and a read-only page for one item (the existing dashboard, kept and evolved: `docs/PRODUCT_CONTINUITY.md`) | Staff of tenants A and B see only their own items; no unmask control exists | MVP | UI-01 (reduced) | part of S-27 | AT-21 |
 | PRD-15 | Work survives a restart without duplicates | Killing the process mid-run leads to completion once or retry without a duplicate item | MVP | FND-04, FND-08 | S-06, S-13 | AT-22 |
 
 ### 3.4 Later releases
@@ -62,7 +63,7 @@ Phase: **MVP** = the smallest Intake pilot, i.e. R1 (see `DEPLOYMENT_TESTING.md`
 | PRD-20 | Reporting builds status reports and alerts from aggregated data with no personal data | RPT-01, RPT-02 | S-36, S-37 |
 | PRD-21 | Per-tenant spend caps, quotas, and metering | FND-09 | S-15 |
 | PRD-22 | Customer data export and deletion, including vault entries | FND-13 | S-26 |
-| PRD-23 | Customer-facing screens: approval inbox, dashboards, audit viewer | UI-01 to UI-03, RPT-03, RPT-04 | S-27, S-38 to S-40 |
+| PRD-23 | Customer-facing screens: approval inbox, dashboards, audit viewer (the Intake owner dashboard already exists and is kept and evolved into the production dashboard, per `docs/PRODUCT_CONTINUITY.md`; the approval inbox and audit viewer remain R4) | UI-01 to UI-03, RPT-03, RPT-04 | S-27, S-38 to S-40 |
 | PRD-24 | Non-English support | INT-14 | S-25 |
 | PRD-25 | Customer API keys with scopes | FND-11 | S-41 |
 
@@ -107,7 +108,7 @@ All numeric targets are **TBD** until the founder sets them.
 
 ## 7. Out of scope (R1 pilot)
 
-Customer replies and outbound actions, approvals, pause/resume, Processing/QC/Reporting logic, billing, plans, non-English, deletion and export, dashboards, any integration beyond the single TBD channel.
+Customer replies and outbound actions, approvals, pause/resume, Processing/QC/Reporting logic, billing, plans, non-English, deletion and export, dashboards beyond the existing owner dashboard (the Intake list and the page for one intake, which is kept and evolved: `docs/PRODUCT_CONTINUITY.md`), any integration beyond the single TBD channel.
 
 ## 8. Assumptions (all unapproved)
 

@@ -1,13 +1,14 @@
 # Project Continuity Handoff
 
-Written 2026-10-25. Purpose: let a new person or session continue without the chat history. This file summarises; the authority is `docs/blueprint/PLATFORM_MASTER_PLAN.md` (73-row checklist, section 11) and `docs/MASTER_BUILD_REGISTER.md` (test figure and change log). If this file and those disagree, they win.
+Written 2026-10-25. Purpose: let a new person or session continue without the chat history. This file summarises; the authority is `docs/blueprint/PLATFORM_MASTER_PLAN.md` (73-row checklist, section 11) and `docs/MASTER_BUILD_REGISTER.md` (test figure and change log). If this file and those disagree, they win. On the dashboard decision (keep and evolve the existing dashboard; never replace it without explicit founder authorization), `docs/PRODUCT_CONTINUITY.md` governs.
 
 ## 1. Standing rules
 
-- Synthetic data only. Mock provider, mock tools, mock clients. No live API calls.
+- Synthetic data and mocks for every automated test. Live calls (Twilio, Claude) happen only through the founder-test gate (a digest-pinned approval plus `INTAKE_ALLOW_LIVE_CALLS=yes`), never in tests, and only when the founder asks.
 - No new dependencies. Only Node built-ins (`node:sqlite` for the dev stores).
 - No commits or pushes without the founder asking.
 - Every change: run the full mock suite from `poc/intake-runner` (`npm test`), update the register's "Test figure" and add a change-log row. New test files must be added to the `test` script in `package.json`.
+- **The dashboard is kept.** Do not discard, replace or rebuild `prototype/intake-work-items/` (the existing test dashboard, which is to evolve into the production customer dashboard after testing and founder approval) without the founder's explicit written authorization. Read `docs/PRODUCT_CONTINUITY.md` first.
 
 ## 2. Architecture
 
@@ -33,11 +34,11 @@ credential -> mint context -> Intake -> Processing -> Quality Control -> Reporti
 
 Optional recovery in the pipeline (`recoverUncertain: true`): after an escalation caused by an uncertain human-approved step, QC reconciles once, and if something settled, one fresh verification is filed as a repeat attempt. The first outcome is never changed.
 
-## 4. Baseline: 940 tests
+## 4. Baseline: 959 tests (committed locally, not pushed)
 
-`npm test` in `poc/intake-runner`: **940 tests, 940 pass, 0 fail, 0 skipped** (a fresh full run on 2026-10-26, about 10 seconds). The register's "Test figure: 940 passed" matches. 874 of them are committed (fc7d4bc); 66 are new and uncommitted. Mocks only: this says nothing about live behaviour.
+`npm test` in `poc/intake-runner`: **959 tests, 959 pass, 0 fail, 0 skipped** (a fresh full run on 2026-10-26, about 10 seconds). **All 959 are committed locally and none is pushed: 940 in b341fd6, and the 19 `skill-cleaning` tests (the unapplied cleaning skill example) in the next commit, "Preserve dashboard product decision and add cleaning skill tests".** The register's "Test figure: 959 passed" matches. The previous committed baseline was 874 (fc7d4bc). Mocks only: this says nothing about live behaviour.
 
-Newest files and their current counts (each file run on 2026-10-26): `founder-call` (40), `founder-dashboard` (21), `pii-screen` (26), `owner-view` (13), `owner-dashboard` (11), `prototype-empty-store` (19; the owner screens run against a stand-in DOM), `founder-call-gate` (20), `ws-server` (16), `pipeline-recovery` (30), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains, a Twilio stand-in, a stand-in browser DOM).
+Newest files and their current counts (each file run on 2026-10-26): `skill-cleaning` (19), `founder-call` (40), `founder-dashboard` (21), `pii-screen` (26), `owner-view` (13), `owner-dashboard` (11), `prototype-empty-store` (19; the owner screens run against a stand-in DOM), `founder-call-gate` (20), `ws-server` (16), `pipeline-recovery` (30), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains, a Twilio stand-in, a stand-in browser DOM).
 
 Checklist roll-up (plan section 11): 73 rows - 11 BUILT, 23 PARTIAL, 21 NOT STARTED, 18 BLOCKED. Of 17 requirements: 0 BUILT, 10 PARTIAL, 1 NOT STARTED, 6 BLOCKED.
 
@@ -75,7 +76,7 @@ Limits: no database-level tenant isolation (FND-02 / R03), single host and file,
 6. A ledger failure mid-batch can leave earlier triples recorded; re-sending is safe (repeats are duplicates).
 7. QC verdict time comes from QC's own clock.
 8. D-06 loop rule still open.
-9. **Backup risk:** the work since fc7d4bc (section 9) exists only on this machine until it is committed and pushed.
+9. **Backup risk:** the two local commits after fc7d4bc (section 9) exist only on this machine until they are pushed.
 
 ## 8. Memory roadmap
 
@@ -91,27 +92,29 @@ LangGraph checkpointing and Temporal were compared (read-only) and not adopted: 
 
 ## 9. GitHub backup state (checked 2026-10-26)
 
-Branch `main`, remote `origin` = `https://github.com/doncelettabellamy-create/business-agent-platform`. **HEAD fc7d4bc equals origin/main**: the platform work through the signed-URL fix is committed and pushed. The earlier description here ("ahead by 6 commits, nothing from Processing/QC/Reporting committed") is obsolete.
+Branch `main`, remote `origin` = `https://github.com/doncelettabellamy-create/business-agent-platform`. **HEAD is the commit "Preserve dashboard product decision and add cleaning skill tests", ahead of `origin/main` by two commits; neither is pushed.** The last pushed commit is fc7d4bc. (Earlier versions of this section said "ahead by 6 commits" and then "HEAD equals origin/main"; both are obsolete. A commit cannot contain its own hash; use `git log` for it.)
 
-**Not committed: the work since fc7d4bc (18 tracked files modified, 5 new files).**
-- Modified: the four documents (plan, register, this handoff, the runbook); `poc/intake-runner/package.json`; `src/call-session.ts`, `dashboard-server.ts`, `founder-call-entry.ts`, `intake-record-store.ts`, `pii-screen.ts`, `relay-handler.ts`; the tests `founder-call`, `founder-dashboard`, `pii-screen`; and `prototype/intake-work-items/` (`app.js`, `data.js`, `index.html`, `styles.css`).
-- New: `src/owner-view.ts`; `tests/owner-view.test.ts`, `owner-dashboard.test.ts`, `prototype-empty-store.test.ts` and `tests/helpers/fake-dom.ts`. (A duplicate second owner page, `prototype/owner-view/` with its `/owner` routes and a page test, was built and then retired inside this same uncommitted work; it never reached a commit.)
+**Committed in b341fd6 (940 tests):** the read-back and confirmation flow, spaced-digit masking, the owner view, the redesigned dashboard in `prototype/intake-work-items/`, and the earlier documentation updates.
+
+**Committed in the second commit (959 tests in all):** `docs/PRODUCT_CONTINUITY.md`; the documentation updates that point to it (the prototype `README.md`, `PRD.md`, `DESIGN_DIRECTION_2026.md`, this handoff, the plan, the register and the runbook); `poc/intake-runner/examples/skill-cleaning.json`; `poc/intake-runner/tests/skill-cleaning.test.ts` (19 tests); and the test-list line in `poc/intake-runner/package.json`.
+
+**Not committed:** nothing was pending when the second commit was made; re-check with `git status`.
 - Ignored and never to be committed: `node_modules/`, `founder-call.config.json` (holds the relay secret and the phone number), `founder-call.stop`, `*.sqlite*`.
-- No secret scan was run for this update; run one before any commit. Git warns that LF will become CRLF on some files; harmless but expect noisy diffs.
+- A secret scan was run on the staged files before the second commit; run one again before any push. Git warns that LF will become CRLF on some files; harmless but expect noisy diffs.
 
 ## 10. Governance
 
-- The plan and register are the source of truth; every status change needs evidence in tests or documents, and no label is raised without it.
+- The plan and register are the source of truth; every status change needs evidence in tests or documents, and no label is raised without it. The dashboard decision is governed by `docs/PRODUCT_CONTINUITY.md`.
 - Founder decisions are listed in plan section 11.5 (item 25) and register section 9.
-- Synthetic-only data until live use is separately approved; live gates exist in `live-run.ts` and are exercised only by tests with mocks.
+- Synthetic data for all automated tests. Live use goes through the founder-test gate only (approved by digest, with caps, an expiry and a kill switch); the `live-run.ts` gates are exercised only by tests with mocks. Real calls were placed on 2026-10-26 under that gate.
 - Dependency policy: exactly one runtime dependency approach; adding anything needs approval.
 - Nothing is pushed or committed without an explicit request.
 
 ## 11. Next steps
 
-1. Delete the pre-schema-2 database, restart the server in the founder's terminal and make a live call to try the read-back flow, the hang-up wait and the owner screens (runbook sections 7 to 10 and its acceptance checks).
-2. Review and commit the uncommitted work (section 9), after a secret scan; push only on the founder's request.
-3. Decide the test business's configuration: the live call was a cleaning request against the plumbing configuration, so it matched no category and had no fields for rooms or a time window.
+1. Look at the dashboard in a real browser and make a live call to try the read-back flow, the hang-up wait and the owner screens (runbook sections 7 to 10 and its acceptance checks). The server was restarted on 2026-10-26 onto the committed code with a fresh schema-2 database (the old one was backed up first), so no database cleanup is needed.
+2. Push the two local commits (section 9) only on the founder's request, after a final secret scan.
+3. Decide the test business's configuration: the live call was a cleaning request against the plumbing configuration, so it matched no category and had no fields for rooms or a time window. A cleaning skill is ready as `poc/intake-runner/examples/skill-cleaning.json` (tested, not applied; applying it changes the approval digest).
 4. Decide whether to store a callback number (consent, retention, masking), so the owner can follow up; today the number is never read or stored.
 5. Plan tie fix B (causal `follows` link) together with D-14. Option A is done and committed.
 6. Composition root that builds entries from configuration.
@@ -121,11 +124,11 @@ Branch `main`, remote `origin` = `https://github.com/doncelettabellamy-create/bu
 
 ## 12. Founder phone test (run live at least twice; later fixes tested locally only)
 
-A real phone-to-dashboard test: dial a Twilio number, talk to an AI assistant, confirm what it reads back, and see the intake on the owner screens of the local dashboard. Steps, blockers and acceptance checks are in `docs/FOUNDER_PHONE_TEST_RUNBOOK.md`; the status record is plan section 11.5 item 24.
+A real phone-to-dashboard test: dial a Twilio number, talk to an AI assistant, confirm what it reads back, and see the intake on the owner screens of the local dashboard. Steps, blockers and acceptance checks are in `docs/FOUNDER_PHONE_TEST_RUNBOOK.md`; the status record is plan section 11.5 item 24. The dashboard decision (keep and evolve it into the production customer dashboard; never replace it without explicit founder authorization) is recorded in `docs/PRODUCT_CONTINUITY.md`.
 
 **What has happened (2026-10-26).** The Twilio account was upgraded, because ConversationRelay is blocked on trial accounts. At least two real calls reached the server and each saved a record (evidence: the two records in the local SQLite file, which carry the live Claude model label, and the founder's report; no server log was kept). The calls found problems: the assistant ended a call before confirming; digits read out one at a time were stored unmasked; a request outside the configured categories became `unknown_category` (a cleaning job against a plumbing configuration, with nothing listed as missing); and the old dashboard showed engineering labels and a misleading "data did not load" message on an empty store.
 
-**What was built in response (uncommitted; tested locally with invented data and stand-ins; not yet tried on a live call or looked at in a browser).**
+**What was built in response (committed in b341fd6, not pushed; tested locally with invented data and stand-ins; not yet tried on a live call or looked at in a browser).**
 - *Read-back and confirmation* (`relay-handler.ts`, `call-session.ts`): when Intake is ready the server runs a fresh Intake pass and reads back the non-address fields in fixed words (never the address, never a placeholder). A short plain yes confirms exactly that item; a no or doubt asks what to change (at most two read-backs); an unclear answer is asked again once; 20 seconds of silence ends the call unconfirmed. The assistant is never told to wrap up while Intake is not ready.
 - *Confirmed versus unconfirmed records* (`intake-record-store.ts`, schema version 2): only a confirmed, ready record may be handed off. Every other ending is saved `needs-human`, not handed off, with the reason `not_confirmed`. `address_status` is `unverified` whenever an address was found, since it is never read back or checked. `eligibleForProcessing` (confirmed, ready, handed off, no unverified address) is the one test a future bridge to Processing must use. Nothing connects the phone path to Processing today.
 - *Hang-up*: waits for the closing line (a pad plus 70 ms per character, at most 15 s, never less than `after_speech_ms`); closing lines cannot be talked over. Whether Twilio's `end` cuts queued speech is undocumented.

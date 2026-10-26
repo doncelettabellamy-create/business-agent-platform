@@ -1,6 +1,7 @@
 # Design Direction 2026: Premium Light UI
 
-> **Status: DRAFT design direction. Not approved. Not implemented.** No screen, token, or component exists. All implementation gates are on HOLD.
+> **Status: DRAFT design direction. Not approved. Not implemented.** No screen, token, or component exists. All implementation gates are on HOLD. *(Historical: see the update below.)*
+> **Update 2026-10-26:** the Intake list and detail screens now exist as the business-owner dashboard (`prototype/intake-work-items`), kept and evolved per `docs/PRODUCT_CONTINUITY.md` (founder decision: never replace it without explicit authorization). Where this document's staff-oriented proposal (Confidence column, reason flags, a counts strip that is "not a dashboard", the step trace, the pipeline strip, keyboard shortcuts) differs from that dashboard, the owner dashboard governs; the rest of this document remains the historical proposal.
 > Sources read: `docs/blueprint/PRD.md`, `UI_UX_DESIGN.md`, `TEMPLATES.md`, `ARCHITECTURAL_ESSENTIALS.md`. This document adds visual and interaction direction only. It does **not** change architecture, requirements, contracts, or runtime code.
 > Brand, component library, and app style are **TBD (D-10)**. Everything below is a **proposal for the founder**, not a decision. Product name is shown as `<Product>`.
 > Labels used: **MVP** = part of the proposed Intake pilot (read-only list and detail). **FUTURE, NOT MVP** = outline for later phases; do not build against it.
@@ -141,8 +142,8 @@ Rules: at most three ranks per view; sentence case everywhere; no all-caps beyon
 | Aspect | Specification |
 |---|---|
 | Hierarchy | Serif title, one-line lede, then a quiet counts strip, then controls, then the table |
-| Counts strip | Counts by status from `work_items` only; **not** a dashboard; optional (see section 12) |
-| Columns | Status (icon + word), Category, Received, Confidence (number), Reason/flags. No message text in the list |
+| Counts strip | Counts by status from `work_items` only; **not** a dashboard; optional (see section 12). *(2026-10-26: the existing owner dashboard has four totals and a total count, and is kept and evolved as the product's dashboard: `docs/PRODUCT_CONTINUITY.md`.)* |
+| Columns | Status (icon + word), Category, Received, Confidence (number), Reason/flags. No message text in the list. *(The owner dashboard shows no confidence and no flags by design; this staff/engineering column set is a proposal for another view.)* |
 | Order | `Needs review` first, then newest first |
 | Row | 48 px; whole row is the link; hover `surface-sunken`; selected `accent-subtle`; focus ring 2 px `accent` with 2 px offset |
 | Confidence | Numeric value only. Qualitative bands are **TBD (D-04)** |
@@ -287,7 +288,7 @@ Target (proposal, standard **TBD** in the UI document): **WCAG 2.2 level AA**. N
 
 | # | Item | PRD / document says | This direction | Proposed resolution (needs founder decision) |
 |---|---|---|---|---|
-| 1 | Counts strip on the list | PRD §7 puts dashboards out of MVP; PRD-14 says "read-only list" | Adds a counts-by-status strip | Treat as optional; counts only, no charts; remove if you want a strictly minimal list |
+| 1 | Counts strip on the list | PRD §7 puts dashboards out of MVP; PRD-14 says "read-only list" | Adds a counts-by-status strip | Treat as optional; counts only, no charts; remove if you want a strictly minimal list. **Resolved 2026-10-26:** the dashboard exists and is kept and evolved (`docs/PRODUCT_CONTINUITY.md`). |
 | 2 | Step trace and pipeline strip on detail | PRD-14 describes the list only; `UI_UX_DESIGN.md` S-02 detail lists fields, reasons, and "Produced by" but no trace or strip | Adds both | Add to the MVP detail only if approved; data comes from existing run steps (no new bodies) |
 | 3 | Detail screen in the PRD | PRD has no detail requirement; it exists only in `UI_UX_DESIGN.md` | Keeps S-02 | Add a PRD line for the read-only detail |
 | 4 | Showing Processing, QC, Reporting | PRD: Processing is a stub in the MVP; QC and Reporting not built | Shows all four with "not active" or "stub" | Required wording keeps FC-04 intact; remove the strip if you prefer not to show them |

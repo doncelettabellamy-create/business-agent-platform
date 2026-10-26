@@ -1,0 +1,27 @@
+{
+  "workspace_id": "ws-synthetic-cleaning",
+  "correlation_id": "corr-synthetic-0303",
+  "event_id": "evt-synthetic-0303",
+  "received_at": "2026-10-26T11:00:00Z",
+  "channel_ref": "channel-tbd",
+  "masking": { "applied": true, "source": "synthetic-fixture" },
+  "masked_text": "Hello, this is [PERSON_1]. I would like a house cleaning.\nJob description: House cleaning\nNumber of rooms: four rooms\nPreferred date: tomorrow\nTime window: between 9 AM and 1 PM",
+  "pii_summary": [
+    { "type": "Person", "count": 1 }
+  ],
+  "skill_config": {
+    "categories": [
+      {
+        "name": "Cleaning request",
+        "keywords": ["cleaning", "clean", "cleaned", "cleaner", "cleaners", "maid", "housekeeping", "house clean", "deep clean", "spring clean", "move out clean", "move in clean"],
+        "requires": ["Number of rooms", "Preferred date", "Time window"]
+      }
+    ],
+    "fields": [
+      { "name": "Job description", "required": false, "extractor": { "kind": "label", "labels": ["job description"] } },
+      { "name": "Number of rooms", "required": false, "extractor": { "kind": "label", "labels": ["number of rooms", "rooms"] } },
+      { "name": "Preferred date", "required": false, "extractor": { "kind": "label", "labels": ["preferred date", "date"] } },
+      { "name": "Time window", "required": false, "extractor": { "kind": "label", "labels": ["time window", "time"] } }
+    ]
+  }
+}
