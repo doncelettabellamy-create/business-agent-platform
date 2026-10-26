@@ -5,9 +5,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { assertSafeRecord, callRefFor, createIntakeRecordStore, RecordRefused } from '../src/intake-record-store.ts';
+import { assertSafeRecord, callRefFor, createIntakeRecordStore, eligibleForProcessing, RecordRefused } from '../src/intake-record-store.ts';
 import type { IntakeRecord, IntakeRecordStore } from '../src/intake-record-store.ts';
-import { createDashboardServer, dataScriptFor, toDashboardItem } from '../src/dashboard-server.ts';
+import { createDashboardServer, dataScriptFor } from '../src/dashboard-server.ts';
+import { toOwnerView } from '../src/owner-view.ts';
 import { createSqliteReportingLedger } from '../src/reporting-ledger-sqlite.ts';
 import { createSqliteApprovalStore } from '../src/approval-store-sqlite.ts';
 
@@ -25,7 +26,7 @@ function rec(tenant: string, id: string, over: Partial<IntakeRecord> = {}): Inta
     item_id: id, workspace_id: tenant, call_ref: callRefFor(tenant, `call-${id}`), received_at: '2026-10-26T12:30:00Z', category: 'Emergency leak', status: 'ready',
     reasons: [], missing_fields: [],
     fields: [{ name: 'Address', value: '[ADDRESS_1]', confidence: 0.9, found: true }, { name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }, { name: 'Preferred date', value: null, confidence: null, found: false }],
-    pii_summary: [{ type: 'Address', count: 1 }], confidence: 0.8, versions: { skill: 'v', model: 'm', prompt: 'p' }, handed_off: true, turns: 3, ...over,
+    pii_summary: [{ type: 'Address', count: 1 }], confidence: 0.8, versions: { skill: 'v', model: 'm', prompt: 'p' }, handed_off: true, turns: 3, confirmation: 'confirmed', address_status: 'unverified', ...over,
   };
 }
 const open = (path = fileDb()) => { const s = createIntakeRecordStore({ path }); closers.push(() => s.close()); return s; };
@@ -66,12 +67,63 @@ test('privacy: a record that looks personal anywhere is refused and nothing is w
     ['phone in a value', { fields: [{ name: 'Address', value: 'call 555 010 0199', confidence: 0.9, found: true }] }],
     ['street address in a value', { fields: [{ name: 'Address', value: '42 Elm Street', confidence: 0.9, found: true }] }],
     ['long number in a field name', { fields: [{ name: 'Ref 1234567', value: null, confidence: null, found: false }] }],
+    ['digits read out one at a time in a value', { fields: [{ name: 'Address', value: '1 5 9 5 1', confidence: 0.4, found: true }] }],
+    ['digits read out in groups in a value', { fields: [{ name: 'Address', value: '15 951', confidence: 0.4, found: true }] }],
+    ['spaced digits left before an address placeholder', { fields: [{ name: 'Address', value: '1 2 3 [ADDRESS_1]', confidence: 0.9, found: true }] }],
     ['address in the category', { category: '7 Oak Avenue' }],
     ['phone in a reason', { reasons: ['call +1 555 010 0199'] }],
     ['email as the item id', { item_id: 'a@b.test' }],
   ];
   for (const [name, over] of personal) assert.throws(() => s.put(A, rec(A, 'wi-p', over)), RecordRefused, name);
   assert.deepEqual(s.list(A), []);
+});
+
+const UNCONFIRMED: Partial<IntakeRecord> = { confirmation: 'unconfirmed', status: 'needs-human', handed_off: false, reasons: ['not_confirmed'] };
+test('confirmation: only a confirmed, ready record can be handed off; an unconfirmed one must be held for a person and say why', () => {
+  const s = open();
+  assert.equal(s.put(A, rec(A, 'wi-ok')), 'new');
+  assert.equal(s.put(A, rec(A, 'wi-un', UNCONFIRMED)), 'new');
+  const bad: Array<[string, Partial<IntakeRecord>]> = [
+    ['handed off but unconfirmed', { ...UNCONFIRMED, handed_off: true, status: 'ready' }],
+    ['unconfirmed but ready', { ...UNCONFIRMED, status: 'ready' }],
+    ['unconfirmed without the reason', { ...UNCONFIRMED, reasons: [] }],
+    ['confirmed but carrying the reason', { reasons: ['not_confirmed'], status: 'needs-human', handed_off: false }],
+    ['unknown confirmation', { confirmation: 'maybe' as never }],
+    ['unknown address status', { address_status: 'verified' as never }],
+    ['address found but marked none', { address_status: 'none' }],
+    ['no address but marked unverified', { fields: [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }], address_status: 'unverified' }],
+  ];
+  bad.forEach(([name, over], i) => assert.throws(() => s.put(A, rec(A, `wi-b${i}`, over)), RecordRefused, name));
+  for (const key of ['confirmation', 'address_status']) {
+    const r: any = rec(A, 'wi-k'); delete r[key];
+    assert.throws(() => s.put(A, r), RecordRefused, `missing ${key}`);
+  }
+  assert.equal(s.list(A).length, 2, 'nothing refused was written');
+});
+
+test('eligibleForProcessing: true only for a confirmed, ready, handed-off record with no unverified address', () => {
+  const noAddress = { fields: [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }], address_status: 'none' as const };
+  assert.equal(eligibleForProcessing(rec(A, 'wi-1', noAddress)), true);
+  assert.equal(eligibleForProcessing(rec(A, 'wi-2')), false, 'an address nobody checked');
+  assert.equal(eligibleForProcessing(rec(A, 'wi-3', { ...noAddress, ...UNCONFIRMED })), false);
+  assert.equal(eligibleForProcessing(rec(A, 'wi-4', { ...noAddress, handed_off: false })), false);
+  assert.equal(eligibleForProcessing(rec(A, 'wi-5', { ...noAddress, status: 'needs-human', handed_off: false })), false);
+});
+
+test('schema: a file from the earlier record layout is refused rather than read', () => {
+  const path = fileDb();
+  const s = createIntakeRecordStore({ path }); s.put(A, rec(A, 'wi-1')); s.close();
+  const raw = new DatabaseSync(path); raw.prepare("UPDATE meta SET value = '1' WHERE key = 'schema_version'").run(); raw.close();
+  assert.throws(() => createIntakeRecordStore({ path }), RangeError);
+});
+
+test('dashboard: an unconfirmed intake is shown to the owner as needing follow-up, in plain words, and an unchecked address is flagged', () => {
+  const day = { fromIso: '2026-10-26T00:00:00Z', toIso: '2026-10-27T00:00:00Z' };
+  const [call] = toOwnerView([rec(A, 'wi-un', UNCONFIRMED)], day).calls;
+  assert.deepEqual([call.statusText, call.needsFollowUp, call.addressGiven], ['Not confirmed by the caller', true, true]);
+  assert.deepEqual(call.nextActions, ['Follow up: the caller did not confirm the details.', 'Verify the address with the caller.']);
+  const script = dataScriptFor(toOwnerView([rec(A, 'wi-un', UNCONFIRMED)], day));
+  assert.ok(!script.includes('not_confirmed') && !script.includes('needs-human'), 'no code reaches the page');
 });
 
 test('shape: extra keys, wrong types and inconsistent records are refused', () => {
@@ -151,19 +203,16 @@ test('statements: every data statement is a literal bound to a tenant', () => {
 });
 
 // ---------------------------------------------------------------- dashboard mapping
-test('dashboard data: items keep the prototype shape, every reason has text, and nothing can end the script', () => {
-  const r = rec(A, 'wi-1', { fields: [{ name: 'Job description', value: '</script><b>x</b> & "q"  ', confidence: 0.5, found: true }] });
-  const item = toDashboardItem(r);
-  assert.deepEqual([item.id, item.status, item.category, item.received, item.handedOff, item.message], ['wi-1', 'ready', 'Emergency leak', '2026-10-26 12:30', true, null]);
-  assert.equal(item.steps.length, 8);
-  assert.deepEqual(toDashboardItem(rec(A, 'wi-2', { status: 'needs-human', handed_off: false, category: 'unknown', reasons: ['missing_fields'] })).steps[7].status, 'skipped');
-  assert.equal(toDashboardItem(rec(A, 'wi-2', { category: 'unknown' })).category, null);
-  const js = dataScriptFor([r]);
+test('dashboard data: the page gets the owner view only, and nothing in a value can end the script', () => {
+  const day = { fromIso: '2026-10-26T00:00:00Z', toIso: '2026-10-27T00:00:00Z' };
+  const r = rec(A, 'wi-1', { fields: [{ name: 'Job description', value: '</script><b>x</b> & "q"  ', confidence: 0.5, found: true }], address_status: 'none' });
+  const js = dataScriptFor(toOwnerView([r], day));
   assert.ok(js.startsWith('/*') && js.includes('window.PROTO_DATA ='));
-  assert.ok(!js.includes('</script>') && !js.includes('<b>') && !js.includes(' '));
-  const data = new Function('window', `${js}; return window.PROTO_DATA;`)({}) as any;
-  assert.equal(data.items[0].fields[0].value, '</script><b>x</b> & "q"  ');
-  for (const code of ['missing_fields', 'unknown_category', 'ambiguous_category', 'ambiguous_field', 'low_confidence', 'model_failed']) assert.ok(typeof data.reasons[code] === 'string' && data.reasons[code].length > 10, code);
+  assert.ok(!js.includes('</script>') && !js.includes('<b>') && !js.includes(String.fromCharCode(0x2028)));
+  const data = new Function('window', js + '; return window.PROTO_DATA;')({}) as any;
+  assert.deepEqual(Object.keys(data).sort(), ['calls', 'summary']);
+  assert.equal(data.calls[0].summary, '</script><b>x</b> & "q"');
+  for (const s of ['wi-1', 'confidence', 'reasons', 'versions', 'steps', 'pii', 'handed', 'item_id']) assert.ok(!js.includes(s), s);
 });
 
 // ---------------------------------------------------------------- dashboard server
@@ -175,7 +224,7 @@ async function dash(store: IntakeRecordStore, tenant = A) {
 }
 
 test('server: serves the prototype page and live data for exactly one tenant, on loopback', async () => {
-  const s = open(); s.put(A, rec(A, 'wi-a')); s.put(B, rec(B, 'wi-b'));
+  const s = open(); s.put(A, rec(A, 'wi-a')); s.put(B, rec(B, 'wi-b', { fields: [{ name: 'Job description', value: 'OTHER-TENANT job', confidence: 0.8, found: true }], address_status: 'none' }));
   const { d, get } = await dash(s);
   assert.equal((d.server.address() as { address: string }).address, '127.0.0.1');
   const page = await get('/');
@@ -184,25 +233,28 @@ test('server: serves the prototype page and live data for exactly one tenant, on
   assert.equal((await get('/app.js')).status, 200);
   assert.equal((await get('/styles.css')).status, 200);
   const data = await (await get('/data.js')).text();
-  assert.ok(data.includes('wi-a') && !data.includes('wi-b'), 'only tenant A');
-  const api: any = await (await get('/api/items')).json();
-  assert.deepEqual(api.items.map((i: any) => i.id), ['wi-a']);
+  assert.ok(data.includes('burst pipe') && !data.includes('OTHER-TENANT'), 'only tenant A');
+  const api: any = await (await get('/api/owner')).json();
+  assert.equal(api.calls.length, 1);
   const other = await dash(s, B);
-  assert.deepEqual(((await (await other.get('/api/items')).json()) as any).items.map((i: any) => i.id), ['wi-b']);
+  const theirs: any = await (await other.get('/api/owner')).json();
+  assert.equal(theirs.calls.length, 1);
+  assert.ok(JSON.stringify(theirs).includes('OTHER-TENANT') && !JSON.stringify(api).includes('OTHER-TENANT'));
 });
 
 test('server: fixed headers, GET and HEAD only, no query string, no other paths, loopback Host only', async () => {
   const s = open(); s.put(A, rec(A, 'wi-a'));
   const { port, get } = await dash(s);
   const r = await get('/data.js');
-  assert.match(r.headers.get('content-security-policy') ?? '', /default-src 'self'.*frame-ancestors 'none'/);
+  assert.match(r.headers.get('content-security-policy') ?? '', /default-src 'none'.*script-src 'self'.*style-src 'self'.*connect-src 'self'.*frame-ancestors 'none'/);
+  assert.ok(!/unsafe-inline|unsafe-eval/.test(r.headers.get('content-security-policy') ?? ''));
   assert.equal(r.headers.get('cache-control'), 'no-store');
   assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(r.headers.get('referrer-policy'), 'no-referrer');
   assert.equal((await fetch(`http://127.0.0.1:${port}/data.js`, { method: 'HEAD' })).status, 200);
   for (const method of ['POST', 'PUT', 'DELETE', 'PATCH']) assert.equal((await fetch(`http://127.0.0.1:${port}/data.js`, { method, body: method === 'DELETE' ? undefined : 'x' })).status, 405, method);
-  for (const q of ['/api/items?tenant=ws-founder-b', '/data.js?workspace_id=ws-founder-b', '/?x=1']) assert.equal((await get(q)).status, 400, q);
-  for (const p of ['/nope', '/../package.json', '/%2e%2e/package.json', '/index.html/', '/api/items/wi-b', '/data.json', '/app.js.map']) assert.equal((await get(p)).status, 404, p);
+  for (const q of ['/api/owner?tenant=ws-founder-b', '/data.js?workspace_id=ws-founder-b', '/?x=1']) assert.equal((await get(q)).status, 400, q);
+  for (const p of ['/nope', '/../package.json', '/%2e%2e/package.json', '/index.html/', '/api/owner/wi-b', '/api/items', '/data.json', '/app.js.map']) assert.equal((await get(p)).status, 404, p);
   const body = await (await get('/nope')).text();
   assert.equal(body, '{"error":"NOT_FOUND"}');
 });
@@ -223,7 +275,7 @@ test('server: a failing or tampered store gives a fixed 503 and leaks nothing', 
   const s = createIntakeRecordStore({ path }); s.put(A, rec(A, 'wi-a')); s.close();
   const raw = new DatabaseSync(path); raw.exec('DROP TRIGGER records_no_update'); raw.exec("UPDATE records SET body = '{\"leak\":\"CANARY-DASH-1\"}'"); raw.close();
   const { get } = await dash(open(path));
-  for (const p of ['/data.js', '/api/items']) {
+  for (const p of ['/data.js', '/api/owner']) {
     const r = await get(p);
     assert.equal(r.status, 503);
     assert.equal(await r.text(), '{"error":"UNAVAILABLE"}');

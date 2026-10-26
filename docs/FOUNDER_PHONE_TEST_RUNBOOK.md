@@ -1,6 +1,6 @@
 # Founder phone test: runbook and blockers
 
-Status 2026-10-26: **the local code is built and tested (874 mock tests); no real call has been placed.** Nothing has been installed, purchased, exposed or called. The authority for status is `docs/blueprint/PLATFORM_MASTER_PLAN.md` section 11.5 item 24.
+Status 2026-10-26: **the code is built and tested locally (940 mock tests, a fresh full run on 2026-10-26), and real calls HAVE been placed.** At least two live calls reached the server and each saved a record (evidence: the two records in the local SQLite file, which carry the live Claude model label; the founder's own report of the calls). The founder upgraded the Twilio account first, because ConversationRelay is blocked on trial accounts. The later call was handled by code that already had the confirmation gate, and ended unconfirmed because the request fitted no configured category, so **no read-back and no "yes" has been seen on a live call**. Those calls found problems, and the fixes made since are **tested locally only and have not been tried on a live call**: the read-back flow, the longer wait before hanging up, standalone spaced-digit masking, the owner screens. The server was not logging to a file, so there is no log of those calls here. The authority for status is `docs/blueprint/PLATFORM_MASTER_PLAN.md` section 11.5 item 24.
 
 All commands below are **PowerShell** and are run from the working folder:
 
@@ -12,13 +12,15 @@ The config file, the kill file and the SQLite file are all resolved **relative t
 
 ## What it is
 
-Dial a Twilio number, talk naturally to an AI assistant, and see a validated Intake record appear on the existing dashboard prototype.
+Dial a Twilio number, talk naturally to an AI assistant, confirm what it read back, and see the intake appear on the owner screens of the local dashboard (the list, and a page for each intake).
 
 ```
 phone -> Twilio ConversationRelay (speech to text and back) -> wss tunnel -> src/ws-server.ts (secret path + signature)
       -> src/relay-handler.ts: consent -> src/pii-screen.ts (mask) -> existing Intake agent (live Claude: classify, extract, ground, validate)
                                       -> src/dialogue-model.ts (live Claude speaks, masked text only)
-      -> src/intake-record-store.ts (SQLite) -> src/dashboard-server.ts (127.0.0.1) -> prototype/intake-work-items
+                                      -> read-back (the server's own fixed words) -> caller says yes or no -> confirmed or unconfirmed record
+      -> src/intake-record-store.ts (SQLite) -> src/owner-view.ts (strict allow-list) -> src/dashboard-server.ts (127.0.0.1)
+      -> prototype/intake-work-items (the owner's list and one-intake screens)
 ```
 
 The Intake agent is the existing one, unchanged except for an opt-in founder tier in `src/intake-entry.ts` (one named `ws-founder-` tenant, masking source `founder-test-call`, event ids `evt-founder-`). The synthetic-only gate and the reviewed-fixture live path are untouched for everything else.
@@ -28,7 +30,7 @@ The Intake agent is the existing one, unchanged except for an opt-in founder tie
 | Item | Value |
 |---|---|
 | Phone endpoint (local) | `127.0.0.1:8788`, WebSocket on `/relay/<your secret>`. The tunnel forwards the public address here. |
-| Dashboard | `http://127.0.0.1:8787/` (also `localhost:8787`). Never tunnelled. |
+| Owner screens | `http://127.0.0.1:8787/` (also `localhost:8787`): the list of intakes and the page for one intake. Their data is `GET /api/owner` (and `/data.js` for the first paint). There is no other page: the earlier second owner page at `/owner` was retired, so `/` is the only dashboard. Never tunnelled. Nothing else is served: the old engineering route `/api/items` no longer exists. |
 | Dry run (opens nothing) | `npm run founder:check -- --config founder-call.config.json` |
 | Serve (needs the whole gate) | `node src/founder-call-entry.ts --serve --config founder-call.config.json` |
 | Exit codes | 64 bad arguments, 65 config problem, 66 config unreadable, 69 official SDK missing, 78 gate refused |
@@ -43,6 +45,19 @@ The Intake agent is the existing one, unchanged except for an opt-in founder tie
 - One call at a time, and no more than `max_calls` calls, `max_minutes`, `max_turns` and `max_claude_calls` from the approved config.
 - **Kill switch:** create the file named by `kill_file` (default `founder-call.stop`). It is checked when a call starts and each time the caller finishes speaking, so it is not instant: a silent caller keeps the call open until the idle timeout. **Ctrl+C in the serving terminal is the immediate stop.**
 
+## How a call ends: read-back, confirmation, and what is saved
+
+**Tested locally (invented data, a stand-in for Twilio, a local fake of the Claude client); not yet tried on a live call.**
+
+1. While the assistant is still collecting details it asks one thing at a time. If Intake lists nothing missing but is not ready (for example the request fits no configured category), the assistant is asked for more about the request. It is never told to say "recorded, goodbye" in that state.
+2. When Intake says the request is ready, the server runs one fresh Intake pass over everything heard so far, then **reads back, in fixed words of its own,** the non-address fields only, for example "Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no." **The address is never spoken in any form, and a mask placeholder is never spoken.** The caller may answer over the read-back.
+3. A short plain **yes** confirms exactly the item that was read back. The assistant says "Thank you. Your request is recorded and a person will follow up. Goodbye." (this line cannot be talked over), the record is saved with no further model call, and the call ends after the line has had time to play (about 1.5 seconds plus 70 milliseconds per character, at most 15 seconds, and never less than `after_speech_ms`).
+4. A **no** (or any refusal or doubt: "no", "wrong", "yes but...") asks "What should I change?", listens, and reads back again. At most two read-backs. An answer that is neither yes nor no is asked for once more; a second one ends the call unconfirmed. **20 seconds of silence** after a read-back ends the call unconfirmed.
+5. Every other ending (the caller hangs up, a turn or time limit, a model failure, a second no) saves a record that is **unconfirmed**: held for a person, not handed off, with the reason `not_confirmed`. (The kill switch is different: it ends the call and saves nothing.)
+6. Only a confirmed record may be handed off. The store refuses any record that breaks that rule. Nothing connects the phone path to Processing today, and `eligibleForProcessing` (confirmed, ready, handed off, **and no unchecked address**) is the one test a future bridge must use. A record that has an address is never eligible, because the address is never read back or checked.
+
+Not covered, and said plainly: the caller's phone number is never read or stored, so the owner cannot call anyone back from this system; "requested time" is what the caller asked for, and nothing here books or schedules anything.
+
 ## Costs: totals versus model estimates
 
 **Total costs (what the providers bill; published prices read from Twilio's pages, not yet seen on a bill):**
@@ -55,7 +70,7 @@ The Intake agent is the existing one, unchanged except for an opt-in founder tie
 | Text-to-speech | basic voices free; premium tiers $0.0008 to $0.013 per 100 characters. Whether the default voice (ElevenLabs) is billed this way is **unconfirmed** |
 | Tunnel | free tier or paid; the founder's choice |
 
-So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before any voice surcharge**, and a 3 to 5 minute call about $0.24 to $0.39, plus the $1.15 monthly for the number. Twilio's FAQ states a $15 trial credit; whether it can pay for ConversationRelay is **unconfirmed**. A trial is expected to call only verified numbers and to play a trial notice (not checked here).
+So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before any voice surcharge**, and a 3 to 5 minute call about $0.24 to $0.39, plus the $1.15 monthly for the number. Twilio's documentation says **ConversationRelay is blocked on trial accounts**, so a paid (upgraded) account is required; the founder upgraded on 2026-10-26 and the calls that followed connected. Twilio's FAQ states a $15 trial credit, but that credit does not apply to this test now. Whether any usage was billed to a credit balance has not been checked.
 
 **Model estimates (not billing; a guess from list prices, to be checked against the Anthropic console afterwards):**
 
@@ -66,19 +81,22 @@ So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before an
 
 ## Confirmed versus unverified
 
-**Confirmed locally (code and the 874 mock tests; no network):** consent gating; masking behaviour; secret-path, signature, lockout, call-budget and replay checks; tenant selection by dialed number; the Intake agent producing and validating the record; the SQLite store; the loopback dashboard and its isolation; the kill file, caps and failure handling; that persona details do not appear in any Claude request, reply to the phone provider, log, database file or dashboard output. These ran against a local fake of the Claude SDK client and a stand-in for Twilio.
+**Confirmed locally (code and the 940 mock tests; no network):** consent gating; masking behaviour, including digits read out one at a time or in groups ("1 5 9 5 1"); secret-path, signature, lockout, call-budget and replay checks; tenant selection by dialed number; the Intake agent producing and validating the record; the read-back, the yes/no gate, the silence timer, and the confirmed and unconfirmed records described above; the store refusing a record that breaks the confirmation or address rules; the assistant never being told to wrap up while Intake is not ready; the SQLite store; the dashboard server (loopback only, one tenant, GET and HEAD only, exact paths, no query string, loopback Host only, one strict page policy with nothing inline) and its isolation; the owner view (a strict allow-list: no confidence, codes, masks, steps, versions, ids or address values ever reach the page; nothing says or implies a booking); the owner screens run against a stand-in for the browser's DOM (list, one intake, empty store, failures, bad data, text-only output); the kill file, caps and failure handling; that persona details do not appear in any Claude request, reply to the phone provider, log, database file, `/api/owner` or `/data.js`. These ran against a local fake of the Claude SDK client and a stand-in for Twilio.
 
-**Read in Twilio's published documentation, never exercised:** the TwiML attributes used (`url`, `language`, `welcomeGreeting`, `welcomeGreetingInterruptible="none"`); the WebSocket messages (`setup` with `callSid`/`to`, `prompt` with `voicePrompt` and `last`, `interrupt` with `utteranceUntilInterrupt`, and our `text`/`end` replies); the need to accept the AI addendum; prices.
+**Observed in the first live calls (2026-10-26), from the saved records and the founder's report, not from a server log:** Twilio connected and the handshake was accepted; the live Claude Intake path produced and saved records (the model label in the records is `claude:claude-haiku-5-5`); calls lasted 6 and 10 caller turns, so the streaming dialogue replies kept a conversation going; the dashboard showed a record; the later record carries the confirmation fields, so the confirmation gate ran live once, on an unconfirmed ending. Problems they exposed, each now fixed in code and tested locally only: the assistant ended a call before confirming; digits read out one at a time were stored unmasked; a request outside the configured categories (a cleaning job in a plumbing configuration) became `unknown_category`; the old dashboard showed engineering labels and a misleading "data did not load" message when the store was empty.
 
-**Unverified (a real call, or a small live check, is the only proof):**
-1. **Claude requests.** The streaming dialogue request (`stream: true` with `output_config: { effort: "low" }`) and the SDK's streaming event shape have never been sent. If the API rejects them the call fails right after consent with a spoken apology. This is the most likely first failure. The existing structured Intake requests have not been sent live either.
-2. **Which URL form Twilio signs** for the handshake. The server accepts the configured address and its `https://` form, each with and without a trailing slash, and the same four without the port if the address names one (Twilio's pages say a trailing slash may fix a failed WebSocket validation and that the port is dropped when signing over HTTPS). The request path must still match the secret path exactly. If every handshake is refused with 403, suspect this first; a 404 would mean Twilio requested a different path.
-3. **Consent timing.** The code treats the caller's first completed utterance after the greeting as the consent answer. How Twilio treats speech during a non-interruptible greeting is unknown.
-4. **Trial limits.** Whether ConversationRelay works on a trial, how the trial notice interacts with the greeting, and whether the one auto-assigned number can be used.
+**Read in Twilio's published documentation, never fully exercised:** the TwiML attributes used (`url`, `language`, `welcomeGreeting`, `welcomeGreetingInterruptible="none"`); the WebSocket messages (`setup` with `callSid`/`to`, `prompt` with `voicePrompt` and `last`, `interrupt` with `utteranceUntilInterrupt`, and our `text` (with `last` and `interruptible`) and `end` replies); the need to accept the AI addendum; prices. Twilio's pages do not say whether `end` cuts speech that is still queued.
+
+**Unverified (a real call is the only proof):**
+1. **The read-back flow on a live call**, including whether Twilio's speech-to-text turns "yes" and "no" into text the classifier reads correctly, and how long the fresh Intake pass adds before the read-back (about 1 to 3 seconds of silence is expected).
+2. **The longer hang-up wait.** The wait is an estimate (length based); whether `end` cuts queued speech is undocumented. If the goodbye is still clipped, the next step is Twilio's playback events.
+3. **Which URL form Twilio signs** for the handshake. Calls connected, so one of the accepted forms matched, but nothing recorded which. The accepted forms are the configured address and its `https://` form, each with and without a trailing slash, and the same four without the port.
+4. **Consent timing.** The code treats the caller's first completed utterance after the greeting as the consent answer. Calls proceeded; how Twilio treats speech during a non-interruptible greeting is not known.
 5. **Voice defaults.** Text-to-speech provider (ElevenLabs by default), speech-to-text provider (Deepgram), interruption and profanity filter use Twilio's defaults and are not set by us.
-6. **Tunnel behaviour.** That the chosen tunnel carries WebSockets, and that the free address stays stable.
+6. **Tunnel behaviour.** A quick tunnel carried the calls. It was stopped once (low memory) and a restarted quick tunnel gets a **new host**, which means a new config, secret, digest and TwiML Bin.
 7. **Missing `ANTHROPIC_API_KEY`.** What the official SDK does with no key is untested; it happens before any port opens.
-8. **End-of-call cut-off, latency and how natural the replies feel.** `after_speech_ms` (4000) is a guess.
+8. **The owner screens in a real browser.** Only their scripts have been run (against a stand-in DOM); layout, dark mode, phone width and the time shown in the viewer's zone have not been looked at.
+9. **How natural the replies feel, and latency.**
 
 ## Approvals and payments the founder must make (nothing below can start without them)
 
@@ -94,7 +112,7 @@ So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before an
 9. Accepting Twilio's "Predictive and Generative AI or ML Features Addendum" in the Twilio console.
 
 **Accounts, installs and money**
-1. A Twilio account; on a trial, verify the founder's own mobile; upgrade or buy the number ($1.15 per month) if a trial cannot be used.
+1. A **paid (upgraded) Twilio account**: ConversationRelay is blocked on trial accounts (Twilio's documentation). The founder upgraded on 2026-10-26. A number ($1.15 per month) on that account, and a TwiML Bin pointing at the tunnel.
 2. An Anthropic API key with a monthly spend limit set in the Anthropic console.
 3. A tunnel tool and account (a **new install**), for example ngrok or Cloudflare Tunnel. Opening it exposes the secret-path WebSocket to the internet; the dashboard stays local.
 
@@ -114,7 +132,7 @@ ngrok http 8788
 cloudflared tunnel --url http://127.0.0.1:8788
 ```
 
-Note the public host the tool prints. Free addresses usually change when the tunnel restarts: if it does, repeat steps 3 to 6 (new config, new digest, new TwiML Bin).
+Note the public host the tool prints. Free addresses change when the tunnel restarts (a quick tunnel always gets a new host): if it does, repeat steps 3 to 5 (new secret, new config, new digest, new TwiML Bin).
 
 ### 3. Write the config and run the first dry run
 
@@ -158,24 +176,26 @@ The gate line must now read `[ok] all checks pass`. If it does not, fix what it 
 Unverified item 1 is the likeliest first failure. A small approved script that sends one real streaming dialogue request and one real structured Intake request through the same code would cost an estimated tenth of a cent and show a request-shape error before any phone call. It does not exist yet; adding it needs the founder's approval for the API call.
 
 ### 7. Serve
+**First delete the database from any earlier version.** The record store is now schema 2 and refuses a schema 1 file, so the server will not start until `founder-call.sqlite`, `founder-call.sqlite-wal` and `founder-call.sqlite-shm` are gone (see section 10 for the copy-then-remove commands).
 
 ```powershell
 node src/founder-call-entry.ts --serve --config founder-call.config.json
 ```
 
-It prints `Serving.` with the two local addresses. Server log lines carry fixed codes and counts only, for example `CALL_STARTED`, `CONSENT_GRANTED`, `RECORD_NEW`, and on trouble `SETUP_REFUSED`, `REPLAY`, `BUSY`, `CALL_BUDGET`, `KILLED`, `DIALOGUE_FAILED`, `FINAL_INTAKE_FAILED`, `UTTERANCE_REFUSED`, `RECORD_REFUSED`.
+It prints `Serving.` with the local addresses (the owner screens at `http://127.0.0.1:8787/`). Server log lines carry fixed codes and counts only, for example `CALL_STARTED`, `CONSENT_GRANTED`, `READBACK`, `CONFIRMED`, `UNCONFIRMED`, `CONFIRM_TIMEOUT`, `RECORD_NEW`, and on trouble `SETUP_REFUSED`, `REPLAY`, `BUSY`, `CALL_BUDGET`, `KILLED`, `DIALOGUE_FAILED`, `FINAL_INTAKE_FAILED`, `UTTERANCE_REFUSED`, `RECORD_REFUSED`. They go to the console only, so copy them from the terminal if you want a record of a call.
 
 ### 8. The call
-From the verified phone, call the Twilio number. Listen to the notice, say "yes", then describe a plumbing problem as the invented persona (for example a burst pipe in the kitchen, with an invented address), and answer the assistant's questions. The assistant closes the call itself once the request is recorded.
+From the verified phone, call the Twilio number. Listen to the notice, say "yes", then describe a job that fits the configured categories as the invented persona (for the plumbing configuration, a burst pipe in the kitchen, with an invented address), and answer the assistant's questions. When it has enough it **reads back the job (never the address) and asks for a yes or no**; say yes. It then says the closing line and ends the call.
 
 ### 9. Check the result
-Open `http://127.0.0.1:8787/` and **press F5**. The prototype loads its data once when the page opens and does not refresh itself, so a record made after the page was opened appears only after a reload. For the raw view:
+Open `http://127.0.0.1:8787/`. The page refreshes itself about every 15 seconds, so no reload should be needed (this is tested, not yet seen in a browser). Press F5 if it does not. Open the intake to see its page. For the raw data the page uses:
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8787/api/items | ConvertTo-Json -Depth 8
+Invoke-RestMethod http://127.0.0.1:8787/api/owner | ConvertTo-Json -Depth 8
 ```
 
 Then work through the acceptance checks below. Read the real costs in the Twilio console usage page and the Anthropic console usage page.
+
 
 ### 10. Stop and clean up
 Order matters: **cut the route first**, so nothing can reach this machine while you clean up. Nothing here is automatic, and the steps marked *optional* are the founder's decision.
@@ -186,7 +206,7 @@ Order matters: **cut the route first**, so nothing can reach this machine while 
 
 **B. Stop the local test**
 3. Press Ctrl+C in the serving terminal (the immediate stop). If a call is in progress and you would rather let it end, create the kill file first: `New-Item founder-call.stop -ItemType File`.
-4. Remove the kill file if you made one, and decide about the test record. To keep it for the record, copy `founder-call.sqlite` somewhere private first. To remove it:
+4. Remove the kill file if you made one, and decide about the test records (they are masked, test-only, and the file must be deleted anyway before the next serve if the code changed the record layout). To keep it for the record, copy `founder-call.sqlite` somewhere private first. To remove it:
    ```powershell
    Remove-Item founder-call.stop -ErrorAction SilentlyContinue
    Remove-Item founder-call.sqlite, founder-call.sqlite-wal, founder-call.sqlite-shm -ErrorAction SilentlyContinue
@@ -214,13 +234,16 @@ Order matters: **cut the route first**, so nothing can reach this machine while 
 | # | Check | Pass |
 |---|---|---|
 | 1 | Consent | Saying anything but a plain yes ends the call, the log shows no `RECORD_NEW`, and the Anthropic console shows no request for that call. |
-| 2 | Conversation | The assistant asks one short question at a time and the call ends by itself once the request is recorded. |
-| 3 | Record | After F5, the dashboard shows one item for the call: category, status Ready (or Needs review with a reason), masked fields, personal-data counts. |
-| 4 | Privacy | The persona's name, address and any number or e-mail spoken appear nowhere in the dashboard, the SQLite file or the server console. Only placeholders such as `[ADDRESS_1]`. |
-| 5 | Cost | Anthropic cost for the call at most $0.05 and Twilio cost at most $1.00, read from the two consoles afterwards. |
-| 6 | Kill switch | With the kill file present, the next call or the next thing the caller says ends the call and saves nothing. |
-| 7 | Clean up | Section 10 parts A and B completed, with routing disabled first; part C decided one item at a time. |
+| 2 | Conversation | The assistant asks one short question at a time and never says the request is recorded before the read-back. |
+| 3 | Read-back | After the details are in, the assistant reads back the job (not the address) and asks for yes or no. The log shows `READBACK`. |
+| 4 | Confirmed ending | After a yes, the closing line is heard **in full**, then the call ends. The log shows `CONFIRMED`. If the line is clipped, that is the finding. |
+| 5 | Unconfirmed ending | After a no twice, two unclear answers, 20 seconds of silence, or hanging up during the read-back, the log shows `UNCONFIRMED` and the intake reads "Not confirmed by the caller" with "Follow up" as its first next step. |
+| 6 | Owner screens | The list shows the intake (it opens on "Needs follow-up" when there is any); the intake page shows what the caller needs, "Requested time (not booked)", other details, an address note when an address was given, and next steps. No confidence, code, mask, step trace or booking wording. |
+| 7 | Privacy | The persona's name, address and any number or e-mail spoken (including digits said one at a time) appear nowhere in the owner screens, `/api/owner`, the SQLite file or the server console. The address is not heard in the read-back. |
+| 8 | Cost | Anthropic cost for the call at most $0.05 and Twilio cost at most $1.00, read from the two consoles afterwards. |
+| 9 | Kill switch | With the kill file present, the next call or the next thing the caller says ends the call and saves nothing. |
+| 10 | Clean up | Section 10 parts A and B completed, with routing disabled first; part C decided one item at a time. |
 
 ## What is NOT included
 
-Processing, Quality Control and Reporting; recording; outbound calls; SMS; more than one tenant live; login or tenant isolation on the dashboard (it is loopback-only, FND-02 / R01 not met); encryption at rest (FND-10); a retention policy (C14); a freshness check on Twilio's signature (the secret path, `max_calls`, the expiry and the kill switch bound a leak). The masker is a stand-in, not INT-07.
+Processing, Quality Control and Reporting (nothing connects the phone path to Processing; `eligibleForProcessing` is the future bridge's single test); recording; outbound calls; SMS; more than one tenant live; **a callback number** (the caller's number is never read or stored, so the owner screens cannot offer a call-back); **any booking or schedule** (a requested time is only what the caller asked for); an address check of any kind (the address is neither read back nor verified, so a person must verify it); login or tenant isolation on the dashboard (it is loopback-only, FND-02 / R01 not met); encryption at rest (FND-10); a retention policy (C14); a freshness check on Twilio's signature (the secret path, `max_calls`, the expiry and the kill switch bound a leak). The masker is a rule-based stand-in, not INT-07, and still cannot recognise a lower-case name or place that nothing introduces. Place names such as a city are masked as if they were names, so the owner screens do not show a city.

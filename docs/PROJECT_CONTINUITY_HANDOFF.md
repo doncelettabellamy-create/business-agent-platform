@@ -33,17 +33,19 @@ credential -> mint context -> Intake -> Processing -> Quality Control -> Reporti
 
 Optional recovery in the pipeline (`recoverUncertain: true`): after an escalation caused by an uncertain human-approved step, QC reconciles once, and if something settled, one fresh verification is filed as a repeat attempt. The first outcome is never changed.
 
-## 4. Baseline: 874 tests
+## 4. Baseline: 940 tests
 
-`npm test` in `poc/intake-runner` on 2026-10-25: **874 tests, 874 pass, 0 fail** (about 9 seconds), run 2026-10-26 after the signed-URL candidates were widened. The register's "Test figure: 874 passed" matches. 867 of them are committed (f15fcee); the 7 new tests and the change they cover are not yet committed.
+`npm test` in `poc/intake-runner`: **940 tests, 940 pass, 0 fail, 0 skipped** (a fresh full run on 2026-10-26, about 10 seconds). The register's "Test figure: 940 passed" matches. 874 of them are committed (fc7d4bc); 66 are new and uncommitted. Mocks only: this says nothing about live behaviour.
 
-Newest files: `founder-call` (20), `founder-dashboard` (17), `founder-call-gate` (13), `pii-screen` (13), `ws-server` (11), `pipeline-recovery` (30, includes the strictly-later tests), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains).
+Newest files and their current counts (each file run on 2026-10-26): `founder-call` (40), `founder-dashboard` (21), `pii-screen` (26), `owner-view` (13), `owner-dashboard` (11), `prototype-empty-store` (19; the owner screens run against a stand-in DOM), `founder-call-gate` (20), `ws-server` (16), `pipeline-recovery` (30), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains, a Twilio stand-in, a stand-in browser DOM).
 
 Checklist roll-up (plan section 11): 73 rows - 11 BUILT, 23 PARTIAL, 21 NOT STARTED, 18 BLOCKED. Of 17 requirements: 0 BUILT, 10 PARTIAL, 1 NOT STARTED, 6 BLOCKED.
 
 ## 5. SQLite (development only)
 
-Two stores on built-in `node:sqlite`, each in its own file with a kind marker so one cannot open the other's file:
+Three stores on built-in `node:sqlite`, each in its own file with a kind marker so one cannot open the other's file:
+
+- `src/intake-record-store.ts` (the founder phone test's masked records; schema version 2, which refuses an older file; records carry `confirmation` and `address_status`; see section 12).
 
 - `src/approval-store-sqlite.ts`: human-approval claims and decisions (durable claim, in-doubt state).
 - `src/reporting-ledger-sqlite.ts`: the Reporting observation log. Each `record` is one `BEGIN IMMEDIATE` transaction (WAL, synchronous FULL); unique keys back duplicate and attempt rules; triggers forbid UPDATE/DELETE on observations; snapshot is one read transaction. Digests are identical to the in-memory ledger.
@@ -61,6 +63,7 @@ Limits: no database-level tenant isolation (FND-02 / R03), single host and file,
 - Reporting: report contract, observation history, duplicate protection, verified current-status derivation, atomic ledger `record`, injectable and untrusted-checked ledger, SQLite ledger.
 - Pipeline with optional recovery that requires a strictly later fresh verdict (Option A), end-to-end tests over SQLite with restarts, startup and runtime failures.
 - Observability allow-list with error-class coverage (77 codes).
+- Founder phone test: a Twilio ConversationRelay call into the existing Intake agent, with consent, masking, a read-back and yes/no confirmation, confirmed and unconfirmed records, and owner screens fed by a strict allow-list (section 12). Run live at least twice on 2026-10-26; the fixes made after those calls are tested locally only.
 
 ## 7. Risks and open findings
 
@@ -72,7 +75,7 @@ Limits: no database-level tenant isolation (FND-02 / R03), single host and file,
 6. A ledger failure mid-batch can leave earlier triples recorded; re-sending is safe (repeats are duplicates).
 7. QC verdict time comes from QC's own clock.
 8. D-06 loop rule still open.
-9. **Backup risk:** most of this work exists only on this machine (section 9).
+9. **Backup risk:** the work since fc7d4bc (section 9) exists only on this machine until it is committed and pushed.
 
 ## 8. Memory roadmap
 
@@ -86,40 +89,54 @@ Memory (component 5, conversation memory) is tracked as register row FND-29, PEN
 
 LangGraph checkpointing and Temporal were compared (read-only) and not adopted: dependency policy, privacy, and no server. Our log plus `deriveStatuses(upToSeq)` plays the checkpoint/event-history role.
 
-## 9. GitHub backup state
+## 9. GitHub backup state (checked 2026-10-26)
 
-Branch `main`, remote `origin` = `https://github.com/doncelettabellamy-create/business-agent-platform`, **ahead of `origin/main` by 6 commits** (all intake work). Nothing from the Processing/QC/Reporting/pipeline/SQLite work is committed.
+Branch `main`, remote `origin` = `https://github.com/doncelettabellamy-create/business-agent-platform`. **HEAD fc7d4bc equals origin/main**: the platform work through the signed-URL fix is committed and pushed. The earlier description here ("ahead by 6 commits, nothing from Processing/QC/Reporting committed") is obsolete.
 
-- 7 tracked files modified (`ARCHITECTURAL_ESSENTIALS.md`, `docs/MASTER_BUILD_REGISTER.md`, `docs/blueprint/AGENT_SPECS.md`, `DEPLOYMENT_TESTING.md`, `PRD.md`, `poc/intake-runner/package.json`, `src/live-entry.ts`), plus this file.
-- 50 untracked files before this file: the plan, 21 `src` modules, 27 test and helper files (listed in the report that accompanied this handoff).
-- Ignored: only `poc/intake-runner/node_modules/`.
-- Secret scan of untracked and changed files (Anthropic, AWS, GitHub, Slack keys, private-key blocks, `.env`, `.pem`, `.key`, `.sqlite`, `.db`): nothing found. `.gitignore` also blocks `.env*`, `*.pem`, `*.key`, `credentials*.json`, `*secret*`. Note `*secret*` would silently ignore any file with that word in its name.
-- Line endings: Git warns LF will become CRLF on six files; harmless but expect noisy diffs.
+**Not committed: the work since fc7d4bc (18 tracked files modified, 5 new files).**
+- Modified: the four documents (plan, register, this handoff, the runbook); `poc/intake-runner/package.json`; `src/call-session.ts`, `dashboard-server.ts`, `founder-call-entry.ts`, `intake-record-store.ts`, `pii-screen.ts`, `relay-handler.ts`; the tests `founder-call`, `founder-dashboard`, `pii-screen`; and `prototype/intake-work-items/` (`app.js`, `data.js`, `index.html`, `styles.css`).
+- New: `src/owner-view.ts`; `tests/owner-view.test.ts`, `owner-dashboard.test.ts`, `prototype-empty-store.test.ts` and `tests/helpers/fake-dom.ts`. (A duplicate second owner page, `prototype/owner-view/` with its `/owner` routes and a page test, was built and then retired inside this same uncommitted work; it never reached a commit.)
+- Ignored and never to be committed: `node_modules/`, `founder-call.config.json` (holds the relay secret and the phone number), `founder-call.stop`, `*.sqlite*`.
+- No secret scan was run for this update; run one before any commit. Git warns that LF will become CRLF on some files; harmless but expect noisy diffs.
 
 ## 10. Governance
 
 - The plan and register are the source of truth; every status change needs evidence in tests or documents, and no label is raised without it.
-- Founder decisions are listed in plan section 11.5 (item 23) and register section 9.
+- Founder decisions are listed in plan section 11.5 (item 25) and register section 9.
 - Synthetic-only data until live use is separately approved; live gates exist in `live-run.ts` and are exercised only by tests with mocks.
 - Dependency policy: exactly one runtime dependency approach; adding anything needs approval.
 - Nothing is pushed or committed without an explicit request.
 
 ## 11. Next steps
 
-1. Back up to GitHub (founder's call): commit and push the work in section 9.
-2. Plan tie fix B (causal `follows` link) together with D-14. Option A is done (uncommitted until the founder asks).
-3. Composition root that builds entries from configuration.
-4. Decide D-14 (production database) and FND-02 (tenant isolation).
-5. Decide D-05 and C14, then start the memory work.
-6. Recovery scheduler, only after the above.
+1. Delete the pre-schema-2 database, restart the server in the founder's terminal and make a live call to try the read-back flow, the hang-up wait and the owner screens (runbook sections 7 to 10 and its acceptance checks).
+2. Review and commit the uncommitted work (section 9), after a secret scan; push only on the founder's request.
+3. Decide the test business's configuration: the live call was a cleaning request against the plumbing configuration, so it matched no category and had no fields for rooms or a time window.
+4. Decide whether to store a callback number (consent, retention, masking), so the owner can follow up; today the number is never read or stored.
+5. Plan tie fix B (causal `follows` link) together with D-14. Option A is done and committed.
+6. Composition root that builds entries from configuration.
+7. Decide D-14 (production database) and FND-02 (tenant isolation).
+8. Decide D-05 and C14, then start the memory work.
+9. Recovery scheduler, only after the above.
 
-## 12. Founder phone test (built and tested locally; not yet run)
+## 12. Founder phone test (run live at least twice; later fixes tested locally only)
 
-A real phone-to-dashboard test: dial a Twilio number, talk naturally to an AI assistant, see a validated Intake record on the existing dashboard prototype. Full steps, blockers and acceptance checks are in `docs/FOUNDER_PHONE_TEST_RUNBOOK.md`; status record is plan section 11.5 item 24.
+A real phone-to-dashboard test: dial a Twilio number, talk to an AI assistant, confirm what it reads back, and see the intake on the owner screens of the local dashboard. Steps, blockers and acceptance checks are in `docs/FOUNDER_PHONE_TEST_RUNBOOK.md`; the status record is plan section 11.5 item 24.
 
-- **Code** (`poc/intake-runner/src/`): `pii-screen.ts` (rule-based masker, fails closed), `call-session.ts` (consent, masked lines, caps), `dialogue-model.ts` (streaming Claude reply, masked text only; it never writes the record), `call-intake.ts` and the existing Intake agent (classify, extract, ground, validate: previews steer the conversation, one final run makes the record), `ws-server.ts` (minimal WebSocket server on `node:http` and `node:crypto`, signature-checked, 127.0.0.1), `relay-handler.ts`, `intake-record-store.ts` (SQLite), `dashboard-server.ts` (loopback, read-only, feeds the unchanged prototype), `founder-call-gate.ts`, `founder-call-entry.ts` (composition root; `npm run founder:check` is the dry run).
-- **Gate:** an opt-in founder tier in `intake-entry.ts` (one `ws-founder-` tenant); a digest-pinned approval (`FOUNDER_CALL_APPROVED_DIGEST`) plus `INTAKE_ALLOW_LIVE_CALLS=yes`; 30-day expiry; caps; kill-switch file. The synthetic-only gate and the reviewed-fixture path are unchanged.
-- **Not done / blockers to the first call:** founder decisions (gate tier, invented-persona rule, consent wording, Twilio retention, legal check, Anthropic terms, spend cap, Twilio AI addendum); accounts and keys (Twilio, `ANTHROPIC_API_KEY`, `TWILIO_AUTH_TOKEN`); a tunnel install; Twilio TwiML Bin and number setup. Unverified until the first call: which URL form Twilio signs, live Claude request shapes, voice billing, latency.
-- **Hardened after review (uncommitted):** the WebSocket needs a secret path as well as the signature, locks out repeated refusals, accepts at most `max_calls` calls per run and refuses repeated call ids; the masker handles spoken e-mail, number-less streets, post codes, honorifics and mid-sentence capitalised words, and fails closed on uncertainty.
-- **Risks:** a lower-case name or place that nothing introduces is still not masked (use an invented persona); the store and dashboard have no login, tenant isolation, encryption or retention; Twilio keeps its own logs (up to 30 days).
-- **Next step:** founder reads the runbook, decides section A, creates the accounts in section B; then the dry run and the first call.
+**What has happened (2026-10-26).** The Twilio account was upgraded, because ConversationRelay is blocked on trial accounts. At least two real calls reached the server and each saved a record (evidence: the two records in the local SQLite file, which carry the live Claude model label, and the founder's report; no server log was kept). The calls found problems: the assistant ended a call before confirming; digits read out one at a time were stored unmasked; a request outside the configured categories became `unknown_category` (a cleaning job against a plumbing configuration, with nothing listed as missing); and the old dashboard showed engineering labels and a misleading "data did not load" message on an empty store.
+
+**What was built in response (uncommitted; tested locally with invented data and stand-ins; not yet tried on a live call or looked at in a browser).**
+- *Read-back and confirmation* (`relay-handler.ts`, `call-session.ts`): when Intake is ready the server runs a fresh Intake pass and reads back the non-address fields in fixed words (never the address, never a placeholder). A short plain yes confirms exactly that item; a no or doubt asks what to change (at most two read-backs); an unclear answer is asked again once; 20 seconds of silence ends the call unconfirmed. The assistant is never told to wrap up while Intake is not ready.
+- *Confirmed versus unconfirmed records* (`intake-record-store.ts`, schema version 2): only a confirmed, ready record may be handed off. Every other ending is saved `needs-human`, not handed off, with the reason `not_confirmed`. `address_status` is `unverified` whenever an address was found, since it is never read back or checked. `eligibleForProcessing` (confirmed, ready, handed off, no unverified address) is the one test a future bridge to Processing must use. Nothing connects the phone path to Processing today.
+- *Hang-up*: waits for the closing line (a pad plus 70 ms per character, at most 15 s, never less than `after_speech_ms`); closing lines cannot be talked over. Whether Twilio's `end` cuts queued speech is undocumented.
+- *Masker*: digits read out one at a time or in groups are masked and refused as residual.
+- *Owner view* (`owner-view.ts`): a pure strict allow-list (nine fields per call and five counts; no confidence, codes, masks, steps, versions, ids or address value; no wording that implies a booking; "Intakes received today" in the owner's day). `dashboard-server.ts` serves it as `/data.js` and `/api/owner` under one strict page policy; the old `/api/items`, the invented `rejectedToday`, placeholder versions and fabricated step trace are gone.
+- *Owner screens* (`prototype/intake-work-items`): the Work Items list and the page for one intake were rewritten for the business owner (totals, a follow-up tab, "Requested time (not booked)", next steps, auto-refresh every 15 s, no engineering labels, no prototype controls). Its `data.js` is now an invented sample for opening the folder alone. There is no other owner page: the earlier duplicate at `/owner` was retired, so `/` is the only dashboard and the startup message prints that one address.
+
+**Earlier code** (`poc/intake-runner/src/`): `pii-screen.ts` (rule-based masker, fails closed), `call-session.ts`, `dialogue-model.ts` (streaming Claude reply, masked text only; it never writes the record), `call-intake.ts` and the existing Intake agent, `ws-server.ts` (minimal WebSocket server, signature and secret path, 127.0.0.1), `relay-handler.ts`, `intake-record-store.ts` (SQLite), `dashboard-server.ts`, `founder-call-gate.ts`, `founder-call-entry.ts` (composition root; `npm run founder:check` is the dry run).
+
+**Gate (unchanged):** an opt-in founder tier in `intake-entry.ts` (one `ws-founder-` tenant); a digest-pinned approval (`FOUNDER_CALL_APPROVED_DIGEST`) plus `INTAKE_ALLOW_LIVE_CALLS=yes`; 30-day expiry; call and Claude-call caps; kill-switch file; one call at a time; call-id replay refusal; the secret path plus Twilio's signature. The synthetic-only gate and the reviewed-fixture path are unchanged. The approval digest is unchanged by the work above.
+
+**Unverified until a live call:** the read-back flow and how well Twilio's speech-to-text hears yes and no; the hang-up wait; the owner screens in a real browser; which URL form Twilio signs; voice billing; latency and naturalness.
+
+**Risks:** a lower-case name or place that nothing introduces is still not masked (use an invented persona); place names are masked as if they were names; the store and dashboard have no login, tenant isolation, encryption or retention (FND-02 / R01, FND-10, C14); no callback number is stored; Twilio keeps its own logs (up to 30 days); a quick tunnel gets a new host each time it restarts, which means a new config, secret, digest and TwiML Bin.

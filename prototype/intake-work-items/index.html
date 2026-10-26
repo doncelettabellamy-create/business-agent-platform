@@ -4,42 +4,28 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
-  <title>Work items (prototype)</title>
+  <meta name="color-scheme" content="light dark">
+  <title>Phone intakes</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <a class="skip-link" href="#content">Skip to content</a>
-  <div class="app">
-    <nav class="rail" aria-label="Main">
-      <div class="brand"><span class="brand-name">&lt;Product&gt;</span><span class="brand-short" aria-hidden="true">&lt;P&gt;</span><small>Prototype, synthetic data</small></div>
-      <ul class="nav">
-        <li>
-          <a href="#/" aria-current="page" id="nav-work-items">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
-            <span class="label">Work items</span>
-          </a>
-        </li>
-      </ul>
-      <p class="rail-note">Other areas (approvals, agents, usage, audit, settings) are not part of the pilot and are not shown.</p>
-    </nav>
-
-    <div class="main-col">
-      <header class="topbar">
-        <span class="topbar-brand">&lt;Product&gt;</span>
-        <span class="mode-banner" id="mode-banner">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
-          Shadow mode: nothing is sent.
-        </span>
-        <span class="user">Staff user (synthetic)</span>
-      </header>
-      <div class="banners" id="banners" aria-live="polite"></div>
-      <main id="content" tabindex="-1"></main>
+  <a class="skip" href="#content">Skip to the content</a>
+  <header class="top">
+    <div class="wrap top-row">
+      <span class="site">Phone assistant</span>
+      <div class="top-actions">
+        <span id="updated" class="updated" role="status"></span>
+        <button id="refresh" class="btn" type="button">Refresh</button>
+      </div>
     </div>
+  </header>
+  <div class="wrap">
+    <div id="banner" class="banner" role="status" hidden></div>
   </div>
-  <div id="live" class="sr-only" aria-live="polite" role="status"></div>
-
+  <main id="content" class="wrap" tabindex="-1"></main>
+  <div id="live" class="sr" aria-live="polite"></div>
+  <noscript><p class="wrap">This page needs JavaScript to show your phone intakes.</p></noscript>
   <script src="data.js"></script>
   <script src="app.js"></script>
-  <noscript>This prototype needs JavaScript to show the synthetic data.</noscript>
 </body>
 </html>

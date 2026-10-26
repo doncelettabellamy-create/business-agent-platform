@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto';
 import { isRecord } from './contracts.ts';
 import { piiProblems } from './pii-screen.ts';
 
-export const RECORD_SCHEMA_VERSION = '1';
+export const RECORD_SCHEMA_VERSION = '2';   // 2: records carry `confirmation` and `address_status`; a version-1 file is refused (delete it)
 const KIND = 'intake-records';
 const TENANT = /^[A-Za-z0-9_.:-]{1,64}$/;
 const CALL_REF = /^[0-9a-f]{16}$/;
@@ -38,6 +38,18 @@ export interface IntakeRecord {
   versions: { skill: string; model: string; prompt: string };
   handed_off: boolean;
   turns: number;
+  /** 'confirmed' only when the caller said yes to a read-back of exactly these values; every other way a call can end is 'unconfirmed'. */
+  confirmation: 'confirmed' | 'unconfirmed';
+  /** 'unverified' when an address was found: it is never read back or checked in this test, so a person must check it. Otherwise 'none'. */
+  address_status: 'unverified' | 'none';
+}
+export const NOT_CONFIRMED = 'not_confirmed';
+/**
+ * The one predicate a future bridge to Processing may use: confirmed by the caller, ready, handed off, and with no unverified address.
+ * (Nothing connects this store to Processing today.)
+ */
+export function eligibleForProcessing(r: IntakeRecord): boolean {
+  return r.confirmation === 'confirmed' && r.status === 'ready' && r.handed_off === true && r.address_status === 'none';
 }
 export type PutResult = 'new' | 'duplicate';
 export interface IntakeRecordStore {
@@ -63,7 +75,7 @@ export function nodeSupportsSqlite(version: unknown): boolean {
   return major > 24 || (major === 24 && minor >= 15);
 }
 
-const KEYS = 'call_ref,category,confidence,fields,handed_off,item_id,missing_fields,pii_summary,reasons,received_at,status,turns,versions,workspace_id';
+const KEYS = 'address_status,call_ref,category,confidence,confirmation,fields,handed_off,item_id,missing_fields,pii_summary,reasons,received_at,status,turns,versions,workspace_id';
 const text = (v: unknown, max = 200): v is string => typeof v === 'string' && v.length <= max;
 
 /** Throws RecordRefused unless `r` is exactly the safe shape for `tenant` and nothing in it looks personal. */
@@ -76,6 +88,16 @@ export function assertSafeRecord(tenant: string, r: unknown): asserts r is Intak
   if (!text(x.received_at) || !TIME.test(x.received_at) || !text(x.category, 100)) bad();
   if (x.status !== 'ready' && x.status !== 'needs-human') bad();
   if (typeof x.handed_off !== 'boolean' || (x.handed_off && x.status !== 'ready')) bad();
+  // Confirmation: only a caller's yes to the read-back makes a record hand-off-able; anything else is held for a person.
+  if (x.confirmation !== 'confirmed' && x.confirmation !== 'unconfirmed') bad();
+  if (x.address_status !== 'unverified' && x.address_status !== 'none') bad();
+  if (x.handed_off && x.confirmation !== 'confirmed') bad();
+  const reasonList = x.reasons;
+  if (Array.isArray(reasonList)) {
+    const flagged = reasonList.includes(NOT_CONFIRMED);
+    if (x.confirmation === 'unconfirmed' && (!flagged || x.status !== 'needs-human' || x.handed_off)) bad();
+    if (x.confirmation === 'confirmed' && flagged) bad();
+  }
   if (!Number.isInteger(x.turns) || (x.turns as number) < 0 || (x.turns as number) > 1000) bad();
   if (x.confidence !== null && (typeof x.confidence !== 'number' || !(x.confidence >= 0 && x.confidence <= 1))) bad();
   for (const k of ['reasons', 'missing_fields'] as const) {
@@ -90,6 +112,8 @@ export function assertSafeRecord(tenant: string, r: unknown): asserts r is Intak
     if (!text(y.name, 100) || typeof y.found !== 'boolean' || !(y.value === null || text(y.value)) || (y.found !== (y.value !== null))) bad();
     if (y.confidence !== null && (typeof y.confidence !== 'number' || !(y.confidence >= 0 && y.confidence <= 1))) bad();
   }
+  const addressFound = (f as RecordField[]).some((e) => e.found && /address/i.test(e.name));
+  if (x.address_status !== (addressFound ? 'unverified' : 'none')) bad();
   const p = x.pii_summary;
   if (!Array.isArray(p) || p.length > 10) bad();
   for (const e of p as unknown[]) {

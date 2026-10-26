@@ -24,7 +24,7 @@ import type { DialogueClient, DialogueParams, StreamEvent } from './dialogue-mod
 import { createIntakeRecordStore } from './intake-record-store.ts';
 import { createDashboardServer } from './dashboard-server.ts';
 import { createRelayWsServer } from './ws-server.ts';
-import { createRelayHandler } from './relay-handler.ts';
+import { createRelayHandler, speechDelayMs } from './relay-handler.ts';
 import { claudeCeilingUsd, founderConfigDigest, founderConfigProblems, founderGateProblems, relayPathFor, signedUrlCandidates } from './founder-call-gate.ts';
 import { randomBytes } from 'node:crypto';
 import type { FounderCallConfig } from './founder-call-gate.ts';
@@ -78,7 +78,7 @@ console.log(`  [${gate.length === 0 ? 'ok' : '--'}] ${gate.length === 0 ? 'all c
 console.log('\nTwilio TwiML Bin (paste into a TwiML Bin, then point the number\'s voice webhook at it):\n');
 console.log(twimlFor(config.public_wss_url));
 console.log(`A fresh random secret for the address, if you need one (generate your own each time; never reuse): ${randomBytes(24).toString('base64url')}`);
-console.log(`Local only: phone endpoint 127.0.0.1:${config.relay_port} (the tunnel forwards the public address to this port), dashboard http://127.0.0.1:${config.dashboard_port}/`);
+console.log(`Local only: phone endpoint 127.0.0.1:${config.relay_port} (the tunnel forwards the public address to this port), owner dashboard http://127.0.0.1:${config.dashboard_port}/`);
 if (!serve) { console.log('\nNo port was opened and nothing was sent.'); process.exit(0); }
 if (gate.length > 0) { for (const g of gate) console.error(`serve refused: ${g}`); process.exit(78); }
 
@@ -118,6 +118,7 @@ const handler = createRelayHandler({
   },
   dialogue, store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,
   now: () => Date.now(), nowIso, killed: () => existsSync(config.kill_file), afterSpeechMs: config.after_speech_ms,
+  speechMs: (text) => speechDelayMs(text), confirmWaitMs: 20_000,
   log: (code, detail) => console.log(`[founder-call] ${nowIso()} ${code}${detail ? ' ' + JSON.stringify(detail) : ''}`),
 });
 const staticDir = fileURLToPath(new URL('../../../prototype/intake-work-items', import.meta.url));
@@ -125,6 +126,6 @@ const dashboard = createDashboardServer({ store, tenant, staticDir });
 const relay = createRelayWsServer({ path: relayPathFor(config.public_wss_url), authToken: twilioToken as string, urls: signedUrlCandidates(config.public_wss_url), maxConnections: 2, onConnection: (c) => handler.handle(c) });
 await dashboard.listen(config.dashboard_port);
 await relay.listen(config.relay_port);
-console.log(`\nServing. Dashboard: http://127.0.0.1:${config.dashboard_port}/   Phone endpoint (local): 127.0.0.1:${config.relay_port}/relay`);
+console.log(`\nServing. Owner dashboard: http://127.0.0.1:${config.dashboard_port}/   Phone endpoint (local): 127.0.0.1:${config.relay_port}/relay`);
 console.log(`Kill switch: create the file "${config.kill_file}" to end calls. Stop everything with Ctrl+C.`);
 process.on('SIGINT', () => { void (async () => { await relay.close(); await dashboard.close(); store.close(); process.exit(0); })(); });

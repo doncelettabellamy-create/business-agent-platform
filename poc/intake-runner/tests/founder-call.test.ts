@@ -13,11 +13,11 @@ import { createClaudeProvider } from '../src/claude-provider.ts';
 import { createClaudeDialogueModel } from '../src/dialogue-model.ts';
 import type { DialogueModel } from '../src/dialogue-model.ts';
 import { mintExecutionContext } from '../src/execution-context.ts';
-import { callRefFor, createIntakeRecordStore, RecordRefused } from '../src/intake-record-store.ts';
+import { callRefFor, createIntakeRecordStore, eligibleForProcessing, RecordRefused } from '../src/intake-record-store.ts';
 import type { IntakeRecordStore } from '../src/intake-record-store.ts';
 import { createDashboardServer } from '../src/dashboard-server.ts';
 import { createRelayWsServer } from '../src/ws-server.ts';
-import { createRelayHandler, SAY } from '../src/relay-handler.ts';
+import { createRelayHandler, MORE_ABOUT_REQUEST, readBackText, SAY, speechDelayMs } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 
 const TOKEN = 'test-auth-token-0123456789';
@@ -65,7 +65,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -88,7 +88,7 @@ async function rig(o: RigOptions = {}) {
     },
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
     limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
-    killed: () => killed.v, afterSpeechMs: 0, log: (code, detail) => { logs.push({ code, detail }); },
+    killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, log: (code, detail) => { logs.push({ code, detail }); },
   });
   const ws = createRelayWsServer({ path: SECRET_PATH, authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, lockout: { failures: 100, windowMs: 60_000 }, onConnection: (c) => handler.handle(c) });
   const port = await ws.listen(0);
@@ -123,8 +123,11 @@ test('a natural call becomes a validated record on the dashboard, with no person
   say(sim, 'The address is 42 Elm Street, you can reach me on 555 010 0199');
   await reply(r, sim);
   say(sim, 'Thanks, that is all');
-  const last = await reply(r, sim);
-  assert.match(last.token, /^$/);
+  const readBack = await reply(r, sim);   // Intake is ready: the server reads back the job (never the address) and asks for a yes or no
+  assert.match(readBack.token, /^Let me check what I have\. Job description: burst pipe\. Is that correct\? Please say yes or no\.$/);
+  say(sim, 'yes that is right');
+  const closing = await sim.next((m) => m.type === 'text' && m.token === SAY.thanks);
+  assert.equal(closing.interruptible, false, 'the closing line cannot be talked over');
   await sim.next((m) => m.type === 'end');
   await sim.closed;
   await r.handler.idle();
@@ -133,17 +136,20 @@ test('a natural call becomes a validated record on the dashboard, with no person
   // The record: made by the existing Intake agent over the masked lines.
   const [rec] = r.store.list(T);
   assert.ok(rec, JSON.stringify(r.logs));
-  assert.deepEqual([rec.status, rec.category, rec.handed_off, rec.missing_fields, rec.reasons, rec.turns], ['ready', 'Emergency leak', true, [], [], 3]);
+  assert.deepEqual([rec.status, rec.category, rec.handed_off, rec.missing_fields, rec.reasons, rec.turns], ['ready', 'Emergency leak', true, [], [], 4]);
+  assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec)], ['confirmed', 'unverified', false], 'confirmed, but the address was never checked, so it is not processable on its own');
   assert.deepEqual(rec.fields.map((f) => [f.name, f.value, f.found]), [['Address', '[ADDRESS_1]', true], ['Job description', 'burst pipe', true], ['Preferred date', null, false]]);
   assert.deepEqual(rec.pii_summary, [{ type: 'Person', count: 1 }, { type: 'Address', count: 1 }, { type: 'Contact detail', count: 1 }]);
   assert.equal(rec.call_ref, callRefFor(T, SID(1)));
-  assert.deepEqual(r.claude.counts, { intake: 8, dialogue: 4 }, 'three previews and the final run, two model calls each; four spoken replies');
+  assert.deepEqual(r.claude.counts, { intake: 6, dialogue: 3 }, 'three Intake runs (the last awaited, then read back and confirmed), two model calls each, and no second run after the yes; three spoken replies, the read-back being the server\'s own');
 
   // The dashboard shows it.
-  const api: any = await (await r.dashGet('/api/items')).json();
-  assert.deepEqual(api.items.map((i: any) => [i.id, i.status, i.category, i.handedOff]), [[rec.item_id, 'ready', 'Emergency leak', true]]);
+  const api: any = await (await r.dashGet('/api/owner')).json();
+  assert.deepEqual(api.calls.map((c: any) => [c.request, c.summary, c.statusText, c.addressGiven]), [['Emergency leak', 'burst pipe', 'Confirmed by the caller', true]]);
+  assert.deepEqual(api.calls[0].nextActions, ['Verify the address with the caller.']);
   const page = await (await r.dashGet('/data.js')).text();
-  assert.ok(page.includes('Emergency leak') && page.includes('[ADDRESS_1]') && page.includes('Phone (founder test)'));
+  assert.ok(page.includes('Emergency leak') && page.includes('burst pipe'));
+  for (const hidden of ['[ADDRESS_1]', 'confidence', 'wi-', rec.item_id, 'needs-human']) assert.ok(!page.includes(hidden) && !JSON.stringify(api).includes(hidden), `the owner's page must not contain "${hidden}"`);
 
   // Privacy: nothing the caller said that is personal reached the model, the phone provider's answers, the logs, the file or the dashboard.
   noSecrets('what Claude was sent', JSON.stringify(r.claude.sent));
@@ -289,7 +295,8 @@ test('hanging up mid-call still produces the record from what was said', async (
   sim.end(); await sim.closed;
   await waitFor(() => r.store.list(T).length === 1);
   const [rec] = r.store.list(T);
-  assert.deepEqual([rec.status, rec.category, rec.turns], ['ready', 'Emergency leak', 1]);
+  assert.deepEqual([rec.status, rec.category, rec.turns, rec.confirmation, rec.handed_off], ['needs-human', 'Emergency leak', 1, 'unconfirmed', false], 'hanging up is never a confirmation');
+  assert.ok(rec.reasons.includes('not_confirmed'));
   noSecrets('the file', readFileSync(r.path).toString('latin1'));
 });
 
@@ -363,7 +370,9 @@ test('a failing Intake model is never trusted: the record goes to a person (mode
   assert.deepEqual([rec.status, rec.handed_off], ['needs-human', false]);
   assert.ok(rec.reasons.includes('model_failed'));
   const page = await (await r.dashGet('/data.js')).text();
-  assert.ok(page.includes('"status":"needs-human"') && page.includes('model_failed'));
+  const api: any = await (await r.dashGet('/api/owner')).json();
+  assert.deepEqual([api.calls[0].statusText, api.calls[0].needsFollowUp], ['Not confirmed by the caller', true]);
+  assert.ok(!page.includes('model_failed') && !page.includes('needs-human'), 'no code reaches the owner');
   noSecrets('anything', page + JSON.stringify(r.logs) + allText(sim));
 });
 
@@ -401,11 +410,11 @@ test('spoken details in the way speech-to-text writes them (spoken e-mail, a str
   const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
   say(sim, 'There is a burst pipe in the kitchen. I live on Willow Street in Riverside and the post code is SW1A 1AA'); await reply(r, sim);
   say(sim, 'My email is priya at example dot com and Mrs Raman next door can let you in'); await reply(r, sim);
-  // Intake already had what it needed after the first turn, so this second turn is the closing one and the call ends by itself.
-  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  // Intake already had what it needed after the first turn, so this second turn is answered with the read-back; a yes closes the call.
+  say(sim, 'yes'); await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
   const spoken = ['Willow', 'Riverside', 'SW1A', '1AA', 'priya', 'example dot com', 'Raman'];
   const everywhere = JSON.stringify(r.claude.sent) + allText(sim) + JSON.stringify(r.logs) + readFileSync(r.path).toString('latin1')
-    + (await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/items')).json());
+    + (await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/owner')).json());
   for (const s of spoken) assert.ok(!everywhere.toLowerCase().includes(s.toLowerCase()), `"${s}" must not appear anywhere`);
   const [rec] = r.store.list(T);
   assert.ok(rec, JSON.stringify(r.logs));
@@ -491,4 +500,182 @@ test('refused setups do not use up the call budget', async () => {
 test('setup validation: the handler needs every dependency', () => {
   assert.throws(() => createRelayHandler(undefined as never), RangeError);
   assert.throws(() => createRelayHandler({} as never), RangeError);
+});
+
+// ---------------------------------------------------------------- read-back and confirmation
+/** Consent, a job, an address, then a closing remark: the turn after which Intake is ready and the server reads back. Returns the read-back message. */
+async function toReadback(r: Rig, sim: Sim, sid = SID(1)) {
+  setup(sim, { sid }); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  say(sim, 'The address is 42 Elm Street'); await reply(r, sim);
+  say(sim, 'That is all');
+  return reply(r, sim);
+}
+const ended = async (sim: Sim, r: Rig) => { await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle(); };
+
+test('read-back: the server reads back the job in fixed words, never the address or a placeholder; a yes confirms exactly that item with no further Intake run', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  const rb = await toReadback(r, sim);
+  assert.equal(rb.token, 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.');
+  for (const s of ['Elm', '42', 'ADDRESS', '[', ']']) assert.ok(!rb.token.includes(s), `the read-back must not contain "${s}"`);
+  assert.equal(rb.interruptible, undefined, 'the caller may answer over a read-back');
+  assert.equal(r.store.list(T).length, 0, 'nothing is saved before the answer');
+  const before = { ...r.claude.counts };
+  say(sim, 'yes'); await ended(sim, r);
+  assert.deepEqual(r.claude.counts, before, 'a yes costs no further model call');
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.address_status, rec.reasons], ['confirmed', 'ready', true, 'unverified', []]);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK') && r.logs.some((l) => l.code === 'CONFIRMED'));
+  noSecrets('what was said to the caller', allText(sim)); noSecrets('what Claude was sent', JSON.stringify(r.claude.sent)); noSecrets('the logs', JSON.stringify(r.logs));
+  noSecrets('the file', readFileSync(r.path).toString('latin1'));
+});
+
+test('read-back: a no asks what to change, listens, and reads back again; a yes then confirms the corrected item', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  await toReadback(r, sim);
+  say(sim, 'no that is not right');
+  assert.equal((await reply(r, sim)).token, SAY.correct);
+  assert.equal(r.store.list(T).length, 0);
+  say(sim, 'it is tomorrow morning');
+  const second = await reply(r, sim);
+  assert.match(second.token, /Job description: burst pipe\. Preferred date: tomorrow morning\. Is that correct/);
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.fields.find((f) => f.name === 'Preferred date')?.value], ['confirmed', true, 'tomorrow morning']);
+});
+
+test('read-back: two noes end the call unconfirmed; the record is held for a person, not handed off, and says why', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  await toReadback(r, sim);
+  say(sim, 'no'); await reply(r, sim);
+  say(sim, 'it is something else entirely'); const again = await reply(r, sim);
+  assert.match(again.token, /^Let me check what I have\./);
+  say(sim, 'no'); await ended(sim, r);
+  assert.ok(sim.messages.some((m) => m.token === SAY.unconfirmed && m.interruptible === false));
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.reasons.includes('not_confirmed'), eligibleForProcessing(rec)], ['unconfirmed', 'needs-human', false, true, false]);
+  assert.ok(r.logs.some((l) => l.code === 'UNCONFIRMED'));
+});
+
+test('read-back: an unclear answer is asked for once more, and a second one ends the call unconfirmed', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  await toReadback(r, sim);
+  say(sim, 'hmm what was that'); assert.equal((await reply(r, sim)).token, SAY.yesno);
+  say(sim, 'banana'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off], ['unconfirmed', 'needs-human', false]);
+});
+
+test('read-back: a clear yes after one unclear answer still confirms', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  await toReadback(r, sim);
+  say(sim, 'pardon'); await reply(r, sim);
+  say(sim, 'yes please'); await ended(sim, r);
+  assert.equal(r.store.list(T)[0].confirmation, 'confirmed');
+});
+
+test('read-back: silence after the read-back ends the call unconfirmed with a fixed line; an answer in time is not cut off by the timer', async () => {
+  const quiet = await rig({ confirmWaitMs: 150 });
+  const a = await quiet.connect();
+  await toReadback(quiet, a);
+  assert.equal((await a.next((m) => m.token === SAY.silence)).interruptible, false);
+  await ended(a, quiet);
+  assert.deepEqual([quiet.store.list(T)[0].confirmation, quiet.logs.some((l) => l.code === 'CONFIRM_TIMEOUT')], ['unconfirmed', true]);
+
+  const timely = await rig({ confirmWaitMs: 500 });
+  const b = await timely.connect();
+  await toReadback(timely, b);
+  await new Promise((res) => setTimeout(res, 150));
+  say(b, 'yes'); await ended(b, timely);
+  await new Promise((res) => setTimeout(res, 600));
+  assert.deepEqual([timely.store.list(T)[0].confirmation, timely.logs.some((l) => l.code === 'CONFIRM_TIMEOUT')], ['confirmed', false]);
+});
+
+test('read-back: hanging up before answering saves one unconfirmed record, never a confirmed one', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  await toReadback(r, sim);
+  sim.end(); await sim.closed;
+  await waitFor(() => r.store.list(T).length === 1);
+  await r.handler.idle();
+  const recs = r.store.list(T);
+  assert.equal(recs.length, 1);
+  assert.deepEqual([recs[0].confirmation, recs[0].status, recs[0].handed_off], ['unconfirmed', 'needs-human', false]);
+});
+
+test('read-back: every other ending (turn cap, a dialogue failure) is saved unconfirmed too', async () => {
+  const capped = await rig({ limits: { maxTurns: 1 } });
+  const a = await capped.connect(); setup(a); say(a, 'yes'); await reply(capped, a);
+  say(a, 'burst pipe, the address is 42 Elm Street'); await reply(capped, a);
+  say(a, 'one more thing'); await ended(a, capped);
+  const [rec] = capped.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off], ['unconfirmed', 'needs-human', false]);
+});
+
+test('not ready, nothing missing (an unknown category): the dialogue model is never told to wrap up, so it cannot say "recorded, goodbye" while the call stays open', async () => {
+  const r = await rig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a cleaning service for four rooms'); await reply(r, sim);
+  say(sim, 'between nine and one tomorrow'); await reply(r, sim);
+  say(sim, 'it is also the zip 9 1 3 6 4'); await reply(r, sim);
+  const systems = r.claude.sent.filter((p) => p.stream).map((p) => String(p.system));
+  assert.ok(systems.length >= 4);
+  for (const s of systems) assert.ok(!/MISSING: none/.test(s), `the model was told to wrap up: ${s.slice(-80)}`);
+  assert.ok(systems.slice(1).some((s) => s.endsWith(`MISSING: ${MORE_ABOUT_REQUEST}`)), 'it is asked for more about the request instead');
+  assert.equal(sim.messages.some((m) => m.type === 'end'), false, 'the call is still open');
+  sim.end(); await sim.closed;
+  await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.status, rec.missing_fields, rec.confirmation, rec.handed_off], ['unknown', 'needs-human', [], 'unconfirmed', false], 'the situation this test is about: not ready, nothing listed as missing');
+  noSecrets('what Claude was sent', JSON.stringify(r.claude.sent));
+  for (const s of ['9 1 3 6 4', '91364']) {
+    assert.ok(!JSON.stringify(r.claude.sent).includes(s) && !JSON.stringify(rec).includes(s) && !readFileSync(r.path).toString('latin1').includes(s), `"${s}" must not appear`);
+  }
+});
+
+test('hang-up: the call is not ended before the closing line has had time to play, and the closing line cannot be talked over', async () => {
+  const slow = await rig({ speechMs: () => 600 });
+  const a = await slow.connect();
+  await toReadback(slow, a);
+  say(a, 'yes');
+  await a.next((m) => m.token === SAY.thanks);
+  const t0 = Date.now();
+  await a.next((m) => m.type === 'end');
+  assert.ok(Date.now() - t0 >= 450, `the end came after ${Date.now() - t0} ms`);
+  await a.closed; await slow.handler.idle();
+  assert.equal(slow.store.list(T)[0].confirmation, 'confirmed');
+});
+
+test('hang-up: a closing line that is already played out does not delay the end', async () => {
+  const fast = await rig({ speechMs: () => 0 });
+  const a = await fast.connect();
+  await toReadback(fast, a);
+  say(a, 'yes');
+  await a.next((m) => m.token === SAY.thanks);
+  const t0 = Date.now();
+  await a.next((m) => m.type === 'end');
+  assert.ok(Date.now() - t0 < 400);
+  await a.closed; await fast.handler.idle();
+});
+
+test('read-back text: only found, non-address fields, in fixed words; placeholders and personal-looking values are never spoken', () => {
+  const f = (name: string, value: string | null) => ({ name, value, confidence: value === null ? null : 0.9, found: value !== null });
+  const item = (fields: ReturnType<typeof f>[]) => ({ fields }) as never;
+  assert.equal(readBackText(item([f('Address', '[ADDRESS_1]'), f('Job description', 'burst pipe'), f('Preferred date', null)])), 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.');
+  assert.equal(readBackText(item([f('Address', '[ADDRESS_1]')])), 'Let me check what I have. I have your request. Is that correct? Please say yes or no.');
+  assert.equal(readBackText(item([f('Job description', 'leak near [ADDRESS_2] again')])), 'Let me check what I have. Job description: leak near a detail you gave again. Is that correct? Please say yes or no.');
+  assert.equal(readBackText(item([f('Job description', 'call 555 010 0199'), f('Home Address line', 'x')])), 'Let me check what I have. I have your request. Is that correct? Please say yes or no.');
+  assert.ok(readBackText(item([f('Job description', 'x'.repeat(500))])).length < 220, 'a long value is cut');
+});
+
+test('hang-up delay: a fixed pad plus a time per character, never more than 15 seconds', () => {
+  assert.equal(speechDelayMs(''), 1500);
+  assert.equal(speechDelayMs('x'.repeat(100)), 1500 + 100 * 70);
+  assert.equal(speechDelayMs('x'.repeat(10_000)), 15_000);
+  assert.equal(speechDelayMs('hello', 0, 0), 0);
 });

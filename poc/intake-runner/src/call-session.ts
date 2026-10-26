@@ -30,6 +30,8 @@ export interface CallSession {
   /** Judges the caller's answer to the consent notice. Anything but a plain yes is a no. */
   consent(raw: unknown): 'granted' | 'declined';
   hear(raw: unknown): Hear;
+  /** Judges the caller's answer to the read-back (the MASKED line). A refusal wins over a yes, and a long answer is never a plain yes. */
+  answer(line: unknown): 'yes' | 'no' | 'unclear';
   /** Records what the assistant said in full. */
   said(text: string): void;
   /** The caller talked over the assistant: only the part actually spoken counts. */
@@ -45,6 +47,9 @@ export interface CallSession {
 
 const YES = /^\s*(?:yes|yeah|yep|yup|sure|ok|okay|i agree|i do|agreed|go ahead|that'?s fine|fine|alright|all right|absolutely|of course)\b/i;
 const NO = /\b(?:no|not|don'?t|do not|stop|never|nope|hang up|disagree)\b/i;
+const CONFIRM_YES = /^\s*(?:yes|yeah|yep|yup|correct|right|exactly|absolutely|affirmative|sure|ok|okay|that'?s (?:right|correct|fine|good)|that is (?:right|correct|fine|good))\b/i;
+const CONFIRM_NO = /\b(?:no|nope|not|wrong|incorrect|isn'?t|aren'?t|don'?t|do not|change|different|actually|wait|but)\b/i;
+const MAX_ANSWER_CHARS = 60;
 const MAX_DIALOGUE = 80;
 const MAX_ASSISTANT_CHARS = 600;
 
@@ -79,6 +84,11 @@ export function createCallSession(config: SessionConfig): CallSession {
       talk.push({ role: 'user', text: m.text });
       if (talk.length > MAX_DIALOGUE) talk = talk.slice(-MAX_DIALOGUE);
       return { ok: true, line: m.text };
+    },
+    answer(line: unknown): 'yes' | 'no' | 'unclear' {
+      if (typeof line !== 'string' || line.length === 0 || line.length > 400) return 'unclear';
+      if (CONFIRM_NO.test(line)) return 'no';
+      return line.length <= MAX_ANSWER_CHARS && CONFIRM_YES.test(line) ? 'yes' : 'unclear';
     },
     said(text: string): void {
       if (state !== 'active' || typeof text !== 'string' || text.length === 0) return;

@@ -38,11 +38,17 @@ const MAIL_HOST = /\bat\s+(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mai
 const URL_LIKE = /\bhttps?:\/\/\S+|\bwww\.\S+/gi;
 const PHONE_LIKE = /\+?\d[\d\s().-]{5,}\d/g;
 const SPOKEN_DIGITS = new RegExp(`\\b${NUM_WORD}(?:[\\s,.-]+${NUM_WORD}){4,}\\b`, 'gi');
-const ADDRESS_DIGITS = new RegExp(`\\b\\d{1,6}\\s+(?:[A-Za-z][A-Za-z'.-]*\\s+){0,3}${STREET}\\b\\.?`, 'gi');
+const ADDRESS_DIGITS = new RegExp(`\\b\\d{1,6}(?:[\\s,.-]+\\d{1,6})*\\s+(?:[A-Za-z][A-Za-z'.-]*\\s+){0,3}${STREET}\\b\\.?`, 'gi');
+/** Digits left standing right before an address placeholder: the number of a street whose name was masked but whose digits were not. */
+const DIGITS_BEFORE_ADDRESS = /\d(?:[\s,.-]+\d)*[\s,]*\[ADDRESS_\d{1,3}\]/;
 const ADDRESS_WORDS = new RegExp(`\\b(?:${NUM_WORD}|ten|eleven|twelve|(?:thir|four|fif|six|seven|eigh|nine)teen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)(?:[\\s-]+(?:${NUM_WORD}|ten|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)){0,4}\\s+(?:[A-Za-z][A-Za-z'.-]*\\s+){0,2}${STREET}\\b\\.?`, 'gi');
 const PO_BOX = /\bp\.?\s?o\.?\s+box\s+\w+/gi;
 const POSTCODE = /\b(?:[a-z]{1,2}\d[a-z\d]?\s?\d[a-z]{2}|[a-z]\d[a-z]\s?\d[a-z]\d)\b/gi;
 const LONG_DIGITS = /\d{5,}/g;
+/** Digits said one at a time or in groups ("1 5 9 5 1", "15 951", "1, 5, 9, 5, 1"): a zip code, a street number or an id read out, 5 or more digits in all. */
+const DIGIT_GROUPS = /\b\d{1,6}(?:\s+\d{1,6})+\b/g;
+const SINGLE_DIGITS = /\b\d(?:[\s,.-]+\d){4,}\b/g;
+const MIN_SPOKEN_DIGITS = 5;
 const MIXED_ID = /\b(?=[A-Za-z0-9-]*\d)(?=[A-Za-z0-9-]*[A-Za-z])[A-Za-z0-9-]{8,}\b/g;
 const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 const STOP = new Set(['a', 'an', 'the', 'about', 'calling', 'regarding', 'my', 'just', 'not', 'so', 'really', 'very', 'in', 'at', 'on', 'for', 'to', 'from', 'with', 'and', 'but', 'having', 'looking', 'trying', 'here', 'there', 'sorry', 'afraid', 'sure', 'ok', 'okay', 'yes', 'no']);
@@ -88,9 +94,10 @@ export function piiProblems(text: string): string[] {
   if (new RegExp(URL_LIKE.source, 'i').test(t)) out.push('url');
   for (const m of t.matchAll(PHONE_LIKE)) if (digitCount(m[0]) >= 7) { out.push('phone'); break; }
   if (new RegExp(SPOKEN_DIGITS.source, 'i').test(t)) out.push('spoken_digits');
-  if (new RegExp(ADDRESS_DIGITS.source, 'i').test(t) || new RegExp(ADDRESS_WORDS.source, 'i').test(t) || new RegExp(PO_BOX.source, 'i').test(t) || plainStreets(t).length > 0) out.push('address');
+  if (new RegExp(ADDRESS_DIGITS.source, 'i').test(t) || new RegExp(ADDRESS_WORDS.source, 'i').test(t) || new RegExp(PO_BOX.source, 'i').test(t) || plainStreets(t).length > 0 || DIGITS_BEFORE_ADDRESS.test(text)) out.push('address');
   if (new RegExp(POSTCODE.source, 'i').test(t)) out.push('postcode');
   if (/\d{5,}/.test(t)) out.push('digits');
+  else if (new RegExp(SINGLE_DIGITS.source).test(t) || [...t.matchAll(DIGIT_GROUPS)].some((m) => digitCount(m[0]) >= MIN_SPOKEN_DIGITS)) out.push('digits');
   if (new RegExp(MIXED_ID.source).test(t)) out.push('identifier');
   return out;
 }
@@ -209,6 +216,9 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
       // 4b. Cues: "my e-mail / phone / number is ..." and "my address is ...", "I live at ...": whatever follows, if not already masked, is masked.
       t = eachSegment(t, (s) => subCue(s, CONTACT_CUE, 'Contact detail'));
       t = eachSegment(t, (s) => subCue(s, ADDRESS_CUE, 'Address'));
+      // 4b'. Digits read out on their own ("the zip is 9 1 3 6 4"): after the cues, so "my address is ..." still counts as an address.
+      t = eachSegment(t, (s) => sub(s, SINGLE_DIGITS, 'Identifier'));
+      t = eachSegment(t, (s) => sub(s, DIGIT_GROUPS, 'Identifier', (m) => digitCount(m) >= MIN_SPOKEN_DIGITS));
       // 4c. Anything left that is still a trace of an e-mail address ("dot com", "at gmail") is masked on its own.
       t = eachSegment(t, (s) => sub(sub(s, DOT_TLD, 'Contact detail'), MAIL_HOST, 'Contact detail'));
       // 4d. Capitalised words in the middle of a sentence are names or places.

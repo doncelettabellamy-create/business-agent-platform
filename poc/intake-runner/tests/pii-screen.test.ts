@@ -128,6 +128,52 @@ test('spoken personal data: ordinary speech about the job is left exactly as it 
   for (const text of plain) assert.deepEqual(createMasker().mask(text), { ok: true, text }, text);
 });
 
+test('spoken personal data: a street number said as separate digits is masked whole, with no digit left before the placeholder', () => {
+  const spoken = [
+    'It is 1 2 3 4 Oak Street', 'It is 1, 2, 3, 4 Oak Street', 'It is 12 34 Oak Street', 'The job is at 1 2 3 4 Oak Street in the morning',
+    'Fence repair at 4 2 Cedar Road next week', 'The place is 5 5 5 Maple Avenue please', 'It is 1-2-3-4 Oak Street', 'I live at 1 2 3 4 Oak Street', 'My address is 1 2 3 4 Oak Street',
+  ];
+  for (const text of spoken) {
+    const t = textOf(text);
+    assert.equal(/\d/.test(t.replace(/\[[A-Z]+_\d+\]/g, '')), false, `a digit survived: ${t}`);
+    assert.deepEqual(piiProblems(t), [], text);
+  }
+  assert.equal(textOf('It is 1 2 3 4 Oak Street'), 'It is [ADDRESS_1]');
+  assert.equal(textOf('I have 2 leaks and the tap has dripped for 3 days'), 'I have 2 leaks and the tap has dripped for 3 days', 'small numbers elsewhere are untouched');
+});
+
+test('spoken personal data: digits read out on their own (a zip code, a street number, an id) are masked, whatever the separator', () => {
+  const read: Array<[string, string]> = [
+    ['It is at 1 5 9 5 1 in the valley', 'It is at [ID_1] in the valley'], ['The zip code is 9 1 3 6 4', 'The zip code is [ID_1]'],
+    ['It is 1, 5, 9, 5, 1 near the school', 'It is [ID_1] near the school'], ['It is 1-5-9-5-1 near the school', 'It is [ID_1] near the school'],
+    ['Reference 15 951 please', 'Reference [ID_1] please'], ['my code is 1 2 3 4 5 6', 'my code is [ID_1]'], ['Call it 12 34 5', 'Call it [ID_1]'],
+  ];
+  for (const [said, masked] of read) {
+    assert.equal(textOf(said), masked, said);
+    assert.deepEqual(piiProblems(masked), [], masked);
+  }
+  assert.equal(textOf('My address is 1 5 9 5 1'), 'My address is [ADDRESS_1]', 'an address cue still makes it an address');
+  assert.equal(textOf('The address is 1 5 9 5 1 Oak Street'), 'The address is [ADDRESS_1]');
+});
+
+test('spoken personal data: numbers that are not identifiers are left alone', () => {
+  const plain = [
+    'We need a cleaning service for 4 rooms from 9 AM to 1 PM on October 27', 'between 2 and 3 in the afternoon', 'it has been 3 days', 'I have 2 leaks and 1 flood',
+    'at 9 30 in the morning', 'about 10 12 people', 'October 27th at 4', 'room 2 and room 3', 'one two three',
+  ];
+  for (const text of plain) assert.deepEqual(createMasker().mask(text), { ok: true, text }, text);
+});
+
+test('piiProblems: digits read out one at a time, or in groups, are named even when nothing masked them', () => {
+  for (const bad of ['It is 1 5 9 5 1', 'zip 9 1 3 6 4', 'It is 1, 5, 9, 5, 1', 'Reference 15 951', 'ok 12 34 5']) assert.deepEqual(piiProblems(bad), ['digits'], bad);
+  for (const ok of ['4 rooms from 9 to 1', 'it has been 3 days', 'at 9 30', 'about 10 12', 'It is [ID_1]']) assert.deepEqual(piiProblems(ok), [], ok);
+});
+
+test('piiProblems: digits left standing right before an address placeholder are named as an address problem; a placeholder alone is not', () => {
+  for (const bad of ['It is 1 2 3 [ADDRESS_1]', 'It is 12 [ADDRESS_1]', 'It is 1, 2, 3, [ADDRESS_1]', '4 2[ADDRESS_3]']) assert.deepEqual(piiProblems(bad), ['address'], bad);
+  for (const ok of ['It is [ADDRESS_1]', 'I have 2 jobs, one at [ADDRESS_1]', '[ADDRESS_2][ADDRESS_1]', 'about 3 days, then [ADDRESS_1]']) assert.deepEqual(piiProblems(ok), [], ok);
+});
+
 test('spoken personal data: a capitalised word in the middle of a sentence is treated as a name or place, a lone sentence-start word is not', () => {
   const m = createMasker();
   assert.equal((m.mask('Please send someone to Riverside') as { text: string }).text, 'Please send someone to [PERSON_1]');
@@ -174,6 +220,19 @@ test('session: consent must be a plain yes; anything else ends the call and clea
     const s = createCallSession(cfg()); assert.equal(s.consent(no), 'declined', String(no)); assert.equal(s.state, 'ended');
     assert.deepEqual(s.hear('anything'), { ok: false, code: 'ENDED' });
   }
+});
+
+test('session: the answer to a read-back is yes only for a short plain yes; any refusal or doubt wins; anything else is unclear', () => {
+  const s = createCallSession(cfg());
+  const yes = ['yes', 'Yes please', 'yeah', 'yep', 'correct', 'that is right', "that's correct", 'right', 'okay', 'absolutely', 'yes that is right'];
+  const no = ['no', 'No.', 'nope', 'that is not right', 'wrong', 'incorrect', 'yes but it is different', 'actually it is tomorrow', "that isn't it", 'yes and no', 'I do not think so'];
+  const unclear = ['', 'banana', 'hmm what was that', 'maybe', 'pardon', 'yes ' + 'and then I would like to say a great many other things about the job '.repeat(3), 'what', 'the pipe is in the kitchen'];
+  for (const t of yes) assert.equal(s.answer(t), 'yes', t);
+  for (const t of no) assert.equal(s.answer(t), 'no', t);
+  for (const t of unclear) assert.notEqual(s.answer(t), 'yes', t);
+  for (const t of ['banana', 'hmm what was that', 'maybe', 'pardon', '']) assert.equal(s.answer(t), 'unclear', t);
+  for (const t of [undefined, null, 12, {}, ['yes']]) assert.equal(s.answer(t as never), 'unclear');
+  assert.equal(s.answer('x'.repeat(401)), 'unclear');
 });
 
 test('session: only masked caller lines are kept, in order, and the dialogue holds masked text', () => {
