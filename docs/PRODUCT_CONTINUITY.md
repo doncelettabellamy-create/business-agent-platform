@@ -65,8 +65,8 @@ Each stage is shown to the founder before the next, and each keeps the dashboard
 ## 5. Verified state at the time of writing
 
 - **Tests:** **959 passing, 0 failing, 0 skipped** (a fresh full run of `npm test` in `poc/intake-runner` on 2026-10-26). Mocks and stand-ins only: this says nothing about live behaviour.
-- **Commits:** `b341fd6` ("Add read-back confirmation, owner dashboard and spaced-digit masking") holds 940 of the tests. The next commit, "Preserve dashboard product decision and add cleaning skill tests", adds this file, the documentation updates that point to it, and the 19 `skill-cleaning` tests (959 in all). Both are on local `main`, **ahead of `origin/main` by two commits, not pushed**. (A commit cannot contain its own hash; use `git log` for it.)
-- **Uncommitted:** nothing was pending when the second commit was made; re-check with `git status`.
+- **Commits that introduced the tests:** `b341fd6` ("Add read-back confirmation, owner dashboard and spaced-digit masking") introduced 940 of them; `2b720a5` ("Preserve dashboard product decision and add cleaning skill tests") added this file, the documentation updates that point to it, and the 19 `skill-cleaning` tests (959 in all). What is pushed is **not** kept in this file: run `git log origin/main..HEAD --oneline` for the commits that exist only on this machine, and `git status --short` for uncommitted files. A dated snapshot is in the handoff, section 9.
+- **Uncommitted:** run `git status --short`. Nothing was pending at the last commit when this was written (2026-10-26).
 - **Live evidence (2026-10-26):** at least two real calls reached the server and each saved a record. The first showed digits stored unmasked and an early hang-up; the second, a cleaning request against the plumbing configuration, was `unknown_category`, so no read-back ran and it was saved unconfirmed. Both were found, and the fixes are in code and tested locally.
 - **Running server:** a graceful restart onto the committed code was done on 2026-10-26 with a fresh schema-2 database; the plumbing skill is still the live configuration.
 - **Checklist roll-up (plan section 11):** 73 rows: 11 BUILT, 23 PARTIAL, 21 NOT STARTED, 18 BLOCKED. Of 17 requirements: 0 BUILT.
@@ -78,7 +78,7 @@ Each stage is shown to the founder before the next, and each keeps the dashboard
 - Switch the live configuration to the cleaning skill (`examples/skill-cleaning.json`): a new approval digest, a restart, then a live call that checks rooms, date, time window, read-back, "yes", and the owner screen.
 - Fix `address_status` so an address that was spoken but not extracted is still marked unverified (code, with tests).
 - Optionally record why a call ended (a fixed word on the record).
-- Push the two local commits (on the founder's word, after a final secret scan).
+- Push the local commits that `git log origin/main..HEAD` lists (on the founder's word, after a final secret scan).
 
 **Needs founder decisions**
 - Business name and services; the consent wording; whether a callback number is stored (consent, retention, a short legal check).
