@@ -1,6 +1,6 @@
 # Founder phone test: runbook and blockers
 
-Status 2026-10-26: **the local code is built and tested (867 mock tests); no real call has been placed.** Nothing has been installed, purchased, exposed or called. The authority for status is `docs/blueprint/PLATFORM_MASTER_PLAN.md` section 11.5 item 24.
+Status 2026-10-26: **the local code is built and tested (874 mock tests); no real call has been placed.** Nothing has been installed, purchased, exposed or called. The authority for status is `docs/blueprint/PLATFORM_MASTER_PLAN.md` section 11.5 item 24.
 
 All commands below are **PowerShell** and are run from the working folder:
 
@@ -66,13 +66,13 @@ So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before an
 
 ## Confirmed versus unverified
 
-**Confirmed locally (code and the 867 mock tests; no network):** consent gating; masking behaviour; secret-path, signature, lockout, call-budget and replay checks; tenant selection by dialed number; the Intake agent producing and validating the record; the SQLite store; the loopback dashboard and its isolation; the kill file, caps and failure handling; that persona details do not appear in any Claude request, reply to the phone provider, log, database file or dashboard output. These ran against a local fake of the Claude SDK client and a stand-in for Twilio.
+**Confirmed locally (code and the 874 mock tests; no network):** consent gating; masking behaviour; secret-path, signature, lockout, call-budget and replay checks; tenant selection by dialed number; the Intake agent producing and validating the record; the SQLite store; the loopback dashboard and its isolation; the kill file, caps and failure handling; that persona details do not appear in any Claude request, reply to the phone provider, log, database file or dashboard output. These ran against a local fake of the Claude SDK client and a stand-in for Twilio.
 
 **Read in Twilio's published documentation, never exercised:** the TwiML attributes used (`url`, `language`, `welcomeGreeting`, `welcomeGreetingInterruptible="none"`); the WebSocket messages (`setup` with `callSid`/`to`, `prompt` with `voicePrompt` and `last`, `interrupt` with `utteranceUntilInterrupt`, and our `text`/`end` replies); the need to accept the AI addendum; prices.
 
 **Unverified (a real call, or a small live check, is the only proof):**
 1. **Claude requests.** The streaming dialogue request (`stream: true` with `output_config: { effort: "low" }`) and the SDK's streaming event shape have never been sent. If the API rejects them the call fails right after consent with a spoken apology. This is the most likely first failure. The existing structured Intake requests have not been sent live either.
-2. **Which URL form Twilio signs** for the handshake (`wss://` or `https://`). The server accepts both and the signed URL includes the secret path. If every handshake is refused with 403, suspect this first.
+2. **Which URL form Twilio signs** for the handshake. The server accepts the configured address and its `https://` form, each with and without a trailing slash, and the same four without the port if the address names one (Twilio's pages say a trailing slash may fix a failed WebSocket validation and that the port is dropped when signing over HTTPS). The request path must still match the secret path exactly. If every handshake is refused with 403, suspect this first; a 404 would mean Twilio requested a different path.
 3. **Consent timing.** The code treats the caller's first completed utterance after the greeting as the consent answer. How Twilio treats speech during a non-interruptible greeting is unknown.
 4. **Trial limits.** Whether ConversationRelay works on a trial, how the trial notice interacts with the greeting, and whether the one auto-assigned number can be used.
 5. **Voice defaults.** Text-to-speech provider (ElevenLabs by default), speech-to-text provider (Deepgram), interruption and profanity filter use Twilio's defaults and are not set by us.

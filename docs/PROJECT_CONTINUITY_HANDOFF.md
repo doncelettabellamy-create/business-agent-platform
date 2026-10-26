@@ -33,9 +33,9 @@ credential -> mint context -> Intake -> Processing -> Quality Control -> Reporti
 
 Optional recovery in the pipeline (`recoverUncertain: true`): after an escalation caused by an uncertain human-approved step, QC reconciles once, and if something settled, one fresh verification is filed as a repeat attempt. The first outcome is never changed.
 
-## 4. Baseline: 867 tests
+## 4. Baseline: 874 tests
 
-`npm test` in `poc/intake-runner` on 2026-10-25: **867 tests, 867 pass, 0 fail** (about 9 seconds), run 2026-10-26 after the call-authentication and masking hardening. The register's "Test figure: 867 passed" matches. 848 of them are committed (f8fdbf7); the 19 new tests and the changes they cover are not yet committed.
+`npm test` in `poc/intake-runner` on 2026-10-25: **874 tests, 874 pass, 0 fail** (about 9 seconds), run 2026-10-26 after the signed-URL candidates were widened. The register's "Test figure: 874 passed" matches. 867 of them are committed (f15fcee); the 7 new tests and the change they cover are not yet committed.
 
 Newest files: `founder-call` (20), `founder-dashboard` (17), `founder-call-gate` (13), `pii-screen` (13), `ws-server` (11), `pipeline-recovery` (30, includes the strictly-later tests), `pipeline-ledger` (10), `reporting-ledger-sqlite` (53), `reporting-history` (29). Helpers are in `tests/helpers/` (ledger and store conformance, multi-process workers, real chains).
 

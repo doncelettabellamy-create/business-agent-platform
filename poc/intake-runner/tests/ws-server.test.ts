@@ -5,6 +5,7 @@ import { createHmac } from 'node:crypto';
 import { createRelayWsServer, signatureMatches, twilioSignature } from '../src/ws-server.ts';
 import type { RelayConnection } from '../src/ws-server.ts';
 import { clientFrame, connectRelay } from './helpers/twilio-sim.ts';
+import { signedUrlCandidates } from '../src/founder-call-gate.ts';
 
 const TOKEN = 'test-auth-token-0123456789';
 const PATH = '/relay/q7Zr2KfX9mWc4TbV8nHs1LpD6yGe3AuJ5oRi0NxE';
@@ -137,6 +138,27 @@ test('handler errors never break the server: a throwing onMessage is contained',
   await new Promise((r) => setTimeout(r, 60));
   const again = await open(s.port);
   assert.equal(again.status, 101);
+});
+
+test('signature forms: a handshake signed over the wss or https address, with or without a trailing slash, is accepted; any other form is refused', async () => {
+  const s = await start({ urls: signedUrlCandidates(URL_WSS), lockout: { failures: 100, windowMs: 60_000 }, maxConnections: 10 });
+  for (const form of [URL_WSS, URL_HTTPS, `${URL_WSS}/`, `${URL_HTTPS}/`]) assert.equal((await open(s.port, { url: form })).status, 101, form);
+  for (const form of [`${URL_WSS}//`, `${URL_WSS}?x=1`, `${URL_HTTPS}#frag`, URL_WSS.toUpperCase(), URL_WSS.replace('tunnel.example.test', 'other.example.test'), URL_HTTPS.replace('https:', 'http:'), URL_WSS.replace(PATH, `${PATH}/extra`), URL_WSS.slice(0, -1)]) {
+    assert.equal((await open(s.port, { url: form })).status, 403, form);
+  }
+});
+
+test('signature forms: a port in the configured address also accepts the forms without it', async () => {
+  const withPort = URL_WSS.replace('tunnel.example.test', 'tunnel.example.test:8443');
+  const s = await start({ urls: signedUrlCandidates(withPort), lockout: { failures: 100, windowMs: 60_000 }, maxConnections: 10 });
+  for (const form of [withPort, withPort.replace('wss:', 'https:'), `${withPort}/`, URL_WSS, URL_HTTPS, `${URL_WSS}/`, `${URL_HTTPS}/`]) assert.equal((await open(s.port, { url: form })).status, 101, form);
+  assert.equal((await open(s.port, { url: URL_WSS.replace('tunnel.example.test', 'tunnel.example.test:9999') })).status, 403, 'a different port is not a candidate');
+});
+
+test('signature forms: a trailing slash on the SIGNED address does not widen the request path, which must still be exact', async () => {
+  const s = await start({ urls: signedUrlCandidates(URL_WSS), lockout: { failures: 100, windowMs: 60_000 }, maxConnections: 10 });
+  assert.equal((await open(s.port, { url: `${URL_WSS}/` })).status, 101);
+  assert.equal((await open(s.port, { url: `${URL_WSS}/`, path: `${PATH}/` })).status, 404);
 });
 
 test('lockout: repeated refused handshakes lock the door for a while, even to the right caller, then it reopens', async () => {

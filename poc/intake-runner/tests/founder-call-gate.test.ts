@@ -120,7 +120,41 @@ test('cost: the Claude ceiling is a small, finite number and unknown models have
   const c = claudeCeilingUsd('claude-haiku-5-5', 150) as number;
   assert.ok(c > 0 && c < 1, String(c));
   assert.equal(claudeCeilingUsd('claude-unknown-9', 10), null);
-  assert.deepEqual(signedUrlCandidates(`wss://h.example.test/relay/${SECRET}`), [`wss://h.example.test/relay/${SECRET}`, `https://h.example.test/relay/${SECRET}`]);
+});
+
+// ---------------------------------------------------------------- the URL forms a handshake signature may cover
+test('signed URL candidates: the address and its https form, each with and without a trailing slash, in a fixed order', () => {
+  const u = `wss://h.example.test/relay/${SECRET}`;
+  assert.deepEqual(signedUrlCandidates(u), [u, `https://h.example.test/relay/${SECRET}`, `${u}/`, `https://h.example.test/relay/${SECRET}/`]);
+});
+
+test('signed URL candidates: an address that names a port also gets the four forms without it (Twilio drops the port when it signs over HTTPS)', () => {
+  const u = `wss://h.example.test:8443/relay/${SECRET}`;
+  const c = signedUrlCandidates(u);
+  assert.equal(c.length, 8);
+  assert.deepEqual(c.slice(0, 4), [u, `https://h.example.test:8443/relay/${SECRET}`, `${u}/`, `https://h.example.test:8443/relay/${SECRET}/`]);
+  assert.deepEqual(c.slice(4), [`wss://h.example.test/relay/${SECRET}`, `https://h.example.test/relay/${SECRET}`, `wss://h.example.test/relay/${SECRET}/`, `https://h.example.test/relay/${SECRET}/`]);
+});
+
+test('signed URL candidates: no duplicates, and every one names the same host and the same secret path (nothing new is ever allowed)', () => {
+  for (const u of [`wss://h.example.test/relay/${SECRET}`, `wss://h.example.test:443/relay/${SECRET}`, `wss://a-b.c.example.test:8443/relay/${SECRET}`]) {
+    const c = signedUrlCandidates(u);
+    assert.equal(new Set(c).size, c.length, u);
+    const want = new URL(u.replace(/^wss:/, 'https:'));
+    for (const form of c) {
+      const got = new URL(form.replace(/^wss:/, 'https:'));
+      assert.equal(got.hostname, want.hostname, form);
+      assert.equal(got.pathname.replace(/\/$/, ''), want.pathname, form);
+      assert.equal(got.search + got.hash, '', form);
+      assert.ok(/^(wss|https):\/\//.test(form), form);
+    }
+  }
+});
+
+test('signed URL candidates: the composition root hands exactly these candidates to the WebSocket server', () => {
+  const entry = readFileSync(new URL('../src/founder-call-entry.ts', import.meta.url), 'utf8');
+  assert.ok(entry.includes('urls: signedUrlCandidates(config.public_wss_url)'));
+  assert.ok(entry.includes('path: relayPathFor(config.public_wss_url)'), 'the request path is still the exact secret path, with no trailing-slash form');
 });
 
 // ---------------------------------------------------------------- the Intake entry's founder tier

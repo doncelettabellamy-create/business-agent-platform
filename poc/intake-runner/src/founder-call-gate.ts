@@ -111,7 +111,21 @@ export function relayPathFor(publicWssUrl: string): string {
   return m[1];
 }
 
-/** The URL forms Twilio may have signed for the WebSocket handshake (see ws-server.ts). */
+/**
+ * The URL forms Twilio may have signed for the WebSocket handshake (see ws-server.ts). Twilio's pages do not say which scheme the handshake
+ * signature covers, and note that a failed WebSocket validation may be fixed by appending a trailing "/". So the candidates are the address as
+ * configured and its https form, each with and without a trailing slash; when the address names a port, the same four without it (Twilio drops
+ * the port when signing voice requests over HTTPS). They all derive from the one configured address, so they add no new path or host.
+ * The server still answers only on the exact secret path.
+ */
 export function signedUrlCandidates(publicWssUrl: string): string[] {
-  return [publicWssUrl, publicWssUrl.replace(/^wss:/, 'https:')];
+  const bases = [publicWssUrl];
+  const noPort = publicWssUrl.replace(/^(wss:\/\/[^/:]+):\d+(?=\/)/, '$1');
+  if (noPort !== publicWssUrl) bases.push(noPort);
+  const out: string[] = [];
+  for (const base of bases) {
+    const https = base.replace(/^wss:/, 'https:');
+    for (const form of [base, https, `${base}/`, `${https}/`]) if (!out.includes(form)) out.push(form);
+  }
+  return out;
 }
