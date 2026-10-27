@@ -14,7 +14,7 @@ import { isSealedHandoff } from '../src/handoff-seal.ts';
 import { runCallIntake } from '../src/call-intake.ts';
 import { createTenantRegistry } from '../src/tenant-boundary.ts';
 import { createClaudeProvider } from '../src/claude-provider.ts';
-import { createClaudeDialogueModel, renderDirective } from '../src/dialogue-model.ts';
+import { createClaudeDialogueModel, fallbackText, renderDirective } from '../src/dialogue-model.ts';
 import type { DialogueModel } from '../src/dialogue-model.ts';
 import { mintExecutionContext } from '../src/execution-context.ts';
 import { callRefFor, createIntakeRecordStore, eligibleForProcessing, RecordRefused } from '../src/intake-record-store.ts';
@@ -83,7 +83,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -104,7 +104,7 @@ async function rig(o: RigOptions = {}) {
     ...(o.confirmedHandoff === undefined ? {} : { confirmedHandoff: o.confirmedHandoff }),
     numbers: new Map([[N1, T], [N2, OTHER]]), categoryNames: () => (o.skill ?? plumbing as any).categories.map((c: { name: string }) => c.name),
     choicesFor: (_t: string, field: string) => ((o.skill ?? plumbing) as any).fields?.find((x: any) => x.name === field)?.choices,
-    ...((): object => { const sk: any = o.skill ?? plumbing; const fc = sk.fields?.find((x: any) => x.role === 'first_clean'); return fc ? { firstClean: { field: fc.name, required: (_t: string, cat: string) => sk.categories.find((c: any) => c.name === cat)?.requires?.includes(fc.name) === true } } : {}; })(), previewBudgetMs: o.previewBudgetMs ?? 3000, intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
+    ...((): object => { const sk: any = o.skill ?? plumbing; const fc = sk.fields?.find((x: any) => x.role === 'first_clean'); return fc ? { firstClean: { field: fc.name, required: (_t: string, cat: string) => sk.categories.find((c: any) => c.name === cat)?.requires?.includes(fc.name) === true } } : {}; })(), previewBudgetMs: o.previewBudgetMs ?? 3000, ...(o.replyRetryMs === undefined ? {} : { replyRetryMs: o.replyRetryMs }), ...(o.replyFirstWordMs === undefined ? {} : { replyFirstWordMs: o.replyFirstWordMs }), ...(o.replyGapMs === undefined ? {} : { replyGapMs: o.replyGapMs }), ...(o.replyTotalMs === undefined ? {} : { replyTotalMs: o.replyTotalMs }), intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
     async intakeContext(tenant, ref) {
       const r = await mintExecutionContext({ credential: 'test', agent: 'intake' }, { verify: () => ({ kind: 'system', id: 'founder-call-test' }), selectTenant: () => tenant, grants: () => ['intake:run'], newCorrelationId: () => `corr-founder-${ref}` });
       if (!r.ok) throw new Error('context');
@@ -1291,21 +1291,26 @@ test('diagnostics: a normal reply logs its size, how soon the first word came, a
   for (const said of ['xylophonic', 'burst pipe', 'Could you tell me', 'yes']) assert.ok(!all.includes(said), `the logs must not contain "${said}"`);
 });
 
-test('diagnostics: an empty model reply is logged as empty, sent no words, and the call goes on', async () => {
-  const silent: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { /* produces nothing */ } };
+test('diagnostics: a model that never produces words is tried twice, each try is logged with how its stream ended, then the fixed wording is sent and the call goes on', async () => {
+  let calls = 0;
+  const silent: DialogueModel = { stats: { calls: 0, errors: [], last: { stop: 'END_TURN', output_tokens: 0, other_blocks: 1 } }, async *reply() { calls++; /* produces nothing */ } };
   const r = await rig({ dialogue: silent });
   const sim = await r.connect(); setup(sim); say(sim, 'yes');
   const first = await reply(r, sim);
-  assert.equal(first.token, '', 'only the empty end marker reached the phone: no words');
+  assert.equal(first.token, fallbackText({ kind: 'open' }), 'the caller hears the fixed opening, not silence');
   say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  assert.equal(calls, 4, 'two tries per turn, never more');
   const empty = diag(r, 'REPLY_EMPTY');
-  assert.equal(empty.length, 2);
+  assert.equal(empty.length, 4, 'every empty try is logged');
   for (const l of empty) {
-    const d = l.detail as Record<string, number>;
-    assert.deepEqual([d.chars, d.parts, d.failed_sends], [0, 0, 0]);
+    const d = l.detail as Record<string, number | string>;
+    assert.deepEqual([d.chars, d.parts, d.failed_sends, d.stop, d.output_tokens, d.other_blocks], [0, 0, 0, 'END_TURN', 0, 1]);
     assert.ok(!('first_token_ms' in d) && !('since_prompt_ms' in d), 'no first word, so no first-word time');
   }
-  assert.equal(diag(r, 'REPLY_SENT').length, 0);
+  assert.deepEqual(empty.map((l) => (l.detail as Record<string, number>).attempt), [1, 2, 1, 2]);
+  assert.equal(diag(r, 'REPLY_RETRY').length, 2);
+  assert.equal(diag(r, 'REPLY_FALLBACK_SENT').length, 2);
+  assert.equal(diag(r, 'REPLY_FALLBACK_FAILED').length + diag(r, 'REPLY_SENT').length, 0);
   assert.ok(!r.logs.some((l) => l.code === 'DIALOGUE_FAILED'), 'an empty reply is not an error');
   sim.end(); await sim.closed; await waitFor(() => diag(r, 'CALL_CLOSED').length === 1); await r.handler.idle();
   shapeOk(r);
@@ -1658,13 +1663,46 @@ test('delivery: a question whose writes were refused (never reached the phone pr
   await thenAnswered(r, sim);
 });
 
-test('delivery: an empty reply (no words produced) cannot establish a pending answer', async () => {
+test('delivery: an empty first try is retried and the question is said once; a plain yes after it answers it', async () => {
   const stub = questionStub('empty-once');
   const r = await strayRig({ dialogue: stub.model });
   const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
-  say(sim, STD + ', no pets, no extras'); await reply(r, sim);
-  assert.ok(r.logs.some((l) => l.code === 'REPLY_EMPTY'));
-  await thenAnswered(r, sim, stub);
+  say(sim, STD + ', no pets, no extras');
+  const q = await reply(r, sim);
+  assert.equal(q.token, '', 'the end marker of the one reply that was sent');
+  assert.equal(stub.asked(), 2, 'the model was asked twice');
+  assert.equal(sim.messages.filter((m: any) => m.type === 'text' && m.token === FIRST_FULL).length, 1, 'the question reached the phone exactly once');
+  assert.deepEqual(['REPLY_EMPTY', 'REPLY_RETRY'].map((c) => r.logs.filter((l) => l.code === c).length), [1, 1]);
+  assert.ok(!r.logs.some((l) => l.code === 'REPLY_FALLBACK_SENT'));
+  say(sim, 'yes');
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /First cleaning with us: yes\./, 'the yes answered the delivered question');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('delivery: when both tries are empty the fixed question is sent once with the configured choices, and a plain yes answers it', async () => {
+  let asks = 0;
+  const model: DialogueModel = {
+    stats: { calls: 0, errors: [] },
+    async *reply(input) {
+      const d = input.directive;
+      if (d.kind === 'ask' && d.field === FIRST_Q) { asks++; return; }   // never produces words for the first-cleaning question
+      yield 'Okay. ';
+    },
+  };
+  const r = await strayRig({ dialogue: model });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras');
+  const q = await reply(r, sim);
+  assert.equal(q.token, fallbackText({ kind: 'ask', field: FIRST_Q, choices: ['yes', 'no'] }));
+  assert.match(q.token, /first cleaning with us.*yes or no/i);
+  assert.equal(asks, 2);
+  assert.equal(sim.messages.filter((m: any) => m.type === 'text' && /Sorry about the pause/.test(m.token)).length, 1, 'said once');
+  say(sim, 'yes');
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /First cleaning with us: yes\./, 'the yes answered the fixed question');
+  shapeOk(r);
+  sim.end(); await sim.closed; await r.handler.idle();
 });
 
 test('delivery: a question that was sent in full but then talked over, with the phone provider reporting only part of it spoken, cannot establish a pending answer', async () => {
@@ -1980,4 +2018,349 @@ test('consistency: the saved status and the vault state come from the same call,
   noPriya('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(api));
   assert.equal(api.calls[0].addressGiven, true);
   assert.ok(!api.calls[0].nextActions.includes('Verify the address with the caller.'));
+});
+
+// ---------------------------------------------------------------- empty replies: bounded retry, fixed wording, interruptions, partial replies, unsendable fallback
+test('fallbackText: fixed, short, bracket-free wording from the directive alone; invalid names never reach the caller', () => {
+  const all = [
+    fallbackText({ kind: 'open' }), fallbackText({ kind: 'listen' }), fallbackText({ kind: 'clarify' }), fallbackText({ kind: 'clarify', categories: ['Standard cleaning', 'Deep cleaning'] }),
+    fallbackText({ kind: 'ask', field: 'Number of bathrooms' }), fallbackText({ kind: 'ask', field: 'Pets', again: true, choices: ['yes', 'no'] }), fallbackText({ kind: 'ask', field: 'Extras', choices: ['oven', 'fridge', 'windows'] }),
+    fallbackText({ kind: 'ask', field: '[PERSON_1]' }), fallbackText({ kind: 'ask', field: 'x\ny', choices: ['[A]'] }), fallbackText({ kind: 'clarify', categories: ['<b>'] }),
+  ];
+  for (const s of all) assert.ok(s.length > 5 && s.length < 400 && !/[\[\]<>\r\n]/.test(s) && !/\$|price|call you|follow up|goodbye|recorded/i.test(s), s);
+  assert.equal(fallbackText({ kind: 'ask', field: 'Number of bathrooms' }), 'Sorry about the pause. Can you tell me about number of bathrooms?');
+  assert.equal(fallbackText({ kind: 'ask', field: 'Pets', choices: ['yes', 'no'] }), 'Sorry about the pause. Can you tell me about pets? You can say yes or no, or tell me in your own words.');
+  assert.equal(fallbackText({ kind: 'ask', field: 'Extras', choices: ['oven', 'fridge', 'windows'] }), 'Sorry about the pause. Can you tell me about extras? You can say oven, fridge, or windows, or tell me in your own words.');
+  assert.equal(fallbackText({ kind: 'ask', field: '[PERSON_1]' }), 'Sorry about the pause. Could you say that again?');
+  assert.equal(fallbackText({ kind: 'clarify', categories: ['Standard cleaning', 'Deep cleaning'] }), 'Sorry about the pause. Are you calling about Standard cleaning or Deep cleaning?');
+});
+
+test('empty replies: the dialogue adapter records how the stream ended as a fixed word and numbers, never text', async () => {
+  const events = (...evs: unknown[]) => ({ messages: { create: async () => (async function* () { for (const e of evs) yield e as never; })() } });
+  const run = async (client: any) => { const m = createClaudeDialogueModel(client, { model: 'claude-haiku-5-5' }); let out = ''; for await (const p of m.reply({ turns: [], directive: { kind: 'open' } })) out += p; return { m, out }; };
+  const a = await run(events({ type: 'message_start' }, { type: 'content_block_start', content_block: { type: 'thinking' } }, { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 160 } }));
+  assert.equal(a.out, '');
+  assert.deepEqual(a.m.stats.last, { stop: 'MAX_TOKENS', output_tokens: 160, other_blocks: 1 });
+  const b = await run(events({ type: 'content_block_start', content_block: { type: 'text' } }, { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hi there' } }, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } }));
+  assert.deepEqual([b.out, b.m.stats.last], ['Hi there', { stop: 'END_TURN', output_tokens: 3, other_blocks: 0 }]);
+  const c = await run(events({ type: 'message_delta', delta: { stop_reason: 'CANARY text from the model' }, usage: { output_tokens: 1.9 } }));
+  assert.deepEqual(c.m.stats.last, { stop: 'OTHER', output_tokens: 1, other_blocks: 0 }, 'an unknown stop reason is a fixed word; no model text is kept');
+  const d = await run(events({ type: 'message_start' }));
+  assert.deepEqual(d.m.stats.last, { stop: 'NONE', output_tokens: null, other_blocks: 0 });
+});
+
+test('empty replies: a retry that never produces its first word is cut at the bound and the fixed wording follows', async () => {
+  let calls = 0;
+  const hang: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; if (calls === 1) return; await new Promise<void>(() => {}); /* never answers and ignores the signal */ yield 'never'; } };
+  const r = await rig({ dialogue: hang, replyRetryMs: 80 });
+  const sim = await r.connect(); setup(sim); const t0 = Date.now(); say(sim, 'yes');
+  const m = await reply(r, sim);
+  assert.equal(m.token, fallbackText({ kind: 'open' }));
+  assert.ok(Date.now() - t0 < 2500, 'bounded by the retry limit');
+  const empty = diag(r, 'REPLY_EMPTY');
+  assert.deepEqual(empty.map((l) => (l.detail as Record<string, number>).attempt), [1, 2]);
+  assert.equal((empty[1].detail as Record<string, number>).timed_out, 1);
+  assert.equal(diag(r, 'REPLY_FALLBACK_SENT').length, 1);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text' && x.token === 'never').length, 0);
+  shapeOk(r);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('empty replies: words that were already sent are never retried or repeated, and a stream that ends after a few words is a normal reply', async () => {
+  let calls = 0;
+  const brief: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; yield 'Hello'; } };
+  const r = await rig({ dialogue: brief });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); const m = await reply(r, sim);
+  assert.deepEqual([calls, m.token, diag(r, 'REPLY_SENT').length, diag(r, 'REPLY_EMPTY').length, diag(r, 'REPLY_RETRY').length, diag(r, 'REPLY_FALLBACK_SENT').length], [1, '', 1, 0, 0, 0]);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text' && x.token === 'Hello').length, 1);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('empty replies: a caller who talks over the wait stops the retry and the fixed wording; nothing is said afterwards', async () => {
+  let calls = 0; let release!: () => void; const gate = new Promise<void>((res) => { release = res; });
+  const slowEmpty: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; await gate; /* then ends with no words */ } };
+  const r = await rig({ dialogue: slowEmpty });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await waitFor(() => calls === 1);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 });
+  await waitFor(() => diag(r, 'REPLY_INTERRUPTED').length === 1);
+  release(); await r.handler.idle();
+  assert.equal(calls, 1, 'no retry');
+  assert.equal(diag(r, 'REPLY_RETRY').length + diag(r, 'REPLY_FALLBACK_SENT').length + diag(r, 'REPLY_EMPTY').length, 0);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text').length, 0, 'nothing was said');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('empty replies: a caller who talks over the retry stops the fixed wording, and a model that throws because it was stopped does not end the call', async () => {
+  let calls = 0;
+  const model: DialogueModel = {
+    stats: { calls: 0, errors: [] },
+    async *reply(input) {
+      calls++;
+      if (calls === 1) return;
+      if (calls >= 3) { yield 'Okay. '; return; }
+      await new Promise<void>((res) => { input.signal?.addEventListener('abort', () => res()); });
+      if (input.signal?.aborted) throw new Error('dialogue model failed');   // as the real adapter does when its request is aborted
+      yield 'late';
+    },
+  };
+  const r = await rig({ dialogue: model, replyRetryMs: 5000 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await waitFor(() => calls === 2);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 });
+  await waitFor(() => diag(r, 'REPLY_INTERRUPTED').length === 1);
+  await r.handler.idle();
+  assert.equal(diag(r, 'REPLY_FALLBACK_SENT').length + diag(r, 'DIALOGUE_FAILED').length, 0);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text').length, 0);
+  say(sim, 'I have a burst pipe in the kitchen');   // the call is still alive and takes the next turn
+  await waitFor(() => calls >= 3);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('empty replies: the fixed wording is kept in the history, so the model sees what the caller was asked', async () => {
+  let calls = 0; const turns: string[] = [];
+  const model: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply(input) { calls++; turns.push(JSON.stringify(input.turns)); if (calls === 2 || calls === 3) return; yield 'Okay. '; } };
+  const r = await rig({ dialogue: model });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  say(sim, 'it is the kitchen sink'); await reply(r, sim);
+  assert.equal(calls, 4);
+  assert.ok(turns[3].includes('Sorry about the pause'), 'the fixed words are in the history');
+  assert.equal((turns[3].match(/Sorry about the pause/g) ?? []).length, 1, 'once');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('empty replies: a failure (not an empty stream) is still an error and ends the call; it is not retried', async () => {
+  let calls = 0;
+  const bad: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; throw new Error('dialogue model failed'); } };
+  const r = await rig({ dialogue: bad });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  assert.equal(calls, 1);
+  assert.equal(diag(r, 'DIALOGUE_FAILED').length, 1);
+  assert.equal(diag(r, 'REPLY_RETRY').length + diag(r, 'REPLY_FALLBACK_SENT').length, 0);
+});
+
+test('empty replies: if even the fixed wording cannot be sent, the request is saved unconfirmed and the call is ended', async () => {
+  const empty: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply(input) { if (input.directive.kind === 'open') { yield 'Hello. '; return; } /* then nothing */ } };
+  let failing = false;
+  const r = await rig({ dialogue: empty, connWrap: refusingWrites(() => failing) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  failing = true;
+  say(sim, 'I have a burst pipe in the kitchen');
+  await waitFor(() => diag(r, 'REPLY_FALLBACK_FAILED').length === 1);
+  await waitFor(() => diag(r, 'CALL_CLOSED').length === 1);
+  await r.handler.idle();
+  assert.equal(diag(r, 'REPLY_FALLBACK_SENT').length, 0);
+  const [rec] = r.store.list(T);
+  assert.ok(rec, 'the request was saved');
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.status, rec.reasons.includes('not_confirmed')], ['unconfirmed', false, 'needs-human', true]);
+  assert.equal(rec.category, 'Emergency leak');
+  assert.equal(r.handler.active(), 0);
+  shapeOk(r);
+});
+
+test('empty replies: the retry limit must be a positive whole number', () => {
+  for (const bad of [0, -1, 1.5, Number.NaN]) {
+    assert.throws(() => createRelayHandler({ replyRetryMs: bad } as never), RangeError);
+  }
+});
+
+// ---------------------------------------------------------------- the first try is bounded too; a refusal is told apart from an empty reply
+test('stalled first try: past the first-word limit it is stopped, one retry runs, and the words of the retry are said once (late words of the stalled try never are)', async () => {
+  let calls = 0;
+  const model: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; if (calls === 1) { await new Promise((res) => setTimeout(res, 300)); yield 'LATE'; return; } yield 'Hello there'; } };
+  const r = await rig({ dialogue: model, replyFirstWordMs: 60, replyRetryMs: 2000 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  await new Promise((res) => setTimeout(res, 400));   // the stalled try would have spoken by now
+  assert.equal(calls, 2);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text' && x.token === 'LATE').length, 0);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text' && x.token === 'Hello there').length, 1);
+  const first = diag(r, 'REPLY_EMPTY')[0].detail as Record<string, number>;
+  assert.deepEqual([first.attempt, first.timed_out, first.chars], [1, 1, 0]);
+  assert.deepEqual([diag(r, 'REPLY_RETRY').length, diag(r, 'REPLY_SENT').length, diag(r, 'REPLY_FALLBACK_SENT').length], [1, 1, 0]);
+  shapeOk(r); sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled first try: when both tries stall the caller hears the fixed wording within the two limits, once', async () => {
+  const stall: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { await new Promise<void>(() => {}); yield 'never'; } };
+  const r = await rig({ dialogue: stall, replyFirstWordMs: 70, replyRetryMs: 90 });
+  const sim = await r.connect(); setup(sim); const t0 = Date.now(); say(sim, 'yes');
+  const m = await reply(r, sim); const took = Date.now() - t0;
+  assert.equal(m.token, fallbackText({ kind: 'open' }));
+  assert.ok(took >= 150 && took < 1500, 'about the sum of the two limits, not more: ' + took);
+  assert.deepEqual(diag(r, 'REPLY_EMPTY').map((l) => [(l.detail as any).attempt, (l.detail as any).timed_out]), [[1, 1], [2, 1]]);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text').length, 1, 'one message: the fixed wording');
+  shapeOk(r); sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled first try: the limit is only for the first word; a reply that has begun is never cut or repeated by it', async () => {
+  let calls = 0;
+  const slowTail: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; yield 'Hello '; await new Promise((res) => setTimeout(res, 250)); yield 'again'; } };
+  const r = await rig({ dialogue: slowTail, replyFirstWordMs: 60 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  assert.equal(calls, 1);
+  assert.deepEqual(sim.messages.filter((x: any) => x.type === 'text' && x.token !== '').map((x: any) => x.token), ['Hello ', 'again']);
+  assert.deepEqual([diag(r, 'REPLY_SENT').length, diag(r, 'REPLY_EMPTY').length, diag(r, 'REPLY_RETRY').length], [1, 0, 0]);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled first try: a caller who talks over the stall ends it at once; no retry, no fixed wording', async () => {
+  let calls = 0;
+  const stall: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; await new Promise<void>(() => {}); yield 'never'; } };
+  const r = await rig({ dialogue: stall, replyFirstWordMs: 5000 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await waitFor(() => calls === 1);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 });
+  await waitFor(() => diag(r, 'REPLY_INTERRUPTED').length === 1);
+  await r.handler.idle();
+  assert.deepEqual([calls, diag(r, 'REPLY_RETRY').length, diag(r, 'REPLY_FALLBACK_SENT').length, sim.messages.filter((x: any) => x.type === 'text').length], [1, 0, 0, 0]);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+/** A dialogue stub whose model stream ends with the given stop word; `words` are what it says first. */
+const stopping = (stop: string, words: string[] = [], onCall?: (n: number) => void): DialogueModel => {
+  let n = 0;
+  return { stats: { calls: 0, errors: [], last: { stop, output_tokens: 0, other_blocks: 0 } }, async *reply() { onCall?.(++n); for (const w of words) yield w; } };
+};
+const TEXTS = (sim: Sim) => sim.messages.filter((x: any) => x.type === 'text' && x.token !== '').map((x: any) => x.token as string);
+
+test('refusal: on the first turn the model declines -> no retry, no question, a fixed goodbye with the emergency line, then the call ends; nothing is saved (no caller line yet)', async () => {
+  let calls = 0;
+  const r = await rig({ dialogue: stopping('REFUSAL', [], () => { calls++; }) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  assert.equal(calls, 1, 'not retried');
+  assert.deepEqual(TEXTS(sim), [SAY.refused], 'only the fixed goodbye: no fixed question');
+  assert.match(SAY.refused, /emergency/);
+  assert.deepEqual([diag(r, 'REPLY_REFUSED').length, diag(r, 'REPLY_RETRY').length, diag(r, 'REPLY_FALLBACK_SENT').length, diag(r, 'REPLY_EMPTY').length], [1, 0, 0, 0]);
+  assert.equal(r.store.list(T).length, 0);
+  assert.equal(r.handler.active(), 0);
+  shapeOk(r);
+});
+
+test('refusal: when the model declines on a later turn the request so far is saved unconfirmed and the call ends; intake does not carry on', async () => {
+  let n = 0;
+  const model: DialogueModel = { stats: { calls: 0, errors: [], last: { stop: 'END_TURN', output_tokens: 5, other_blocks: 0 } }, async *reply() { n++; if (n === 1) { yield 'Hello. '; return; } this.stats.last = { stop: 'REFUSAL', output_tokens: 0, other_blocks: 0 }; } };
+  const r = await rig({ dialogue: model });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen');
+  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  assert.equal(n, 2, 'one call on the refused turn');
+  assert.equal(TEXTS(sim).filter((x) => x === SAY.refused).length, 1);
+  assert.equal(sim.messages.filter((x: any) => x.type === 'text' && /Sorry about the pause/.test(x.token)).length, 0);
+  const [rec] = r.store.list(T);
+  assert.ok(rec, 'saved');
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.status, rec.reasons.includes('not_confirmed'), rec.category], ['unconfirmed', false, 'needs-human', true, 'Emergency leak']);
+  shapeOk(r);
+});
+
+test('refusal: a stream that gave words and then ended with a refusal has its words closed, is not repeated, and ends the call the same way', async () => {
+  const r = await rig({ dialogue: stopping('REFUSAL', ['I cannot ', 'help']) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
+  assert.deepEqual(TEXTS(sim), ['I cannot ', 'help', SAY.refused]);
+  assert.ok(sim.messages.some((x: any) => x.type === 'text' && x.token === '' && x.last === true), 'the words that were spoken were closed');
+  assert.deepEqual([diag(r, 'REPLY_REFUSED').length, diag(r, 'REPLY_SENT').length, diag(r, 'REPLY_RETRY').length], [1, 0, 0]);
+});
+
+test('refusal: only the model\'s own stop reason counts; an ordinary empty stream is still retried, and a timed-out or interrupted try is never called a refusal', async () => {
+  let calls = 0;
+  const r = await rig({ dialogue: stopping('END_TURN', [], () => { calls++; }) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); const m = await reply(r, sim);
+  assert.equal(m.token, fallbackText({ kind: 'open' }));
+  assert.deepEqual([calls, diag(r, 'REPLY_REFUSED').length, diag(r, 'REPLY_EMPTY').length, diag(r, 'REPLY_RETRY').length], [2, 0, 2, 1]);
+  sim.end(); await sim.closed; await r.handler.idle();
+  const stall: DialogueModel = { stats: { calls: 0, errors: [], last: { stop: 'REFUSAL', output_tokens: 0, other_blocks: 0 } }, async *reply() { await new Promise<void>(() => {}); yield 'x'; } };
+  const r2 = await rig({ dialogue: stall, replyFirstWordMs: 40, replyRetryMs: 40 });
+  const sim2 = await r2.connect(); setup(sim2); say(sim2, 'yes'); await reply(r2, sim2);
+  assert.deepEqual([diag(r2, 'REPLY_REFUSED').length, diag(r2, 'REPLY_EMPTY').length, diag(r2, 'REPLY_RETRY').length], [0, 2, 1]);
+  sim2.end(); await sim2.closed; await r2.handler.idle();
+});
+
+test('stalled reply: words then silence from the model -> closed at the gap limit, not repeated, not kept as a question; the fixed question follows once', async () => {
+  let calls = 0;
+  const model: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; yield 'Can you tell me about the num'; await new Promise<void>(() => {}); yield 'LATE'; } };
+  const r = await rig({ dialogue: model, replyGapMs: 80 });
+  const sim = await r.connect(); setup(sim); const t0 = Date.now(); say(sim, 'yes');
+  await sim.next((m) => m.type === 'text' && m.token === fallbackText({ kind: 'open' })); const took = Date.now() - t0;
+  await r.handler.idle();
+  assert.ok(took >= 70 && took < 1500, 'cut at about the gap limit: ' + took);
+  assert.equal(calls, 1, 'no retry after words were sent');
+  const texts = TEXTS(sim);
+  assert.deepEqual(texts, ['Can you tell me about the num', fallbackText({ kind: 'open' })]);
+  const closeAt = sim.messages.findIndex((x: any) => x.type === 'text' && x.token === '' && x.last === true);
+  assert.ok(closeAt > 0 && closeAt < sim.messages.findIndex((x: any) => x.token === fallbackText({ kind: 'open' })), 'the partial words were closed before the fixed wording');
+  assert.equal(diag(r, 'REPLY_STALLED').length, 1);
+  const d = diag(r, 'REPLY_STALLED')[0].detail as Record<string, number>;
+  assert.deepEqual([d.chars, d.parts, d.stalled], ['Can you tell me about the num'.length, 1, 1]);
+  assert.deepEqual([diag(r, 'REPLY_SENT').length, diag(r, 'REPLY_RETRY').length, diag(r, 'REPLY_FALLBACK_SENT').length], [0, 0, 1]);
+  assert.equal(sim.messages.filter((x: any) => x.token === 'LATE').length, 0);
+  shapeOk(r); sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled reply: a half-sent first-cleaning question is not a delivered question; only the complete fixed question can be answered by a plain yes', async () => {
+  const model: DialogueModel = {
+    stats: { calls: 0, errors: [] },
+    async *reply(input) {
+      const d = input.directive;
+      if (d.kind === 'ask' && d.field === FIRST_Q) { yield 'Is this your first cl'; await new Promise<void>(() => {}); }
+      yield 'Okay. ';
+    },
+  };
+  const r = await strayRig({ dialogue: model, replyGapMs: 60 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras');
+  await sim.next((m) => m.type === 'text' && /first cleaning with us/i.test(m.token) && /Sorry about the pause/.test(m.token));
+  await r.handler.idle();
+  assert.equal(diag(r, 'REPLY_STALLED').length, 1);
+  say(sim, 'yes');
+  const rb = await sim.next((m) => m.type === 'text' && /First cleaning with us: yes./.test(m.token)); await r.handler.idle();
+  assert.match(rb.token, /First cleaning with us: yes\./, 'the yes answers the complete fixed question');
+  shapeOk(r); sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled reply: if the fixed question after a stall cannot be sent either, the request is saved unconfirmed and the call ends', async () => {
+  let n = 0; let failing = false;
+  const model: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { n++; if (n === 1) { yield 'Hello. '; return; } yield 'Can you'; failing = true; await new Promise<void>(() => {}); } };
+  const r = await rig({ dialogue: model, replyGapMs: 60, connWrap: refusingWrites(() => failing) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen');
+  await waitFor(() => diag(r, 'REPLY_FALLBACK_FAILED').length === 1);
+  await waitFor(() => diag(r, 'CALL_CLOSED').length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.ok(rec);
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.reasons.includes('not_confirmed')], ['unconfirmed', false, true]);
+  shapeOk(r);
+});
+
+test('stalled reply: a slow trickle that keeps beating the gap limit is still closed at the whole-reply limit', async () => {
+  const trickle: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { for (let i = 0; i < 100; i++) { yield 'a '; await new Promise((res) => setTimeout(res, 30)); } } };
+  const r = await rig({ dialogue: trickle, replyGapMs: 200, replyTotalMs: 250 });
+  const sim = await r.connect(); setup(sim); const t0 = Date.now(); say(sim, 'yes');
+  await sim.next((m) => m.type === 'text' && m.token === fallbackText({ kind: 'open' })); const took = Date.now() - t0;
+  assert.ok(took >= 240 && took < 1500, String(took));
+  assert.equal(diag(r, 'REPLY_STALLED').length, 1);
+  shapeOk(r); sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled reply: a caller who talks over a reply that is still arriving stops it as before; that is an interruption, not a stall', async () => {
+  let release!: () => void; const gate = new Promise<void>((res) => { release = res; });
+  const slow: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply(input) { yield 'Hello there, '; await gate; if (input.signal?.aborted) return; yield 'never sent'; } };
+  const r = await rig({ dialogue: slow, replyGapMs: 5000 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  await sim.next((m) => m.type === 'text' && m.token === 'Hello there, ');
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'Hello', durationUntilInterruptMs: 300 });
+  await waitFor(() => diag(r, 'REPLY_INTERRUPTED').length === 1); release(); await r.handler.idle();
+  assert.deepEqual([diag(r, 'REPLY_STALLED').length, diag(r, 'REPLY_FALLBACK_SENT').length], [0, 0]);
+  assert.deepEqual(TEXTS(sim), ['Hello there, ']);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('stalled reply: the gap and whole-reply limits must be positive whole numbers', () => {
+  for (const k of ['replyGapMs', 'replyTotalMs']) for (const bad of [0, -1, 1.5, Number.NaN]) assert.throws(() => createRelayHandler({ [k]: bad } as never), RangeError);
+});
+
+test('stalled first try: the first-word limit must be a positive whole number', () => {
+  for (const bad of [0, -1, 1.5, Number.NaN]) assert.throws(() => createRelayHandler({ replyFirstWordMs: bad } as never), RangeError);
 });

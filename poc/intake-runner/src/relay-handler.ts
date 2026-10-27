@@ -22,6 +22,7 @@ import { createCallSession } from './call-session.ts';
 import type { CallSession, SessionLimits } from './call-session.ts';
 import { runCallIntake } from './call-intake.ts';
 import type { IntakeEntry } from './intake-entry.ts';
+import { fallbackText } from './dialogue-model.ts';
 import type { DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
 import { spokenDigits } from './contact-capture.ts';
@@ -53,6 +54,7 @@ export const SAY = Object.freeze({
   declined: 'No problem. This test line will not continue. Goodbye.',
   unavailable: 'Sorry, this test line is not available right now. Goodbye.',
   trouble: "Sorry, I can't continue this call. Goodbye.",
+  refused: "Sorry, I can't continue this call. If this is an emergency, please hang up and dial your local emergency number. Goodbye.",
   limit: 'Thank you. That is all the time I have for this call. Goodbye.',
   thanks: 'Thank you. Your request is recorded. Goodbye.',
   correct: 'Sorry about that. What should I change?',
@@ -103,6 +105,14 @@ export interface RelayDeps {
   confirmWaitMs: number;
   /** The longest to wait for the Intake run of a turn. A result that misses it chooses nothing; the assistant just listens. */
   previewBudgetMs: number;
+  /** The longest the one retry of an EMPTY model reply waits for its first word, in milliseconds (default 4000). After that the server asks in fixed words. */
+  replyRetryMs?: number;
+  /** The longest the FIRST try at a reply waits for its first word, in milliseconds (default 5000). A model that stalls is treated like an empty reply: one retry, then the fixed wording. */
+  replyFirstWordMs?: number;
+  /** The longest to wait for the NEXT piece once a reply has started, in milliseconds (default 4000). A reply that stalls is closed where it stands, never repeated, and the server asks the same thing in fixed words. */
+  replyGapMs?: number;
+  /** The longest a whole reply may take, in milliseconds (default 15000), however steadily it arrives. */
+  replyTotalMs?: number;
   /**
    * The cleaning pilot's encrypted contact vault. When present, a name, a usable callback number and a service address are required before a request
    * is ready, the number is read back with the job, and a yes stores the contact (and only then can the request be handed off). When absent, nothing
@@ -126,6 +136,9 @@ export interface RelayHandler {
   idle(): Promise<void>;
 }
 
+/** One try at a reply (see attemptReply). */
+interface Attempt { said: string; chars: number; parts: number; failed: number; threw: boolean; timedOut: boolean; stalled: boolean; aborted: boolean; began: number; firstTokenAt: number | undefined }
+
 /** One Intake result. `handoff` is the original sealed envelope object (in memory only: never logged, stored, copied or sent anywhere). */
 interface Preview { item: WorkItemV1; handedOff: boolean; handoff: HandoffEnvelopeV1 | null }
 
@@ -146,11 +159,19 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
   const fns = ['categoryNames', 'intakeContext', 'now', 'nowIso', 'killed', 'log', 'speechMs'] as const;
   if (!isRecord(deps) || !(deps.numbers instanceof Map) || !isRecord(deps.intake) || !isRecord(deps.dialogue) || !isRecord(deps.store) || !isRecord(deps.limits)
     || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !Number.isInteger(deps.confirmWaitMs) || deps.confirmWaitMs < 1 || !Number.isInteger(deps.previewBudgetMs) || deps.previewBudgetMs < 1 || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1
+    || (deps.replyFirstWordMs !== undefined && (!Number.isInteger(deps.replyFirstWordMs) || deps.replyFirstWordMs < 1))
+    || (deps.replyGapMs !== undefined && (!Number.isInteger(deps.replyGapMs) || deps.replyGapMs < 1))
+    || (deps.replyTotalMs !== undefined && (!Number.isInteger(deps.replyTotalMs) || deps.replyTotalMs < 1))
+    || (deps.replyRetryMs !== undefined && (!Number.isInteger(deps.replyRetryMs) || deps.replyRetryMs < 1))
     || (deps.confirmedHandoff !== undefined && typeof deps.confirmedHandoff !== 'function')
     || (deps.contacts !== undefined && (!isRecord(deps.contacts) || typeof deps.contacts.put !== 'function'))
     || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
     throw new RangeError('the relay handler needs every dependency');
   }
+  const replyRetryMs = deps.replyRetryMs ?? 4000;
+  const replyFirstWordMs = deps.replyFirstWordMs ?? 5000;
+  const replyGapMs = deps.replyGapMs ?? 4000;
+  const replyTotalMs = deps.replyTotalMs ?? 15_000;
   let active = 0;
   let accepted = 0;
   const seen = new Set<string>();
@@ -352,47 +373,118 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       return got;
     }
 
-    /** Speaks one reply. True only when the reply was produced in full and every write to the socket was accepted: it still cannot prove the phone provider played it. */
-    async function speak(directive: Directive): Promise<boolean> {
+    /** One try at a reply: streams the model's words to the phone as they come. Returns what happened, in counts. `limitMs` bounds the wait for the FIRST word only. */
+    async function attemptReply(directive: Directive, limitMs?: number): Promise<Attempt> {
       const s = session as CallSession;
       const controller = new AbortController();
       streaming = controller;
-      let said = '';
-      const began = deps.now();
-      let firstTokenAt: number | undefined; let chars = 0; let parts = 0; let failed = 0; let threw = false;
-      const send = (m: unknown): void => { if (!sendCounted(m)) failed++; };
+      const a: Attempt = { said: '', chars: 0, parts: 0, failed: 0, threw: false, timedOut: false, stalled: false, aborted: false, began: deps.now(), firstTokenAt: undefined };
+      const send = (m: unknown): void => { if (!sendCounted(m)) a.failed++; };
+      // Three bounds: the first word (`limitMs`), the gap between pieces once words have begun, and the whole reply. Past any of them the try is stopped where it stands.
+      const expire = (): void => { if (controller.signal.aborted) return; if (a.chars === 0) a.timedOut = true; else a.stalled = true; controller.abort(); };
+      let timer: ReturnType<typeof setTimeout> | undefined; let gap: ReturnType<typeof setTimeout> | undefined;
+      if (limitMs !== undefined) { timer = setTimeout(() => { if (a.chars === 0) expire(); }, limitMs); timer.unref?.(); }
+      const total = setTimeout(expire, replyTotalMs); total.unref?.();
+      const stopped = new Promise<'stop'>((resolve) => { controller.signal.addEventListener('abort', () => resolve('stop'), { once: true }); });
       try {
-        for await (const piece of deps.dialogue.reply({ turns: s.dialogue(), directive, signal: controller.signal })) {
+        const it = deps.dialogue.reply({ turns: s.dialogue(), directive, signal: controller.signal })[Symbol.asyncIterator]();
+        for (;;) {
+          const pending = it.next(); pending.catch(() => {});   // a model that fails after we stopped waiting must not become an unhandled rejection
+          const n = await Promise.race([pending, stopped]);
+          if (n === 'stop') { void Promise.resolve(it.return?.()).catch(() => {}); break; }   // interrupted or out of time: stop waiting at once, even if the model ignores the signal
+          if (n.done) break;
           if (controller.signal.aborted || done) break;
-          if (firstTokenAt === undefined) firstTokenAt = deps.now();
-          said += piece; chars += piece.length; parts++;
+          const piece = n.value;
+          if (a.firstTokenAt === undefined) a.firstTokenAt = deps.now();
+          a.said += piece; a.chars += piece.length; a.parts++;
           send({ type: 'text', token: piece, last: false });
+          if (gap !== undefined) clearTimeout(gap);
+          gap = setTimeout(expire, replyGapMs); gap.unref?.();
         }
-        if (!controller.signal.aborted && !done) send({ type: 'text', token: '', last: true });
+        // The end marker closes words that were sent. An empty try sends nothing at all, so a retry or the fixed wording never follows a stray end marker.
+        // A reply that stalled after it began is closed the same way, so the words already spoken are not left open.
+        if (a.chars > 0 && !done && (!controller.signal.aborted || a.stalled)) send({ type: 'text', token: '', last: true });
       } catch {
-        threw = true;
-        deps.log('DIALOGUE_FAILED', { chars, parts, failed_sends: failed });
+        // A model that fails AFTER the caller talked over it (or the wait ran out) is not a failure of the call; any other failure is.
+        if (!controller.signal.aborted) a.threw = true;
+      } finally { if (timer !== undefined) clearTimeout(timer); if (gap !== undefined) clearTimeout(gap); clearTimeout(total); streaming = undefined; lastReplyEndAt = deps.now(); }
+      a.aborted = controller.signal.aborted;
+      return a;
+    }
+
+    /**
+     * Speaks one reply. True only when the reply was produced in full and every write to the socket was accepted: it still cannot prove the phone provider played it.
+     * A reply with NO words (the model streamed nothing and did not fail) (or a stall past `replyFirstWordMs` to the first word) is tried once more, for at most `replyRetryMs` to the first word; a refusal (the model's own stop reason) is not retried; if that is empty too, or
+     * runs out of time, the server asks the same thing itself in fixed words (fallbackText). Nothing is retried once any word has been sent, so nothing is said twice, and
+     * a caller who talks over the reply stops both the retry and the fallback.
+     */
+    async function speak(directive: Directive): Promise<boolean> {
+      const s = session as CallSession;
+      const began = deps.now();
+      // What happened to a try, in numbers: how much was produced, how soon, whether any write was refused. Plus, for an empty try, how the model's stream ended (fixed word and numbers).
+      const detailOf = (a: Attempt, extra: Record<string, number | string> = {}): Record<string, number | string> => {
+        const d: Record<string, number | string> = { chars: a.chars, parts: a.parts, failed_sends: a.failed, total_ms: Math.max(0, deps.now() - a.began), ...extra };
+        if (a.firstTokenAt !== undefined) {
+          d.first_token_ms = Math.max(0, a.firstTokenAt - a.began);
+          if (lastPromptAt !== undefined) d.since_prompt_ms = Math.max(0, a.firstTokenAt - lastPromptAt);
+        }
+        return d;
+      };
+      const modelEnd = (): Record<string, number | string> => {
+        const l = deps.dialogue.stats?.last;
+        return l === undefined || l === null ? {} : { stop: /^[A-Z_]{1,20}$/.test(String(l.stop)) ? String(l.stop) : 'OTHER', output_tokens: typeof l.output_tokens === 'number' ? l.output_tokens : -1, other_blocks: Number.isInteger(l.other_blocks) ? l.other_blocks : 0 };
+      };
+      // A refusal is the model's own stop reason on a stream with no words (never inferred from text): retrying the same request is pointless, so it goes straight to the fixed wording.
+      const refused = (x: Attempt): boolean => !x.threw && !x.timedOut && !x.stalled && !x.aborted && modelEnd().stop === 'REFUSAL';
+      let a = await attemptReply(directive, replyFirstWordMs);
+      let tries = 1;
+      if (!a.threw && (!a.aborted || a.timedOut) && !done && a.chars === 0 && !refused(a)) {
+        deps.log('REPLY_EMPTY', detailOf(a, { attempt: 1, timed_out: a.timedOut ? 1 : 0, ...modelEnd() }));
+        deps.log('REPLY_RETRY');
+        a = await attemptReply(directive, replyRetryMs);
+        tries = 2;
+      }
+      replies++;
+      if (a.threw) {
+        deps.log('DIALOGUE_FAILED', { chars: a.chars, parts: a.parts, failed_sends: a.failed });
         if (!done) await farewell(SAY.trouble, true);
         return false;
-      } finally { streaming = undefined; lastReplyEndAt = deps.now(); replies++; }
-      // What happened to this reply, in numbers: how much was produced, how soon, whether any write was refused, and whether it was cut short.
-      // (REPLY_SENT proves words were produced and written to the socket; it cannot prove the phone provider spoke them.)
-      const total = Math.max(0, deps.now() - began);
-      const detail: Record<string, number> = { chars, parts, failed_sends: failed, total_ms: total };
-      if (firstTokenAt !== undefined) {
-        detail.first_token_ms = Math.max(0, firstTokenAt - began);
-        if (lastPromptAt !== undefined) detail.since_prompt_ms = Math.max(0, firstTokenAt - lastPromptAt);
       }
-      if (controller.signal.aborted) deps.log('REPLY_INTERRUPTED', detail);
+      if (refused(a)) {
+        // The model itself declined (its own stop reason, never inferred from text). The request is not retried and intake does not simply carry on: whatever words were produced
+        // have been closed, a fixed goodbye with the emergency line is said, and the call is saved unconfirmed.
+        deps.log('REPLY_REFUSED', detailOf(a, { attempts: tries, ...modelEnd() }));
+        if (a.failed > 0) deps.log('REPLY_SEND_FAILED', { failed_sends: a.failed });
+        if (!done) await farewell(SAY.refused, true);
+        return false;
+      }
+      const empty = a.chars === 0 && !done && (!a.aborted || a.timedOut);
+      const detail = detailOf(a, { attempts: tries, ...(empty ? { attempt: tries, timed_out: a.timedOut ? 1 : 0, ...modelEnd() } : {}), ...(a.stalled ? { stalled: 1 } : {}) });
+      if (a.aborted && !a.timedOut && !a.stalled) deps.log('REPLY_INTERRUPTED', detail);
       else if (done) deps.log('REPLY_CUT', detail);
-      else if (chars === 0 && !threw) deps.log('REPLY_EMPTY', detail);
+      else if (a.stalled) deps.log('REPLY_STALLED', detail);
+      else if (empty) deps.log('REPLY_EMPTY', detail);
       else deps.log('REPLY_SENT', detail);
-      if (failed > 0) deps.log('REPLY_SEND_FAILED', { failed_sends: failed });
+      if (a.failed > 0) deps.log('REPLY_SEND_FAILED', { failed_sends: a.failed });
       if (done) return false;
-      s.said(said);
-      if (controller.signal.aborted) { s.interrupted(interruptedText); interruptedText = ''; return false; }
-      lastReply = said;
-      return chars > 0 && failed === 0;
+      if (empty || a.stalled) {
+        // Nothing was said, or the reply stopped part-way (its words are closed and are never repeated or kept as a question): the server asks the same thing in fixed words, and keeps only those in the dialogue history.
+        const text = fallbackText(directive);
+        if (!say(text)) {
+          // Not even this could be sent: the connection is not carrying words. The request is saved unconfirmed and the call is ended.
+          deps.log('REPLY_FALLBACK_FAILED', { total_ms: Math.max(0, deps.now() - began) });
+          await finish(true);
+          await hangUp();
+          return false;
+        }
+        deps.log('REPLY_FALLBACK_SENT', { chars: text.length, total_ms: Math.max(0, deps.now() - began) });
+        s.said(text); lastReply = text;
+        return true;
+      }
+      s.said(a.said);
+      if (a.aborted) { s.interrupted(interruptedText); interruptedText = ''; return false; }
+      lastReply = a.said;
+      return a.chars > 0 && a.failed === 0;
     }
     let interruptedText = '';
 

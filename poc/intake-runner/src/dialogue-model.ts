@@ -18,7 +18,7 @@ export interface DialogueParams {
   stream: true;
   output_config: { effort: 'low' };
 }
-export interface StreamEvent { type: string; delta?: { type?: string; text?: string } }
+export interface StreamEvent { type: string; delta?: { type?: string; text?: string; stop_reason?: string }; content_block?: { type?: string }; usage?: { output_tokens?: number } }
 export interface DialogueClient {
   messages: { create(params: DialogueParams, options?: { signal?: AbortSignal }): Promise<AsyncIterable<StreamEvent>> };
 }
@@ -36,7 +36,9 @@ export interface DialogueInput {
   directive: Directive;
   signal?: AbortSignal;
 }
-export interface DialogueStats { calls: number; errors: { name: string; status: number | null }[] }
+/** How the newest model call ended, as a fixed word and numbers only: never any text the model produced. */
+export interface DialogueLast { stop: string; output_tokens: number | null; other_blocks: number }
+export interface DialogueStats { calls: number; errors: { name: string; status: number | null }[]; last?: DialogueLast }
 export interface DialogueModel {
   reply(input: DialogueInput): AsyncIterable<string>;
   readonly stats: DialogueStats;
@@ -57,6 +59,7 @@ export const DIALOGUE_INSTRUCTION = [
   'Plain spoken text only: no lists, no markdown, no emojis.',
 ].join(' ');
 
+const STOP_REASONS: ReadonlySet<string> = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'tool_use', 'pause_turn', 'refusal']);
 const MODEL_ID = /^claude-[a-z0-9]+(-[a-z0-9]+)*$/;
 export const OPENING_PROMPT = 'The caller has agreed to continue. Greet them briefly and ask how you can help.';
 const MAX_REPLY_CHARS = 600;
@@ -91,6 +94,33 @@ export function renderDirective(d: Directive): string {
   }
 }
 
+/** "a, b, or c" (two: "a or b"). */
+function orList(items: readonly string[]): string {
+  if (items.length <= 1) return items.join('');
+  if (items.length === 2) return `${items[0]} or ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')}, or ${items[items.length - 1]}`;
+}
+/**
+ * Pure: safe fixed wording for a turn on which the model produced no words, so the caller is never left in silence. It says only what the directive
+ * already allows (the configured field, the configured choices or category names), uses no word of the caller's and no bracket, and never offers anything of its own.
+ */
+export function fallbackText(d: Directive): string {
+  const good = (s: unknown): s is string => typeof s === 'string' && NAME.test(s) && s.trim().length > 0;
+  switch (d?.kind) {
+    case 'open': return 'Hello, thanks for calling. How can I help you today?';
+    case 'ask': {
+      const choices = (d.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
+      const offer = choices.length > 0 ? ` You can say ${orList(choices)}, or tell me in your own words.` : '';
+      return good(d.field) ? `Sorry about the pause. Can you tell me about ${d.field.trim().toLowerCase()}?${offer}` : 'Sorry about the pause. Could you say that again?';
+    }
+    case 'clarify': {
+      const names = (d.categories ?? []).slice(0, 10).filter(good).map((c) => c.trim());
+      return names.length > 0 ? `Sorry about the pause. Are you calling about ${orList(names)}?` : 'Sorry about the pause. Could you say in a few words what you need?';
+    }
+    default: return 'Sorry about the pause. Please go on, I am listening.';
+  }
+}
+
 /** Pure: the exact request body. Used by the model adapter and by the dry run's cost ceiling. */
 export function buildDialogueParams(input: DialogueInput, model: string, maxTokens: number): DialogueParams {
   if (typeof model !== 'string' || !MODEL_ID.test(model)) throw new RangeError('model must be an exact Claude model id such as claude-haiku-5-5');
@@ -116,10 +146,18 @@ export function createClaudeDialogueModel(client: DialogueClient, options: { mod
     async *reply(input: DialogueInput): AsyncIterable<string> {
       const params = buildDialogueParams(input, options.model, maxTokens);
       stats.calls++;
+      const last: DialogueLast = { stop: 'NONE', output_tokens: null, other_blocks: 0 };
+      stats.last = last;
       let sent = 0;
       try {
         const stream = await client.messages.create(params, input.signal === undefined ? undefined : { signal: input.signal });
         for await (const ev of stream) {
+          // Diagnostics only: why the stream ended, how many tokens it used, and whether it opened any block that is not plain text (for example a thinking block).
+          if (ev && ev.type === 'content_block_start' && ev.content_block && ev.content_block.type !== 'text') last.other_blocks++;
+          if (ev && ev.type === 'message_delta') {
+            if (typeof ev.delta?.stop_reason === 'string') last.stop = STOP_REASONS.has(ev.delta.stop_reason) ? ev.delta.stop_reason.toUpperCase() : 'OTHER';
+            if (typeof ev.usage?.output_tokens === 'number' && Number.isFinite(ev.usage.output_tokens)) last.output_tokens = Math.max(0, Math.trunc(ev.usage.output_tokens));
+          }
           if (ev && ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta' && typeof ev.delta.text === 'string') {
             const piece = ev.delta.text.slice(0, MAX_REPLY_CHARS - sent);
             if (piece.length === 0) break;
