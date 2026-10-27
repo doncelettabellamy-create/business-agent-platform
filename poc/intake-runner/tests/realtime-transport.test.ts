@@ -18,7 +18,7 @@ import { fallbackText } from '../src/dialogue-model.ts';
 import type { DialogueModel, Directive } from '../src/dialogue-model.ts';
 import type { DialogueTurn } from '../src/call-session.ts';
 import type { ModelProvider, ModelRequest } from '../src/model-gateway.ts';
-import { createRealtimeTransport, sameSpeech, SAY_PREFIX, SPEAK_ONLY } from '../src/realtime-transport.ts';
+import { createRealtimeTransport, sameSpeech, SAY_PREFIX, SPEAK_ONLY, wordsOf } from '../src/realtime-transport.ts';
 import type { TransportEvent } from '../src/call-transport.ts';
 import { createRealtimeSim } from './helpers/realtime-sim.ts';
 import type { Behaviour, RealtimeSim } from './helpers/realtime-sim.ts';
@@ -113,7 +113,7 @@ async function rig(o: RigOptions = {}) {
 type Rig = Awaited<ReturnType<typeof rig>>;
 const codes = (r: Rig, code: string) => r.logs.filter((l) => l.code === code);
 const has = (r: Rig, code: string) => codes(r, code).length > 0;
-const SAYS = (sim: RealtimeSim) => sim.sent.filter((m) => m.type === 'response.create').map((m) => String(m.response.instructions).slice(SAY_PREFIX.length));
+const SAYS = (sim: RealtimeSim) => sim.sent.filter((m) => m.type === 'response.create').map((m) => wordsOf(String(m.response.instructions)));
 const raw = (x: unknown) => JSON.stringify(x);
 
 /** Starts the call, lets the notice play, and gives consent. The opening question is then the second thing heard. */
@@ -143,7 +143,10 @@ test('consent: the notice is spoken first, exactly, and cannot be talked over; t
   assert.equal(r.sim.spoken[0], NOTICE);
   assert.deepEqual(r.sim.sent.map((m) => m.type), ['session.update', 'session.update', 'response.create']);
   assert.deepEqual(r.sim.sent.slice(0, 2).map((m) => m.session.audio.input.turn_detection.interrupt_response), [true, false], 'interruption on, then off for the notice, then the request to speak it');
-  assert.equal(r.sim.sent[2].response.instructions, SAY_PREFIX + NOTICE);
+  assert.equal(r.sim.sent[2].response.instructions, `${SPEAK_ONLY} ${SAY_PREFIX}${NOTICE}`, 'every request repeats the speak-only rule, because the instructions of a request may replace those of the session');
+  assert.equal(wordsOf(r.sim.sent[2].response.instructions), NOTICE);
+  assert.ok(r.sim.sent.filter((m) => m.type === 'session.update').every((m) => m.session.type === 'realtime'), 'every settings update names its session type');
+  assert.deepEqual(r.sim.refused, [], 'the stand-in refused nothing the documented schema would refuse');
   assert.equal(r.sim.sent[2].response.conversation, 'none', 'out of band: nothing is added to the voice service\'s own conversation');
   assert.equal(r.sim.sent[0].session.instructions, SPEAK_ONLY);
   assert.equal(r.sim.sent[0].session.audio.input.turn_detection.create_response, false, 'the voice service never replies on its own');

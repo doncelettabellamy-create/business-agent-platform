@@ -2,7 +2,7 @@
 // they are played) and a voice service (a WebSocket that takes settings, audio and "say exactly ..." requests and answers with audio, transcripts and events). No socket, no network, no key.
 //
 // IMPORTANT: both are models built from documentation read on 2026-10-27. Nothing here has been checked against Twilio or OpenAI, so a passing test shows behaviour against THESE models only.
-import { SAY_PREFIX } from '../../src/realtime-transport.ts';
+import { wordsOf } from '../../src/realtime-transport.ts';
 import type { VoiceSocket } from '../../src/realtime-bridge.ts';
 import type { CloseInfo, RelayConnection } from '../../src/ws-server.ts';
 
@@ -32,6 +32,8 @@ export interface WirePhone extends RelayConnection {
 }
 export interface WireVoice extends VoiceSocket {
   received: any[];
+  /** Requests refused as the documented schema would (see the link-level stand-in). */
+  refused: string[];
   appended(): number;
   /** The settings last sent. */
   settings(): any;
@@ -89,7 +91,7 @@ export function createWirePhone(o: { speed?: number } = {}): WirePhone {
 
 export function createWireVoice(o: { msPerChar?: number; behave?: (text: string, n: number) => Behaviour; accept?: () => boolean; autoOpen?: boolean } = {}): WireVoice {
   const mpc = o.msPerChar ?? 2;
-  const received: any[] = []; const spoken: string[] = []; const closedWith: Array<number | undefined> = [];
+  const received: any[] = []; const refused: string[] = []; const items = new Set<string>(); const spoken: string[] = []; const closedWith: Array<number | undefined> = [];
   let isOpen = false; let interruptible = true; let n = 0; let item = 0; let appended = 0; let settings: any;
   let chain: Promise<void> = Promise.resolve();
   interface Play { rid: string; mid: string; text: string; b: Behaviour; timer?: ReturnType<typeof setTimeout>; cancelled: boolean }
@@ -99,7 +101,7 @@ export function createWireVoice(o: { msPerChar?: number; behave?: (text: string,
 
   function begin(m: any): void {
     const ins = String(m.response?.instructions ?? '');
-    const text = ins.startsWith(SAY_PREFIX) ? ins.slice(SAY_PREFIX.length) : ins;
+    const text = wordsOf(ins);
     n++;
     const p: Play = { rid: `resp_${n}`, mid: String(m.response?.metadata?.id), text, b: o.behave?.(text, n) ?? 'exact', cancelled: false };
     play = p;
@@ -132,24 +134,32 @@ export function createWireVoice(o: { msPerChar?: number; behave?: (text: string,
     p.cancelled = true; if (p.timer !== undefined) clearTimeout(p.timer); play = undefined;
     deliver({ type: 'response.done', response: { id: p.rid, status: 'cancelled', metadata: { id: p.mid } } });
   }
+  const refuse = (m: any, why: string, code: string): void => { refused.push(why); deliver({ type: 'error', error: { type: 'invalid_request_error', code, message: why, event_id: m.event_id ?? null } }); };
   const v: WireVoice = {
-    received, spoken, closedWith,
+    received, refused, spoken, closedWith,
     appended: () => appended, settings: () => settings, playing: () => play !== undefined,
     send(text: string): boolean {
       if (!isOpen || !(o.accept?.() ?? true)) return false;
       const m = JSON.parse(text);
       received.push(m);
       if (m.type === 'input_audio_buffer.append') appended++;
-      else if (m.type === 'session.update') { settings = m.session; const td = m.session?.audio?.input?.turn_detection; if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response; }
+      else if (m.type === 'session.update') { if (m.session?.type !== 'realtime') { refuse(m, 'session.update without session.type', 'missing_required_parameter'); return true; } settings = m.session; const td = m.session?.audio?.input?.turn_detection; if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response; }
       else if (m.type === 'response.create') begin(m);
-      else if (m.type === 'response.cancel') cancel();
+      else if (m.type === 'response.cancel') {
+        if (typeof m.response_id !== 'string') refused.push('response.cancel without response_id');   // not in the default conversation: it reaches nothing
+        else if (play === undefined || play.rid !== m.response_id) refuse(m, 'response.cancel of a reply that is not playing', 'response_cancel_not_active');
+        else cancel();
+      } else if (m.type === 'conversation.item.delete') {
+        if (typeof m.item_id !== 'string' || !items.has(m.item_id)) refuse(m, 'conversation.item.delete of an item that does not exist', 'item_not_found');
+        else { items.delete(m.item_id); deliver({ type: 'conversation.item.deleted', item_id: m.item_id }); }
+      }
       return true;
     },
     close(code?: number): void { closedWith.push(code); isOpen = false; },
     onOpen: () => {}, onMessage: () => {}, onClose: () => {},
     open() { isOpen = true; v.onOpen(); },
     hear(text) {
-      const id = `item_${++item}`;
+      const id = `item_${++item}`; items.add(id);
       deliver({ type: 'input_audio_buffer.speech_started' });
       if (play !== undefined && interruptible) chain = chain.then(() => { cancel(); });
       deliver({ type: 'input_audio_buffer.speech_stopped' });

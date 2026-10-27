@@ -5,13 +5,13 @@
 // IMPORTANT: this is a model of the service built from documentation read on 2026-10-27. It has not been checked against the real service, so a passing test shows how the adapter
 // and the call logic behave against THIS model, not against OpenAI. The event names, the transcript events and the `x_played_ms` field (how much of a reply the phone layer says was
 // played) are assumptions.
-import { SAY_PREFIX } from '../../src/realtime-transport.ts';
+import { wordsOf } from '../../src/realtime-transport.ts';
 import type { RealtimeLink } from '../../src/realtime-transport.ts';
 import type { CloseInfo } from '../../src/ws-server.ts';
 
 const WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
 /** How a requested reply is played. `words` says every numeral as a word; `{ say }` says other words than the ones asked for. */
-export type Behaviour = 'exact' | 'words' | 'silent' | 'fail' | 'incomplete' | { say: string };
+export type Behaviour = 'exact' | 'words' | 'silent' | 'fail' | 'incomplete' | 'hang' | { say: string };
 export interface RealtimeSimOptions {
   /** Milliseconds of playback per character. Default 2 (fast). The adapter is given the same figure. */
   msPerChar?: number;
@@ -19,6 +19,8 @@ export interface RealtimeSimOptions {
   behave?: (text: string, n: number) => Behaviour;
   /** Whether a send reaches the service. */
   accept?: () => boolean;
+  /** A voice service that ignores every cancel (and never stops a reply of its own accord). */
+  ignoreCancel?: boolean;
   /** Whether the hang-up works. */
   hangupWorks?: () => boolean;
 }
@@ -27,6 +29,8 @@ export interface RealtimeSim {
   link: RealtimeLink;
   /** Everything the adapter sent, in order. */
   sent: any[];
+  /** Requests the stand-in refused as the documented schema would: a settings update without `session.type`, a cancel that names no reply, a cancel of a reply that is not playing, a delete of an item that does not exist. */
+  refused: string[];
   /** What the caller heard, in order: replies that played to the end with words. */
   spoken: string[];
   /** Calls to hangup() and close(), in order, mixed with the replies heard: lets a test see that the goodbye finished before the hang-up. */
@@ -53,6 +57,7 @@ export interface RealtimeSim {
 export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
   const msPerChar = o.msPerChar ?? 2;
   const sent: any[] = []; const spoken: string[] = []; const events: string[] = []; const closeCodes: Array<number | undefined> = [];
+  const refused: string[] = []; const items = new Set<string>();
   let hungUp = false; let interruptible = true; let n = 0; let item = 0;
   let chain: Promise<void> = Promise.resolve();
   interface Play { rid: string; mid: string; text: string; behaviour: Behaviour; startedAt: number; timer: ReturnType<typeof setTimeout> }
@@ -77,27 +82,37 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
   }
   function cancel(): void {
     const p = play;
-    if (p === undefined) return;
+    if (p === undefined || o.ignoreCancel === true) return;
     clearTimeout(p.timer); play = undefined;
     deliver({ type: 'response.done', response: { id: p.rid, status: 'cancelled', metadata: { id: p.mid } } });
   }
+  /** The service answers a refused request with an error that names the request (`error.event_id`), as the documented server does. */
+  const refuse = (m: any, why: string, code: string): void => { refused.push(why); deliver({ type: 'error', error: { type: 'invalid_request_error', code, message: why, event_id: m.event_id ?? null } }); };
   function handle(m: any): void {
     if (m?.type === 'session.update') {
+      if (m.session?.type !== 'realtime') { refuse(m, 'session.update without session.type', 'missing_required_parameter'); return; }
       const td = m.session?.audio?.input?.turn_detection;
       if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response;
     } else if (m?.type === 'response.create') {
       const instructions = String(m.response?.instructions ?? '');
-      const text = instructions.startsWith(SAY_PREFIX) ? instructions.slice(SAY_PREFIX.length) : instructions;
+      const text = wordsOf(instructions);
       n++;
       const rid = `resp_${n}`;
       const behaviour = o.behave?.(text, n) ?? 'exact';
       const p: Play = { rid, mid: String(m.response?.metadata?.id), text, behaviour, startedAt: Date.now(), timer: setTimeout(() => { /* replaced below */ }, 0) };
       clearTimeout(p.timer);
-      p.timer = setTimeout(() => finish(p), Math.max(1, text.length * msPerChar)); p.timer.unref?.();   // a long reply must not keep the test process alive
+      p.timer = setTimeout(() => { if (behaviour !== 'hang') finish(p); }, Math.max(1, text.length * msPerChar)); p.timer.unref?.();   // a long reply must not keep the test process alive
       play = p;
       deliver({ type: 'response.created', response: { id: rid, metadata: { id: p.mid } } });
     } else if (m?.type === 'response.cancel') {
+      // A reply requested out of band is not in the default conversation: only a cancel that names it reaches it.
+      if (typeof m.response_id !== 'string') { refused.push('response.cancel without response_id'); return; }
+      if (play === undefined || play.rid !== m.response_id) { refuse(m, 'response.cancel of a reply that is not playing', 'response_cancel_not_active'); return; }
       cancel();
+    } else if (m?.type === 'conversation.item.delete') {
+      if (typeof m.item_id !== 'string' || !items.has(m.item_id)) { refuse(m, 'conversation.item.delete of an item that does not exist', 'item_not_found'); return; }
+      items.delete(m.item_id);
+      deliver({ type: 'conversation.item.deleted', item_id: m.item_id });
     }
   }
 
@@ -114,12 +129,12 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
     onClose: () => {},
   };
   const sim: RealtimeSim = {
-    link, sent, spoken, events, closeCodes,
+    link, sent, refused, spoken, events, closeCodes,
     get hungUp() { return hungUp; },
     playing: () => play !== undefined,
     start(c) { deliver({ type: 'carrier.start', to: c.to, callSid: c.callSid }); },
     say(text, opts) {
-      const id = `item_${++item}`;
+      const id = `item_${++item}`; items.add(id);
       const talkingOver = play !== undefined;
       const playedMs = opts?.playedMs ?? (play ? Date.now() - play.startedAt : 0);
       deliver({ type: 'input_audio_buffer.speech_started', ...(talkingOver ? { x_played_ms: playedMs } : {}) });
@@ -127,7 +142,7 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
       deliver({ type: 'input_audio_buffer.speech_stopped' });
       deliver({ type: 'conversation.item.input_audio_transcription.completed', item_id: id, transcript: text });
     },
-    mumble() { deliver({ type: 'conversation.item.input_audio_transcription.completed', item_id: `item_${++item}`, transcript: '  ' }); },
+    mumble() { const id = `item_${++item}`; items.add(id); deliver({ type: 'conversation.item.input_audio_transcription.completed', item_id: id, transcript: '  ' }); },
     drop(info) { chain = chain.then(() => { link.onClose(info); }); },
     async idle() {
       for (let i = 0; i < 200; i++) {

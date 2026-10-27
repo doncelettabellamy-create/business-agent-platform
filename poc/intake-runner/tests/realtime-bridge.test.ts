@@ -73,7 +73,9 @@ test('setup: the Drew persona reaches the voice service as manner only, and the 
   const h = harness({ realtime: { persona: p } });
   await live(h);
   assert.equal(h.voice.received[0].session.instructions, `${SPEAK_ONLY} ${voiceManner(p)}`);
-  assert.equal(h.voice.received[2].response.instructions, SAY_PREFIX + NOTICE);
+  assert.equal(h.voice.received[2].response.instructions, `${SPEAK_ONLY} ${voiceManner(p)} ${SAY_PREFIX}${NOTICE}`, 'the Drew manner is in the request itself, not only the session');
+  assert.deepEqual(h.voice.refused, []);
+  assert.equal(h.voice.received[0].session.type, 'realtime');
   assert.equal(h.voice.spoken[0], NOTICE);
   assert.throws(() => harness({ realtime: { persona: { business_name: 'Drew Cleaning' } } }), RangeError, 'a lookalike is refused');
 });
@@ -227,6 +229,28 @@ test('interruption: late audio and late markers of a reply that was cleared are 
   await h.voice.idle(); await sleep(30);
   assert.equal(h.phone.sent.filter((m) => m.event === 'media').length, media, 'nothing more is played after the clear');
   assert.ok(h.bridge.stats().marksLate >= 1);
+});
+
+test('interruption: through the bridge the cancel names the reply, the phone is cleared once, and the next line is spoken once with the Drew manner', async () => {
+  const p = createPersona(drew);
+  const h = harness({ realtime: { persona: p } });
+  await live(h);
+  const before = mediaSent(h);
+  h.t.speak('This is a rather long reply that goes on and on so that the caller can talk over it before it is finished. '.repeat(3).trim(), true);
+  await until(() => mediaSent(h) > before);
+  h.voice.hear('excuse me');
+  await until(() => h.kinds().includes('utterance'));
+  h.t.speak('Sure, what is the address?', true);
+  await until(() => h.voice.spoken.length >= 2);
+  await h.voice.idle(); await h.phone.drained(); await sleep(30);
+  const cancels = h.voice.received.filter((m) => m.type === 'response.cancel');
+  assert.equal(cancels.length, 1);
+  assert.equal(typeof cancels[0].response_id, 'string');
+  assert.equal(h.phone.sent.filter((m) => m.event === 'clear').length, 1);
+  assert.deepEqual(h.voice.spoken, [NOTICE, 'Sure, what is the address?'], 'the interrupted reply never finished and was not repeated');
+  assert.ok(h.voice.received.filter((m) => m.type === 'response.create').every((m) => String(m.response.instructions).startsWith(`${SPEAK_ONLY} ${voiceManner(p)} `)), 'every request keeps the persona');
+  assert.ok(!h.kinds().includes('reply_failed') && !h.kinds().includes('error'));
+  assert.deepEqual(h.voice.refused.filter((r) => !r.startsWith('response.cancel of a reply')), []);
 });
 
 test('interruption: the consent notice is never cleared or cut off, even if the caller talks over it', async () => {
