@@ -3,11 +3,12 @@
 //   Twilio `setup`   the dialed number picks the tenant from a server-side table (never from speech); unknown number, kill switch, a call
 //                    already running, or a call id seen before -> the call is ended and nothing is processed. The caller's number is not read.
 //   first `prompt`   the answer to the spoken consent notice. Not a plain yes -> goodbye, hang up, nothing kept, no model contacted.
-//   later `prompt`   masked (pii-screen.ts); a refused utterance ends the call. The existing Intake agent runs over the masked caller
-//                    lines in the background (what is still missing?) while the dialogue model streams the next spoken reply. Intake's
-//                    answer steers the NEXT turn.
-//   read-back        when Intake says `ready`, a fresh Intake run over everything heard so far is awaited; if it is still ready the server
-//                    itself (not the model) reads back the non-address fields in fixed words and asks for a yes or no. The address is
+//   later `prompt`   masked (pii-screen.ts); a refused utterance ends the call. ONE Intake run over all the masked caller lines is awaited
+//                    for every turn (within `previewBudgetMs`). A result that is validated (no `model_failed`) and covers every line so far
+//                    is fresh; next-field.ts then chooses, by code, what happens next: read back, ask one named field, clarify, or just listen.
+//                    The dialogue model is told that one directive and nothing else. A late, failed or stale result chooses nothing.
+//   read-back        when the fresh result is `ready`, the server itself (not the model) reads back the non-address fields in fixed words
+//                    and asks for a yes or no, on the same turn. The address is
 //                    never spoken, in any form. A yes confirms exactly the item that was read back; a no goes back to listening (at most
 //                    two read-backs); anything unclear twice, or silence, ends the call unconfirmed.
 //   end of call      the record is saved. CONFIRMED only after a yes to the read-back; every other ending (hang-up, limit, timeout, error,
@@ -21,10 +22,15 @@ import { createCallSession } from './call-session.ts';
 import type { CallSession, SessionLimits } from './call-session.ts';
 import { runCallIntake } from './call-intake.ts';
 import type { IntakeEntry } from './intake-entry.ts';
-import type { DialogueModel } from './dialogue-model.ts';
-import type { RelayConnection } from './ws-server.ts';
+import type { DialogueModel, Directive } from './dialogue-model.ts';
+import { freshFrom, selectNext } from './next-field.ts';
+import { spokenDigits } from './contact-capture.ts';
+import type { Contact } from './contact-capture.ts';
+import type { ContactVault } from './contact-vault.ts';
+import type { Fresh } from './next-field.ts';
+import type { CloseInfo, RelayConnection } from './ws-server.ts';
 import { isRecord } from './contracts.ts';
-import type { WorkItemV1 } from './contracts.ts';
+import type { HandoffEnvelopeV1, WorkItemV1 } from './contracts.ts';
 import { piiProblems } from './pii-screen.ts';
 
 const CALL_SID = /^[A-Za-z0-9]{10,40}$/;
@@ -32,19 +38,24 @@ const E164 = /^\+[1-9][0-9]{6,14}$/;
 const MAX_READBACKS = 2;
 const MAX_SPEECH_WAIT_MS = 15_000;
 const PLACEHOLDER = /\[[A-Z]+_\d{1,3}\]/g;
-/** What the dialogue model is asked to collect when Intake is not ready but names no missing field. */
-export const MORE_ABOUT_REQUEST = 'a short description of what the caller needs';
+const SENSITIVE_NAME = /\b(?:name|phone|mobile|cell|e-?mail|callback|contact)\b/i;
+/** The record's fields with every name, phone, mobile or e-mail field's value replaced by a placeholder. Pure. */
+export function redactSensitive(fields: readonly { name: string; value: string | number | boolean | null; confidence: number | null; found: boolean }[]): { name: string; value: string | number | boolean | null; confidence: number | null; found: boolean }[] {
+  return fields.map((f) => ({ name: f.name, value: f.found && f.value !== null && SENSITIVE_NAME.test(f.name) ? '[CONTACT_1]' : f.value, confidence: f.confidence, found: f.found }));
+}
+/** Reason on a confirmed request whose contact could not be stored: it is held for a person. */
+export const CONTACT_MISSING = 'contact_missing';
 
 export const SAY = Object.freeze({
   declined: 'No problem. This test line will not continue. Goodbye.',
   unavailable: 'Sorry, this test line is not available right now. Goodbye.',
-  trouble: "Sorry, I can't continue this call. A person will follow up. Goodbye.",
-  limit: 'Thank you. That is all the time I have for this call. A person will follow up. Goodbye.',
-  thanks: 'Thank you. Your request is recorded and a person will follow up. Goodbye.',
+  trouble: "Sorry, I can't continue this call. Goodbye.",
+  limit: 'Thank you. That is all the time I have for this call. Goodbye.',
+  thanks: 'Thank you. Your request is recorded. Goodbye.',
   correct: 'Sorry about that. What should I change?',
   yesno: 'Sorry, I did not catch that. Please say yes or no.',
-  silence: 'I did not hear a reply. A person will follow up. Goodbye.',
-  unconfirmed: 'Thank you. I could not confirm the details, so a person will follow up. Goodbye.',
+  silence: 'I did not hear a reply. Goodbye.',
+  unconfirmed: 'Thank you. I could not confirm the details. Goodbye.',
 });
 
 /** How long a spoken line needs to play: a fixed pad plus a time per character, never more than the cap. Pure. */
@@ -55,8 +66,8 @@ export function speechDelayMs(text: string, msPerChar = 70, padMs = 1500): numbe
 export interface RelayDeps {
   /** Dialed number (E.164) -> tenant. The only way a tenant is chosen. */
   numbers: ReadonlyMap<string, string>;
-  /** The field names of the tenant's configuration, used as the first "missing" list. */
-  fieldNames(tenant: string): string[];
+  /** The category names of the tenant's configuration, offered to a caller whose request was not recognised (never customer data). */
+  categoryNames(tenant: string): string[];
   intake: IntakeEntry;
   /** A minted Intake context for this call (the composition root mints it; this file never does). */
   intakeContext(tenant: string, callRef: string): Promise<unknown>;
@@ -75,6 +86,20 @@ export interface RelayDeps {
   speechMs(text: string): number;
   /** How long to wait for the caller's yes or no after a read-back before ending the call unconfirmed. */
   confirmWaitMs: number;
+  /** The longest to wait for the Intake run of a turn. A result that misses it chooses nothing; the assistant just listens. */
+  previewBudgetMs: number;
+  /**
+   * The cleaning pilot's encrypted contact vault. When present, a name, a usable callback number and a service address are required before a request
+   * is ready, the number is read back with the job, and a yes stores the contact (and only then can the request be handed off). When absent, nothing
+   * about contacts changes.
+   */
+  contacts?: ContactVault;
+  /**
+   * Called once, after the record is saved, when (and only when) the caller confirmed and the confirmed record is ready and handed off. It receives the ORIGINAL
+   * sealed handoff envelope of the very Intake result that was read back, and the tenant and call reference. It is the single seam for a later bridge to Processing;
+   * nothing here decides eligibility or uses the envelope. The object is never logged or stored. A throw or rejection is caught and logged as a fixed code.
+   */
+  confirmedHandoff?(handoff: HandoffEnvelopeV1, call: { tenant: string; callRef: string }): unknown;
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number>): void;
 }
@@ -85,10 +110,11 @@ export interface RelayHandler {
   idle(): Promise<void>;
 }
 
-interface Preview { item: WorkItemV1; handedOff: boolean }
+/** One Intake result. `handoff` is the original sealed envelope object (in memory only: never logged, stored, copied or sent anywhere). */
+interface Preview { item: WorkItemV1; handedOff: boolean; handoff: HandoffEnvelopeV1 | null }
 
 /** The read-back, in fixed words: the non-address fields only. A placeholder is never spoken, and a value that still looks personal is left out. */
-export function readBackText(item: WorkItemV1): string {
+export function readBackText(item: WorkItemV1, phone?: string): string {
   const parts: string[] = [];
   for (const f of item.fields) {
     if (!f.found || f.value === null || /address/i.test(f.name)) continue;
@@ -96,13 +122,16 @@ export function readBackText(item: WorkItemV1): string {
     if (v.length === 0 || piiProblems(v).length > 0) continue;
     parts.push(`${f.name}: ${v}.`);
   }
-  return `Let me check what I have. ${parts.length > 0 ? parts.join(' ') : 'I have your request.'} Is that correct? Please say yes or no.`;
+  const callback = phone === undefined ? '' : ` Your callback number: ${spokenDigits(phone)}.`;
+  return `Let me check what I have. ${parts.length > 0 ? parts.join(' ') : 'I have your request.'}${callback} Is that correct? Please say yes or no.`;
 }
 
 export function createRelayHandler(deps: RelayDeps): RelayHandler {
-  const fns = ['fieldNames', 'intakeContext', 'now', 'nowIso', 'killed', 'log', 'speechMs'] as const;
+  const fns = ['categoryNames', 'intakeContext', 'now', 'nowIso', 'killed', 'log', 'speechMs'] as const;
   if (!isRecord(deps) || !(deps.numbers instanceof Map) || !isRecord(deps.intake) || !isRecord(deps.dialogue) || !isRecord(deps.store) || !isRecord(deps.limits)
-    || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !Number.isInteger(deps.confirmWaitMs) || deps.confirmWaitMs < 1 || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1
+    || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !Number.isInteger(deps.confirmWaitMs) || deps.confirmWaitMs < 1 || !Number.isInteger(deps.previewBudgetMs) || deps.previewBudgetMs < 1 || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1
+    || (deps.confirmedHandoff !== undefined && typeof deps.confirmedHandoff !== 'function')
+    || (deps.contacts !== undefined && (!isRecord(deps.contacts) || typeof deps.contacts.put !== 'function'))
     || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
     throw new RangeError('the relay handler needs every dependency');
   }
@@ -123,23 +152,31 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let bad = 0;
     let chain: Promise<unknown> = Promise.resolve();
     let streaming: AbortController | undefined;
-    let missing: string[] = [];
-    let ready = false;
-    let latest: Preview | undefined;   // the newest successful Intake run over everything heard
-    let background: Promise<void> | undefined;
+    let lastValid: Preview | undefined;   // the newest validated Intake run, kept only to save a record if the final run fails
+    let lastValidCovers = 0;
     let previewN = 0;
+    const lastAskedAt = new Map<string, number>();   // field -> caller-line count when it was last asked
+    let clarified = false;
     let phase: 'collect' | 'confirm' = 'collect';
     let readbacks = 0;
     let unclear = 0;
     let readBack: Preview | undefined;   // exactly what the caller was asked to confirm
+    let readBackContact: Contact | undefined;   // the contact as it stood when the number was read back: RAW, never logged, never sent to a model, cleared in finish()
     let confirmTimer: ReturnType<typeof setTimeout> | undefined;
     let setupSeen = false;   // a prompt may arrive while setup is still being prepared: it waits behind it
     let hardStop: ReturnType<typeof setTimeout> | undefined;
+    // Diagnostics: counts and milliseconds only. Nothing here ever holds, or is derived from, what anyone said.
+    const startedAt = deps.now();
+    let lastPromptAt: number | undefined;   // when the newest FINAL caller utterance arrived
+    let lastReplyEndAt: number | undefined; // when the assistant last finished (or stopped) a reply
+    let replies = 0; let failedSends = 0; let partialPrompts = 0; let interrupts = 0; let otherFrames = 0;
     const setupTimer = setTimeout(() => { if (session === undefined) { deps.log('SETUP_TIMEOUT'); conn.close(1008); } }, 5000);
     setupTimer.unref?.();
 
     /** `final` lines end the call, so the caller cannot talk over them. */
-    const say = (text: string, final = false): void => { conn.send(final ? { type: 'text', token: text, last: true, interruptible: false } : { type: 'text', token: text, last: true }); };
+    /** Every outgoing message goes through here so a refused write (the peer gone or too slow) is counted, never silently lost. */
+    const sendCounted = (m: unknown): boolean => { const ok = conn.send(m); if (!ok) failedSends++; return ok; };
+    const say = (text: string, final = false): void => { sendCounted(final ? { type: 'text', token: text, last: true, interruptible: false } : { type: 'text', token: text, last: true }); };
     const clearConfirmTimer = (): void => { if (confirmTimer !== undefined) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
     function release(): void {
       clearTimeout(setupTimer);
@@ -153,7 +190,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const left = need - (spokeAt === undefined ? 0 : deps.now() - spokeAt);
       const wait = Math.max(deps.afterSpeechMs, left);
       if (wait > 0) await new Promise<void>((r) => { setTimeout(r, wait); });
-      conn.send({ type: 'end' }); conn.close(1000);
+      sendCounted({ type: 'end' }); conn.close(1000);
     };
     /** A closing line, then the save (while it plays), then the hang-up. */
     async function farewell(line: string, save: boolean): Promise<void> {
@@ -174,75 +211,119 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const s = session;
       if (s === undefined) return;
       const text = s.maskedText(); const pii = s.piiSummary(); const turns = s.turns();
+      const fallback = lastValid; lastValid = undefined;
+      const contact = readBackContact; readBackContact = undefined;
       s.dispose();
       if (!save || turns === 0) { deps.log('CALL_ENDED', { turns, saved: 0 }); return; }
       let w: WorkItemV1; let handedOff: boolean;
+      const sealed = confirmed?.handoff ?? null;   // the original object of the confirmed read-back; used only for the confirmedHandoff seam below
       if (confirmed !== undefined) { w = confirmed.item; handedOff = confirmed.handedOff; }
       else {
         const r = await runCallIntake(deps.intake, ctx, { tenant, callId, tag: 'final', maskedText: text, pii });
-        if (!r.ok) { deps.log('FINAL_INTAKE_FAILED', { code: r.code }); return; }
-        w = r.item; handedOff = r.handedOff;
+        if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) { w = r.item; handedOff = r.handedOff; }
+        else if (fallback !== undefined) {
+          // The final run failed or was not validated (`model_failed`). An earlier validated run is still better than a guess or losing the request; it is saved unconfirmed like any other.
+          deps.log('FINAL_INTAKE_FAILED', { code: r.ok ? 0 : r.code }); deps.log('FALLBACK_RECORD', { turns });
+          w = fallback.item; handedOff = fallback.handedOff;
+        } else { deps.log('FINAL_INTAKE_FAILED', { code: r.code }); return; }
       }
-      const ok = confirmed !== undefined && w.status === 'ready' && handedOff;
+      // Contact: stored only after a yes, before the record. A request is not actionable unless its contact is safely stored.
+      let contactOk = deps.contacts === undefined;
+      if (confirmed !== undefined && deps.contacts !== undefined) {
+        if (contact === undefined) deps.log('CONTACT_MISSING');
+        else {
+          try { deps.contacts.put(tenant, ref, contact); contactOk = true; deps.log('CONTACT_STORED'); }
+          catch { deps.log('CONTACT_STORE_FAILED'); }
+        }
+      }
+      const addressStored = confirmed !== undefined && deps.contacts !== undefined && contactOk && contact !== undefined;
+      const ok = confirmed !== undefined && w.status === 'ready' && handedOff && contactOk;
       const found = w.fields.filter((f) => f.found && f.confidence !== null).map((f) => f.confidence as number);
       const record: IntakeRecord = {
         item_id: w.item_id, workspace_id: tenant, call_ref: ref, received_at: deps.nowIso(), category: w.category,
         status: ok ? w.status : 'needs-human',
-        reasons: ok ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED])], missing_fields: [...w.missing_fields],
-        fields: w.fields.map((f) => ({ name: f.name, value: f.value, confidence: f.confidence, found: f.found })),
+        reasons: ok ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : [])])], missing_fields: [...w.missing_fields],
+        // A field that holds a person's name, number or e-mail never keeps its value in the record, even if the masker missed it (a lower-case name).
+        fields: redactSensitive(w.fields),
         pii_summary: w.pii_summary.map((p) => ({ type: p.type, count: p.count })),
         confidence: found.length > 0 ? Math.min(...found) : null, versions: { ...w.versions }, handed_off: ok, turns,
         confirmation: ok ? 'confirmed' : 'unconfirmed',
-        address_status: w.fields.some((f) => f.found && /address/i.test(f.name)) ? 'unverified' : 'none',
+        // An address nobody has checked: one found in a field, or one held in the contact vault for this call (the cleaning skill has no address field).
+        address_status: w.fields.some((f) => f.found && /address/i.test(f.name)) || addressStored ? 'unverified' : 'none',
       };
       deps.log(ok ? 'CONFIRMED' : 'UNCONFIRMED', { turns });
-      try { deps.log('RECORD_' + deps.store.put(tenant, record).toUpperCase(), { turns }); }
+      let saved = false;
+      try { const put = deps.store.put(tenant, record); saved = put === 'new'; deps.log('RECORD_' + put.toUpperCase(), { turns }); }
       catch (e) { deps.log(e instanceof RecordRefused ? 'RECORD_REFUSED' : 'RECORD_FAILED'); }
+      if (saved && ok && sealed !== null && deps.confirmedHandoff !== undefined) {
+        try { await deps.confirmedHandoff(sealed, { tenant, callRef: ref }); }
+        catch { deps.log('HANDOFF_SEAM_FAILED'); }
+      }
     }
 
-    /** One Intake run over everything heard so far. A failure clears `ready`, so a stale yes is never read back. */
-    function runPreview(): Promise<void> {
-      const s = session;
-      if (s === undefined || s.turns() === 0) return Promise.resolve();
+    /**
+     * One Intake run over every caller line so far, awaited for at most `previewBudgetMs`. Returns a preview only when the run finished in time, was
+     * validated (not `model_failed`) and covers every line; anything else returns undefined and the turn only listens. A run that finishes late still
+     * updates `lastValid` (never backwards), which is used only as a fallback record, never to choose a question.
+     */
+    async function freshPreview(covers: number): Promise<{ fresh: Fresh; preview: Preview } | undefined> {
+      const s = session as CallSession;
       const tag = `p${++previewN % 1000}`;
       const text = s.maskedText(); const pii = s.piiSummary();
-      return track(runCallIntake(deps.intake, ctx, { tenant, callId, tag, maskedText: text, pii }).then((r) => {
-        if (done) return;
-        if (r.ok) { missing = [...r.item.missing_fields]; ready = r.item.status === 'ready'; latest = { item: r.item, handedOff: r.handedOff }; }
-        else { deps.log('PREVIEW_FAILED', { code: r.code }); ready = false; latest = undefined; }
-      }, () => { ready = false; latest = undefined; }));
-    }
-    function previewIntake(): void {
-      if (background !== undefined) return;
-      const p = runPreview().finally(() => { if (background === p) background = undefined; });
-      background = p;
-    }
-    /** Waits for any background run, then makes a fresh one that includes the caller's latest words. */
-    async function previewNow(): Promise<void> {
-      if (background !== undefined) await background;
-      if (!done) await runPreview();
+      const started = deps.now();
+      const run = track(runCallIntake(deps.intake, ctx, { tenant, callId, tag, maskedText: text, pii }).then((r) => {
+        if (done) return undefined;
+        if (!r.ok) { deps.log('PREVIEW_FAILED', { code: r.code }); return undefined; }
+        const fresh = freshFrom(r.item, covers);
+        if (fresh === undefined) { deps.log('PREVIEW_UNUSABLE'); return undefined; }
+        const preview: Preview = { item: r.item, handedOff: r.handedOff, handoff: r.handoff };
+        if (covers >= lastValidCovers) { lastValid = preview; lastValidCovers = covers; }
+        return { fresh, preview };
+      }, () => { deps.log('PREVIEW_FAILED', { code: 0 }); return undefined; }));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), deps.previewBudgetMs); timer.unref?.(); });
+      const got = await Promise.race([run, late]);
+      if (timer !== undefined) clearTimeout(timer);
+      deps.log('TIMING', { preview_ms: Math.max(0, deps.now() - started) });
+      if (got === 'late') { deps.log('PREVIEW_BUDGET_EXCEEDED', { budget_ms: deps.previewBudgetMs }); return undefined; }
+      return got;
     }
 
-    async function speak(): Promise<void> {
+    async function speak(directive: Directive): Promise<void> {
       const s = session as CallSession;
       const controller = new AbortController();
       streaming = controller;
       let said = '';
+      const began = deps.now();
+      let firstTokenAt: number | undefined; let chars = 0; let parts = 0; let failed = 0; let threw = false;
+      const send = (m: unknown): void => { if (!sendCounted(m)) failed++; };
       try {
-        // An empty list means "wrap up" to the dialogue model, and only the server's own read-back may end a call. When Intake is not ready but
-        // lists nothing missing (an unknown category, say), the model is asked for more about the request instead of saying goodbye.
-        const stillNeeded = missing.length > 0 ? missing : [MORE_ABOUT_REQUEST];
-        for await (const piece of deps.dialogue.reply({ turns: s.dialogue(), missing: stillNeeded, signal: controller.signal })) {
+        for await (const piece of deps.dialogue.reply({ turns: s.dialogue(), directive, signal: controller.signal })) {
           if (controller.signal.aborted || done) break;
-          said += piece;
-          conn.send({ type: 'text', token: piece, last: false });
+          if (firstTokenAt === undefined) firstTokenAt = deps.now();
+          said += piece; chars += piece.length; parts++;
+          send({ type: 'text', token: piece, last: false });
         }
-        if (!controller.signal.aborted && !done) conn.send({ type: 'text', token: '', last: true });
+        if (!controller.signal.aborted && !done) send({ type: 'text', token: '', last: true });
       } catch {
-        deps.log('DIALOGUE_FAILED');
+        threw = true;
+        deps.log('DIALOGUE_FAILED', { chars, parts, failed_sends: failed });
         if (!done) await farewell(SAY.trouble, true);
         return;
-      } finally { streaming = undefined; }
+      } finally { streaming = undefined; lastReplyEndAt = deps.now(); replies++; }
+      // What happened to this reply, in numbers: how much was produced, how soon, whether any write was refused, and whether it was cut short.
+      // (REPLY_SENT proves words were produced and written to the socket; it cannot prove the phone provider spoke them.)
+      const total = Math.max(0, deps.now() - began);
+      const detail: Record<string, number> = { chars, parts, failed_sends: failed, total_ms: total };
+      if (firstTokenAt !== undefined) {
+        detail.first_token_ms = Math.max(0, firstTokenAt - began);
+        if (lastPromptAt !== undefined) detail.since_prompt_ms = Math.max(0, firstTokenAt - lastPromptAt);
+      }
+      if (controller.signal.aborted) deps.log('REPLY_INTERRUPTED', detail);
+      else if (done) deps.log('REPLY_CUT', detail);
+      else if (chars === 0 && !threw) deps.log('REPLY_EMPTY', detail);
+      else deps.log('REPLY_SENT', detail);
+      if (failed > 0) deps.log('REPLY_SEND_FAILED', { failed_sends: failed });
       if (done) return;
       s.said(said);
       if (controller.signal.aborted) { s.interrupted(interruptedText); interruptedText = ''; }
@@ -265,9 +346,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     function startReadback(item: Preview): void {
       const s = session as CallSession;
       phase = 'confirm'; readbacks++; unclear = 0; readBack = item;
-      const text = readBackText(item.item);
-      say(text);
-      s.said(text);
+      readBackContact = deps.contacts === undefined ? undefined : s.revealContact();
+      // The caller hears the number; the dialogue history (which goes to the model on later turns) gets the same words WITHOUT it.
+      say(readBackText(item.item, readBackContact?.phone));
+      s.said(readBackText(item.item));
       deps.log('READBACK', { n: readbacks });
       armConfirmTimer();
     }
@@ -284,7 +366,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       }
       if (a === 'no') {
         if (readbacks >= MAX_READBACKS) return await farewell(SAY.unconfirmed, true);
-        phase = 'collect'; ready = true; latest = undefined; readBack = undefined;   // `ready` here means: check again after the correction
+        phase = 'collect'; readBack = undefined; readBackContact = undefined;   // the next turn makes a fresh Intake run over everything, correction included
         say(SAY.correct); s.said(SAY.correct);
         return;
       }
@@ -300,7 +382,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (s.state === 'consent') {
         if (s.consent(raw) === 'declined') { await farewell(SAY.declined, false); return; }
         deps.log('CONSENT_GRANTED');
-        return speak();
+        return speak({ kind: 'open' });
       }
       const limit = s.limit();
       if (limit === 'KILLED') { await farewell(SAY.unavailable, false); return; }
@@ -308,12 +390,29 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const heard = s.hear(raw);
       if (!heard.ok) { deps.log('UTTERANCE_REFUSED', { code: heard.code }); await farewell(SAY.trouble, true); return; }
       if (phase === 'confirm') return onAnswer(heard.line);
-      if (ready) {
-        await previewNow();
-        if (done) return;
-        if (ready && latest !== undefined) return startReadback(latest);
-      } else previewIntake();
-      return speak();
+      const covers = s.turns();
+      const got = await freshPreview(covers);
+      if (done) return;
+      // With the contact vault on, the three contact items are required too: they are added to what is missing, by code, from this turn's lines.
+      let fresh = got?.fresh;
+      if (fresh !== undefined && deps.contacts !== undefined) {
+        const need = s.contactMissing();
+        fresh = { ...fresh, missing: [...fresh.missing, ...need], ready: fresh.ready && need.length === 0 };
+      }
+      const next = selectNext(fresh, covers, { lastAskedAt, clarified });
+      if (next.kind === 'ready' && got !== undefined) return startReadback(got.preview);
+      if (next.kind === 'ask') {
+        lastAskedAt.set(next.field, covers);
+        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers });
+        return speak({ kind: 'ask', field: next.field, again: next.again });
+      }
+      if (next.kind === 'clarify') {
+        clarified = true;
+        deps.log('CLARIFY', { first: next.first ? 1 : 0, lines: covers });
+        return speak(next.first ? { kind: 'clarify', categories: deps.categoryNames(tenant).filter((c) => c !== 'unknown') } : { kind: 'clarify' });
+      }
+      deps.log('LISTEN', { lines: covers });
+      return speak({ kind: 'listen' });
     }
 
     async function onSetup(m: Record<string, unknown>): Promise<void> {
@@ -331,7 +430,6 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       tenant = t; callId = sid; ref = r;
       try { ctx = await deps.intakeContext(t, r); } catch { deps.log('CONTEXT_FAILED'); done = true; release(); return await hangUp(); }
       session = createCallSession({ limits: deps.limits, names: deps.names, now: deps.now, killed: deps.killed });
-      missing = deps.fieldNames(t);
       hardStop = setTimeout(() => { void track(finish(true).then(() => hangUp())); }, (deps.limits.maxMinutes + 1) * 60_000);
       hardStop.unref?.();
       deps.log('CALL_STARTED');
@@ -343,6 +441,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (!isRecord(m) || typeof m.type !== 'string') { if (++bad > 5) conn.close(1008); return; }
       const msg = m as Record<string, unknown>;
       if (msg.type === 'interrupt') {
+        interrupts++;
         const spoken = typeof msg.utteranceUntilInterrupt === 'string' ? msg.utteranceUntilInterrupt.slice(0, 600) : '';
         if (streaming !== undefined) { interruptedText = spoken; streaming.abort(); } else session?.interrupted(spoken);
         return;
@@ -350,7 +449,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (msg.type === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup(msg)).catch(() => deps.log('HANDLER_ERROR')); } return; }
       if (!setupSeen) { if (++bad > 5) conn.close(1008); return; }
       if (msg.type === 'prompt') {
-        if (msg.last !== true || typeof msg.voicePrompt !== 'string') return;
+        if (msg.last !== true || typeof msg.voicePrompt !== 'string') { partialPrompts++; return; }   // a partial result is not acted on, but it is counted
+        lastPromptAt = deps.now();
         const heard = msg.voicePrompt;
         clearConfirmTimer();   // an answer is on its way: the silence timer must not win the race against it
         chain = chain.then(() => onPrompt(heard)).catch(() => deps.log('HANDLER_ERROR'));
@@ -358,9 +458,16 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         return;
       }
       // dtmf, error and anything else: not used. Twilio's own error text is never logged.
+      otherFrames++;
       if (msg.type === 'error') deps.log('TWILIO_ERROR');
     };
-    conn.onClose = (): void => {
+    conn.onClose = (info?: CloseInfo): void => {
+      // One line per connection, whoever ended it: who closed (a fixed word), the WebSocket close code, how long since the last caller utterance and the last reply, and counts.
+      const now = deps.now();
+      deps.log('CALL_CLOSED', {
+        by: info?.cause ?? 'PEER', code: info?.code ?? 0, since_prompt_ms: Math.max(0, now - (lastPromptAt ?? startedAt)), since_reply_ms: Math.max(0, now - (lastReplyEndAt ?? startedAt)),
+        mid_reply: streaming === undefined ? 0 : 1, replies, failed_sends: failedSends, partial_prompts: partialPrompts, interrupts, other_frames: otherFrames,
+      });
       void track(chain.then(async () => { if (!done) await finish(!deps.killed()); release(); }).catch(() => deps.log('HANDLER_ERROR')));
     };
   }

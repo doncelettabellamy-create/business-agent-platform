@@ -28,19 +28,15 @@ import { createRelayHandler, speechDelayMs } from './relay-handler.ts';
 import { claudeCeilingUsd, founderConfigDigest, founderConfigProblems, founderGateProblems, relayPathFor, signedUrlCandidates } from './founder-call-gate.ts';
 import { randomBytes } from 'node:crypto';
 import type { FounderCallConfig } from './founder-call-gate.ts';
+import { contactsPathFor, createContactVault, keyFromEnv } from './contact-vault.ts';
+import { twimlFor } from './opening.ts';
 import { estimateCall } from './cost-estimate.ts';
 import { buildClassifyRequest } from './model-gateway.ts';
 import { buildClaudeParams } from './claude-provider.ts';
 import { formatUsd, PRICES_AS_OF } from './cost-estimate.ts';
 
-const CONSENT_NOTICE = 'Hello. This is an automated A I assistant, part of a test of a business phone line. We do not record the audio. Our phone provider turns your speech into text, and personal details are masked before an A I model reads it. Please say yes to continue, or hang up now.';
-const xml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const nowIso = (): string => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
-/** The TwiML to paste into a Twilio TwiML Bin (so the phone provider hosts it and this machine exposes no HTTP endpoint for it). */
-export function twimlFor(publicWssUrl: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <ConversationRelay url="${xml(publicWssUrl)}" language="en-US" welcomeGreeting="${xml(CONSENT_NOTICE)}" welcomeGreetingInterruptible="none" />\n  </Connect>\n</Response>\n`;
-}
 
 const argv = process.argv.slice(2);
 const serve = argv.includes('--serve');
@@ -76,7 +72,7 @@ const gate = founderGateProblems({
 console.log('\nGate (every line must be [ok] to serve):');
 console.log(`  [${gate.length === 0 ? 'ok' : '--'}] ${gate.length === 0 ? 'all checks pass' : gate.join('; ')}`);
 console.log('\nTwilio TwiML Bin (paste into a TwiML Bin, then point the number\'s voice webhook at it):\n');
-console.log(twimlFor(config.public_wss_url));
+console.log(twimlFor(config.public_wss_url, config.opening));
 console.log(`A fresh random secret for the address, if you need one (generate your own each time; never reuse): ${randomBytes(24).toString('base64url')}`);
 console.log(`Local only: phone endpoint 127.0.0.1:${config.relay_port} (the tunnel forwards the public address to this port), owner dashboard http://127.0.0.1:${config.dashboard_port}/`);
 if (!serve) { console.log('\nNo port was opened and nothing was sent.'); process.exit(0); }
@@ -102,11 +98,21 @@ const intake = createIntakeEntry({
 });
 const dialogue = createClaudeDialogueModel(dialogueClient, { model: config.model });
 const store = createIntakeRecordStore({ path: config.db_path });
-const skill = config.skill_config as { fields: { name: string }[] };
+const skill = config.skill_config as { categories: { name: string }[] };
+// Cleaning-pilot contact capture is OPT-IN by environment: with FOUNDER_CONTACT_KEY set (32 bytes, base64; get one with `node src/contact-lookup-main.ts --new-key`)
+// the assistant must collect a name, a callback number and a service address, and a confirmed caller's contact goes, encrypted, to its own file with 30-day
+// retention. Without the variable nothing changes. A variable that is set but invalid stops the start rather than silently running without it.
+const rawContactKey = process.env.FOUNDER_CONTACT_KEY;
+const contactKey = keyFromEnv(rawContactKey);
+if (rawContactKey !== undefined && rawContactKey !== '' && contactKey === undefined) { console.error('serve refused: FOUNDER_CONTACT_KEY is set but is not a valid 32-byte base64 key. Nothing was started.'); process.exit(78); }
+let contacts: ReturnType<typeof createContactVault> | undefined;
+try { contacts = contactKey === undefined ? undefined : createContactVault({ path: contactsPathFor(config.db_path), key: contactKey, now: () => Date.now() }); }
+catch { console.error('serve refused: the contact vault could not be opened (wrong key for the existing file?). Nothing was started.'); process.exit(78); }
+console.log(`Contact capture (name, callback number, service address; encrypted, 30-day retention): ${contacts === undefined ? 'OFF (no FOUNDER_CONTACT_KEY)' : 'ON'}`);
 
 const handler = createRelayHandler({
   numbers: new Map(config.numbers.map((n) => [n, tenant])),
-  fieldNames: () => skill.fields.map((f) => f.name),
+  categoryNames: () => skill.categories.map((c) => c.name),
   intake,
   async intakeContext(t, ref) {
     if (t !== tenant) throw new Error('tenant');
@@ -118,7 +124,7 @@ const handler = createRelayHandler({
   },
   dialogue, store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,
   now: () => Date.now(), nowIso, killed: () => existsSync(config.kill_file), afterSpeechMs: config.after_speech_ms,
-  speechMs: (text) => speechDelayMs(text), confirmWaitMs: 20_000,
+  speechMs: (text) => speechDelayMs(text), confirmWaitMs: 20_000, previewBudgetMs: 8000, ...(contacts === undefined ? {} : { contacts }),
   log: (code, detail) => console.log(`[founder-call] ${nowIso()} ${code}${detail ? ' ' + JSON.stringify(detail) : ''}`),
 });
 const staticDir = fileURLToPath(new URL('../../../prototype/intake-work-items', import.meta.url));
@@ -128,4 +134,4 @@ await dashboard.listen(config.dashboard_port);
 await relay.listen(config.relay_port);
 console.log(`\nServing. Owner dashboard: http://127.0.0.1:${config.dashboard_port}/   Phone endpoint (local): 127.0.0.1:${config.relay_port}/relay`);
 console.log(`Kill switch: create the file "${config.kill_file}" to end calls. Stop everything with Ctrl+C.`);
-process.on('SIGINT', () => { void (async () => { await relay.close(); await dashboard.close(); store.close(); process.exit(0); })(); });
+process.on('SIGINT', () => { void (async () => { await relay.close(); await dashboard.close(); store.close(); contacts?.close(); process.exit(0); })(); });

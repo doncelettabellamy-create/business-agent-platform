@@ -113,7 +113,8 @@ export function assertSafeRecord(tenant: string, r: unknown): asserts r is Intak
     if (y.confidence !== null && (typeof y.confidence !== 'number' || !(y.confidence >= 0 && y.confidence <= 1))) bad();
   }
   const addressFound = (f as RecordField[]).some((e) => e.found && /address/i.test(e.name));
-  if (x.address_status !== (addressFound ? 'unverified' : 'none')) bad();
+  // A found address field always means 'unverified'. 'unverified' without such a field is allowed: the address may be held elsewhere (the contact vault) and not yet checked.
+  if (addressFound && x.address_status !== 'unverified') bad();
   const p = x.pii_summary;
   if (!Array.isArray(p) || p.length > 10) bad();
   for (const e of p as unknown[]) {

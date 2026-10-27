@@ -35,6 +35,9 @@ export function signatureMatches(authToken: string, header: unknown, urls: reado
   return ok;
 }
 
+/** Who ended the connection first: the phone provider (PEER: its close frame, or the socket going away), the handler (HANDLER), the idle timer (IDLE), or a protocol or size violation (PROTOCOL). `code` is the WebSocket close code involved, or 0 when there was none. */
+export type CloseCause = 'PEER' | 'HANDLER' | 'IDLE' | 'PROTOCOL';
+export interface CloseInfo { cause: CloseCause; code: number }
 export interface RelayConnection {
   /** Sends one JSON message. False when the peer is gone or too slow. */
   send(message: unknown): boolean;
@@ -42,7 +45,7 @@ export interface RelayConnection {
   /** Set by the handler. Called with each text frame (already valid UTF-8, within the size cap). */
   onMessage: (text: string) => void;
   /** Called once when the connection ends for any reason. */
-  onClose: () => void;
+  onClose: (info?: CloseInfo) => void;
 }
 export interface RelayWsConfig {
   /** Exact request path, for example `/relay`. */
@@ -132,13 +135,15 @@ export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
     let closing = false;
     let ended = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let cause: CloseCause | undefined; let causeCode = 0;
+    const note = (c: CloseCause, code: number): void => { if (cause === undefined) { cause = c; causeCode = code; } };   // the first reason wins
     const conn: RelayConnection = {
       send(message: unknown): boolean {
         if (closing || ended || socket.destroyed) return false;
         if (socket.writableLength > 1_048_576) { shut(1013); return false; }
         try { socket.write(encodeFrame(0x1, Buffer.from(JSON.stringify(message), 'utf8'))); return true; } catch { return false; }
       },
-      close(code = 1000): void { shut(code); },
+      close(code = 1000): void { note('HANDLER', code); shut(code); },
       onMessage: () => {},
       onClose: () => {},
     };
@@ -147,16 +152,17 @@ export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
       ended = true;
       if (timer !== undefined) clearTimeout(timer);
       sockets.delete(socket);
-      try { conn.onClose(); } catch { /* the handler must not break the server */ }
+      try { conn.onClose({ cause: cause ?? 'PEER', code: causeCode }); } catch { /* the handler must not break the server */ }
     }
     function shut(code: number): void {
       if (closing) return;
+      note('PROTOCOL', code);   // every internal caller is a protocol or size violation; the explicit reasons above are noted first
       closing = true;
       try { const p = Buffer.alloc(2); p.writeUInt16BE(code, 0); socket.write(encodeFrame(0x8, p)); } catch { /* gone */ }
       try { socket.end(); } catch { /* gone */ }
       setTimeout(() => { try { socket.destroy(); } catch { /* gone */ } }, 1000).unref();
     }
-    const touch = (): void => { if (timer !== undefined) clearTimeout(timer); timer = setTimeout(() => shut(1001), idleMs); timer.unref?.(); };
+    const touch = (): void => { if (timer !== undefined) clearTimeout(timer); timer = setTimeout(() => { note('IDLE', 1001); shut(1001); }, idleMs); timer.unref?.(); };
     touch();
 
     function parse(): void {
@@ -183,7 +189,7 @@ export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
           try { conn.onMessage(textValue); } catch { /* the handler must not break the server */ }
         } else if (op === 0x9) { try { socket.write(encodeFrame(0xa, data)); } catch { /* gone */ } }
         else if (op === 0xa) { /* pong: nothing to do */ }
-        else if (op === 0x8) { return shut(1000); }
+        else if (op === 0x8) { note('PEER', data.length >= 2 ? data.readUInt16BE(0) : 0); return shut(1000); }
         else return shut(1003);                                    // binary, continuation and unknown opcodes
       }
     }
@@ -195,7 +201,7 @@ export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
     });
     socket.on('error', () => { /* the close event follows */ });
     socket.on('close', finish);
-    socket.on('end', () => { shut(1000); finish(); });
+    socket.on('end', () => { note('PEER', 0); shut(1000); finish(); });
     try { onConnection(conn); } catch { shut(1011); }
     if (buf.length > 0) parse();
   }

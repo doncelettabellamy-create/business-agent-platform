@@ -4,14 +4,16 @@
 
 import type { IntakeEntry } from './intake-entry.ts';
 import type { PiiCount } from './pii-screen.ts';
-import type { WorkItemV1 } from './contracts.ts';
+import type { HandoffEnvelopeV1, WorkItemV1 } from './contracts.ts';
 
 export const FOUNDER_MASKING_SOURCE = 'founder-test-call';
 const CALL_ID = /^[A-Za-z0-9]{10,40}$/;
 const TAG = /^(?:p[0-9]{1,3}|final)$/;
 
 export type CallIntakeResult =
-  | { ok: true; item: WorkItemV1; handedOff: boolean }
+  // `handoff` is the very object the Intake entry issued and sealed (null when nothing is handed off). It is passed through untouched: never copied, parsed,
+  // frozen or serialised, because Processing accepts only the original object (handoff-seal.ts). It lives in memory only.
+  | { ok: true; item: WorkItemV1; handedOff: boolean; handoff: HandoffEnvelopeV1 | null }
   | { ok: false; code: string };
 
 export async function runCallIntake(
@@ -28,7 +30,7 @@ export async function runCallIntake(
       masking: { applied: true, source: FOUNDER_MASKING_SOURCE },
     });
     if (!r.ok) return { ok: false, code: String(r.error.code) };
-    return { ok: true, item: r.workItem, handedOff: r.handoff !== null };
+    return { ok: true, item: r.workItem, handedOff: r.handoff !== null, handoff: r.handoff };
   } catch {
     return { ok: false, code: 'INTAKE_ERROR' };
   }

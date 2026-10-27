@@ -91,7 +91,6 @@ test('confirmation: only a confirmed, ready record can be handed off; an unconfi
     ['unknown confirmation', { confirmation: 'maybe' as never }],
     ['unknown address status', { address_status: 'verified' as never }],
     ['address found but marked none', { address_status: 'none' }],
-    ['no address but marked unverified', { fields: [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }], address_status: 'unverified' }],
   ];
   bad.forEach(([name, over], i) => assert.throws(() => s.put(A, rec(A, `wi-b${i}`, over)), RecordRefused, name));
   for (const key of ['confirmation', 'address_status']) {
@@ -99,6 +98,16 @@ test('confirmation: only a confirmed, ready record can be handed off; an unconfi
     assert.throws(() => s.put(A, r), RecordRefused, `missing ${key}`);
   }
   assert.equal(s.list(A).length, 2, 'nothing refused was written');
+});
+
+test('address_status: unverified is allowed without an address field (a contact address held in the vault), none is never allowed with one, and an unverified record is not eligible', () => {
+  const s = open();
+  const job = { fields: [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }] };
+  assert.equal(s.put(A, rec(A, 'wi-v1', { ...job, address_status: 'unverified' })), 'new', 'the safer value is accepted');
+  assert.equal(s.put(A, rec(A, 'wi-v2', { ...job, address_status: 'none' })), 'new');
+  assert.throws(() => s.put(A, rec(A, 'wi-v3', { address_status: 'none' })), RecordRefused, 'an address field found and marked none is still refused');
+  assert.equal(eligibleForProcessing(rec(A, 'wi-v4', { ...job, address_status: 'unverified' })), false);
+  assert.equal(eligibleForProcessing(rec(A, 'wi-v5', { ...job, address_status: 'none' })), true);
 });
 
 test('eligibleForProcessing: true only for a confirmed, ready, handed-off record with no unverified address', () => {

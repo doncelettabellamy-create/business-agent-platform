@@ -11,6 +11,8 @@
 
 import { createMasker } from './pii-screen.ts';
 import type { PiiCount } from './pii-screen.ts';
+import { contactMissing, extractContact } from './contact-capture.ts';
+import type { Contact } from './contact-capture.ts';
 
 export interface SessionLimits { maxTurns: number; maxMinutes: number; maxChars: number }
 export interface SessionConfig {
@@ -40,6 +42,13 @@ export interface CallSession {
   maskedText(): string;
   turns(): number;
   piiSummary(): PiiCount[];
+  /** The fixed names of the contact items (name, callback number, service address) the caller has not yet given in a usable form. No caller data. */
+  contactMissing(): string[];
+  /**
+   * The caller's name, callback number and service address, only when all three are usable. RAW personal data: for the spoken read-back of the number
+   * and the encrypted contact vault, nowhere else.
+   */
+  revealContact(): Contact | undefined;
   dialogue(): DialogueTurn[];
   limit(): LimitReason | null;
   dispose(): void;
@@ -105,6 +114,11 @@ export function createCallSession(config: SessionConfig): CallSession {
     maskedText(): string { return lines.join('\n'); },
     turns(): number { return lines.length; },
     piiSummary(): PiiCount[] { return masker.summary(); },
+    contactMissing(): string[] { return contactMissing(extractContact(masker.reveal())); },
+    revealContact(): Contact | undefined {
+      const c = extractContact(masker.reveal());
+      return c.name !== undefined && c.phone !== undefined && c.address !== undefined ? { name: c.name, phone: c.phone, address: c.address } : undefined;
+    },
     dialogue(): DialogueTurn[] { return talk.map((t) => ({ ...t })); },
     limit(): LimitReason | null {
       if (config.killed()) return 'KILLED';

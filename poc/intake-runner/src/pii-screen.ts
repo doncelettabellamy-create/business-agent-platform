@@ -108,6 +108,11 @@ export interface Masker {
   mask(raw: unknown): MaskResult;
   /** Counts of placeholders handed out so far. */
   summary(): PiiCount[];
+  /**
+   * The raw value behind every placeholder handed out in this call, in the order they were made. For the one caller that must have them (the contact
+   * capture of the cleaning pilot, which sends them only to the caller over the phone and to the encrypted contact vault). Empty after dispose().
+   */
+  reveal(): { type: PiiType; token: string; raw: string }[];
   /** Forgets every raw value. After this, mask() refuses. */
   dispose(): void;
 }
@@ -119,6 +124,7 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
   const counters: Record<PiiType, number> = { Person: 0, Address: 0, 'Contact detail': 0, Identifier: 0 };
   const counts: Record<PiiType, number> = { Person: 0, Address: 0, 'Contact detail': 0, Identifier: 0 };
   let known = new Map<string, string>();   // raw value (lower case) -> placeholder, for this call only
+  let originals: { type: PiiType; token: string; raw: string }[] = [];   // the same values as first said, for reveal(); cleared by dispose()
   let disposed = false;
 
   function tokenFor(type: PiiType, raw: string): string {
@@ -129,6 +135,7 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
     counts[type]++;
     const token = `[${TOKEN[type]}_${counters[type]}]`;
     known.set(key, token);
+    originals.push({ type, token, raw: raw.trim().slice(0, 200) });
     return token;
   }
   const sub = (text: string, re: RegExp, type: PiiType, accept: (m: string) => boolean = () => true): string =>
@@ -232,6 +239,7 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
     summary(): PiiCount[] {
       return PII_TYPES.filter((type) => counts[type] > 0).map((type) => ({ type, count: counts[type] }));
     },
-    dispose(): void { disposed = true; known = new Map(); },
+    reveal(): { type: PiiType; token: string; raw: string }[] { return disposed ? [] : originals.map((o) => ({ ...o })); },
+    dispose(): void { disposed = true; known = new Map(); originals = []; },
   };
 }

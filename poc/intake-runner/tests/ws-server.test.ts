@@ -183,3 +183,47 @@ test('setup is validated', () => {
     assert.throws(() => createRelayWsServer({ ...ok, ...bad } as never), RangeError);
   }
 });
+
+// ---------------------------------------------------------------- who closed the connection (a fixed word and a number; used for diagnostics)
+async function startWithInfo(over: Record<string, unknown> = {}) {
+  const infos: Array<{ cause: string; code: number } | undefined> = []; const conns: RelayConnection[] = [];
+  const server = createRelayWsServer({
+    path: PATH, authToken: TOKEN, urls: [URL_WSS, URL_HTTPS], maxPayload: 2048, idleMs: 5000, maxConnections: 2,
+    onConnection: (c) => { conns.push(c); c.onClose = (i) => { infos.push(i); }; }, ...over,
+  } as never);
+  const port = await server.listen(0);
+  servers.push(server);
+  return { port, infos, conns };
+}
+const until = async (fn: () => boolean, ms = 3000) => { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error('timed out'); await new Promise((r) => setTimeout(r, 15)); } };
+
+test('close cause: the phone provider ending the connection is PEER (with its close code when it sent one)', async () => {
+  const s = await startWithInfo();
+  const a = await open(s.port); a.end(); await until(() => s.infos.length === 1);
+  assert.deepEqual(s.infos[0], { cause: 'PEER', code: 0 });
+  const b = await open(s.port); b.raw(clientFrame(0x8, Buffer.from([0x03, 0xe9]))); await until(() => s.infos.length === 2);
+  assert.deepEqual(s.infos[1], { cause: 'PEER', code: 1001 });
+});
+
+test('close cause: the handler closing is HANDLER, the idle timer is IDLE, and a protocol violation is PROTOCOL', async () => {
+  const s = await startWithInfo();
+  await open(s.port); await until(() => s.conns.length === 1);
+  s.conns[0].close(1000); await until(() => s.infos.length === 1);
+  assert.deepEqual(s.infos[0], { cause: 'HANDLER', code: 1000 });
+
+  const idle = await startWithInfo({ idleMs: 150 });
+  await open(idle.port); await until(() => idle.infos.length === 1);
+  assert.deepEqual(idle.infos[0], { cause: 'IDLE', code: 1001 });
+
+  const bad = await startWithInfo();
+  const c = await open(bad.port); c.raw(clientFrame(0x1, 'x', { mask: false })); await until(() => bad.infos.length === 1);
+  assert.deepEqual(bad.infos[0], { cause: 'PROTOCOL', code: 1002 });
+});
+
+test('close cause: the first reason wins, and onClose is still called exactly once', async () => {
+  const s = await startWithInfo();
+  const a = await open(s.port); await until(() => s.conns.length === 1);
+  s.conns[0].close(1000); a.end(); await new Promise((r) => setTimeout(r, 150));
+  assert.equal(s.infos.length, 1);
+  assert.equal(s.infos[0]?.cause, 'HANDLER');
+});

@@ -15,6 +15,8 @@ import { validateSkillConfig } from './classify-extract.ts';
 import { isClaudeModelId } from './claude-provider.ts';
 import { fixtureDigest } from './reviewed-fixtures.ts';
 import { PRICES_PER_MILLION } from './cost-estimate.ts';
+import { openingProblems } from './opening.ts';
+import type { Opening } from './opening.ts';
 
 export const MAX_APPROVAL_DAYS = 30;
 const E164 = /^\+[1-9][0-9]{6,14}$/;
@@ -43,6 +45,8 @@ export interface FounderCallConfig {
   dashboard_port: number;
   after_speech_ms: number;
   skill_config: unknown;
+  /** Optional. How the call opens: the business and agent introduced, the disclosure, and a special only if the business approved one (opening.ts). Part of the approval digest. */
+  opening?: Opening;
 }
 const KEYS = 'after_speech_ms,approval_id,dashboard_port,db_path,expires,kill_file,max_calls,max_claude_calls,max_minutes,max_turns,model,numbers,persona_names,public_wss_url,relay_port,skill_config,tenant';
 
@@ -53,7 +57,10 @@ const plainPath = (v: unknown): v is string => typeof v === 'string' && v.length
 export function founderConfigProblems(cfg: unknown): string[] {
   const p: string[] = [];
   if (!isRecord(cfg)) return ['config must be an object'];
-  if (Object.keys(cfg).sort().join(',') !== KEYS) p.push('config must have exactly the expected keys');
+  // The expected keys, plus the one optional key `opening`. Anything else is refused.
+  const given = Object.keys(cfg).sort().join(',');
+  if (given !== KEYS && given !== [...KEYS.split(','), 'opening'].sort().join(',')) p.push('config must have exactly the expected keys');
+  if ('opening' in cfg) for (const m of openingProblems((cfg as Record<string, unknown>).opening)) p.push(m);
   const c = cfg as Record<string, unknown>;
   if (typeof c.approval_id !== 'string' || !/^[A-Za-z0-9_.:-]{1,64}$/.test(c.approval_id)) p.push('approval_id must be an id-like string');
   if (typeof c.tenant !== 'string' || !/^ws-founder-[A-Za-z0-9_.:-]{1,50}$/.test(c.tenant)) p.push('tenant must begin ws-founder-');

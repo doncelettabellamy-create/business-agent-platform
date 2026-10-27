@@ -1,0 +1,176 @@
+{
+  "workspace_id": "ws-synthetic-cleaning",
+  "correlation_id": "corr-synthetic-0303",
+  "event_id": "evt-cleaning-services-001",
+  "received_at": "2026-10-26T11:00:00Z",
+  "channel_ref": "channel-tbd",
+  "masking": {
+    "applied": true,
+    "source": "synthetic-fixture"
+  },
+  "masked_text": "Caller: I need a deep clean for four rooms.\nCaller: The last professional clean was a year ago.\nCaller: Tomorrow please, between 9 AM and 1 PM.",
+  "pii_summary": [],
+  "skill_config": {
+    "categories": [
+      {
+        "name": "Standard cleaning",
+        "keywords": [
+          "standard cleaning",
+          "standard clean",
+          "regular cleaning",
+          "regular clean",
+          "recurring cleaning",
+          "weekly cleaning",
+          "biweekly cleaning",
+          "maintenance clean",
+          "maid service",
+          "housekeeping",
+          "house cleaning",
+          "home cleaning"
+        ],
+        "requires": [
+          "Number of rooms",
+          "Cleaning frequency",
+          "Preferred date",
+          "Time window"
+        ]
+      },
+      {
+        "name": "Deep cleaning",
+        "keywords": [
+          "deep cleaning",
+          "deep clean",
+          "deep cleaned",
+          "spring cleaning",
+          "spring clean",
+          "thorough cleaning",
+          "top to bottom clean"
+        ],
+        "requires": [
+          "Number of rooms",
+          "Last professional clean",
+          "Preferred date",
+          "Time window"
+        ]
+      },
+      {
+        "name": "Move-in or move-out cleaning",
+        "keywords": [
+          "move out cleaning",
+          "move out clean",
+          "move in cleaning",
+          "move in clean",
+          "moving out",
+          "moving in",
+          "end of lease clean",
+          "end of tenancy clean"
+        ],
+        "requires": [
+          "Number of rooms",
+          "Home empty",
+          "Preferred date",
+          "Time window"
+        ]
+      }
+    ],
+    "fields": [
+      {
+        "name": "Job description",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "job description"
+          ]
+        }
+      },
+      {
+        "name": "Number of rooms",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "number of rooms",
+            "rooms"
+          ]
+        }
+      },
+      {
+        "name": "Cleaning frequency",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "cleaning frequency",
+            "frequency"
+          ]
+        }
+      },
+      {
+        "name": "Last professional clean",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "last professional clean",
+            "last cleaned"
+          ]
+        }
+      },
+      {
+        "name": "Home empty",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "home empty",
+            "empty"
+          ]
+        }
+      },
+      {
+        "name": "Pets",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "pets"
+          ]
+        }
+      },
+      {
+        "name": "Add-ons",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "add-ons",
+            "add ons"
+          ]
+        }
+      },
+      {
+        "name": "Preferred date",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "preferred date",
+            "date"
+          ]
+        }
+      },
+      {
+        "name": "Time window",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "time window",
+            "time"
+          ]
+        }
+      }
+    ]
+  }
+}

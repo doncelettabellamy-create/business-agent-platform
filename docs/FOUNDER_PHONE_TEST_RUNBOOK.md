@@ -98,6 +98,26 @@ So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before an
 8. **The owner screens in a real browser.** Only their scripts have been run (against a stand-in DOM); layout, dark mode, phone width and the time shown in the viewer's zone have not been looked at.
 9. **How natural the replies feel, and latency.**
 
+## Option A and optional contact capture (added 2026-10-26; tested locally, not yet tried live)
+
+- **What changed in the call.** Each caller turn waits (up to 8000 ms) for one fresh Intake pass over everything said; code, not the model, then picks one thing: read back, ask for one named field, clarify, or just listen. A slow, failed or stale pass makes the assistant listen; it never asks from old data. Closing lines no longer promise a follow-up; the confirmed line is "Thank you. Your request is recorded. Goodbye."
+- **Log lines to expect** (fixed words and numbers only): `TIMING` (milliseconds of the Intake pass), `ASK`, `LISTEN`, `CLARIFY`, `PREVIEW_BUDGET_EXCEEDED`, `PREVIEW_UNUSABLE`, `FALLBACK_RECORD`, then `READBACK` and `CONFIRMED` or `UNCONFIRMED`.
+- **Cleaning skill.** The live configuration is the cleaning skill (approval digest `2959c7c5…c41`). The digest it replaced was `79e6dcbd…ab78a15`: to roll back, restore the backed-up config and set that digest. Keep backups outside the repository; the config holds the relay secret.
+- **Restart.** Stop the server with Ctrl+C in the terminal that runs it (its credentials stay in that terminal). Set `FOUNDER_CALL_APPROVED_DIGEST` to the digest you approve, then run `node src/founder-call-entry.ts --serve --config founder-call.config.json`. To keep a log, pipe it through `Tee-Object`; PowerShell 5.1 writes UTF-16, so remove the null bytes before searching. The log is gitignored.
+- **Contact capture (optional, off unless a key is set).** With `FOUNDER_CONTACT_KEY` (32 bytes, base64; `npm run contact:lookup -- --new-key` prints one on an interactive terminal) the assistant must collect a name, a usable callback number and a service address before a request is ready; the number (only) is read back; a yes stores the contact encrypted in its own file for 30 days. Lose the key and the contacts cannot be read. The owner reads one with `npm run contact:lookup -- --list` and `-- --show <call_ref>` on this machine, on an interactive terminal only. The dashboard never shows it. Known limits: the name is a rule-based guess and the name and address are not read back. The running server was started before this code existed and has it off.
+
+## Opening, services skill, handoff preservation and diagnostics (added 2026-10-26; tested locally, not yet tried live)
+
+- **State.** All of this is in uncommitted code. The running server (started 9:52 PM) has the code and contact capture ON but still uses the original one-category cleaning config with no `opening` block, so a live call today hears the original notice. **No call has been made since that restart.**
+- **To use the opening or the services skill.** Add the `opening` block (business name, agent name, optional disclosure wording, optional special) and/or the services `skill_config` to the config, read the new approval digest from the dry run, paste the new TwiML (it carries the opening) into the Twilio TwiML Bin, set the digest, and restart. Each of those is its own request to the founder. The disclosure wording needs the business's legal check; a special is spoken only if you put it in the config, exactly as written.
+- **Log lines to read after a call** (fixed words and numbers only): per reply, `REPLY_SENT` (words produced and written), `REPLY_EMPTY` (the model produced nothing), `REPLY_INTERRUPTED` (the caller talked over it), `REPLY_CUT` (the call ended mid-reply), `REPLY_SEND_FAILED` (a write was refused); per connection, `CALL_CLOSED` with who closed it (PEER, HANDLER, IDLE or PROTOCOL), the close code, milliseconds since the last caller words and the last reply, and counts of refused writes, partial results, interruptions and other frames.
+- **What they can and cannot show.** They show whether words were produced and written to the socket, how long the first word took, and who ended the connection. They cannot show that the phone provider spoke the words, what the caller said, or why a peer hung up; the Twilio console's call log is the source for the call's end status.
+- **Open.** The silent response (two cleaning calls ended shortly after the assistant's question; cause unknown) needs one founder-placed call on this build, invented details only. The Processing handoff is not wired: a saved record is where a call ends.
+
+## Development order and approval (added 2026-10-26)
+
+Development order and approval: the industry order is Cleaning → Towing → Plumbing → HVAC, one at a time, and the founder approves each task before it begins (implementation → automated tests → live validation where applicable → founder review; finishing one task never authorises the next). See `docs/DEVELOPMENT_ROADMAP.md` sections 1b and 2. The prototype dashboard is preserved and evolved, never replaced (`docs/PRODUCT_CONTINUITY.md` governs).
+
 ## Approvals and payments the founder must make (nothing below can start without them)
 
 **Decisions**

@@ -2,7 +2,7 @@
 // comes from the existing Intake agent (classify, extract, ground, validate) run over the masked caller lines.
 //
 // What the model is sent: a fixed instruction, the MASKED conversation so far (caller lines and the assistant's own earlier words), and
-// the names of the fields Intake still lacks (configuration, not customer data). No tenant id, no phone number, no raw speech.
+// ONE directive chosen by code (next-field.ts): a field name or category names from the configuration, never customer data. No tenant id, no phone number, no raw speech.
 //
 // Like claude-provider.ts this file imports no SDK, reads no environment and holds no credential: it is handed an already-built client
 // (the official SDK's `client.messages.create(..., { stream: true })` shape) by the composition root (founder-call-entry.ts).
@@ -22,10 +22,18 @@ export interface StreamEvent { type: string; delta?: { type?: string; text?: str
 export interface DialogueClient {
   messages: { create(params: DialogueParams, options?: { signal?: AbortSignal }): Promise<AsyncIterable<StreamEvent>> };
 }
+/**
+ * What the assistant is told to do next. Chosen by code from a fresh Intake result (next-field.ts); the model never sees the list of missing
+ * fields and never chooses the field. Field and category names come from the skill configuration.
+ */
+export type Directive =
+  | { kind: 'open' }
+  | { kind: 'ask'; field: string; again?: boolean }
+  | { kind: 'clarify'; categories?: readonly string[] }
+  | { kind: 'listen' };
 export interface DialogueInput {
   turns: readonly DialogueTurn[];
-  /** Field names Intake still lacks. Empty means: wrap up. */
-  missing: readonly string[];
+  directive: Directive;
   signal?: AbortSignal;
 }
 export interface DialogueStats { calls: number; errors: { name: string; status: number | null }[] }
@@ -37,11 +45,15 @@ export interface DialogueModel {
 export const DIALOGUE_INSTRUCTION = [
   'You are the phone intake assistant for a service business. You are an AI, and the caller has already been told so.',
   'Speak in short, natural, friendly sentences: at most two per reply, and ask for only one thing at a time.',
-  'Your job is to understand what the caller needs and to collect the items listed after MISSING.',
-  'Never read back or repeat personal details, and never say anything that appears in square brackets.',
-  'Do not give prices, advice, diagnoses or promises. Do not make up facts about the business.',
+  'The last line of this message starts with NEXT. Do exactly what it says and nothing else.',
+  'NEXT OPEN: greet the caller briefly and ask how you can help.',
+  'NEXT ASK <item>: ask one short, plain question about that item only. If it says it was asked before, ask it a different way, briefly. Never ask about any other item.',
+  'NEXT CLARIFY with names: ask in plain words whether the caller is calling about one of those. NEXT CLARIFY with no names: ask the caller to say in a few words what they need.',
+  'NEXT LISTEN: acknowledge briefly and invite the caller to go on. Do not ask for any specific item.',
+  "Accept whatever words the caller uses. Never repeat the caller's answers, never read back personal details, and never say anything that appears in square brackets.",
+  'Never say goodbye, never thank the caller for calling, and never say the request is recorded: only the system ends the call.',
+  'Do not give prices, advice, diagnoses, availability or promises, and never say that anyone will call or follow up. Do not make up facts about the business.',
   'If the caller describes immediate danger, tell them to hang up and call the local emergency number.',
-  'If MISSING is empty, thank the caller, say the request has been recorded and a person will follow up, and say goodbye.',
   'Plain spoken text only: no lists, no markdown, no emojis.',
 ].join(' ');
 
@@ -62,13 +74,25 @@ export function toMessages(turns: readonly DialogueTurn[]): { role: 'user' | 'as
   return out;
 }
 
+const NAME = /^[^\r\n[\]<>]{1,80}$/;
+/** Pure: the NEXT line. Names come from configuration but are checked anyway: one line, short, no brackets or angle brackets. */
+export function renderDirective(d: Directive): string {
+  const name = (s: unknown): string => { if (typeof s !== 'string' || !NAME.test(s)) throw new RangeError('a field or category name is not acceptable'); return s; };
+  switch (d?.kind) {
+    case 'open': return 'NEXT OPEN';
+    case 'ask': return `NEXT ASK ${name(d.field)}${d.again === true ? ' (asked before: ask it a different way)' : ''}`;
+    case 'clarify': return d.categories === undefined || d.categories.length === 0 ? 'NEXT CLARIFY' : `NEXT CLARIFY: ${d.categories.slice(0, 10).map(name).join('; ')}`;
+    case 'listen': return 'NEXT LISTEN';
+    default: throw new RangeError('unknown directive');
+  }
+}
+
 /** Pure: the exact request body. Used by the model adapter and by the dry run's cost ceiling. */
 export function buildDialogueParams(input: DialogueInput, model: string, maxTokens: number): DialogueParams {
   if (typeof model !== 'string' || !MODEL_ID.test(model)) throw new RangeError('model must be an exact Claude model id such as claude-haiku-5-5');
   if (!Number.isInteger(maxTokens) || maxTokens < 16 || maxTokens > 400) throw new RangeError('maxTokens must be an integer from 16 to 400');
-  const missing = input.missing.length === 0 ? 'none' : input.missing.join('; ');
   return {
-    model, max_tokens: maxTokens, system: `${DIALOGUE_INSTRUCTION}\nMISSING: ${missing}`,
+    model, max_tokens: maxTokens, system: `${DIALOGUE_INSTRUCTION}\n${renderDirective(input.directive)}`,
     messages: toMessages(input.turns), stream: true, output_config: { effort: 'low' },
   };
 }
@@ -76,7 +100,7 @@ export function buildDialogueParams(input: DialogueInput, model: string, maxToke
 export function createClaudeDialogueModel(client: DialogueClient, options: { model: string; maxTokens?: number }): DialogueModel {
   if (typeof client?.messages?.create !== 'function') throw new RangeError('client must have messages.create');
   const maxTokens = options.maxTokens ?? 160;
-  buildDialogueParams({ turns: [], missing: [] }, options.model, maxTokens);   // validates the options now, not mid-call
+  buildDialogueParams({ turns: [], directive: { kind: 'open' } }, options.model, maxTokens);   // validates the options now, not mid-call
   const stats: DialogueStats = { calls: 0, errors: [] };
   const recordError = (e: unknown): void => {
     const o = (typeof e === 'object' && e !== null ? e : {}) as { constructor?: { name?: string }; status?: unknown };
