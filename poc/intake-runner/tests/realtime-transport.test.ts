@@ -630,7 +630,7 @@ test('boundary: the adapter imports only local files, holds no credential or net
   for (const banned of [/\bfetch\s*\(/, /process\./, /node:/, /console\./, /api[_-]?key/i, /authorization/i, /https?:\/\//, /wss?:\/\//, /from\s+'openai'/, /require\s*\(/, /\beval\s*\(/, /new Function/, /input_audio_buffer\.append/]) {
     assert.ok(!banned.test(adapter), `banned pattern in the adapter: ${banned}`);
   }
-  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'realtime-transport.ts')) {
+  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'realtime-transport.ts' && n !== 'realtime-bridge.ts')) {   // the bridge (offline, itself unused) is the one file that joins it to a phone and a voice socket
     assert.ok(!/realtime-transport/.test(code(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'))), `${f} must not import the Realtime adapter yet`);
   }
   const handler = code(src('relay-handler'));
