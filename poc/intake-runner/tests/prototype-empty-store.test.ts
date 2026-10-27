@@ -135,7 +135,7 @@ test('detail: opening an intake shows the full picture in plain words, with a wa
   p.b.navigate(href);
   const text = p.content();
   for (const s of ['All intakes', 'Emergency leak', OWNER_TEXT.notConfirmed, 'What the caller needs', 'burst pipe', OWNER_LABELS.requestedTime, 'tomorrow morning', 'Address',
-    'An address was given. It is not shown here. A person needs to check it with the caller.', 'Next steps', OWNER_TEXT.followUpUnconfirmed, OWNER_TEXT.verifyAddress]) assert.ok(text.includes(s), s);
+    'An address was given but it is not confirmed. It is not shown here. A person needs to check it with the caller.', 'Next steps', OWNER_TEXT.followUpUnconfirmed, OWNER_TEXT.verifyAddress]) assert.ok(text.includes(s), s);
   noTechnicalWords('the detail page', text);
   const time = p.b.node('content').descendants().find((x) => x.tag === 'time');
   assert.equal(time?.getAttribute('datetime'), '2026-10-26T20:09:21Z');
@@ -305,6 +305,39 @@ test('files: the script writes only text, loads nothing from elsewhere, asks onl
   assert.ok(!/@import|url\(|\/\/[a-z]/i.test(css));
   assert.ok(/prefers-color-scheme: dark/.test(css) && /min-width: 720px/.test(css) && /focus-visible/.test(css) && /prefers-reduced-motion/.test(css));
   assert.ok(!/style=|\.style\b|cssText/.test(code), 'no inline styles, which the page policy forbids');
+});
+
+test('detail: a caller-confirmed address is described as confirmed by the caller and not checked, never as something a person must check; an unconfirmed one is the reverse', async () => {
+  const confirmedText = 'An address was given and the caller confirmed it on the phone. It is not shown here. It was not checked against any address data.';
+  const unconfirmedText = 'An address was given but it is not confirmed. It is not shown here. A person needs to check it with the caller.';
+  const records = [
+    rec('wi-c', { address_status: 'caller_confirmed', received_at: '2026-10-26T20:00:00Z' }),
+    rec('wi-u', { address_status: 'unverified', received_at: '2026-10-26T19:00:00Z' }),
+    rec('wi-n', { ...NO_ADDRESS, received_at: '2026-10-26T18:00:00Z' }),
+  ];
+  const p = await live(records);
+  const [cLink, uLink, nLink] = ['2026-10-26T20:00:00Z', '2026-10-26T19:00:00Z', '2026-10-26T18:00:00Z'].map((at) => `#/call/${at}-0`);
+
+  p.b.navigate(cLink);
+  const confirmed = p.content();
+  assert.ok(confirmed.includes(confirmedText));
+  assert.ok(confirmed.includes(OWNER_TEXT.addressConfirmedValue), 'the owner view\'s own detail line is still shown');
+  assert.ok(!confirmed.includes('A person needs to check it with the caller'), 'no contradiction on a confirmed call');
+  assert.ok(!confirmed.includes(OWNER_TEXT.verifyAddress), 'no instruction to verify it');
+  assert.ok(!/ADDRESS_|\[|valid|verified by|usps|postal/i.test(confirmed.replace('checked against any address data', '')), 'never claims validation, never shows a value');
+  noTechnicalWords('the confirmed-address detail page', confirmed);
+
+  p.b.navigate('#/');
+  p.b.navigate(uLink);
+  const unconfirmed = p.content();
+  assert.ok(unconfirmed.includes(unconfirmedText));
+  assert.ok(unconfirmed.includes(OWNER_TEXT.verifyAddress));
+  assert.ok(!unconfirmed.includes('the caller confirmed it') && !unconfirmed.includes(OWNER_TEXT.addressConfirmedValue));
+  noTechnicalWords('the unconfirmed-address detail page', unconfirmed);
+
+  p.b.navigate('#/');
+  p.b.navigate(nLink);
+  assert.ok(!p.content().includes('An address was given'), 'no address, no address section');
 });
 
 test('files: the words the screens show are the owner view\'s own, and nothing in them says or implies a booking', () => {

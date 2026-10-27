@@ -178,7 +178,13 @@
     if (call.details.length > 0) {
       panels.push(section('Other details', [h('dl', { class: 'facts' }, call.details.map(function (d) { return fact(d.label, d.value); }))]));
     }
-    if (call.addressGiven) { panels.push(section('Address', [h('p', { text: 'An address was given. It is not shown here. A person needs to check it with the caller.' })])); }
+    if (call.addressGiven) {
+      /* The owner view puts an 'Address' detail on a call only when the caller confirmed the address on the phone. */
+      var addressConfirmed = call.details.some(function (d) { return d.label === 'Address'; });
+      panels.push(section('Address', [h('p', { text: addressConfirmed
+        ? 'An address was given and the caller confirmed it on the phone. It is not shown here. It was not checked against any address data.'
+        : 'An address was given but it is not confirmed. It is not shown here. A person needs to check it with the caller.' })]));
+    }
     panels.push(section('Next steps', [actions(call.nextActions)]));
     content.appendChild(h('div', { class: 'panels' }, panels));
   }
