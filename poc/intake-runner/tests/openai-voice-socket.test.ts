@@ -262,7 +262,7 @@ test('platform: Node\'s built-in WebSocket sends custom request headers (checked
 });
 
 // ================================================================ static guards
-test('static: the file reads no environment, logs nothing, imports only a type, holds the key in no variable that outlives the connect, and nothing in src uses it yet', () => {
+test('static: the file reads no environment, logs nothing, imports only a type, holds the key in no variable that outlives the connect, and only the voice composition uses it, never the live Claude entry', () => {
   const code = (f: string) => readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const own = code('openai-voice-socket.ts');
   for (const bad of [/process\./, /console\./, /\bfetch\s*\(/, /require\s*\(/, /\beval\s*\(/, /node:/, /@anthropic-ai|from 'openai'/, /OpenAI-Beta/, /localStorage|writeFile|appendFile/]) assert.ok(!bad.test(own), String(bad));
@@ -270,5 +270,5 @@ test('static: the file reads no environment, logs nothing, imports only a type, 
   assert.ok(/^import type \{ VoiceSocket \}/m.test(own), 'a type import only');
   assert.deepEqual([...own.matchAll(/wss?:\/\/[^'"`\s)]+/g)].map((m) => m[0]), ['wss://api.openai.com/v1/realtime'], 'one address, and it is OpenAI\'s');
   assert.ok(!/diag\((?!'VOICE_[A-Z_]+'\))/.test(own), 'every diagnostic is a fixed code literal, never a variable');
-  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'openai-voice-socket.ts')) assert.ok(!/openai-voice-socket/.test(code(f)), `${f} must not use the voice socket yet`);
+  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'openai-voice-socket.ts')) assert.equal(/openai-voice-socket/.test(code(f)), f === 'founder-voice-entry.ts', `${f}: only the voice entry (not the live Claude entry) may use the voice socket`);
 });

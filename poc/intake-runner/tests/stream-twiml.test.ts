@@ -61,11 +61,11 @@ test('twiml: addresses and numbers that are not acceptable are refused with fixe
   for (const p of streamTwimlProblems(`${URL_WSS}?x=${CANARY}`, { number: `+1${CANARY}` })) assert.ok(!p.includes(CANARY), p);
 });
 
-test('twiml: the live ConversationRelay TwiML is unchanged, and nothing in the live path uses the stream TwiML yet', () => {
+test('twiml: the live ConversationRelay TwiML is unchanged, and only the voice entry uses the stream TwiML, never the live Claude entry', () => {
   assert.ok(twimlFor(URL_WSS).includes('<ConversationRelay '));
   assert.ok(!twimlFor(URL_WSS).includes('<Stream'));
   const code = (f: string) => readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'stream-twiml.ts')) assert.ok(!/stream-twiml/.test(code(f)), `${f} must not use the stream TwiML yet`);
+  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'stream-twiml.ts')) assert.equal(/stream-twiml/.test(code(f)), f === 'founder-voice-entry.ts', `${f}: only the voice entry (not the live Claude entry) may use the stream TwiML`);
   const own = code('stream-twiml.ts');
   assert.ok(!/^import\s/m.test(own) && !/process\.|fetch\s*\(|node:|console\./.test(own), 'it imports nothing, reads nothing and sends nothing');
 });

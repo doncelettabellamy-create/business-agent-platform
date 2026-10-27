@@ -1,0 +1,14 @@
+{
+  "approval_id": "founder-voice-001",
+  "openai_model": "REPLACE-WITH-EXACT-OPENAI-TEXT-MODEL-ID",
+  "realtime_model": "REPLACE-WITH-EXACT-REALTIME-MODEL-ID",
+  "transcription_model": "REPLACE-WITH-EXACT-TRANSCRIPTION-MODEL-ID",
+  "voice": "REPLACE-WITH-VOICE-NAME",
+  "max_openai_calls": 150,
+  "persona": {
+    "business_name": "Drew Cleaning",
+    "traits": ["warm", "clear", "patient", "professional", "concise"],
+    "max_sentences": 2,
+    "pace": "calm"
+  }
+}

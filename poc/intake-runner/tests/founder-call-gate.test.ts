@@ -221,7 +221,7 @@ test('inventory: only the composition root mints a context, only the record stor
   const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const files = readdirSync(dir).filter((f) => f.endsWith('.ts'));
   const code = (f: string) => strip(readFileSync(new URL(f, dir), 'utf8'));
-  assert.deepEqual(files.filter((f) => /\bmintExecutionContext\b/.test(code(f)) && f !== 'execution-context.ts'), ['founder-call-entry.ts', 'live-run.ts', 'pipeline.ts']);
+  assert.deepEqual(files.filter((f) => /\bmintExecutionContext\b/.test(code(f)) && f !== 'execution-context.ts'), ['founder-call-entry.ts', 'founder-voice-entry.ts', 'live-run.ts', 'pipeline.ts']);
   assert.deepEqual(files.filter((f) => /node:sqlite/.test(code(f))), ['approval-store-sqlite.ts', 'contact-vault.ts', 'intake-record-store.ts', 'reporting-ledger-sqlite.ts']);
   assert.deepEqual(files.filter((f) => /from 'node:(http|net|https|tls|dgram)'/.test(code(f))).sort(), ['dashboard-server.ts', 'ws-server.ts']);
   assert.deepEqual(files.filter((f) => /@anthropic-ai\/sdk/.test(code(f))).sort(), ['founder-call-entry.ts', 'live-entry.ts']);

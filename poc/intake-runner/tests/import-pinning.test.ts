@@ -31,7 +31,7 @@ test('live-run: live-entry.ts uses it through one static named import and one ca
 });
 
 test('live-run: the files that can mint or reach raw authority are exactly the known ones', () => {
-  assert.deepEqual(srcFiles.filter((f) => /\bmintExecutionContext\b/.test(code(f)) && f !== 'execution-context.ts'), ['founder-call-entry.ts', 'live-run.ts', 'pipeline.ts']);
+  assert.deepEqual(srcFiles.filter((f) => /\bmintExecutionContext\b/.test(code(f)) && f !== 'execution-context.ts'), ['founder-call-entry.ts', 'founder-voice-entry.ts', 'live-run.ts', 'pipeline.ts']);
   assert.deepEqual(mentions('live-run.ts'), ['live-entry.ts', 'observability.ts'].filter((f) => code(f).includes('live-run')).sort());
 });
 

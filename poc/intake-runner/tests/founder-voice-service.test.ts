@@ -1,0 +1,293 @@
+// The founder VOICE service end to end, with MOCKED outside services: a stand-in for Twilio (a Media Streams style client on loopback) -> the real WebSocket server (secret path + signature) -> the real voice
+// bridge -> the real OpenAI voice socket over a mocked connection -> the Drew persona -> the real call logic, consent notice, masker, Intake agent, record store and (optionally) contact vault, with a mocked OpenAI
+// text client for the Intake extraction and the spoken wording. No network, no real key; invented data only. A passing test shows behaviour against the mocks, not against Twilio or OpenAI. Run: npm test
+import test, { after } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createRelayWsServer } from '../src/ws-server.ts';
+import { signedUrlCandidates } from '../src/founder-call-gate.ts';
+import type { FounderCallConfig } from '../src/founder-call-gate.ts';
+import type { FounderVoiceConfig } from '../src/founder-voice-gate.ts';
+import { createFounderVoiceService } from '../src/founder-voice-service.ts';
+import { createOpenAiVoiceSocket } from '../src/openai-voice-socket.ts';
+import type { WebSocketLike } from '../src/openai-voice-socket.ts';
+import { createIntakeRecordStore } from '../src/intake-record-store.ts';
+import { mintExecutionContext } from '../src/execution-context.ts';
+import { consentNoticeFor } from '../src/opening.ts';
+import { SAY } from '../src/relay-handler.ts';
+import { SPEAK_ONLY } from '../src/realtime-transport.ts';
+import { createPersona, dialogueStyle, voiceManner } from '../src/persona.ts';
+import { createOpenAIHttpClient } from '../src/openai-http-client.ts';
+import { fallbackText } from '../src/dialogue-model.ts';
+import { connectRelay } from './helpers/twilio-sim.ts';
+import type { Sim } from './helpers/twilio-sim.ts';
+import { b64, createWireVoice } from './helpers/realtime-wire-sim.ts';
+import type { WireVoice } from './helpers/realtime-wire-sim.ts';
+
+const T = 'ws-founder-plumbing';
+const N1 = '+15555550100';
+const TOKEN = 'test-auth-token-0123456789';
+const FAKE_KEY = 'sk-test-not-a-real-key-0123456789';
+const SECRET = 'q7Zr2KfX9mWc4TbV8nHs1LpD6yGe3AuJ5oRi0NxE';
+const PATH = `/relay/${SECRET}`;
+const URL_WSS = `wss://tunnel.example.test${PATH}`;
+const SID = 'CA00000000000000000000000000000001';
+const OPENING = 'Hello, how can I help you today?';
+const plumbing = JSON.parse(readFileSync(new URL('../examples/skill-plumbing.json', import.meta.url), 'utf8')).skill_config;
+const drewConfig = JSON.parse(readFileSync(new URL('../examples/persona-drew-cleaning.json', import.meta.url), 'utf8'));
+const persona = createPersona(drewConfig);
+const dir = mkdtempSync(join(tmpdir(), 'voice-service-'));
+const closers: Array<() => unknown> = [];
+after(async () => { for (const c of closers.reverse()) try { await c(); } catch { /* already closed */ } rmSync(dir, { recursive: true, force: true }); });
+async function until(fn: () => boolean, ms = 4000): Promise<void> { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error('timed out'); await new Promise<void>((r) => setTimeout(r, 4)); } }
+const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** A mocked OpenAI text API: the Intake extraction (structured output) and the spoken wording (plain text), answering from what it is sent, as the real one would from the masked text. */
+function mockOpenAiText(opts: { failDialogue?: boolean; emptyDialogue?: boolean } = {}) {
+  const seen: any[] = [];
+  const reply = (text: string) => ({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text }] }], usage: { input_tokens: 20, output_tokens: 8 } });
+  const fetch = (async (_url: string, init: RequestInit) => {
+    const params = JSON.parse(String(init.body));
+    seen.push(params);
+    if (params.text?.format) {
+      const { task, data } = JSON.parse(params.input);
+      const text: string = data.masked_text;
+      if (task === 'classify_request') return new Response(JSON.stringify(reply(JSON.stringify({ category: /burst pipe|leak|flood/i.test(text) ? 'Emergency leak' : null, confidence: 0.9 }))), { status: 200 });
+      const fields = (data.fields ?? []).map((f: { name: string }) => {
+        const m = f.name === 'Address' ? /\[ADDRESS_\d+\]/.exec(text) : f.name === 'Job description' ? /burst pipe|leak/i.exec(text) : /tomorrow morning/i.exec(text);
+        return { name: f.name, value: m ? m[0] : null, confidence: m ? 0.9 : null };
+      });
+      return new Response(JSON.stringify(reply(JSON.stringify({ fields }))), { status: 200 });
+    }
+    if (opts.failDialogue) return new Response('{}', { status: 500 });
+    if (opts.emptyDialogue) return new Response(JSON.stringify(reply('')), { status: 200 });
+    const next = String(params.instructions).split('\n').pop() ?? '';
+    const field = /^NEXT ASK (.+?)(?: \(asked before.*?\))?(?: CHOICES:.*)?$/.exec(next)?.[1];
+    return new Response(JSON.stringify(reply(next.startsWith('NEXT OPEN') ? OPENING : field ? `Could you tell me the ${field.toLowerCase()}?` : next.startsWith('NEXT CLARIFY') ? 'Could you say what you need?' : 'Okay, please go on.')), { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  return { fetch, seen, count: () => seen.length };
+}
+
+/** A mocked client WebSocket backed by the wire-level voice stand-in. */
+function wsOver(v: WireVoice): WebSocketLike {
+  const ws: WebSocketLike = {
+    readyState: 0, bufferedAmount: 0, onopen: null, onmessage: null, onclose: null, onerror: null,
+    send: (d: string) => { if (!v.send(d)) throw new Error('refused'); },
+    close: (c?: number) => { ws.readyState = 3; v.close(c); },
+  };
+  v.onMessage = (t: string) => { ws.onmessage?.({ data: t }); };
+  v.onClose = () => { ws.onclose?.({}); };
+  setTimeout(() => { ws.readyState = 1; v.open(); ws.onopen?.({}); }, 0);
+  return ws;
+}
+
+async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean } = {}) {
+  const callConfig: FounderCallConfig = {
+    approval_id: 'voice-test', tenant: T, numbers: [N1], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'],
+    kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
+  };
+  const voiceConfig: FounderVoiceConfig = { approval_id: 'v1', openai_model: 'gpt-test-model', realtime_model: 'realtime-test-model', transcription_model: 'transcribe-test-model', voice: 'test-voice', max_openai_calls: 50, persona: drewConfig };
+  const store = createIntakeRecordStore({ path: join(dir, `calls-${Math.random().toString(36).slice(2)}.sqlite`) });
+  closers.push(() => store.close());
+  const text = mockOpenAiText({ failDialogue: o.failDialogue, emptyDialogue: o.emptyDialogue });
+  const voices: WireVoice[] = []; const handshakes: Array<{ url: string; headers: Record<string, string> }> = [];
+  const logs: Array<{ code: string; detail?: Record<string, unknown> }> = [];
+  const service = createFounderVoiceService({
+    config: callConfig, voice: voiceConfig,
+    textClient: createOpenAIHttpClient({ getKey: () => FAKE_KEY, fetch: text.fetch }),
+    openVoice: () => createOpenAiVoiceSocket({
+      model: voiceConfig.realtime_model, getKey: o.key ?? (() => FAKE_KEY), connectTimeoutMs: 3000,
+      factory: (url, init) => { handshakes.push({ url, headers: init.headers }); const v = createWireVoice({ msPerChar: 1, autoOpen: false }); voices.push(v); return wsOver(v); },
+    }),
+    store,
+    async intakeContext(tenant, ref) {
+      const r = await mintExecutionContext({ credential: 'test', agent: 'intake' }, { verify: () => ({ kind: 'system', id: 'voice-service-test' }), selectTenant: () => tenant, grants: () => ['intake:run'], newCorrelationId: () => `corr-${ref}` });
+      if (!r.ok) throw new Error('context');
+      return r.context;
+    },
+    now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z', killed: () => false, log: (code, detail) => { logs.push({ code, detail }); },
+  });
+  const server = createRelayWsServer({ path: PATH, authToken: TOKEN, urls: signedUrlCandidates(URL_WSS), maxConnections: 2, onConnection: (c) => service.handleStream(c) } as never);
+  const port = await server.listen(0);
+  closers.push(() => server.close());
+  const connect = async (over: Record<string, unknown> = {}): Promise<Sim> => {
+    const sim = await connectRelay({ port, token: TOKEN, url: URL_WSS, path: PATH, ...over } as never);
+    if (sim.status === 101) {
+      let seen = 0;   // the phone side: echoes every marker once the audio would have played
+      const timer = setInterval(() => { for (; seen < sim.messages.length; seen++) { const m = sim.messages[seen]; if (m.event === 'mark') sim.send({ event: 'mark', streamSid: m.streamSid, mark: { name: m.mark.name } }); } }, 5);
+      timer.unref?.(); void sim.closed.then(() => clearInterval(timer));
+    }
+    return sim;
+  };
+  const start = (sim: Sim, to = N1) => { sim.send({ event: 'connected', protocol: 'Call', version: '1.0.0' }); sim.send({ event: 'start', sequenceNumber: '1', start: { streamSid: 'MZ1', callSid: SID, tracks: ['inbound'], customParameters: { to }, mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } }, streamSid: 'MZ1' }); };
+  const has = (code: string) => logs.some((l) => l.code === code);
+  return { service, store, text, voices, handshakes, logs, connect, start, has, handler: service.handler, notice: service.notice };
+}
+type Rig = Awaited<ReturnType<typeof rig>>;
+const spokenCount = (r: Rig) => r.voices[0]?.spoken.length ?? 0;
+async function say(r: Rig, text: string, n: number) { r.voices[0].hear(text); await until(() => spokenCount(r) >= n); await r.handler.idle(); }
+const SECRETS = ['Sam Example', 'sam example', 'Elm Street', '42 Elm', '555 010 0199', '0199'];
+
+test('full call: the notice, a yes, the cleaning questions, the fixed read-back and a saved confirmed record, all over the stream, with the Drew persona on every spoken line', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  assert.equal(sim.status, 101);
+  r.start(sim);
+  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1);
+  sim.send({ event: 'media', media: { payload: b64(160) } });   // sound during the notice
+  assert.equal(r.voices[0].appended(), 0, 'no caller audio reaches the voice service before the notice has been played');
+  await until(() => r.has('CALL_STARTED'));
+  assert.equal(r.voices[0].spoken[0], r.notice);
+  assert.equal(r.notice, consentNoticeFor(undefined), 'the notice is the one the existing call logic uses');
+  sim.send({ event: 'media', media: { payload: b64(160) } });
+  await until(() => r.voices[0].appended() === 1);
+  await say(r, 'yes I agree', 2);
+  assert.equal(r.voices[0].spoken[1], OPENING);
+  assert.ok(r.has('CONSENT_GRANTED'));
+  await say(r, 'Hi, I have a burst pipe in the kitchen', 3);
+  await say(r, 'The address is 42 Elm Street', 4);
+  assert.equal(r.voices[0].spoken[3], 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.', 'the read-back is the server\'s fixed wording');
+  await say(r, 'yes that is right', 5);
+  await sim.closed;
+  assert.equal(sim.closeCode(), 1000, 'the stream is closed after the goodbye, which is what lets the TwiML hang up');
+  await r.handler.idle();
+  assert.equal(r.voices[0].spoken[4], SAY.thanks);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.status, rec.category], ['confirmed', true, 'ready', 'Emergency leak']);
+  // The Drew persona is on every speech request, in front of the exact words.
+  const creates = r.voices[0].received.filter((m) => m.type === 'response.create');
+  assert.equal(creates.length, 5);
+  assert.ok(creates.every((m) => String(m.response.instructions).startsWith(`${SPEAK_ONLY} ${voiceManner(persona)} `)));
+  assert.ok(creates.every((m) => m.response.conversation === 'none'));
+  assert.ok(r.voices[0].received.filter((m) => m.type === 'session.update').every((m) => m.session.type === 'realtime' && m.session.audio.input.format.type === 'audio/pcmu'));
+  assert.deepEqual(r.voices[0].refused, [], 'nothing the documented schema would refuse was sent');
+  // The spoken wording came from the OpenAI text model with the persona line before the NEXT line, which is last.
+  const dialogue = r.text.seen.filter((p) => !p.text);
+  assert.ok(dialogue.length >= 2, 'the opening question and the address question were worded by the text model');
+  for (const p of dialogue) {
+    const lines = String(p.instructions).split('\n');
+    assert.equal(lines[lines.length - 2], dialogueStyle(persona));
+    assert.ok(lines[lines.length - 1].startsWith('NEXT'));
+    assert.equal(p.store, false);
+  }
+});
+
+test('privacy: the raw caller words never reach the OpenAI text model, the key is only in the handshake, and no log line holds speech', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  await say(r, 'yes I agree', 2);
+  await say(r, 'Hi this is Sam Example, I have a burst pipe in the kitchen', 3);
+  await say(r, 'The address is 42 Elm Street and call me on 555 010 0199', 4);
+  const sentToText = JSON.stringify(r.text.seen);
+  for (const s of SECRETS) assert.ok(!sentToText.includes(s), `raw text reached the text model: ${s}`);
+  assert.ok(sentToText.includes('[PERSON_1]') || sentToText.includes('[ADDRESS_1]'), 'masked placeholders are what it sees');
+  assert.equal(r.handshakes.length, 1);
+  assert.equal(r.handshakes[0].url, 'wss://api.openai.com/v1/realtime?model=realtime-test-model');
+  assert.equal(r.handshakes[0].headers.Authorization, `Bearer ${FAKE_KEY}`);
+  assert.ok(!JSON.stringify(r.voices[0].received).includes(FAKE_KEY), 'the key is never in anything sent over the voice connection');
+  assert.ok(!sentToText.includes(FAKE_KEY));
+  const logText = JSON.stringify(r.logs);
+  for (const s of [...SECRETS, FAKE_KEY, 'burst pipe']) assert.ok(!logText.includes(s), `a log line holds: ${s}`);
+  sim.end();
+});
+
+test('consent: anything but a plain yes ends the call with the fixed goodbye; no text model is contacted and nothing is kept', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  r.voices[0].hear('no thank you');
+  await sim.closed;
+  assert.equal(r.voices[0].spoken[1], SAY.declined);
+  assert.equal(r.text.count(), 0, 'no OpenAI text call was made');
+  assert.equal(r.store.list(T).length, 0);
+  assert.ok(!r.has('CONSENT_GRANTED'));
+  await r.handler.idle();
+});
+
+test('consent-before-audio, as it is: the answer to the consent question is audio the voice service hears before the server has checked it', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  sim.send({ event: 'media', media: { payload: b64(160) } });   // the caller's "no", as audio
+  await until(() => r.voices[0].appended() === 1);
+  assert.equal(r.voices[0].appended(), 1, 'THE OPEN GAP: closing it needs consent collected on the phone side first');
+  sim.end(); await pause(20);
+});
+
+test('safeguards: an unknown number is refused (after the notice, a known gap), a stream with no dialed number is refused, and neither contacts a text model or keeps a record', async () => {
+  for (const to of ['+15555550177', '']) {
+    const r = await rig();
+    const sim = await r.connect(); r.start(sim, to);
+    await sim.closed;
+    assert.equal(r.text.count(), 0, to);
+    assert.equal(r.store.list(T).length, 0, to);
+    await r.handler.idle();
+  }
+});
+
+test('safeguards: the stream endpoint refuses a wrong signature and a wrong path, so no voice connection and no key use happen', async () => {
+  const r = await rig();
+  const bad = [await r.connect({ signature: null }), await r.connect({ signature: 'AAAAAAAAAAAAAAAAAAAAAAAAAAA=' }), await r.connect({ path: '/relay/wrongwrongwrongwrongwrongwrongwrongwrong' })];
+  assert.ok(bad.every((b) => b.status !== 101));
+  await pause(30);
+  assert.deepEqual([r.voices.length, r.handshakes.length, r.text.count()], [0, 0, 0]);
+});
+
+test('safeguards: with no usable key the call ends before anything is said, no connection is made and no record is kept', async () => {
+  const r = await rig({ key: () => undefined });
+  const sim = await r.connect(); r.start(sim);
+  await sim.closed;
+  assert.deepEqual([r.handshakes.length, r.text.count(), r.store.list(T).length], [0, 0, 0]);
+  assert.ok(!r.has('CALL_STARTED'));
+  await r.handler.idle();
+});
+
+test('limits: the caller hanging up mid-call closes the voice connection and saves the request unconfirmed, nothing is left open', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  await say(r, 'yes I agree', 2);
+  await say(r, 'Hi, I have a burst pipe in the kitchen', 3);
+  sim.send({ event: 'stop', sequenceNumber: '9', stop: { callSid: SID }, streamSid: 'MZ1' });
+  await until(() => r.voices[0].closedWith.length > 0);
+  await r.handler.idle();
+  assert.deepEqual(r.voices[0].closedWith, [1000]);
+  assert.equal(r.handler.active(), 0);
+});
+
+test('failure: when the OpenAI text model answers with nothing, the caller is not left in silence: one retry, then the server asks in its own fixed wording', async () => {
+  const r = await rig({ emptyDialogue: true });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  r.voices[0].hear('yes I agree');
+  await until(() => spokenCount(r) >= 2, 8000);
+  assert.equal(r.voices[0].spoken[1], fallbackText({ kind: 'open' }));
+  assert.ok(r.has('REPLY_FALLBACK_SENT'));
+  assert.equal(r.text.seen.filter((p) => !p.text).length, 2, 'asked, retried once, then the fixed wording');
+  sim.end(); await pause(20);
+});
+
+test('failure: when the OpenAI text model errors, the call ends with the fixed apology, saved unconfirmed with nothing handed on, and the stream is closed', async () => {
+  const r = await rig({ failDialogue: true });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  r.voices[0].hear('yes I agree');
+  await sim.closed;
+  await r.handler.idle();
+  assert.equal(r.voices[0].spoken[1], SAY.trouble);
+  assert.equal(sim.closeCode(), 1000);
+  assert.ok(r.store.list(T).every((x) => x.handed_off === false));
+});
+
+test('failure: a voice service that drops mid-call ends the call and closes the stream', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  r.voices[0].onClose();
+  await sim.closed;
+  await r.handler.idle();
+  assert.equal(r.handler.active(), 0);
+});

@@ -451,13 +451,13 @@ test('call logic: a reply the phone never confirms is asked again, not treated a
 });
 
 // ================================================================ static guards
-test('static: the bridge opens no connection, reads no environment, holds no key and imports no SDK; nothing in src uses it yet', () => {
+test('static: the bridge opens no connection, reads no environment, holds no key and imports no SDK; only the voice composition uses it, never the live Claude entry', () => {
   const code = (f: string) => readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const own = code('realtime-bridge.ts');
   for (const bad of [/process\.env/, /\bfetch\s*\(/, /\bimport\s*\(/, /@anthropic-ai|from 'openai'|from "openai"/, /new\s+WebSocket/, /node:(net|http|https|tls|dgram)/, /console\./, /\bpersona\b|createPersona|isPersona/i, /api[_-]?key|secret|authorization|bearer/i]) {
     assert.ok(!bad.test(own), String(bad));
   }
   for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((x) => x.endsWith('.ts') && x !== 'realtime-bridge.ts' && x !== 'openai-voice-socket.ts')) {   // the voice socket names the bridge's VoiceSocket type only
-    assert.ok(!/realtime-bridge/.test(code(f)), `${f} must not use the bridge yet`);
+    assert.equal(/realtime-bridge/.test(code(f)), f === 'founder-voice-service.ts', `${f}: only the voice service (not the live Claude entry) may use the bridge`);
   }
 });

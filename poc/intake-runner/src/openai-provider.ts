@@ -83,7 +83,7 @@ export function buildOpenAIParams(request: ModelRequest, model: string, effort?:
 }
 
 /** How the answer ended, as a fixed word: completed, refusal, incomplete_<reason>, status_<status>, or status_none. Only completed is usable. */
-function endWord(r: OpenAIResponse): string {
+export function endWord(r: OpenAIResponse): string {
   const status = typeof r.status === 'string' && WORD.test(r.status) ? r.status : (r.status === undefined || r.status === null ? 'none' : 'other');
   const blocks = Array.isArray(r.output) ? r.output : [];
   const refused = blocks.some((b) => b && Array.isArray(b.content) && b.content.some((c) => c && c.type === 'refusal'));
@@ -95,7 +95,7 @@ function endWord(r: OpenAIResponse): string {
   return status === 'completed' ? 'completed' : `status_${status}`;
 }
 
-function textOf(r: OpenAIResponse): string {
+export function textOf(r: OpenAIResponse): string {
   const items = Array.isArray(r.output) ? r.output : [];
   const parts: string[] = [];
   for (const item of items) {
