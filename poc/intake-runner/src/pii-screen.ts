@@ -37,7 +37,26 @@ const DOT_TLD = /\bdot\s+(?:com|net|org|edu|gov|io|co|uk|us|info|biz|ca|au|de|fr
 const MAIL_HOST = /\bat\s+(?:gmail|yahoo|hotmail|outlook|icloud|aol|proton(?:mail)?|msn)\b/gi;
 const URL_LIKE = /\bhttps?:\/\/\S+|\bwww\.\S+/gi;
 const PHONE_LIKE = /\+?\d[\d\s().-]{5,}\d/g;
-const SPOKEN_DIGITS = new RegExp(`\\b${NUM_WORD}(?:[\\s,.-]+${NUM_WORD}){4,}\\b`, 'gi');
+/** One digit as spoken ("five"), written ("5") or a whole group of written digits ("0199"), optionally repeated: "double zero", "triple 5" ("treble" is the British form). */
+const SPOKEN_TOKEN = `(?:(?:double|triple|treble)[\\s-]+)?(?:${NUM_WORD}|\\d+)`;
+/** A run of two or more such tokens. It is only a candidate: it is a number when it has at least one spoken word in it (a run of written digits alone has its own rules below) and stands for 5 or more digits. */
+const SPOKEN_DIGITS = new RegExp(`\\b${SPOKEN_TOKEN}(?:[\\s,.-]+${SPOKEN_TOKEN})+\\b`, 'gi');
+const REPEATS: Readonly<Record<string, number>> = { double: 2, triple: 3, treble: 3 };
+/** How many digits a run stands for: "double zero" is two, "triple five" three, "0199" four. A repeat word repeats one digit only, never a group. */
+export function spokenDigitCount(run: string): number {
+  let n = 0; let times = 1;
+  for (const w of run.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (w === '') continue;
+    if (REPEATS[w] !== undefined) { times = REPEATS[w]; continue; }
+    n += /^\d+$/.test(w) ? (w.length === 1 ? times : w.length) : times;
+    times = 1;
+  }
+  return n;
+}
+const MIN_SPOKEN_RUN = 5;
+/** A run that mixes or consists of spoken digit words and stands for a number of 5 or more digits. Digits written alone are left to the rules for written digits. */
+const isSpokenNumber = (run: string): boolean => /[a-z]/i.test(run) && spokenDigitCount(run) >= MIN_SPOKEN_RUN;
+const hasSpokenDigits = (t: string): boolean => [...t.matchAll(new RegExp(SPOKEN_DIGITS.source, 'gi'))].some((m) => isSpokenNumber(m[0]));
 const ADDRESS_DIGITS = new RegExp(`\\b\\d{1,6}(?:[\\s,.-]+\\d{1,6})*\\s+(?:[A-Za-z][A-Za-z'.-]*\\s+){0,3}${STREET}\\b\\.?`, 'gi');
 /** Digits left standing right before an address placeholder: the number of a street whose name was masked but whose digits were not. */
 const DIGITS_BEFORE_ADDRESS = /\d(?:[\s,.-]+\d)*[\s,]*\[ADDRESS_\d{1,3}\]/;
@@ -93,7 +112,7 @@ export function piiProblems(text: string): string[] {
   if (new RegExp(SPOKEN_EMAIL.source, 'i').test(t) || new RegExp(DOT_TLD.source, 'i').test(t) || new RegExp(MAIL_HOST.source, 'i').test(t)) out.push('spoken_email');
   if (new RegExp(URL_LIKE.source, 'i').test(t)) out.push('url');
   for (const m of t.matchAll(PHONE_LIKE)) if (digitCount(m[0]) >= 7) { out.push('phone'); break; }
-  if (new RegExp(SPOKEN_DIGITS.source, 'i').test(t)) out.push('spoken_digits');
+  if (hasSpokenDigits(t)) out.push('spoken_digits');
   if (new RegExp(ADDRESS_DIGITS.source, 'i').test(t) || new RegExp(ADDRESS_WORDS.source, 'i').test(t) || new RegExp(PO_BOX.source, 'i').test(t) || plainStreets(t).length > 0 || DIGITS_BEFORE_ADDRESS.test(text)) out.push('address');
   if (new RegExp(POSTCODE.source, 'i').test(t)) out.push('postcode');
   if (/\d{5,}/.test(t)) out.push('digits');
@@ -214,9 +233,10 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
       t = eachSegment(t, (s) => sub(s, EMAIL, 'Contact detail'));
       t = eachSegment(t, (s) => sub(s, SPOKEN_EMAIL, 'Contact detail'));
       t = eachSegment(t, (s) => sub(s, URL_LIKE, 'Contact detail'));
+      // A number said in words, digits or both comes before the identifier rule, so one joined with hyphens ("five-5-0-oh-1-...") is a contact detail, not an identifier.
+      t = eachSegment(t, (s) => sub(s, SPOKEN_DIGITS, 'Contact detail', isSpokenNumber));
       t = eachSegment(t, (s) => sub(s, MIXED_ID, 'Identifier'));
       t = eachSegment(t, (s) => sub(s, PHONE_LIKE, 'Contact detail', (m) => digitCount(m) >= 7));
-      t = eachSegment(t, (s) => sub(s, SPOKEN_DIGITS, 'Contact detail'));
       t = eachSegment(t, (s) => sub(s, ADDRESS_DIGITS, 'Address'));
       t = eachSegment(t, (s) => sub(s, ADDRESS_WORDS, 'Address'));
       t = eachSegment(t, (s) => sub(s, PO_BOX, 'Address'));

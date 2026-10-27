@@ -20,16 +20,25 @@ export interface Contact { readonly name: string; readonly phone: string; readon
 export const CONTACT_FIELDS = Object.freeze({ name: 'Customer name', phone: 'Callback phone number', address: 'Service address' });
 
 const WORD: Readonly<Record<string, string>> = { zero: '0', oh: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+const REPEAT: Readonly<Record<string, number>> = { double: 2, triple: 3, treble: 3 };
 const MAX_PART = 120;
 
 /** The digits of a spoken or written phone number, or undefined when it is not a usable one (10 to 15 digits, no e-mail). */
 export function phoneDigits(raw: string): string | undefined {
   if (typeof raw !== 'string' || raw.length > 200 || raw.includes('@') || /\bdot\b/i.test(raw)) return undefined;
   let digits = '';
+  let last = '';
+  let times = 1;   // "double zero" is 00, "triple five" is 555
   for (const t of raw.toLowerCase().split(/[^a-z0-9]+/)) {
-    if (/^\d+$/.test(t)) digits += t;
-    else if (WORD[t] !== undefined) digits += WORD[t];
+    if (t !== '') last = t;
+    if (REPEAT[t] !== undefined) { times = REPEAT[t]; continue; }
+    const d = /^\d+$/.test(t) ? t : WORD[t];
+    if (d !== undefined) digits += times > 1 && d.length === 1 ? d.repeat(times) : d;
+    times = 1;
   }
+  // A spoken "oh" at the very end of a run ("... nine nine oh well") is often the interjection, not a zero: when it makes a US-style number one digit too long, it is dropped.
+  // The read-back to the caller is what settles any doubt left.
+  if (last === 'oh' && digits.length === 11 && /^[2-9]/.test(digits)) digits = digits.slice(0, -1);
   return /^\d{10,15}$/.test(digits) ? digits : undefined;
 }
 

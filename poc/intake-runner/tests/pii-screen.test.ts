@@ -1,7 +1,7 @@
 // The founder-test masker and the call session. Pure tests: no network. Every personal-looking value below is INVENTED.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMasker, piiProblems, MAX_UTTERANCE_CHARS } from '../src/pii-screen.ts';
+import { createMasker, piiProblems, spokenDigitCount, MAX_UTTERANCE_CHARS } from '../src/pii-screen.ts';
 import { createCallSession } from '../src/call-session.ts';
 
 const mask = (text: string, names: string[] = []) => { const m = createMasker({ names }); const r = m.mask(text); return { r, m }; };
@@ -275,4 +275,124 @@ test('session: limits (turns, time, characters, kill switch) are reported, and d
 
 test('session: setup limits are validated', () => {
   for (const bad of [{ maxTurns: 0 }, { maxTurns: 61 }, { maxMinutes: 11 }, { maxChars: 10 }, { maxTurns: 1.5 }]) assert.throws(() => createCallSession(cfg(bad as never)), RangeError);
+});
+
+// ---------------------------------------------------------------- spoken repeats: "double zero", "triple five" (invented numbers only)
+test('masker: a number said with "double" or "triple" is masked whole, with nothing of it left behind', () => {
+  assert.equal(textOf('call me at five five five oh one double zero one nine nine'), 'call me at [CONTACT_1]');
+  assert.equal(textOf('five five five oh one double zero one nine nine'), '[CONTACT_1]');
+  assert.equal(textOf('triple five zero one zero zero one nine nine'), '[CONTACT_1]');
+  assert.equal(textOf('my number is treble five oh one oh oh one nine nine'), 'my number is [CONTACT_1]');
+  assert.equal(textOf('five-five-five-oh-one-double-zero-one-nine-nine'), '[CONTACT_1]');
+  assert.equal(textOf('five five five, oh one, double zero, one nine nine'), '[CONTACT_1]');
+  assert.equal(textOf('Double Five Oh One Double Zero One Nine Nine', ['Sam Example']).includes('Double'), false);
+  assert.equal(textOf('double nine zero one two'), '[CONTACT_1]', 'five digits in all, said as four words');
+  assert.equal(textOf('call me at five five five oh one double zero one nine nine or on 555 010 0198'), 'call me at [CONTACT_1] or on [CONTACT_2]');
+});
+
+test('masker: "double" and "triple" in ordinary speech, and short repeats, are left alone', () => {
+  for (const s of ['please double check the oven', 'a triple layer cake', 'it is a double bed and a triple dresser', 'the double doors are stuck', 'double double toil and trouble',
+    'I want it done in two or three days', 'double zero seven', 'double five', 'triple nine', 'I have two double beds and one single', 'the oven is double wide']) {
+    assert.equal(textOf(s), s, s);
+  }
+});
+
+test('masker: spokenDigitCount counts repeats as their digits, and piiProblems sees a repeated-digit number but not ordinary speech', () => {
+  assert.equal(spokenDigitCount('five five five oh one double zero one nine nine'), 10);
+  assert.equal(spokenDigitCount('triple five'), 3);
+  assert.equal(spokenDigitCount('treble five'), 3);
+  assert.equal(spokenDigitCount('double Zero'), 2);
+  assert.ok(piiProblems('five five five oh one double zero one nine nine').includes('spoken_digits'));
+  assert.ok(piiProblems('triple five zero one zero zero one nine nine').includes('spoken_digits'));
+  assert.deepEqual(piiProblems('please double check the oven and the triple layer cake'), []);
+  assert.deepEqual(piiProblems('double zero seven'), []);
+});
+
+test('masker: the stored utterance never keeps a repeated-digit number, and the raw number is available to the contact capture only', () => {
+  const m = createMasker({ names: [] });
+  const r = m.mask('you can reach me on five five five oh one double zero one nine nine');
+  assert.deepEqual(r, { ok: true, text: 'you can reach me on [CONTACT_1]' });
+  assert.deepEqual(m.reveal().map((x) => [x.type, x.raw]), [['Contact detail', 'five five five oh one double zero one nine nine']]);
+  m.dispose();
+  assert.deepEqual(m.reveal(), []);
+});
+
+// ---------------------------------------------------------------- numbers that mix spoken digits, written digits and repeat words (invented numbers only)
+test('masker: a number that mixes spoken digits, written digits and repeat words is masked whole', () => {
+  const whole: Array<[string, string]> = [
+    ['five five five 0 1 0 oh one nine nine', '[CONTACT_1]'],
+    ['my number is five five five 0 1 0 0 1 9 9', 'my number is [CONTACT_1]'],
+    ['5 5 5 zero one zero zero one nine nine', '[CONTACT_1]'],
+    ['five five five 0 1 0 double 0 1 9 9', '[CONTACT_1]'],
+    ['5 5 5 0 1 double 0 1 9 9', '[CONTACT_1]'],
+    ['call me at 555 oh one oh oh one nine nine', 'call me at [CONTACT_1]'],
+    ['reach me on 555-010 oh one nine nine', 'reach me on [CONTACT_1]'],
+    ['my number is triple 5 0 1 0 0 1 9 9', 'my number is [CONTACT_1]'],
+    ['my number is 555 010 double nine nine', 'my number is [CONTACT_1]'],
+    ['the zip is seven 6 four three three', 'the zip is [CONTACT_1]'],
+    ['five-five-five-0-1-0-oh-one-nine-nine', '[CONTACT_1]'],
+    ['five, five, five, 0, 1, 0, oh, one, nine, nine', '[CONTACT_1]'],
+    ['it is five five five 0 1 0 oh one nine nine and I live at 42 Elm Street', 'it is [CONTACT_1] and I live at [ADDRESS_1]'],
+    ['call me on five five five 0 1 0 oh one nine nine or on 555 010 0198', 'call me on [CONTACT_1] or on [CONTACT_2]'],
+  ];
+  for (const [raw, masked] of whole) assert.equal(textOf(raw), masked, raw);
+});
+
+test('masker: any ten-digit number built from spoken words, written digits and repeat words is masked whole, in every spacing', () => {
+  const words = ['zero', 'oh', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
+  let seed = 3; const rnd = (): number => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const seps = [' ', ', ', '-', ' - '];
+  let mixed = 0;
+  for (let k = 0; k < 300; k++) {
+    const sep = seps[Math.floor(rnd() * seps.length)];
+    const parts: string[] = []; let digits = 0; let usedWord = false; let usedNumeral = false;
+    while (digits < 10) {
+      const d = Math.floor(rnd() * 10); const style = rnd();
+      if (style < 0.4 && d !== 0) { parts.push(words[d + 1]); usedWord = true; }
+      else if (style < 0.5) { parts.push(d === 0 ? 'oh' : words[d + 1]); usedWord = true; }
+      else if (style < 0.6 && digits <= 8) { parts.push((rnd() < 0.5 ? 'double ' : 'triple ') + (rnd() < 0.5 ? String(d) : (d === 0 ? 'zero' : words[d + 1]))); digits += (parts[parts.length - 1].startsWith('double') ? 1 : 2); usedWord = true; }
+      else { parts.push(String(d)); usedNumeral = true; }
+      digits++;
+    }
+    if (!usedWord) continue;   // digits written alone have their own rules (they become an identifier, not a contact detail)
+    if (usedNumeral) mixed++;
+    const lead = ['', 'call me on ', 'reach me at '][k % 3]; const tail = ['', ' please'][k % 2];
+    const raw = lead + parts.join(sep) + tail;
+    const { r } = mask(raw);
+    if (!r.ok) continue;   // refusing the utterance is also safe: it never reaches a model
+    assert.equal(r.text, lead + '[CONTACT_1]' + tail, raw);
+  }
+  assert.ok(mixed > 100, 'the sweep really did mix styles: ' + mixed);
+});
+
+test('masker: fail-closed for mixed numbers, an utterance that still looks like a number is refused, and the check sees them', () => {
+  for (const raw of ['five five five 0 1 0 oh one nine nine', '5 5 5 0 1 double 0 1 9 9', 'seven 6 four three three', 'triple 5 0 1 0 0 1 9 9']) {
+    assert.ok(piiProblems(raw).includes('spoken_digits'), raw);
+    assert.ok(!piiProblems(textOf(raw)).includes('spoken_digits'), 'the masked text no longer looks like a number');
+  }
+  assert.deepEqual(piiProblems('a three bedroom 2 bath house, every two weeks'), []);
+  // A number the masker cannot mask cleanly (here it runs into the word "street") is refused rather than passed on with digits in it.
+  for (const raw of ['my number is 3. 7. one. six. three. 4. 4. 1 street', 'the zip is 0. zero. 1. 6. zero. three. 7. nine street']) {
+    const { r } = mask(raw);
+    assert.deepEqual(r, { ok: false, code: 'RESIDUAL' }, raw);
+  }
+  // A caller cannot forge a placeholder to hide digits behind.
+  assert.deepEqual(mask('five five [CONTACT_1] 0 1 nine nine').r, { ok: false, code: 'ODD_TEXT' });
+});
+
+test('masker: ordinary speech with small numbers beside number words is left exactly as said', () => {
+  for (const s of ['a three bedroom 2 bath house', 'every two weeks starting June 5', 'about 1800 square feet with two bedrooms', 'it is a one bedroom with 2 bathrooms', 'around 3 or 4 rooms',
+    'we have 2 dogs and one cat', 'between 9 and 5', 'two 20 minute visits', 'I have 3 5 gallon buckets', 'we are 4 people and 2 kids', 'one 12 foot ladder', 'ten 15 minute breaks',
+    'two bedrooms and 2 baths please', 'about 2 or 3 bedrooms, 1 or 2 baths', 'I need it by the 15th', 'on the 3rd and the 4th', 'from 8 to 10 in the morning', 'three 4 and a half', 'two or 3 days',
+    'a double bed, 2 bathrooms and a triple dresser']) {
+    assert.equal(textOf(s), s, s);
+  }
+});
+
+test('masker: the raw mixed number is available to the contact capture only, in the order it was said, and is gone after dispose', () => {
+  const m = createMasker({ names: [] });
+  assert.deepEqual(m.mask('you can reach me on five five five 0 1 0 oh one nine nine'), { ok: true, text: 'you can reach me on [CONTACT_1]' });
+  assert.deepEqual(m.reveal().map((x) => [x.type, x.raw]), [['Contact detail', 'five five five 0 1 0 oh one nine nine']]);
+  m.dispose();
+  assert.deepEqual(m.reveal(), []);
 });

@@ -104,3 +104,81 @@ test('session: forgetAddress makes the address missing again until a corrected o
   s.dispose();
   assert.deepEqual(s.revealContactParts(), {});
 });
+
+test('phoneDigits: "double" and "triple" repeat the digit that follows them, and only that one', () => {
+  assert.equal(phoneDigits('five five five oh one double zero one nine nine'), '5550100199');
+  assert.equal(phoneDigits('triple five zero one zero zero one nine nine'), '5550100199');
+  assert.equal(phoneDigits('treble five oh one oh oh one nine nine'), '5550100199');
+  assert.equal(phoneDigits('555 01 double 0 199'), '5550100199');
+  assert.equal(phoneDigits('Five Five Five Oh One Double Zero One Nine Nine'), '5550100199');
+  assert.equal(phoneDigits('five five five oh one double check one nine nine'), undefined, 'a repeat word before a non-digit repeats nothing and the number is too short');
+  assert.equal(phoneDigits('double 10 555 010 0199'), '105550100199', 'a repeat word before a multi-digit group is ignored');
+  assert.equal(phoneDigits('double'), undefined);
+});
+
+test('session: a callback number said with "double zero" is masked, kept for the callback, and read back as ten digits', () => {
+  const s = session();
+  assert.equal(s.consent('yes'), 'granted');
+  const a = s.hear('my name is Sam Example'); const b = s.hear('call me on five five five oh one double zero one nine nine'); const c = s.hear('I live at 42 Elm Street');
+  assert.deepEqual([a.ok, b.ok, c.ok], [true, true, true]);
+  assert.ok(b.ok && b.line === 'call me on [CONTACT_1]');
+  assert.deepEqual(s.contactMissing(), []);
+  const contact = s.revealContact();
+  assert.equal(contact?.phone, '5550100199');
+  assert.equal(spokenDigits(contact?.phone ?? ''), '5 5 5 0 1 0 0 1 9 9');
+  assert.ok(!s.maskedText().includes('double') && !s.maskedText().includes('nine'));
+  s.dispose();
+});
+
+test('phoneDigits: numbers that mix spoken words, written digits and repeat words give the same ten digits', () => {
+  for (const raw of ['five five five 0 1 0 oh one nine nine', '5 5 5 zero one zero zero one nine nine', 'five five five 0 1 double 0 1 9 9', '5 5 5 0 1 double 0 1 9 9', 'call 555 oh one oh oh one nine nine',
+    '555-010 oh one nine nine', 'triple 5 0 1 0 0 1 9 9', '555 010 0 1 double nine', 'five, five, five, 0, 1, 0, oh, one, nine, nine', 'five-five-five-0-1-0-oh-one-nine-nine', 'five-5-5-0-1-double-0-1-9-9']) {
+    assert.equal(phoneDigits(raw), '5550100199', raw);
+  }
+  assert.equal(phoneDigits('five five five 0 1 0 oh one'), undefined, 'eight digits is not a callback number');
+  assert.equal(phoneDigits('seven 6 four three three'), undefined, 'five digits is a zip code, not a callback number');
+});
+
+test('session: a callback number that mixes spoken digits, numerals and repeat words is masked, captured, read back and replaced by a correction', () => {
+  const s = session();
+  assert.equal(s.consent('yes'), 'granted');
+  const lines = ['my name is Sam Example', 'you can call me on five five five 0 1 double 0 1 9 9', 'I live at 42 Elm Street'].map((x) => s.hear(x));
+  assert.deepEqual(lines.map((x) => x.ok), [true, true, true]);
+  assert.ok(lines[1].ok && lines[1].line === 'you can call me on [CONTACT_1]');
+  assert.deepEqual(s.contactMissing(), []);
+  assert.equal(s.revealContact()?.phone, '5550100199');
+  assert.equal(spokenDigits(s.revealContact()?.phone ?? ''), '5 5 5 0 1 0 0 1 9 9');
+  assert.ok(!/\d|five|nine|double/i.test(s.maskedText().replace(/\[[A-Z]+_\d+\]/g, '')), 'no digit of the number is left in what is kept');
+  assert.ok(s.hear('sorry it is 5 5 5 0 1 0 0 1 two three').ok);
+  assert.equal(s.revealContact()?.phone, '5550100123', 'the later number wins');
+  s.dispose();
+  assert.equal(s.revealContact(), undefined);
+});
+
+test('session: a mixed number that is too short to be a callback number leaves the phone missing, and nothing of it is kept', () => {
+  const s = session();
+  assert.equal(s.consent('yes'), 'granted');
+  assert.ok(s.hear('my name is Sam Example').ok && s.hear('I live at 42 Elm Street').ok);
+  const h = s.hear('the number is five five five 0 1 0 oh one');
+  assert.ok(h.ok && h.line === 'the number is [CONTACT_1]', 'it is masked all the same');
+  assert.ok(s.contactMissing().includes(CONTACT_FIELDS.phone));
+  assert.equal(s.revealContact(), undefined);
+});
+
+test('phoneDigits: a spoken "oh" that ends a run of ten digits is the interjection, not an eleventh digit; a written zero or a real leading digit is kept', () => {
+  assert.equal(phoneDigits('five five five 0 1 0 0 1 9 9 oh'), '5550100199');
+  assert.equal(phoneDigits('five five five oh one zero zero one nine nine oh'), '5550100199');
+  assert.equal(phoneDigits('five five five 0 1 0 0 1 9 9 0'), '55501001990', 'a written zero is a digit');
+  assert.equal(phoneDigits('one five five five 0 1 0 0 1 9 9'), '15550100199', 'a leading 1 is a country code and stays');
+  assert.equal(phoneDigits('one five five five 0 1 0 0 1 9 oh'), '15550100190', 'an 11-digit number starting with 1 keeps its last digit');
+  assert.equal(phoneDigits('oh seven seven oh oh nine oh oh one two oh'), '07700900120', 'a number with a leading zero keeps its last digit');
+});
+
+test('session: "oh well" after a spoken number does not corrupt the callback number', () => {
+  const s = session();
+  assert.equal(s.consent('yes'), 'granted');
+  assert.ok(s.hear('my name is Sam Example').ok && s.hear('I live at 42 Elm Street').ok);
+  const h = s.hear('my number is five five five 0 1 0 0 1 9 9 oh well');
+  assert.ok(h.ok && h.line === 'my number is [CONTACT_1] well', h.ok ? h.line : h.code);
+  assert.equal(s.revealContact()?.phone, '5550100199');
+});
