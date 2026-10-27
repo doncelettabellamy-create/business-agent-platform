@@ -32,7 +32,7 @@ import type { AddressState, ContactVault, StoredContact } from './contact-vault.
 import type { Fresh } from './next-field.ts';
 import type { CloseInfo, RelayConnection } from './ws-server.ts';
 import { createConversationRelayTransport } from './call-transport.ts';
-import type { TransportEvent } from './call-transport.ts';
+import type { CallTransport, TransportEvent } from './call-transport.ts';
 import { isRecord } from './contracts.ts';
 import type { HandoffEnvelopeV1, WorkItemV1 } from './contracts.ts';
 import { piiProblems } from './pii-screen.ts';
@@ -133,6 +133,8 @@ export interface RelayDeps {
 }
 export interface RelayHandler {
   handle(conn: RelayConnection): void;
+  /** Runs one call over any carrier (call-transport.ts). `handle` is this over the ConversationRelay carrier. */
+  serve(transport: CallTransport): void;
   active(): number;
   /** Resolves when no call has work in flight (used by the tests and the shutdown path). */
   idle(): Promise<void>;
@@ -180,9 +182,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
   const work = new Set<Promise<unknown>>();
   const track = <T>(p: Promise<T>): Promise<T> => { work.add(p); void p.finally(() => work.delete(p)).catch(() => {}); return p; };
 
-  function handle(conn: RelayConnection): void {
-    // All of the carrier's wire format lives in call-transport.ts: this function sees normalised events and speaks through three methods.
-    const carrier = createConversationRelayTransport(conn);
+  function handle(conn: RelayConnection): void { serve(createConversationRelayTransport(conn)); }
+
+  function serve(carrier: CallTransport): void {
+    // All of the carrier's wire format lives in a call-transport implementation: this function sees normalised events and speaks through three methods.
     let session: CallSession | undefined;
     let tenant = '';
     let callId = '';
@@ -211,6 +214,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let readbacks = 0;
     let unclear = 0;
     let readBack: Preview | undefined;   // exactly what the caller was asked to confirm
+    let readBackLost = false;   // the carrier reported that the read-back was not played as sent: the next answer cannot be taken as a confirmation of it
     let readBackContact: Contact | undefined;   // the contact as it stood when the number was read back: RAW, never logged, never sent to a model, cleared in finish()
     let confirmTimer: ReturnType<typeof setTimeout> | undefined;
     let setupSeen = false;   // a prompt may arrive while setup is still being prepared: it waits behind it
@@ -510,9 +514,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       phase = 'confirm'; readbacks++; unclear = 0; readBack = item;
       readBackContact = deps.contacts === undefined ? undefined : s.revealContact();
       // The caller hears the number; the dialogue history (which goes to the model on later turns) gets the same words WITHOUT it.
-      say(readBackText(item.item, readBackContact?.phone));
-      s.said(readBackText(item.item));
+      // Words that could not be sent were never heard: a yes cannot confirm them, and the history does not claim they were said. The next answer sends them again (up to the same limit).
+      const sent = say(readBackText(item.item, readBackContact?.phone));
+      readBackLost = !sent;
+      if (sent) s.said(readBackText(item.item));
       deps.log('READBACK', { n: readbacks });
+      if (!sent) deps.log('READBACK_NOT_SENT');
       armConfirmTimer();
     }
 
@@ -568,6 +575,14 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
 
     async function onAnswer(line: string): Promise<void> {
       const s = session as CallSession;
+      if (readBackLost && readBack !== undefined) {
+        // Whatever the caller said, it was not an answer to words they did not hear as sent: say the read-back again, up to the same limit.
+        readBackLost = false;
+        deps.log('READBACK_NOT_HEARD');
+        if (readbacks >= MAX_READBACKS) return await farewell(SAY.unconfirmed, true);
+        startReadback(readBack);
+        return;
+      }
       const a = s.answer(line);
       if (a === 'yes' && deps.contacts !== undefined && readBackContact !== undefined) { addressTries = 0; addressUnclear = 0; addressState = undefined; askAddress(); return; }
       if (a === 'yes') {
@@ -677,6 +692,14 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       }
       if (ev.kind === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup({ to: ev.to, callSid: ev.callSid })).catch(() => deps.log('HANDLER_ERROR')); } return; }
       if (!setupSeen) { if (++bad > 5) carrier.close(1008); return; }
+      if (ev.kind === 'reply_failed') {
+        // A question the caller did not hear is not delivered: nothing may treat their next plain yes or no as its answer.
+        failedSends++; deps.log('REPLY_NOT_PLAYED');
+        activeAsk = undefined;
+        if (phase === 'address') addressAsked = false;
+        if (phase === 'confirm' && readBack !== undefined) readBackLost = true;
+        return;
+      }
       if (ev.kind === 'partial') { partialPrompts++; return; }   // a partial result is not acted on, but it is counted
       if (ev.kind === 'utterance') {
         lastPromptAt = deps.now();
@@ -703,6 +726,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
 
   return Object.freeze({
     handle,
+    serve,
     active: () => active,
     async idle(): Promise<void> { while (work.size > 0) await Promise.allSettled([...work]); },
   });

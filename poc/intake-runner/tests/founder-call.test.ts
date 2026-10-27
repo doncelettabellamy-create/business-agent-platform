@@ -600,6 +600,47 @@ test('read-back: a clear yes after one unclear answer still confirms', async () 
   assert.equal(r.store.list(T)[0].confirmation, 'confirmed');
 });
 
+test('read-back: a read-back that could not be sent is not confirmed by a yes; it is sent again, and only a yes to the one that was sent confirms', async () => {
+  let failing = false;
+  const r = await rig({ connWrap: refusingWrites(() => failing) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  failing = true;
+  say(sim, 'The address is 42 Elm Street');
+  await waitFor(() => r.logs.some((l) => l.code === 'READBACK_NOT_SENT'));
+  failing = false; await r.handler.idle();
+  assert.equal(sim.messages.filter((m) => m.type === 'text' && /^Let me check/.test(m.token)).length, 0, 'nothing of the read-back reached the caller');
+  say(sim, 'yes');                                   // a yes to words nobody heard
+  const again = await sim.next((m) => m.type === 'text' && /^Let me check/.test(m.token));
+  assert.match(again.token, /Job description: burst pipe/);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK_NOT_HEARD'));
+  assert.equal(r.store.list(T).length, 0, 'the first yes confirmed nothing');
+  assert.equal(r.logs.filter((l) => l.code === 'READBACK').length, 2, 'it counts against the same two read-backs');
+  say(sim, 'yes that is right');
+  await sim.next((m) => m.type === 'text' && m.token === SAY.thanks);
+  await ended(sim, r);
+  assert.deepEqual([r.store.list(T)[0].confirmation, r.store.list(T)[0].handed_off], ['confirmed', true]);
+});
+
+test('read-back: if the read-back can never be sent, no yes confirms it; the call ends unconfirmed after the same two read-backs', async () => {
+  let failing = false;
+  const r = await rig({ connWrap: refusingWrites(() => failing) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  failing = true;
+  say(sim, 'The address is 42 Elm Street');
+  await waitFor(() => r.logs.some((l) => l.code === 'READBACK_NOT_SENT'));
+  say(sim, 'yes');
+  await waitFor(() => r.logs.filter((l) => l.code === 'READBACK_NOT_SENT').length === 2);
+  say(sim, 'yes');
+  await waitFor(() => r.store.list(T).length === 1);
+  await sim.closed; await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.status, rec.reasons.includes('not_confirmed')], ['unconfirmed', false, 'needs-human', true]);
+  assert.equal(sim.messages.filter((m) => m.type === 'text' && /^Let me check/.test(m.token)).length, 0);
+  assert.equal(r.logs.filter((l) => l.code === 'CONFIRMED').length, 0);
+});
+
 test('read-back: silence after the read-back ends the call unconfirmed with a fixed line; an answer in time is not cut off by the timer', async () => {
   const quiet = await rig({ confirmWaitMs: 150 });
   const a = await quiet.connect();

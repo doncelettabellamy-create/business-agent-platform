@@ -30,7 +30,12 @@ export type TransportEvent =
   /** The carrier reported an error. Its text is never passed on. */
   | { kind: 'error' }
   /** Any other frame (keypad digits and so on). Not used. */
-  | { kind: 'other' };
+  | { kind: 'other' }
+  /**
+   * A reply the call logic sent was NOT played as sent: the carrier reports that it failed, produced no sound, or said different words. The carrier in use today
+   * (ConversationRelay) never reports this; a carrier that speaks for itself must, because the call logic otherwise takes a spoken question to have been heard.
+   */
+  | { kind: 'reply_failed' };
 
 export interface CallTransport {
   /** Set by the call logic. Called once per inbound event, in order. */
