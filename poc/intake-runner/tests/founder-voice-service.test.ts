@@ -41,7 +41,8 @@ const persona = createPersona(drewConfig);
 const dir = mkdtempSync(join(tmpdir(), 'voice-service-'));
 const closers: Array<() => unknown> = [];
 after(async () => { for (const c of closers.reverse()) try { await c(); } catch { /* already closed */ } rmSync(dir, { recursive: true, force: true }); });
-async function until(fn: () => boolean, ms = 4000): Promise<void> { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error('timed out'); await new Promise<void>((r) => setTimeout(r, 4)); } }
+/** Waits for a condition; on timeout the error says where the call had got to (log codes and counts only, never speech), so an intermittent failure explains itself. */
+async function until(fn: () => boolean, ms = 4000, where?: () => string): Promise<void> { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error(`timed out${where === undefined ? '' : ': ' + where()}`); await new Promise<void>((r) => setTimeout(r, 4)); } }
 const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** A mocked OpenAI text API: the Intake extraction (structured output) and the spoken wording (plain text), answering from what it is sent, as the real one would from the masked text. */
@@ -127,6 +128,7 @@ async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; 
 }
 type Rig = Awaited<ReturnType<typeof rig>>;
 const spokenCount = (r: Rig) => r.voices[0]?.spoken.length ?? 0;
+const where = (r: Rig, sim: Sim): string => JSON.stringify({ logs: r.logs.map((l) => l.code), spoken: spokenCount(r), voiceTypes: (r.voices[0]?.received ?? []).map((m: { type: string }) => m.type), phoneEvents: sim.messages.map((m: { event: string }) => m.event), appended: r.voices[0]?.appended() });
 async function say(r: Rig, text: string, n: number) { r.voices[0].hear(text); await until(() => spokenCount(r) >= n); await r.handler.idle(); }
 const SECRETS = ['Sam Example', 'sam example', 'Elm Street', '42 Elm', '555 010 0199', '0199'];
 
@@ -138,7 +140,7 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1);
   sim.send({ event: 'media', media: { payload: b64(160) } });   // sound during the notice
   assert.equal(r.voices[0].appended(), 0, 'no caller audio reaches the voice service before the notice has been played');
-  await until(() => r.has('CALL_STARTED'));
+  await until(() => r.has('CALL_STARTED'), 4000, () => where(r, sim));
   assert.equal(r.voices[0].spoken[0], r.notice);
   assert.equal(r.notice, consentNoticeFor(undefined), 'the notice is the one the existing call logic uses');
   sim.send({ event: 'media', media: { payload: b64(160) } });
