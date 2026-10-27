@@ -9,6 +9,8 @@
 // Errors are recorded as a class name and HTTP status only. No provider message is ever kept or returned.
 
 import type { DialogueTurn } from './call-session.ts';
+import { dialogueStyle, isPersona } from './persona.ts';
+import type { Persona } from './persona.ts';
 
 export interface DialogueParams {
   model: string;
@@ -122,19 +124,22 @@ export function fallbackText(d: Directive): string {
 }
 
 /** Pure: the exact request body. Used by the model adapter and by the dry run's cost ceiling. */
-export function buildDialogueParams(input: DialogueInput, model: string, maxTokens: number): DialogueParams {
+export function buildDialogueParams(input: DialogueInput, model: string, maxTokens: number, persona?: Persona): DialogueParams {
   if (typeof model !== 'string' || !MODEL_ID.test(model)) throw new RangeError('model must be an exact Claude model id such as claude-haiku-5-5');
   if (!Number.isInteger(maxTokens) || maxTokens < 16 || maxTokens > 400) throw new RangeError('maxTokens must be an integer from 16 to 400');
+  // A persona (persona.ts) adds one line of manner AFTER every rule above and BEFORE the NEXT line, which stays the last line. Only a persona made there is accepted, never text.
+  if (persona !== undefined && !isPersona(persona)) throw new RangeError('persona must be made by createPersona');
+  const style = persona === undefined ? '' : `${dialogueStyle(persona)}\n`;
   return {
-    model, max_tokens: maxTokens, system: `${DIALOGUE_INSTRUCTION}\n${renderDirective(input.directive)}`,
+    model, max_tokens: maxTokens, system: `${DIALOGUE_INSTRUCTION}\n${style}${renderDirective(input.directive)}`,
     messages: toMessages(input.turns), stream: true, output_config: { effort: 'low' },
   };
 }
 
-export function createClaudeDialogueModel(client: DialogueClient, options: { model: string; maxTokens?: number }): DialogueModel {
+export function createClaudeDialogueModel(client: DialogueClient, options: { model: string; maxTokens?: number; persona?: Persona }): DialogueModel {
   if (typeof client?.messages?.create !== 'function') throw new RangeError('client must have messages.create');
   const maxTokens = options.maxTokens ?? 160;
-  buildDialogueParams({ turns: [], directive: { kind: 'open' } }, options.model, maxTokens);   // validates the options now, not mid-call
+  buildDialogueParams({ turns: [], directive: { kind: 'open' } }, options.model, maxTokens, options.persona);   // validates the options now, not mid-call
   const stats: DialogueStats = { calls: 0, errors: [] };
   const recordError = (e: unknown): void => {
     const o = (typeof e === 'object' && e !== null ? e : {}) as { constructor?: { name?: string }; status?: unknown };
@@ -144,7 +149,7 @@ export function createClaudeDialogueModel(client: DialogueClient, options: { mod
   return {
     stats,
     async *reply(input: DialogueInput): AsyncIterable<string> {
-      const params = buildDialogueParams(input, options.model, maxTokens);
+      const params = buildDialogueParams(input, options.model, maxTokens, options.persona);
       stats.calls++;
       const last: DialogueLast = { stop: 'NONE', output_tokens: null, other_blocks: 0 };
       stats.last = last;

@@ -17,6 +17,8 @@
 
 import type { CallTransport, TransportEvent } from './call-transport.ts';
 import type { CloseInfo } from './ws-server.ts';
+import { isPersona, voiceManner } from './persona.ts';
+import type { Persona } from './persona.ts';
 
 /** The two-way link to the voice service and the phone. A fake with this shape is used in tests. */
 export interface RealtimeLink {
@@ -41,6 +43,8 @@ export interface RealtimeOptions {
   msPerChar?: number;
   /** The longest a hang-up waits for a reply that is still playing. Default 3000. */
   endWaitMs?: number;
+  /** The receptionist persona (persona.ts). It changes how the exact words are delivered, never the words. Only a persona made by createPersona is accepted. */
+  persona?: Persona;
 }
 
 export const SPEAK_ONLY = 'You are only a voice on a phone line. Never speak on your own. When you are asked to say words, say exactly those words and nothing else: no greeting, no comment, no change of wording, and every digit exactly as given.';
@@ -63,11 +67,13 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
   if (!isObj(options) || typeof options.notice !== 'string' || options.notice.trim().length === 0 || options.notice.length > 1500
     || typeof options.transcriptionModel !== 'string' || options.transcriptionModel.length === 0 || typeof options.voice !== 'string' || options.voice.length === 0
     || (options.msPerChar !== undefined && (!Number.isInteger(options.msPerChar) || options.msPerChar < 1 || options.msPerChar > 1000))
-    || (options.endWaitMs !== undefined && (!Number.isInteger(options.endWaitMs) || options.endWaitMs < 1 || options.endWaitMs > 30_000))) {
+    || (options.endWaitMs !== undefined && (!Number.isInteger(options.endWaitMs) || options.endWaitMs < 1 || options.endWaitMs > 30_000))
+    || (options.persona !== undefined && !isPersona(options.persona))) {
     throw new RangeError('the realtime transport needs a notice, a transcription model, a voice, and sane timings');
   }
   const msPerChar = options.msPerChar ?? 70;
   const endWaitMs = options.endWaitMs ?? 3000;
+  const instructions = options.persona === undefined ? SPEAK_ONLY : `${SPEAK_ONLY} ${voiceManner(options.persona)}`;
   let phase: 'idle' | 'notice' | 'live' | 'ended' = 'idle';
   let start: { to: unknown; callSid: unknown } | undefined;
   let seq = 0;
@@ -81,7 +87,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
 
   const session = (interruptible: boolean): unknown => ({
     type: 'session.update',
-    session: { instructions: SPEAK_ONLY, output_modalities: ['audio'], audio: { input: { transcription: { model: options.transcriptionModel }, turn_detection: { type: 'server_vad', create_response: false, interrupt_response: interruptible } }, output: { voice: options.voice } } },
+    session: { instructions, output_modalities: ['audio'], audio: { input: { transcription: { model: options.transcriptionModel }, turn_detection: { type: 'server_vad', create_response: false, interrupt_response: interruptible } }, output: { voice: options.voice } } },
   });
   const clearTimers = (): void => { if (hangupTimer !== undefined) { clearTimeout(hangupTimer); hangupTimer = undefined; } };
   const emit = (e: TransportEvent): void => { try { transport.onEvent(e); } catch { /* the call logic never throws into the carrier */ } };
