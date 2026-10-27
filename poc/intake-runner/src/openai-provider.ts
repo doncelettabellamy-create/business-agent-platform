@@ -18,7 +18,9 @@
 import type { ModelProvider, ModelRequest, ModelResponse } from './model-gateway.ts';
 import { answerSchema } from './claude-provider.ts';   // provider-neutral; move it into model-gateway.ts when the Claude adapter is retired
 
-export type OpenAIEffort = 'minimal' | 'low' | 'medium' | 'high';
+/** The documented values of `reasoning.effort` for the Responses API (read 2026-10-27). Not every model accepts every value: gpt-6-luna documents none, low, medium, high, xhigh and max, and does not list minimal. */
+export const OPENAI_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type OpenAIEffort = typeof OPENAI_EFFORTS[number];
 
 export interface OpenAIContentPart { type: string; text?: string; refusal?: string }
 export interface OpenAIOutputItem { type: string; content?: OpenAIContentPart[] }
@@ -58,7 +60,7 @@ export interface OpenAIProvider extends ModelProvider {
 }
 
 const MODEL_ID = /^(?:gpt|chatgpt|o[0-9])[a-z0-9]*(?:[.-][a-z0-9]+)*$/;
-const EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high'];
+const EFFORTS: readonly string[] = OPENAI_EFFORTS;
 const WORD = /^[a-z][a-z_]{0,39}$/;
 
 /** A plausible OpenAI model id (for example gpt-5-mini). There is deliberately no default: the model is a decision, not a guess. */
@@ -69,7 +71,7 @@ export function isOpenAIModelId(id: unknown): id is string {
 /** Pure: the exact request body that would be sent. Used by the adapter and, later, a dry run and a cost estimate. */
 export function buildOpenAIParams(request: ModelRequest, model: string, effort?: OpenAIEffort): OpenAIParams {
   if (!isOpenAIModelId(model)) throw new RangeError('model must be an exact OpenAI model id such as gpt-5-mini');
-  if (effort !== undefined && !EFFORTS.includes(effort)) throw new RangeError('effort must be minimal, low, medium, or high');
+  if (effort !== undefined && !EFFORTS.includes(effort)) throw new RangeError('effort must be none, minimal, low, medium, high, xhigh, or max');
   if (!Number.isInteger(request.max_output_tokens) || request.max_output_tokens < 1) throw new RangeError('max_output_tokens must be a positive integer');
   return {
     model,

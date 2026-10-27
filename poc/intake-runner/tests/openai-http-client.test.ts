@@ -115,6 +115,12 @@ test('dialogue: the request is the fixed instruction, the Drew line, then the NE
   assert.ok(!('reasoning' in buildOpenAIDialogueParams({ turns, directive: { kind: 'open' } }, 'gpt-test', 160)));
 });
 
+test('dialogue: every documented effort is accepted, including none, and the effort is sent only when given', () => {
+  for (const e of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) assert.deepEqual(buildOpenAIDialogueParams({ turns, directive: { kind: 'listen' } }, 'gpt-test', 160, drew, e).reasoning, { effort: e }, e);
+  assert.ok(!('reasoning' in buildOpenAIDialogueParams({ turns, directive: { kind: 'listen' } }, 'gpt-test', 160, drew)));
+  for (const e of ['', 'extreme', 'NONE', 5]) assert.throws(() => buildOpenAIDialogueParams({ turns, directive: { kind: 'listen' } }, 'gpt-test', 160, drew, e as never), RangeError, String(e));
+});
+
 test('dialogue: options are validated up front, and only a persona made by createPersona is accepted', () => {
   const client = { responses: { create: async () => answer('x') } };
   for (const bad of [{ model: 'claude-haiku-5-5' }, { model: '' }, { model: 'gpt-test', maxTokens: 5 }, { model: 'gpt-test', maxTokens: 500 }, { model: 'gpt-test', persona: { business_name: 'Drew Cleaning' } as never }, { model: 'gpt-test', effort: 'extreme' as never }]) {

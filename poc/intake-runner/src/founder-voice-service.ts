@@ -22,6 +22,7 @@ import { createPersona } from './persona.ts';
 import { startRealtimeCall } from './realtime-bridge.ts';
 import type { VoiceSocket } from './realtime-bridge.ts';
 import type { FounderCallConfig } from './founder-call-gate.ts';
+import { effectiveVoiceSettings } from './founder-voice-gate.ts';
 import type { FounderVoiceConfig } from './founder-voice-gate.ts';
 import type { RelayConnection } from './ws-server.ts';
 import type { IntakeRecordStore } from './intake-record-store.ts';
@@ -58,12 +59,13 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
   const skill = config.skill_config as { categories: { name: string; requires?: string[] }[]; fields: { name: string; choices?: string[]; role?: string }[] };
   const firstCleanField = skill.fields.find((f) => f.role === 'first_clean')?.name;
   const persona = createPersona(voice.persona);
+  const settings = effectiveVoiceSettings(voice);
   const notice = consentNoticeFor(config.opening);
   const intake = createIntakeEntry({
-    registry: createTenantRegistry({ [tenant]: config.skill_config as never }), provider: createOpenAIProvider(deps.textClient, { model: voice.openai_model }),
+    registry: createTenantRegistry({ [tenant]: config.skill_config as never }), provider: createOpenAIProvider(deps.textClient, { model: voice.openai_model, effort: settings.textReasoning }),
     limits: { maxOutputTokens: 1024, timeoutMs: 30_000, maxAttempts: 1 }, channelRef: 'channel-founder-phone', now: deps.nowIso, founderTest: { tenant },
   });
-  const dialogue = createOpenAIDialogueModel(deps.textClient, { model: voice.openai_model, persona });
+  const dialogue = createOpenAIDialogueModel(deps.textClient, { model: voice.openai_model, persona, effort: settings.textReasoning });
   const handler = createRelayHandler({
     numbers: new Map(config.numbers.map((n) => [n, tenant])),
     categoryNames: () => skill.categories.map((c) => c.name),
@@ -81,7 +83,8 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     handler, notice,
     handleStream(conn: RelayConnection): void {
       startRealtimeCall(conn, deps.openVoice(), (t) => handler.serve(t), {
-        notice, transcriptionModel: voice.transcription_model, voice: voice.voice, persona,
+        notice, transcriptionModel: voice.transcription_model, voice: voice.voice, persona, reasoningEffort: settings.realtimeReasoning,
+        ...(settings.transcription === undefined ? {} : { transcription: settings.transcription }),
       }, { maxCallMs: config.max_minutes * 60_000 + 30_000 });
     },
   };

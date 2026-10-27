@@ -83,12 +83,12 @@ function wsOver(v: WireVoice): WebSocketLike {
   return ws;
 }
 
-async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean } = {}) {
+async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig> } = {}) {
   const callConfig: FounderCallConfig = {
     approval_id: 'voice-test', tenant: T, numbers: [N1], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'],
     kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
   };
-  const voiceConfig: FounderVoiceConfig = { approval_id: 'v1', openai_model: 'gpt-test-model', realtime_model: 'realtime-test-model', transcription_model: 'transcribe-test-model', voice: 'test-voice', max_openai_calls: 50, persona: drewConfig };
+  const voiceConfig: FounderVoiceConfig = { approval_id: 'v1', openai_model: 'gpt-test-model', realtime_model: 'realtime-test-model', transcription_model: 'transcribe-test-model', voice: 'test-voice', max_openai_calls: 50, persona: drewConfig, ...o.voice };
   const store = createIntakeRecordStore({ path: join(dir, `calls-${Math.random().toString(36).slice(2)}.sqlite`) });
   closers.push(() => store.close());
   const text = mockOpenAiText({ failDialogue: o.failDialogue, emptyDialogue: o.emptyDialogue });
@@ -172,6 +172,44 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
     assert.ok(lines[lines.length - 1].startsWith('NEXT'));
     assert.equal(p.store, false);
   }
+});
+
+test('settings: with none configured the documented defaults reach the wire (minimal voice reasoning, no text reasoning), and a transcriber that documents no hints gets none', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  await say(r, 'yes I agree', 2);
+  await say(r, 'Hi, I have a burst pipe in the kitchen', 3);
+  const v = r.voices[0];
+  const updates = v.received.filter((m) => m.type === 'session.update');
+  assert.ok(updates.length >= 2 && updates.every((m) => m.session.reasoning.effort === 'minimal'));
+  assert.deepEqual(updates[0].session.audio.input.transcription, { model: 'transcribe-test-model' });
+  assert.ok(v.received.filter((m) => m.type === 'response.create').every((m) => m.response.reasoning.effort === 'minimal'));
+  assert.ok(r.text.seen.length >= 3, 'extraction and wording were both asked');
+  assert.ok(r.text.seen.every((p) => p.reasoning.effort === 'none'), 'every text request, Intake and wording, carries the text reasoning default');
+  assert.deepEqual(v.refused, []);
+  sim.end(); await pause(20);
+});
+
+test('settings: a transcriber that documents hints gets English by default, and explicit settings reach both the voice and the text models', async () => {
+  const d = await rig({ voice: { transcription_model: 'gpt-live-transcribe' } });
+  const s1 = await d.connect(); d.start(s1);
+  await until(() => d.has('CALL_STARTED'));
+  assert.deepEqual(d.voices[0].received.find((m) => m.type === 'session.update').session.audio.input.transcription, { model: 'gpt-live-transcribe', languages: ['en'] });
+  assert.deepEqual(d.voices[0].refused, []);
+  s1.end(); await pause(20);
+  const e = await rig({ voice: { transcription_model: 'gpt-live-transcribe', realtime_reasoning: 'low', text_reasoning: 'low', transcription: { languages: ['en'], keywords: ['Drew Cleaning'] } } });
+  const s2 = await e.connect(); e.start(s2);
+  await until(() => e.has('CALL_STARTED'));
+  await say(e, 'yes I agree', 2);
+  await say(e, 'Hi, I have a burst pipe in the kitchen', 3);
+  const u = e.voices[0].received.find((m) => m.type === 'session.update');
+  assert.equal(u.session.reasoning.effort, 'low');
+  assert.deepEqual(u.session.audio.input.transcription, { model: 'gpt-live-transcribe', languages: ['en'], keywords: ['Drew Cleaning'] });
+  assert.ok(e.voices[0].received.filter((m) => m.type === 'response.create').every((m) => m.response.reasoning.effort === 'low'));
+  assert.ok(e.text.seen.every((p) => p.reasoning.effort === 'low'));
+  assert.deepEqual(e.voices[0].refused, []);
+  s2.end(); await pause(20);
 });
 
 test('privacy: the raw caller words never reach the OpenAI text model, the key is only in the handshake, and no log line holds speech', async () => {

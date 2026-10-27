@@ -18,6 +18,8 @@
 import type { CallTransport, TransportEvent } from './call-transport.ts';
 import type { CloseInfo } from './ws-server.ts';
 import { isPersona, voiceManner } from './persona.ts';
+import { isRealtimeEffort, transcriptionHintProblems } from './realtime-settings.ts';
+import type { RealtimeEffort, RealtimeTranscription } from './realtime-settings.ts';
 import type { Persona } from './persona.ts';
 
 /** The two-way link to the voice service and the phone. A fake with this shape is used in tests. */
@@ -45,6 +47,10 @@ export interface RealtimeOptions {
   endWaitMs?: number;
   /** The receptionist persona (persona.ts). It changes how the exact words are delivered, never the words. Only a persona made by createPersona is accepted. */
   persona?: Persona;
+  /** How hard the voice model reasons (realtime-settings.ts). Sent on the session and on every speech request when set; when absent nothing is sent and the model's own default applies. */
+  reasoningEffort?: RealtimeEffort;
+  /** Hints for the live transcriber (languages, keywords), sent only when set. Valid only for the transcribers that document them (the voice gate checks that). */
+  transcription?: RealtimeTranscription;
 }
 
 export const SPEAK_ONLY = 'You are only a voice on a phone line. Never speak on your own. When you are asked to say words, say exactly those words and nothing else: no greeting, no comment, no change of wording, and every digit exactly as given.';
@@ -73,11 +79,18 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     || typeof options.transcriptionModel !== 'string' || options.transcriptionModel.length === 0 || typeof options.voice !== 'string' || options.voice.length === 0
     || (options.msPerChar !== undefined && (!Number.isInteger(options.msPerChar) || options.msPerChar < 1 || options.msPerChar > 1000))
     || (options.endWaitMs !== undefined && (!Number.isInteger(options.endWaitMs) || options.endWaitMs < 1 || options.endWaitMs > 30_000))
-    || (options.persona !== undefined && !isPersona(options.persona))) {
+    || (options.persona !== undefined && !isPersona(options.persona))
+    || (options.reasoningEffort !== undefined && !isRealtimeEffort(options.reasoningEffort))
+    || (options.transcription !== undefined && transcriptionHintProblems(options.transcription).length > 0)) {
     throw new RangeError('the realtime transport needs a notice, a transcription model, a voice, and sane timings');
   }
   const msPerChar = options.msPerChar ?? 70;
   const endWaitMs = options.endWaitMs ?? 3000;
+  const reasoning = options.reasoningEffort === undefined ? {} : { reasoning: { effort: options.reasoningEffort } };
+  const hints = options.transcription === undefined ? {} : {
+    ...(options.transcription.languages === undefined ? {} : { languages: [...options.transcription.languages] }),
+    ...(options.transcription.keywords === undefined ? {} : { keywords: [...options.transcription.keywords] }),
+  };
   const instructions = options.persona === undefined ? SPEAK_ONLY : `${SPEAK_ONLY} ${voiceManner(options.persona)}`;
   let phase: 'idle' | 'notice' | 'live' | 'ended' = 'idle';
   let start: { to: unknown; callSid: unknown } | undefined;
@@ -95,7 +108,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
 
   const session = (interruptible: boolean): unknown => ({
     type: 'session.update',
-    session: { type: 'realtime', instructions, output_modalities: ['audio'], audio: { input: { transcription: { model: options.transcriptionModel }, turn_detection: { type: 'server_vad', create_response: false, interrupt_response: interruptible } }, output: { voice: options.voice } } },
+    session: { type: 'realtime', instructions, output_modalities: ['audio'], ...reasoning, audio: { input: { transcription: { model: options.transcriptionModel, ...hints }, turn_detection: { type: 'server_vad', create_response: false, interrupt_response: interruptible } }, output: { voice: options.voice } } },
   });
   const clearTimers = (): void => {
     if (hangupTimer !== undefined) { clearTimeout(hangupTimer); hangupTimer = undefined; }
@@ -125,7 +138,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     // A line the caller must not talk over turns the voice service's own interruption off first, and the next interruptible line turns it back on.
     if (!o.interruptible && !interruptOff) { if (!link.send(session(false))) return false; interruptOff = true; }
     else if (o.interruptible && interruptOff) { if (!link.send(session(true))) return false; interruptOff = false; }
-    const sent = link.send({ type: 'response.create', response: { conversation: 'none', output_modalities: ['audio'], instructions: `${instructions} ${SAY_PREFIX}${o.text}`, metadata: { id: o.id } } });
+    const sent = link.send({ type: 'response.create', response: { conversation: 'none', output_modalities: ['audio'], ...reasoning, instructions: `${instructions} ${SAY_PREFIX}${o.text}`, metadata: { id: o.id } } });
     if (sent) current = o;
     return sent;
   }

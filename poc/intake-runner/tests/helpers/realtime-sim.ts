@@ -6,6 +6,7 @@
 // and the call logic behave against THIS model, not against OpenAI. The event names, the transcript events and the `x_played_ms` field (how much of a reply the phone layer says was
 // played) are assumptions.
 import { wordsOf } from '../../src/realtime-transport.ts';
+import { refusalFor } from './realtime-schema-rules.ts';
 import type { RealtimeLink } from '../../src/realtime-transport.ts';
 import type { CloseInfo } from '../../src/ws-server.ts';
 
@@ -90,10 +91,11 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
   const refuse = (m: any, why: string, code: string): void => { refused.push(why); deliver({ type: 'error', error: { type: 'invalid_request_error', code, message: why, event_id: m.event_id ?? null } }); };
   function handle(m: any): void {
     if (m?.type === 'session.update') {
-      if (m.session?.type !== 'realtime') { refuse(m, 'session.update without session.type', 'missing_required_parameter'); return; }
+      const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return; }
       const td = m.session?.audio?.input?.turn_detection;
       if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response;
     } else if (m?.type === 'response.create') {
+      const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return; }
       const instructions = String(m.response?.instructions ?? '');
       const text = wordsOf(instructions);
       n++;

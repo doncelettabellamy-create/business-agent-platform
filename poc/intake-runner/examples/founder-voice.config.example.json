@@ -4,7 +4,13 @@
   "realtime_model": "REPLACE-WITH-EXACT-REALTIME-MODEL-ID",
   "transcription_model": "REPLACE-WITH-EXACT-TRANSCRIPTION-MODEL-ID",
   "voice": "REPLACE-WITH-VOICE-NAME",
-  "max_openai_calls": 150,
+  "max_openai_calls": 100,
+  "realtime_reasoning": "minimal",
+  "text_reasoning": "none",
+  "transcription": {
+    "languages": ["en"],
+    "keywords": ["Drew Cleaning"]
+  },
   "persona": {
     "business_name": "Drew Cleaning",
     "traits": ["warm", "clear", "patient", "professional", "concise"],

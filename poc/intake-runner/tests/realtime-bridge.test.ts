@@ -68,6 +68,17 @@ test('setup: the voice service is set to the phone\'s audio format in both direc
   assert.deepEqual([setup.to, setup.callSid], [N1, 'CA00000000000000000000000000000001'], 'the dialed number and call id reach the call logic from the stream\'s start parameters');
 });
 
+test('setup: the reasoning effort and the transcription hints pass through the bridge untouched, next to the audio format it adds', async () => {
+  const h = harness({ realtime: { reasoningEffort: 'minimal', transcriptionModel: 'gpt-live-transcribe', transcription: { languages: ['en'], keywords: ['Drew Cleaning'] } } });
+  await live(h);
+  const first = h.voice.received[0];
+  assert.equal(first.session.reasoning.effort, 'minimal');
+  assert.deepEqual(first.session.audio.input.transcription, { model: 'gpt-live-transcribe', languages: ['en'], keywords: ['Drew Cleaning'] });
+  assert.deepEqual(first.session.audio.input.format, { type: 'audio/pcmu' });
+  assert.ok(h.voice.received.filter((m) => m.type === 'response.create').every((m) => m.response.reasoning.effort === 'minimal'));
+  assert.deepEqual(h.voice.refused, []);
+});
+
 test('setup: the Drew persona reaches the voice service as manner only, and the notice is still spoken word for word first', async () => {
   const p = createPersona(drew);
   const h = harness({ realtime: { persona: p } });

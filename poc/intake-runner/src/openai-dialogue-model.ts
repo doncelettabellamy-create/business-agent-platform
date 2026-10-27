@@ -11,7 +11,7 @@ import { DIALOGUE_INSTRUCTION, renderDirective, toMessages } from './dialogue-mo
 import type { DialogueInput, DialogueModel, DialogueStats } from './dialogue-model.ts';
 import { dialogueStyle, isPersona } from './persona.ts';
 import type { Persona } from './persona.ts';
-import { endWord, isOpenAIModelId, textOf } from './openai-provider.ts';
+import { endWord, isOpenAIModelId, OPENAI_EFFORTS, textOf } from './openai-provider.ts';
 import type { OpenAIEffort, OpenAIResponse } from './openai-provider.ts';
 
 export interface OpenAITextClient {
@@ -26,14 +26,14 @@ export interface OpenAIDialogueParams {
   reasoning?: { effort: OpenAIEffort };
 }
 const MAX_REPLY_CHARS = 600;
-const EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high'];
+const EFFORTS: readonly string[] = OPENAI_EFFORTS;
 
 /** Pure: the exact request body. */
 export function buildOpenAIDialogueParams(input: DialogueInput, model: string, maxTokens: number, persona?: Persona, effort?: OpenAIEffort): OpenAIDialogueParams {
   if (!isOpenAIModelId(model)) throw new RangeError('model must be an exact OpenAI model id such as gpt-5-mini');
   if (!Number.isInteger(maxTokens) || maxTokens < 16 || maxTokens > 400) throw new RangeError('maxTokens must be an integer from 16 to 400');
   if (persona !== undefined && !isPersona(persona)) throw new RangeError('persona must be made by createPersona');
-  if (effort !== undefined && !EFFORTS.includes(effort)) throw new RangeError('effort must be minimal, low, medium, or high');
+  if (effort !== undefined && !EFFORTS.includes(effort)) throw new RangeError('effort must be none, minimal, low, medium, high, xhigh, or max');
   const style = persona === undefined ? '' : `${dialogueStyle(persona)}\n`;
   return {
     model, instructions: `${DIALOGUE_INSTRUCTION}\n${style}${renderDirective(input.directive)}`, input: toMessages(input.turns),

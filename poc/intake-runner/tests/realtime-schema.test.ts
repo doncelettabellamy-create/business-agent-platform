@@ -183,3 +183,67 @@ test('missing item: the same request id is forgiven once only', async () => {
   await pause(10);
   assert.equal(a.kinds().filter((k) => k === 'error').length, 1);
 });
+
+// ================================================================ reasoning effort and transcription hints
+function configured(rt: Record<string, unknown>, transcriptionModel = 'gpt-live-transcribe') {
+  const sim = createRealtimeSim({ msPerChar: 1 });
+  const t = createRealtimeTransport(sim.link, { notice: NOTICE, transcriptionModel, voice: 'sim-voice', msPerChar: 1, endWaitMs: 200, persona: drew, ...rt });
+  const events: TransportEvent[] = []; t.onEvent = (e) => { events.push(e); };
+  return { sim, t, events, kinds: () => events.map((e) => e.kind) };
+}
+
+test('settings: with nothing configured, no reasoning field and no transcription hint is sent (the earlier behaviour is unchanged)', async () => {
+  const a = configured({});
+  await live(a as never);
+  const update = a.sim.sent.find((m) => m.type === 'session.update');
+  assert.equal('reasoning' in update.session, false);
+  assert.deepEqual(update.session.audio.input.transcription, { model: 'gpt-live-transcribe' });
+  assert.ok(a.sim.sent.filter((m) => m.type === 'response.create').every((m) => !('reasoning' in m.response)));
+  assert.deepEqual(a.sim.refused, []);
+});
+
+test('settings: a reasoning effort is sent on the session and on every speech request, and the transcription hints go in the session as documented', async () => {
+  const a = configured({ reasoningEffort: 'minimal', transcription: { languages: ['en'], keywords: ['Drew Cleaning'] } });
+  await live(a as never);
+  a.t.speak('Could you tell me the address of the job?', true);
+  await a.sim.heard(2);
+  const updates = a.sim.sent.filter((m) => m.type === 'session.update');
+  assert.ok(updates.length >= 2 && updates.every((m) => m.session.reasoning.effort === 'minimal'), 'every settings update carries the effort');
+  assert.deepEqual(updates[0].session.audio.input.transcription, { model: 'gpt-live-transcribe', languages: ['en'], keywords: ['Drew Cleaning'] });
+  assert.ok(!('language' in updates[0].session.audio.input.transcription) && !('delay' in updates[0].session.audio.input.transcription) && !('prompt' in updates[0].session.audio.input.transcription));
+  const creates = a.sim.sent.filter((m) => m.type === 'response.create');
+  assert.equal(creates.length, 2);
+  assert.ok(creates.every((m) => m.response.reasoning.effort === 'minimal' && m.response.conversation === 'none'));
+  assert.deepEqual(a.sim.refused, [], 'nothing the documented schema would refuse');
+  assert.ok(!a.kinds().includes('error'));
+});
+
+test('settings: every documented effort is accepted; others (including the text-only none and max) are refused up front, echoing nothing', () => {
+  for (const effort of ['minimal', 'low', 'medium', 'high', 'xhigh']) assert.doesNotThrow(() => configured({ reasoningEffort: effort }), effort);
+  const CANARY = 'canary-value-9013';
+  const bad: Array<Record<string, unknown>> = [
+    { reasoningEffort: 'none' }, { reasoningEffort: 'max' }, { reasoningEffort: 'extreme' }, { reasoningEffort: CANARY }, { reasoningEffort: 5 },
+    { transcription: 'en' }, { transcription: [] }, { transcription: { prompt: 'x' } }, { transcription: { delay: 'low' } }, { transcription: { language: 'en' } },
+    { transcription: { languages: [] } }, { transcription: { languages: ['english'] } }, { transcription: { languages: ['EN'] } }, { transcription: { languages: ['en', 'fr', 'de', 'es', 'it', 'pt'] } },
+    { transcription: { keywords: [] } }, { transcription: { keywords: [`<${CANARY}>`] } }, { transcription: { keywords: [`line one\nline two ${CANARY}`] } }, { transcription: { keywords: [' padded '] } },
+    { transcription: { keywords: ['x'.repeat(65)] } }, { transcription: { keywords: Array.from({ length: 21 }, (_, i) => `k${i}`) } }, { transcription: { keywords: [5] } },
+  ];
+  for (const o of bad) assert.throws(() => configured(o), (e: unknown) => e instanceof RangeError && !String((e as Error).message).includes(CANARY), JSON.stringify(o).slice(0, 60));
+});
+
+test('settings: the stand-in refuses what the documented schema refuses, so a wrong request would fail a test rather than a call', () => {
+  const sim = createRealtimeSim({ msPerChar: 1 });
+  const ok = { type: 'session.update', session: { type: 'realtime', reasoning: { effort: 'low' }, audio: { input: { transcription: { model: 'gpt-live-transcribe', languages: ['en'], keywords: ['Drew Cleaning'] } } } } };
+  const cases: Array<[string, any]> = [
+    ['effort none', { ...ok, session: { ...ok.session, reasoning: { effort: 'none' } } }],
+    ['prompt', { ...ok, session: { ...ok.session, audio: { input: { transcription: { model: 'gpt-live-transcribe', prompt: 'x' } } } } }],
+    ['delay', { ...ok, session: { ...ok.session, audio: { input: { transcription: { model: 'gpt-live-transcribe', delay: 'low' } } } } }],
+    ['both language fields', { ...ok, session: { ...ok.session, audio: { input: { transcription: { model: 'gpt-live-transcribe', language: 'en', languages: ['en'] } } } } }],
+    ['hints with another model', { ...ok, session: { ...ok.session, audio: { input: { transcription: { model: 'whisper-1', languages: ['en'] } } } } }],
+    ['bracket keyword', { ...ok, session: { ...ok.session, audio: { input: { transcription: { model: 'gpt-live-transcribe', keywords: ['<b>'] } } } } }],
+    ['response effort', { type: 'response.create', response: { reasoning: { effort: 'none' }, instructions: 'x' } }],
+  ];
+  assert.equal(sim.link.send(ok), true);
+  for (const [name, m] of cases) { assert.equal(sim.link.send(structuredClone(m)), true); void name; }
+  assert.equal(sim.refused.length, cases.length, sim.refused.join(' | '));
+});

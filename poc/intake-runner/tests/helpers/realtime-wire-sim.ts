@@ -3,6 +3,7 @@
 //
 // IMPORTANT: both are models built from documentation read on 2026-10-27. Nothing here has been checked against Twilio or OpenAI, so a passing test shows behaviour against THESE models only.
 import { wordsOf } from '../../src/realtime-transport.ts';
+import { refusalFor } from './realtime-schema-rules.ts';
 import type { VoiceSocket } from '../../src/realtime-bridge.ts';
 import type { CloseInfo, RelayConnection } from '../../src/ws-server.ts';
 
@@ -143,8 +144,8 @@ export function createWireVoice(o: { msPerChar?: number; behave?: (text: string,
       const m = JSON.parse(text);
       received.push(m);
       if (m.type === 'input_audio_buffer.append') appended++;
-      else if (m.type === 'session.update') { if (m.session?.type !== 'realtime') { refuse(m, 'session.update without session.type', 'missing_required_parameter'); return true; } settings = m.session; const td = m.session?.audio?.input?.turn_detection; if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response; }
-      else if (m.type === 'response.create') begin(m);
+      else if (m.type === 'session.update') { { const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return true; } } settings = m.session; const td = m.session?.audio?.input?.turn_detection; if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response; }
+      else if (m.type === 'response.create') { const why = refusalFor(m); if (why !== undefined) refuse(m, why, 'invalid_request_error'); else begin(m); }
       else if (m.type === 'response.cancel') {
         if (typeof m.response_id !== 'string') refused.push('response.cancel without response_id');   // not in the default conversation: it reaches nothing
         else if (play === undefined || play.rid !== m.response_id) refuse(m, 'response.cancel of a reply that is not playing', 'response_cancel_not_active');

@@ -70,6 +70,12 @@ test('request shape: the strict schema pins categories and field names and requi
   assert.deepEqual(e.properties.fields.items.required, ['name', 'value', 'confidence'], 'strict mode needs every key listed as required');
 });
 
+test('request shape: every documented Responses effort is accepted (none to max), and anything else is refused', () => {
+  const req = buildClassifyRequest('t', ['A'], 100);
+  for (const e of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) assert.deepEqual(buildOpenAIParams(req, MODEL, e).reasoning, { effort: e }, e);
+  for (const e of ['', 'extreme', 'NONE', 'auto', 5]) assert.throws(() => buildOpenAIParams(req, MODEL, e as never), RangeError, String(e));
+});
+
 test('request shape: configuration is validated (model id, effort, token budget); there is no default model', () => {
   const req = buildClassifyRequest('t', ['A'], 100);
   for (const bad of ['claude-haiku-5-5', 'GPT-5', 'gpt 5', '', 'gpt-', 'o', 'gpt-5/mini', 'x'.repeat(65)]) {
