@@ -31,6 +31,8 @@ import type { Contact } from './contact-capture.ts';
 import type { AddressState, ContactVault, StoredContact } from './contact-vault.ts';
 import type { Fresh } from './next-field.ts';
 import type { CloseInfo, RelayConnection } from './ws-server.ts';
+import { createConversationRelayTransport } from './call-transport.ts';
+import type { TransportEvent } from './call-transport.ts';
 import { isRecord } from './contracts.ts';
 import type { HandoffEnvelopeV1, WorkItemV1 } from './contracts.ts';
 import { piiProblems } from './pii-screen.ts';
@@ -179,6 +181,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
   const track = <T>(p: Promise<T>): Promise<T> => { work.add(p); void p.finally(() => work.delete(p)).catch(() => {}); return p; };
 
   function handle(conn: RelayConnection): void {
+    // All of the carrier's wire format lives in call-transport.ts: this function sees normalised events and speaks through three methods.
+    const carrier = createConversationRelayTransport(conn);
     let session: CallSession | undefined;
     let tenant = '';
     let callId = '';
@@ -216,7 +220,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let lastPromptAt: number | undefined;   // when the newest FINAL caller utterance arrived
     let lastReplyEndAt: number | undefined; // when the assistant last finished (or stopped) a reply
     let replies = 0; let failedSends = 0; let partialPrompts = 0; let interrupts = 0; let otherFrames = 0;
-    const setupTimer = setTimeout(() => { if (session === undefined) { deps.log('SETUP_TIMEOUT'); conn.close(1008); } }, 5000);
+    const setupTimer = setTimeout(() => { if (session === undefined) { deps.log('SETUP_TIMEOUT'); carrier.close(1008); } }, 5000);
     setupTimer.unref?.();
 
     /** `final` lines end the call, so the caller cannot talk over them. */
@@ -245,8 +249,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     }
 
     /** Every outgoing message goes through here so a refused write (the peer gone or too slow) is counted, never silently lost. */
-    const sendCounted = (m: unknown): boolean => { const ok = conn.send(m); if (!ok) failedSends++; return ok; };
-    const say = (text: string, final = false): boolean => sendCounted(final ? { type: 'text', token: text, last: true, interruptible: false } : { type: 'text', token: text, last: true });
+    const tally = (ok: boolean): boolean => { if (!ok) failedSends++; return ok; };
+    const say = (text: string, final = false): boolean => tally(final ? carrier.speak(text, true, { interruptible: false }) : carrier.speak(text, true));
     const clearConfirmTimer = (): void => { if (confirmTimer !== undefined) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
     function release(): void {
       clearTimeout(setupTimer);
@@ -260,7 +264,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const left = need - (spokeAt === undefined ? 0 : deps.now() - spokeAt);
       const wait = Math.max(deps.afterSpeechMs, left);
       if (wait > 0) await new Promise<void>((r) => { setTimeout(r, wait); });
-      sendCounted({ type: 'end' }); conn.close(1000);
+      tally(carrier.endCall()); carrier.close(1000);
     };
     /** A closing line, then the save (while it plays), then the hang-up. */
     async function farewell(line: string, save: boolean): Promise<void> {
@@ -379,7 +383,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const controller = new AbortController();
       streaming = controller;
       const a: Attempt = { said: '', chars: 0, parts: 0, failed: 0, threw: false, timedOut: false, stalled: false, aborted: false, began: deps.now(), firstTokenAt: undefined };
-      const send = (m: unknown): void => { if (!sendCounted(m)) a.failed++; };
+      const send = (token: string, last: boolean): void => { if (!tally(carrier.speak(token, last))) a.failed++; };
       // Three bounds: the first word (`limitMs`), the gap between pieces once words have begun, and the whole reply. Past any of them the try is stopped where it stands.
       const expire = (): void => { if (controller.signal.aborted) return; if (a.chars === 0) a.timedOut = true; else a.stalled = true; controller.abort(); };
       let timer: ReturnType<typeof setTimeout> | undefined; let gap: ReturnType<typeof setTimeout> | undefined;
@@ -397,13 +401,13 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
           const piece = n.value;
           if (a.firstTokenAt === undefined) a.firstTokenAt = deps.now();
           a.said += piece; a.chars += piece.length; a.parts++;
-          send({ type: 'text', token: piece, last: false });
+          send(piece, false);
           if (gap !== undefined) clearTimeout(gap);
           gap = setTimeout(expire, replyGapMs); gap.unref?.();
         }
         // The end marker closes words that were sent. An empty try sends nothing at all, so a retry or the fixed wording never follows a stray end marker.
         // A reply that stalled after it began is closed the same way, so the words already spoken are not left open.
-        if (a.chars > 0 && !done && (!controller.signal.aborted || a.stalled)) send({ type: 'text', token: '', last: true });
+        if (a.chars > 0 && !done && (!controller.signal.aborted || a.stalled)) send('', true);
       } catch {
         // A model that fails AFTER the caller talked over it (or the wait ran out) is not a failure of the call; any other failure is.
         if (!controller.signal.aborted) a.threw = true;
@@ -656,14 +660,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       deps.log('CALL_STARTED');
     }
 
-    conn.onMessage = (text: string): void => {
-      let m: unknown;
-      try { m = JSON.parse(text); } catch { if (++bad > 5) conn.close(1008); return; }
-      if (!isRecord(m) || typeof m.type !== 'string') { if (++bad > 5) conn.close(1008); return; }
-      const msg = m as Record<string, unknown>;
-      if (msg.type === 'interrupt') {
+    carrier.onEvent = (ev: TransportEvent): void => {
+      if (ev.kind === 'malformed') { if (++bad > 5) carrier.close(1008); return; }
+      if (ev.kind === 'interrupt') {
         interrupts++;
-        const spoken = typeof msg.utteranceUntilInterrupt === 'string' ? msg.utteranceUntilInterrupt.slice(0, 600) : '';
+        const spoken = ev.spoken;
         if (streaming !== undefined) { interruptedText = spoken; streaming.abort(); }
         else {
           // The reply had been sent, but the caller talked over it. Unless the phone provider reports that all of it was spoken, the question cannot be assumed heard.
@@ -674,22 +675,22 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         }
         return;
       }
-      if (msg.type === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup(msg)).catch(() => deps.log('HANDLER_ERROR')); } return; }
-      if (!setupSeen) { if (++bad > 5) conn.close(1008); return; }
-      if (msg.type === 'prompt') {
-        if (msg.last !== true || typeof msg.voicePrompt !== 'string') { partialPrompts++; return; }   // a partial result is not acted on, but it is counted
+      if (ev.kind === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup({ to: ev.to, callSid: ev.callSid })).catch(() => deps.log('HANDLER_ERROR')); } return; }
+      if (!setupSeen) { if (++bad > 5) carrier.close(1008); return; }
+      if (ev.kind === 'partial') { partialPrompts++; return; }   // a partial result is not acted on, but it is counted
+      if (ev.kind === 'utterance') {
         lastPromptAt = deps.now();
-        const heard = msg.voicePrompt;
+        const heard = ev.text;
         clearConfirmTimer();   // an answer is on its way: the silence timer must not win the race against it
         chain = chain.then(() => onPrompt(heard)).catch(() => deps.log('HANDLER_ERROR'));
         void track(chain);
         return;
       }
-      // dtmf, error and anything else: not used. Twilio's own error text is never logged.
+      // keypad digits, error and anything else: not used. The carrier's own error text is never logged.
       otherFrames++;
-      if (msg.type === 'error') deps.log('TWILIO_ERROR');
+      if (ev.kind === 'error') deps.log('TWILIO_ERROR');
     };
-    conn.onClose = (info?: CloseInfo): void => {
+    carrier.onClose = (info?: CloseInfo): void => {
       // One line per connection, whoever ended it: who closed (a fixed word), the WebSocket close code, how long since the last caller utterance and the last reply, and counts.
       const now = deps.now();
       deps.log('CALL_CLOSED', {
