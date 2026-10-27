@@ -98,7 +98,8 @@ const intake = createIntakeEntry({
 });
 const dialogue = createClaudeDialogueModel(dialogueClient, { model: config.model });
 const store = createIntakeRecordStore({ path: config.db_path });
-const skill = config.skill_config as { categories: { name: string }[] };
+const skill = config.skill_config as { categories: { name: string; requires?: string[] }[]; fields: { name: string; choices?: string[]; role?: string }[] };
+const firstCleanField = skill.fields.find((f) => f.role === 'first_clean')?.name;
 // Cleaning-pilot contact capture is OPT-IN by environment: with FOUNDER_CONTACT_KEY set (32 bytes, base64; get one with `node src/contact-lookup-main.ts --new-key`)
 // the assistant must collect a name, a callback number and a service address, and a confirmed caller's contact goes, encrypted, to its own file with 30-day
 // retention. Without the variable nothing changes. A variable that is set but invalid stops the start rather than silently running without it.
@@ -113,6 +114,8 @@ console.log(`Contact capture (name, callback number, service address; encrypted,
 const handler = createRelayHandler({
   numbers: new Map(config.numbers.map((n) => [n, tenant])),
   categoryNames: () => skill.categories.map((c) => c.name),
+  choicesFor: (_t, field) => skill.fields.find((f) => f.name === field)?.choices,
+  ...(firstCleanField === undefined ? {} : { firstClean: { field: firstCleanField, required: (_t: string, category: string) => skill.categories.find((c) => c.name === category)?.requires?.includes(firstCleanField) === true } }),
   intake,
   async intakeContext(t, ref) {
     if (t !== tenant) throw new Error('tenant');

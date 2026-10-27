@@ -1,0 +1,20 @@
+{
+  "fixture_id": "drew-cleaning-simulation-v1",
+  "mode": "SIMULATION",
+  "label": "SIMULATION ONLY: Drew Cleaning pricing fixture. Invented test data, not an approved rate card. No real customer may be quoted from it.",
+  "currency": "USD",
+  "first_clean_field": "First cleaning with us",
+  "rules": [
+    {
+      "service": "Standard cleaning",
+      "property_types": [
+        "house",
+        "apartment"
+      ],
+      "max_bedrooms": 2,
+      "max_bathrooms": 2,
+      "base_cents": 19999,
+      "first_clean_discount_cents": 2500
+    }
+  ]
+}

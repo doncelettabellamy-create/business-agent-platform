@@ -51,7 +51,7 @@ test('validation: required names, exact keys, length limits and plain single-lin
   assert.deepEqual(openingProblems(OPEN), []);
   assert.deepEqual(openingProblems({ ...OPEN, disclosure: 'We do not record calls.', special: 'Ask about our spring offer' }), []);
   const bad: Array<[string, unknown]> = [
-    ['not an object', 'x'], ['null', null], ['array', []], ['no business', { agent_name: 'Ava' }], ['no agent', { business_name: 'Sparkle Example Cleaning' }],
+    ['not an object', 'x'], ['null', null], ['array', []], ['no business', { agent_name: 'Ava' }],
     ['extra key', { ...OPEN, price: '10' }], ['business too short', { ...OPEN, business_name: 'S' }], ['business too long', { ...OPEN, business_name: 'x'.repeat(81) }],
     ['agent too long', { ...OPEN, agent_name: 'x'.repeat(41) }], ['special too long', { ...OPEN, special: 'x'.repeat(201) }], ['disclosure too short', { ...OPEN, disclosure: 'short' }],
     ['newline', { ...OPEN, special: 'line one\nline two' }], ['angle bracket', { ...OPEN, special: '<b>sale</b>' }], ['square bracket (a placeholder look-alike)', { ...OPEN, agent_name: '[PERSON_1]' }],
@@ -80,6 +80,38 @@ test('config gate: opening is the one optional key; it is validated; changing an
   const d3 = founderConfigDigest(withOpening({ ...OPEN, agent_name: 'Mia' }));
   const d4 = founderConfigDigest(withOpening({ ...OPEN, disclosure: 'We do not record calls.' }));
   assert.equal(new Set([d0, d1, d2, d3, d4]).size, 5, 'every change needs a new approval');
+});
+
+test('the agent name is optional and never invented: without one the introduction has no name, and a name changes the approval digest', () => {
+  const n = consentNoticeFor({ business_name: 'Sparkle Example Cleaning' });
+  assert.equal(n, `Hello. This is the automated A I assistant for Sparkle Example Cleaning. ${DEFAULT_DISCLOSURE} Please say yes to continue, or hang up now.`);
+  assert.deepEqual(openingProblems({ business_name: 'Sparkle Example Cleaning' }), []);
+  assert.ok(openingProblems({ business_name: 'Sparkle Example Cleaning', agent_name: 'A' }).length > 0, 'a name that is given must still be valid');
+  assert.ok(openingProblems({ business_name: 'Sparkle Example Cleaning', agent_name: undefined }).length === 0, 'an undefined name counts as absent');
+  const base = { ...example() };
+  assert.notEqual(founderConfigDigest({ ...base, opening: { business_name: 'Sparkle Example Cleaning' } }), founderConfigDigest({ ...base, opening: OPEN }));
+});
+
+test('order: introduction, then the special if any, then the unchanged disclosure, then the unchanged request to say yes', () => {
+  const tail = DEFAULT_CONSENT_NOTICE.slice(DEFAULT_CONSENT_NOTICE.indexOf('We do not record the audio'));
+  assert.ok(tail.startsWith('We do not record the audio.') && tail.endsWith('Please say yes to continue, or hang up now.'));
+  const withSpecial = consentNoticeFor({ business_name: 'Sparkle Example Cleaning', special: 'Ask about our spring offer' });
+  const without = consentNoticeFor({ business_name: 'Sparkle Example Cleaning' });
+  assert.ok(withSpecial.endsWith(tail) && without.endsWith(tail), 'the existing disclosure and consent question are byte for byte the original ending');
+  assert.ok(withSpecial.indexOf('spring offer') > withSpecial.indexOf('assistant for') && withSpecial.indexOf('spring offer') < withSpecial.indexOf('We do not record'));
+  assert.equal(withSpecial.replace(' Ask about our spring offer.', ''), without, 'removing the special sentence leaves exactly the notice without one: nothing else is added around it');
+});
+
+test('Drew Cleaning (founder-only test): the exact spoken opening, with the priced special word for word and no terms added', () => {
+  const drew = { business_name: 'Drew Cleaning', special: '$25 cleaning special' };
+  assert.deepEqual(openingProblems(drew), [], 'the code accepts a special that contains a price: it does not judge the words, the founder\'s approval of the config does');
+  const n = consentNoticeFor(drew);
+  assert.equal(n, 'Hello. This is the automated A I assistant for Drew Cleaning. $25 cleaning special. We do not record the audio. Our phone provider turns your speech into text, and personal details are masked before an A I model reads it. Please say yes to continue, or hang up now.');
+  assert.equal(n.split('$25 cleaning special').length, 2, 'once, verbatim');
+  const stripped = n.replace('$25 cleaning special.', '');
+  assert.ok(!/[$%]|\d/.test(stripped), 'no other price, percentage or number appears anywhere');
+  assert.ok(!/\b(?:per|only|off|free|each|today|first|new|limited|valid|expires?|until|minimum|rooms?|hours?|deposit|discount|save)\b/i.test(n.replace(/Please say yes to continue, or hang up now\./, '')), 'no term of the special (what it covers, who gets it, until when) is invented');
+  assert.deepEqual(founderConfigProblems({ ...example(), opening: drew }), []);
 });
 
 test('twiml: the greeting carries the notice, escaped, with no way to break out of the attribute', () => {

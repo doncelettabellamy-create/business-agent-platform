@@ -105,6 +105,8 @@ interface Resolved {
   unionRequires?: string[];
   /** Skill mode only: true when the final category is the one the local keyword match found. */
   categoryVerified?: boolean;
+  /** Categories configured with route 'human': their items always carry the reason human_review and are never handed off. */
+  humanCategories?: Set<string>;
 }
 interface Meta {
   modelLabel: string;
@@ -235,6 +237,7 @@ function resolveDeterministic(input: IntakeInput): Resolved {
       categoryRequires: new Map(input.skill_config.categories.map((c) => [c.name, c.requires ?? []])),
       unionRequires: [...new Set(input.skill_config.categories.flatMap((c) => c.requires ?? []))],
       categoryVerified: true,   // the local result is its own confirmation; the model path recomputes this
+      humanCategories: new Set(input.skill_config.categories.filter((c) => c.route === 'human').map((c) => c.name)),
     };
   }
   return {
@@ -255,7 +258,10 @@ function resolveDeterministic(input: IntakeInput): Resolved {
  */
 function requiredFor(input: IntakeInput, src: Resolved, category: string): string[] {
   if (!input.skill_config || !src.categoryRequires || category === 'unknown') return src.requiredFields;
-  const extra = new Set(src.categoryVerified === false ? src.unionRequires ?? [] : src.categoryRequires.get(category) ?? []);
+  // A model-chosen category that the keywords did not confirm is asked for the union of every service's requirements, except a human-route category: it goes to a
+  // person whatever is answered, so it keeps its own (usually empty) list and never drags residential questions in.
+  const own = src.humanCategories?.has(category) === true;
+  const extra = new Set(src.categoryVerified === false && !own ? src.unionRequires ?? [] : src.categoryRequires.get(category) ?? []);
   const base = new Set(src.requiredFields);
   return input.skill_config.fields.map((f) => f.name).filter((n) => base.has(n) || extra.has(n));
 }
@@ -284,6 +290,7 @@ function buildWorkItem(input: IntakeInput, src: Resolved, options: RunOptions, m
   const reasons: ReasonCode[] = [];
   if (missing.length) reasons.push('missing_fields');
   if (category === 'unknown') reasons.push(src.categoryAmbiguous ? 'ambiguous_category' : 'unknown_category');
+  if (src.humanCategories?.has(category)) reasons.push('human_review');
   if (src.fieldAmbiguous) reasons.push('ambiguous_field');
   if (options.minConfidence !== undefined && (overall === null || overall < options.minConfidence)) reasons.push('low_confidence');
   for (const r of meta.extraReasons) if (!reasons.includes(r)) reasons.push(r);
@@ -387,6 +394,9 @@ export async function runIntakeWithModel(input: unknown, options: ModelRunOption
     trace.push({ skill: 'classify-request', source: 'deterministic-fallback', provider_id: provider.id, attempts: cls.attempts, failure: cls.code });
   }
 
+  // A local keyword match in a human-route category is final: the model cannot move such a request into an automated service (or into unknown).
+  if (det.candidate.category !== null && det.humanCategories?.has(det.candidate.category)) { category = det.candidate.category; categoryAmbiguous = false; }
+
   // extract-fields
   let fields = det.candidate.fields;
   let fieldAmbiguous = det.fieldAmbiguous;
@@ -417,6 +427,7 @@ export async function runIntakeWithModel(input: unknown, options: ModelRunOption
     categoryRequires: det.categoryRequires,
     unionRequires: det.unionRequires,
     categoryVerified: category !== null && det.candidate.category === category,
+    humanCategories: det.humanCategories,
   };
   // Any model failure ALWAYS requires human review. There is no configuration that turns this off.
   const result = finish(typed, src, options, {

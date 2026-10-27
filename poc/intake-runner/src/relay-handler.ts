@@ -25,8 +25,9 @@ import type { IntakeEntry } from './intake-entry.ts';
 import type { DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
 import { spokenDigits } from './contact-capture.ts';
+import { isBareAnswer, parseFirstClean } from './first-clean.ts';
 import type { Contact } from './contact-capture.ts';
-import type { ContactVault } from './contact-vault.ts';
+import type { AddressState, ContactVault, StoredContact } from './contact-vault.ts';
 import type { Fresh } from './next-field.ts';
 import type { CloseInfo, RelayConnection } from './ws-server.ts';
 import { isRecord } from './contracts.ts';
@@ -36,6 +37,8 @@ import { piiProblems } from './pii-screen.ts';
 const CALL_SID = /^[A-Za-z0-9]{10,40}$/;
 const E164 = /^\+[1-9][0-9]{6,14}$/;
 const MAX_READBACKS = 2;
+/** A caller declining to give the address (not merely correcting it). */
+const ADDRESS_REFUSAL = /\b(?:rather not|prefer not|not comfortable|refuse|decline)\b|\b(?:do not|don't|dont) want to (?:give|share|say|tell)\b|\b(?:won't|will not|am not going to|not going to|not gonna) (?:give|share|say|tell)\b|\bnot (?:giving|sharing)\b/i;
 const MAX_SPEECH_WAIT_MS = 15_000;
 const PLACEHOLDER = /\[[A-Z]+_\d{1,3}\]/g;
 const SENSITIVE_NAME = /\b(?:name|phone|mobile|cell|e-?mail|callback|contact)\b/i;
@@ -55,6 +58,10 @@ export const SAY = Object.freeze({
   correct: 'Sorry about that. What should I change?',
   yesno: 'Sorry, I did not catch that. Please say yes or no.',
   silence: 'I did not hear a reply. Goodbye.',
+  addressAsk: 'I have your service address. Is that correct? Please say yes or no.',   // what the dialogue history keeps: the address itself is never in it
+  addressWrong: 'Sorry about that. What is the correct service address?',
+  addressMissing: 'I did not catch an address. What is the service address?',
+  addressRefused: 'Understood. I will not keep an address. Your request is recorded. Goodbye.',
   unconfirmed: 'Thank you. I could not confirm the details. Goodbye.',
 });
 
@@ -68,6 +75,14 @@ export interface RelayDeps {
   numbers: ReadonlyMap<string, string>;
   /** The category names of the tenant's configuration, offered to a caller whose request was not recognised (never customer data). */
   categoryNames(tenant: string): string[];
+  /** The business-configured choices for a field, if the skill gives any. Optional: without it no choices are ever offered. */
+  choicesFor?(tenant: string, field: string): readonly string[] | undefined;
+  /**
+   * The skill's first-cleaning question, if it has one (the field with role first_clean) and whether a category requires it. With it, a plain yes or no counts as the answer
+   * ONLY when it follows that very question being asked; explicit wording ("my first cleaning", "not my first") counts wherever it was said, and the newest such answer wins.
+   * Optional: without it nothing changes.
+   */
+  firstClean?: { field: string; required(tenant: string, category: string): boolean };
   intake: IntakeEntry;
   /** A minted Intake context for this call (the composition root mints it; this file never does). */
   intakeContext(tenant: string, callRef: string): Promise<unknown>;
@@ -97,9 +112,10 @@ export interface RelayDeps {
   /**
    * Called once, after the record is saved, when (and only when) the caller confirmed and the confirmed record is ready and handed off. It receives the ORIGINAL
    * sealed handoff envelope of the very Intake result that was read back, and the tenant and call reference. It is the single seam for a later bridge to Processing;
-   * nothing here decides eligibility or uses the envelope. The object is never logged or stored. A throw or rejection is caught and logged as a fixed code.
+   * nothing here decides eligibility or uses the envelope. `addressConfirmed` is true only when the caller was read the address back and said yes (never postal validation); it is
+   * in memory only and is NOT in the saved record, whose address_status stays `unverified` because that contract has no way to say "confirmed by the caller". The object is never logged or stored. A throw or rejection is caught and logged as a fixed code.
    */
-  confirmedHandoff?(handoff: HandoffEnvelopeV1, call: { tenant: string; callRef: string }): unknown;
+  confirmedHandoff?(handoff: HandoffEnvelopeV1, call: { tenant: string; callRef: string; addressConfirmed: boolean }): unknown;
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number>): void;
 }
@@ -157,7 +173,16 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let previewN = 0;
     const lastAskedAt = new Map<string, number>();   // field -> caller-line count when it was last asked
     let clarified = false;
-    let phase: 'collect' | 'confirm' = 'collect';
+    // The field the assistant asked about most recently, but ONLY once that question was cleanly delivered (words produced, every write accepted, not cut short by the caller
+    // or the end of the call) and not since reported as talked over. Until the caller's next line is read. See speak() and the interrupt handler.
+    let activeAsk: string | undefined;
+    let lastReply = '';   // the full text of the assistant's most recent reply, to compare with what the phone provider says was spoken before an interruption
+    let capture: { yes: boolean; text: string } | undefined;   // the caller's newest attributable first-cleaning answer (their own masked words)
+    let phase: 'collect' | 'confirm' | 'address' | 'addressfix' = 'collect';
+    // The service-address confirmation that follows the first yes when contact capture is on.
+    let addressState: AddressState | undefined; let addressTries = 0; let addressUnclear = 0;
+    let addressAsked = false;   // the address question was sent in full and has not since been reported talked over: only then can a yes or no answer it
+    let lastAddressText = '';
     let readbacks = 0;
     let unclear = 0;
     let readBack: Preview | undefined;   // exactly what the caller was asked to confirm
@@ -174,9 +199,33 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     setupTimer.unref?.();
 
     /** `final` lines end the call, so the caller cannot talk over them. */
+    /** What Intake reads: the masked conversation, plus the caller's attributable first-cleaning answer on its own labelled line. */
+    const intakeText = (s: CallSession): string => s.maskedText() + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '');
+    /**
+     * The first-cleaning guard. A value for the first-cleaning field survives only if it is the caller's newest attributable answer, or explicit wording said with no newer
+     * attributable answer. A plain yes or no that no first-cleaning question was asked for, and anything that disagrees with the newest attributable answer, is dropped:
+     * the field is not found, the item is held (reason ambiguous_field, and missing_fields when the category requires it) and its handoff is discarded. An unclear answer
+     * is kept as said (it is not a yes, and the pricing fixture reads it as unknown).
+     */
+    function guardFirstClean(item: WorkItemV1, handoff: HandoffEnvelopeV1 | null, handedOff: boolean): { item: WorkItemV1; handoff: HandoffEnvelopeV1 | null; handedOff: boolean } {
+      const fc = deps.firstClean;
+      if (fc === undefined) return { item, handoff, handedOff };
+      const f = item.fields.find((x) => x.name === fc.field);
+      if (f === undefined || !f.found || typeof f.value !== 'string') return { item, handoff, handedOff };
+      const v = parseFirstClean(f.value);
+      const keep = capture !== undefined ? v !== null && v === capture.yes : !isBareAnswer(f.value);
+      if (keep) return { item, handoff, handedOff };
+      deps.log('FIRST_CLEAN_DROPPED');
+      const required = fc.required(tenant, item.category);
+      const missing = required && !item.missing_fields.includes(fc.field) ? [...item.missing_fields, fc.field] : [...item.missing_fields];
+      const reasons = [...new Set([...item.reasons, ...(required ? ['missing_fields' as const] : []), 'ambiguous_field' as const])];
+      const held: WorkItemV1 = { ...item, fields: item.fields.map((x) => (x.name === fc.field ? { ...x, value: null, confidence: null, found: false } : x)), missing_fields: missing, reasons, status: 'needs-human' };
+      return { item: held, handoff: null, handedOff: false };
+    }
+
     /** Every outgoing message goes through here so a refused write (the peer gone or too slow) is counted, never silently lost. */
     const sendCounted = (m: unknown): boolean => { const ok = conn.send(m); if (!ok) failedSends++; return ok; };
-    const say = (text: string, final = false): void => { sendCounted(final ? { type: 'text', token: text, last: true, interruptible: false } : { type: 'text', token: text, last: true }); };
+    const say = (text: string, final = false): boolean => sendCounted(final ? { type: 'text', token: text, last: true, interruptible: false } : { type: 'text', token: text, last: true });
     const clearConfirmTimer = (): void => { if (confirmTimer !== undefined) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
     function release(): void {
       clearTimeout(setupTimer);
@@ -210,9 +259,18 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       release();
       const s = session;
       if (s === undefined) return;
-      const text = s.maskedText(); const pii = s.piiSummary(); const turns = s.turns();
+      const text = intakeText(s); const pii = s.piiSummary(); const turns = s.turns();
       const fallback = lastValid; lastValid = undefined;
-      const contact = readBackContact; readBackContact = undefined;
+      const confirmedContact = readBackContact; readBackContact = undefined;
+      const parts = s.revealContactParts();   // RAW: used only to build the stored contact below
+      // A call that ends while the address is being confirmed keeps what the caller already confirmed (the job and the number), with the address marked unconfirmed.
+      if (confirmed === undefined && (phase === 'address' || phase === 'addressfix') && readBack !== undefined) { confirmed = readBack; addressState = addressState ?? 'unconfirmed'; }
+      let contact: StoredContact | undefined;
+      if (confirmed !== undefined && confirmedContact !== undefined) {
+        const st: AddressState = addressState ?? 'unconfirmed';
+        const address = st === 'refused' ? undefined : parts.address;
+        contact = { name: confirmedContact.name, phone: confirmedContact.phone, address_state: st === 'confirmed' && address === undefined ? 'unconfirmed' : st, ...(address !== undefined ? { address } : {}) };
+      }
       s.dispose();
       if (!save || turns === 0) { deps.log('CALL_ENDED', { turns, saved: 0 }); return; }
       let w: WorkItemV1; let handedOff: boolean;
@@ -220,7 +278,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (confirmed !== undefined) { w = confirmed.item; handedOff = confirmed.handedOff; }
       else {
         const r = await runCallIntake(deps.intake, ctx, { tenant, callId, tag: 'final', maskedText: text, pii });
-        if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) { w = r.item; handedOff = r.handedOff; }
+        if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) { const g = guardFirstClean(r.item, r.handoff, r.handedOff); w = g.item; handedOff = g.handedOff; }
         else if (fallback !== undefined) {
           // The final run failed or was not validated (`model_failed`). An earlier validated run is still better than a guess or losing the request; it is saved unconfirmed like any other.
           deps.log('FINAL_INTAKE_FAILED', { code: r.ok ? 0 : r.code }); deps.log('FALLBACK_RECORD', { turns });
@@ -238,25 +296,29 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       }
       const addressStored = confirmed !== undefined && deps.contacts !== undefined && contactOk && contact !== undefined;
       const ok = confirmed !== undefined && w.status === 'ready' && handedOff && contactOk;
+      // A request the business routes to a person (human_review) that the caller confirmed is a CONFIRMED request held for a person: never handed off, not "unconfirmed".
+      const reviewed = !ok && confirmed !== undefined && contactOk && w.status === 'needs-human' && w.reasons.length > 0 && w.reasons.every((r) => r === 'human_review');
       const found = w.fields.filter((f) => f.found && f.confidence !== null).map((f) => f.confidence as number);
       const record: IntakeRecord = {
         item_id: w.item_id, workspace_id: tenant, call_ref: ref, received_at: deps.nowIso(), category: w.category,
         status: ok ? w.status : 'needs-human',
-        reasons: ok ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : [])])], missing_fields: [...w.missing_fields],
+        reasons: ok || reviewed ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : [])])], missing_fields: [...w.missing_fields],
         // A field that holds a person's name, number or e-mail never keeps its value in the record, even if the masker missed it (a lower-case name).
         fields: redactSensitive(w.fields),
         pii_summary: w.pii_summary.map((p) => ({ type: p.type, count: p.count })),
         confidence: found.length > 0 ? Math.min(...found) : null, versions: { ...w.versions }, handed_off: ok, turns,
-        confirmation: ok ? 'confirmed' : 'unconfirmed',
+        confirmation: ok || reviewed ? 'confirmed' : 'unconfirmed',
         // An address nobody has checked: one found in a field, or one held in the contact vault for this call (the cleaning skill has no address field).
-        address_status: w.fields.some((f) => f.found && /address/i.test(f.name)) || addressStored ? 'unverified' : 'none',
+        // 'caller_confirmed' only when the caller confirmed the address AND the confirmed contact was stored for this call AND the record itself is confirmed; every other held address is
+        // 'unverified' (a refused, unanswered, unconfirmed or unstored one included), and 'none' means no address is held. Never a postal check.
+        address_status: addressStored && (ok || reviewed) && contact?.address_state === 'confirmed' ? 'caller_confirmed' : w.fields.some((f) => f.found && /address/i.test(f.name)) || addressStored ? 'unverified' : 'none',
       };
-      deps.log(ok ? 'CONFIRMED' : 'UNCONFIRMED', { turns });
+      deps.log(ok ? 'CONFIRMED' : reviewed ? 'CONFIRMED_FOR_REVIEW' : 'UNCONFIRMED', { turns });
       let saved = false;
       try { const put = deps.store.put(tenant, record); saved = put === 'new'; deps.log('RECORD_' + put.toUpperCase(), { turns }); }
       catch (e) { deps.log(e instanceof RecordRefused ? 'RECORD_REFUSED' : 'RECORD_FAILED'); }
       if (saved && ok && sealed !== null && deps.confirmedHandoff !== undefined) {
-        try { await deps.confirmedHandoff(sealed, { tenant, callRef: ref }); }
+        try { await deps.confirmedHandoff(sealed, { tenant, callRef: ref, addressConfirmed: contact?.address_state === 'confirmed' }); }
         catch { deps.log('HANDOFF_SEAM_FAILED'); }
       }
     }
@@ -269,14 +331,15 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     async function freshPreview(covers: number): Promise<{ fresh: Fresh; preview: Preview } | undefined> {
       const s = session as CallSession;
       const tag = `p${++previewN % 1000}`;
-      const text = s.maskedText(); const pii = s.piiSummary();
+      const text = intakeText(s); const pii = s.piiSummary();
       const started = deps.now();
       const run = track(runCallIntake(deps.intake, ctx, { tenant, callId, tag, maskedText: text, pii }).then((r) => {
         if (done) return undefined;
         if (!r.ok) { deps.log('PREVIEW_FAILED', { code: r.code }); return undefined; }
-        const fresh = freshFrom(r.item, covers);
+        const g = guardFirstClean(r.item, r.handoff, r.handedOff);
+        const fresh = freshFrom(g.item, covers);
         if (fresh === undefined) { deps.log('PREVIEW_UNUSABLE'); return undefined; }
-        const preview: Preview = { item: r.item, handedOff: r.handedOff, handoff: r.handoff };
+        const preview: Preview = { item: g.item, handedOff: g.handedOff, handoff: g.handoff };
         if (covers >= lastValidCovers) { lastValid = preview; lastValidCovers = covers; }
         return { fresh, preview };
       }, () => { deps.log('PREVIEW_FAILED', { code: 0 }); return undefined; }));
@@ -289,7 +352,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       return got;
     }
 
-    async function speak(directive: Directive): Promise<void> {
+    /** Speaks one reply. True only when the reply was produced in full and every write to the socket was accepted: it still cannot prove the phone provider played it. */
+    async function speak(directive: Directive): Promise<boolean> {
       const s = session as CallSession;
       const controller = new AbortController();
       streaming = controller;
@@ -309,7 +373,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         threw = true;
         deps.log('DIALOGUE_FAILED', { chars, parts, failed_sends: failed });
         if (!done) await farewell(SAY.trouble, true);
-        return;
+        return false;
       } finally { streaming = undefined; lastReplyEndAt = deps.now(); replies++; }
       // What happened to this reply, in numbers: how much was produced, how soon, whether any write was refused, and whether it was cut short.
       // (REPLY_SENT proves words were produced and written to the socket; it cannot prove the phone provider spoke them.)
@@ -324,9 +388,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       else if (chars === 0 && !threw) deps.log('REPLY_EMPTY', detail);
       else deps.log('REPLY_SENT', detail);
       if (failed > 0) deps.log('REPLY_SEND_FAILED', { failed_sends: failed });
-      if (done) return;
+      if (done) return false;
       s.said(said);
-      if (controller.signal.aborted) { s.interrupted(interruptedText); interruptedText = ''; }
+      if (controller.signal.aborted) { s.interrupted(interruptedText); interruptedText = ''; return false; }
+      lastReply = said;
+      return chars > 0 && failed === 0;
     }
     let interruptedText = '';
 
@@ -334,7 +400,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       clearConfirmTimer();
       confirmTimer = setTimeout(() => {
         chain = chain.then(async () => {
-          if (done || phase !== 'confirm') return;
+          if (done || phase === 'collect') return;
           deps.log('CONFIRM_TIMEOUT');
           await farewell(SAY.silence, true);
         }).catch(() => deps.log('HANDLER_ERROR'));
@@ -354,9 +420,60 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       armConfirmTimer();
     }
 
+    /** Reads the captured service address back to the caller (over the phone only) and asks for a yes or no. The dialogue history keeps a version without the address. */
+    function askAddress(): void {
+      const s = session as CallSession;
+      const address = s.revealContactParts().address;
+      if (address === undefined) { phase = 'addressfix'; addressAsked = say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer(); return; }
+      phase = 'address';
+      lastAddressText = `I have your service address as ${address}. Is that correct? Please say yes or no.`;
+      addressAsked = say(lastAddressText);   // false when the write was refused: that question cannot be answered
+      s.said(SAY.addressAsk);
+      deps.log('ADDRESS_READBACK', { n: addressTries + 1 });
+      armConfirmTimer();
+    }
+    async function finishAddress(state: AddressState): Promise<void> {
+      addressState = state;
+      deps.log(state === 'confirmed' ? 'ADDRESS_CONFIRMED' : state === 'refused' ? 'ADDRESS_REFUSED' : 'ADDRESS_UNCONFIRMED');
+      const line = state === 'refused' ? SAY.addressRefused : SAY.thanks;
+      say(line, true);
+      const at = deps.now();
+      await finish(true, readBack);
+      return await hangUp(line, at);
+    }
+    async function onAddressAnswer(line: string): Promise<void> {
+      const s = session as CallSession;
+      if (ADDRESS_REFUSAL.test(line)) return await finishAddress('refused');
+      const a = s.answer(line);
+      if (!addressAsked) {   // the question was never sent in full, or was talked over: this answer cannot be taken as an answer to it
+        deps.log('ADDRESS_ANSWER_IGNORED');
+        if (++addressUnclear > 1) return await finishAddress('unconfirmed');
+        askAddress();
+        return;
+      }
+      if (a === 'yes') return await finishAddress('confirmed');
+      if (a === 'no') {
+        if (++addressTries > 2) { s.forgetAddress(); return await finishAddress('unconfirmed'); }   // the caller said this address is wrong: it is not kept
+        deps.log('ADDRESS_CORRECTION', { n: addressTries });
+        s.forgetAddress(); phase = 'addressfix'; addressAsked = false; addressUnclear = 0;
+        say(SAY.addressWrong); s.said(SAY.addressWrong); armConfirmTimer();
+        return;
+      }
+      if (++addressUnclear > 1) return await finishAddress('unconfirmed');
+      askAddress();
+    }
+    async function onAddressFix(line: string): Promise<void> {
+      const s = session as CallSession;
+      if (ADDRESS_REFUSAL.test(line)) return await finishAddress('refused');
+      if (s.revealContactParts().address !== undefined) { addressUnclear = 0; askAddress(); return; }
+      if (++addressUnclear > 1) return await finishAddress('unconfirmed');
+      say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer();
+    }
+
     async function onAnswer(line: string): Promise<void> {
       const s = session as CallSession;
       const a = s.answer(line);
+      if (a === 'yes' && deps.contacts !== undefined && readBackContact !== undefined) { addressTries = 0; addressUnclear = 0; addressState = undefined; askAddress(); return; }
       if (a === 'yes') {
         const item = readBack;
         say(SAY.thanks, true);
@@ -390,6 +507,14 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const heard = s.hear(raw);
       if (!heard.ok) { deps.log('UTTERANCE_REFUSED', { code: heard.code }); await farewell(SAY.trouble, true); return; }
       if (phase === 'confirm') return onAnswer(heard.line);
+      if (phase === 'address') return onAddressAnswer(heard.line);
+      if (phase === 'addressfix') return onAddressFix(heard.line);
+      if (deps.firstClean !== undefined) {
+        // A plain yes or no is the answer to the first-cleaning question only if that was the question just asked; explicit wording counts anywhere. The newest one wins.
+        const answer = parseFirstClean(heard.line);
+        if (answer !== null && (activeAsk === deps.firstClean.field || !isBareAnswer(heard.line))) capture = { yes: answer, text: heard.line.trim().slice(0, 80) };
+      }
+      activeAsk = undefined;
       const covers = s.turns();
       const got = await freshPreview(covers);
       if (done) return;
@@ -404,7 +529,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (next.kind === 'ask') {
         lastAskedAt.set(next.field, covers);
         deps.log('ASK', { again: next.again ? 1 : 0, lines: covers });
-        return speak({ kind: 'ask', field: next.field, again: next.again });
+        const choices = deps.choicesFor?.(tenant, next.field);
+        const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}) });
+        // Only a question that was actually produced and sent in full can make the caller's next plain yes or no an answer to it.
+        activeAsk = delivered ? next.field : undefined;
+        return;
       }
       if (next.kind === 'clarify') {
         clarified = true;
@@ -443,7 +572,14 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (msg.type === 'interrupt') {
         interrupts++;
         const spoken = typeof msg.utteranceUntilInterrupt === 'string' ? msg.utteranceUntilInterrupt.slice(0, 600) : '';
-        if (streaming !== undefined) { interruptedText = spoken; streaming.abort(); } else session?.interrupted(spoken);
+        if (streaming !== undefined) { interruptedText = spoken; streaming.abort(); }
+        else {
+          // The reply had been sent, but the caller talked over it. Unless the phone provider reports that all of it was spoken, the question cannot be assumed heard.
+          const flat = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+          if (activeAsk !== undefined && !(flat(lastReply).length > 0 && flat(spoken).length >= flat(lastReply).length)) activeAsk = undefined;
+          if (addressAsked && phase === 'address' && !(flat(lastAddressText).length > 0 && flat(spoken).length >= flat(lastAddressText).length)) addressAsked = false;
+          session?.interrupted(spoken);
+        }
         return;
       }
       if (msg.type === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup(msg)).catch(() => deps.log('HANDLER_ERROR')); } return; }

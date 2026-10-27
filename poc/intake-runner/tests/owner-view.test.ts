@@ -194,3 +194,27 @@ test('inventory: the module is pure (no I/O, no clock, no environment, no networ
     assert.ok(!banned.test(code.replace(/\/\/.*$/gm, '')), String(banned));
   }
 });
+
+test('caller_confirmed: the owner is told plainly that the caller confirmed it and that nothing checked it, is not told to verify it, and no address value is carried', () => {
+  const call = toOwnerCall(rec('wi-cc', { address_status: 'caller_confirmed' }));
+  assert.equal(call.addressGiven, true);
+  assert.ok(!call.nextActions.includes(OWNER_TEXT.verifyAddress), 'the caller already confirmed it');
+  assert.deepEqual(call.nextActions, [OWNER_TEXT.ready]);
+  assert.equal(call.needsFollowUp, false);
+  assert.deepEqual(call.details[0], { label: 'Address', value: 'Confirmed by the caller on the phone. Not checked against any address data.' }, 'first, so it is never cut off by the details limit');
+  const text = JSON.stringify(call);
+  assert.ok(!/\[[A-Z]+_\d+\]|valid|verified by|usps|postal code/i.test(text.replace('Not checked against any address data', '')), 'never claims a validation, never carries a value');
+  assert.ok(!/book|appointment|schedul/i.test(text));
+});
+
+test('caller_confirmed: the other statuses read exactly as before, a confirmed address on a held request is still reviewed, and an unrecognised status is refused', () => {
+  const unv = toOwnerCall(rec('wi-u', { address_status: 'unverified' }));
+  assert.equal(unv.addressGiven, true);
+  assert.ok(unv.nextActions.includes(OWNER_TEXT.verifyAddress));
+  assert.ok(!unv.details.some((d) => d.label === 'Address'));
+  const none = toOwnerCall(rec('wi-n', NO_ADDRESS));
+  assert.equal(none.addressGiven, false);
+  const held = toOwnerCall(rec('wi-h', { address_status: 'caller_confirmed', status: 'needs-human', handed_off: false, reasons: ['human_review'] }));
+  assert.deepEqual(held.nextActions, [OWNER_TEXT.review], 'confirmed address, but a person still has to look at the request');
+  assert.throws(() => toOwnerCall(rec('wi-x', { address_status: 'validated' as never })), RangeError);
+});

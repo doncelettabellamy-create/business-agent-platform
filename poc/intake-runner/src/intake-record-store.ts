@@ -40,16 +40,31 @@ export interface IntakeRecord {
   turns: number;
   /** 'confirmed' only when the caller said yes to a read-back of exactly these values; every other way a call can end is 'unconfirmed'. */
   confirmation: 'confirmed' | 'unconfirmed';
-  /** 'unverified' when an address was found: it is never read back or checked in this test, so a person must check it. Otherwise 'none'. */
-  address_status: 'unverified' | 'none';
+  /**
+   * 'none': no address is held for this call. 'unverified': an address was found or held but is not confirmed (never read back, refused, unanswered, or confirmation could not be
+   * stored): a person must check it. 'caller_confirmed': the address was read back to the caller, who said yes, and the contact vault holds it as confirmed. It is NEVER a postal or
+   * address-database validation, and it is never inferred: it is written only when the confirmed contact was stored for this call. Records written before 'caller_confirmed' existed
+   * only ever hold 'none' or 'unverified' and are read unchanged.
+   */
+  address_status: 'unverified' | 'none' | 'caller_confirmed';
 }
 export const NOT_CONFIRMED = 'not_confirmed';
 /**
- * The one predicate a future bridge to Processing may use: confirmed by the caller, ready, handed off, and with no unverified address.
+ * The one predicate a future bridge to Processing may use: confirmed by the caller, ready, handed off, and either no address at all or an address the caller confirmed (checked against
+ * the encrypted contact via `witness`; never an unverified one).
  * (Nothing connects this store to Processing today.)
  */
-export function eligibleForProcessing(r: IntakeRecord): boolean {
-  return r.confirmation === 'confirmed' && r.status === 'ready' && r.handed_off === true && r.address_status === 'none';
+/**
+ * What can confirm, from the encrypted contact for the SAME tenant and call, that an address was read back and confirmed. It answers with a state only, never the address.
+ * The contact vault is one; anything else that fails to answer makes a 'caller_confirmed' record ineligible.
+ */
+export interface AddressWitness { addressState(tenant: string, callRef: string): 'confirmed' | 'unconfirmed' | 'refused' | undefined }
+export function eligibleForProcessing(r: IntakeRecord, witness?: AddressWitness): boolean {
+  if (!(r.confirmation === 'confirmed' && r.status === 'ready' && r.handed_off === true)) return false;
+  if (r.address_status === 'none') return true;
+  if (r.address_status !== 'caller_confirmed') return false;   // 'unverified' (or anything unrecognised) never qualifies
+  // A record can only claim a confirmed address; the encrypted contact for this tenant and call must say so too. No witness, no contact, any other state, or any error: not eligible.
+  try { return witness !== undefined && witness.addressState(r.workspace_id, r.call_ref) === 'confirmed'; } catch { return false; }
 }
 export type PutResult = 'new' | 'duplicate';
 export interface IntakeRecordStore {
@@ -90,7 +105,8 @@ export function assertSafeRecord(tenant: string, r: unknown): asserts r is Intak
   if (typeof x.handed_off !== 'boolean' || (x.handed_off && x.status !== 'ready')) bad();
   // Confirmation: only a caller's yes to the read-back makes a record hand-off-able; anything else is held for a person.
   if (x.confirmation !== 'confirmed' && x.confirmation !== 'unconfirmed') bad();
-  if (x.address_status !== 'unverified' && x.address_status !== 'none') bad();
+  if (x.address_status !== 'unverified' && x.address_status !== 'none' && x.address_status !== 'caller_confirmed') bad();
+  if (x.address_status === 'caller_confirmed' && x.confirmation !== 'confirmed') bad();   // an unconfirmed request cannot claim a confirmed address
   if (x.handed_off && x.confirmation !== 'confirmed') bad();
   const reasonList = x.reasons;
   if (Array.isArray(reasonList)) {
@@ -113,8 +129,9 @@ export function assertSafeRecord(tenant: string, r: unknown): asserts r is Intak
     if (y.confidence !== null && (typeof y.confidence !== 'number' || !(y.confidence >= 0 && y.confidence <= 1))) bad();
   }
   const addressFound = (f as RecordField[]).some((e) => e.found && /address/i.test(e.name));
-  // A found address field always means 'unverified'. 'unverified' without such a field is allowed: the address may be held elsewhere (the contact vault) and not yet checked.
-  if (addressFound && x.address_status !== 'unverified') bad();
+  // A found address field is never 'none': the address is either unverified or confirmed by the caller. 'unverified' or 'caller_confirmed' without such a field is allowed: the address may be held
+  // elsewhere (the contact vault).
+  if (addressFound && x.address_status === 'none') bad();
   const p = x.pii_summary;
   if (!Array.isArray(p) || p.length > 10) bad();
   for (const e of p as unknown[]) {

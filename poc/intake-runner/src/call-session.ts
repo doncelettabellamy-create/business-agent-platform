@@ -49,6 +49,10 @@ export interface CallSession {
    * and the encrypted contact vault, nowhere else.
    */
   revealContact(): Contact | undefined;
+  /** The contact items usable so far, any of them missing. RAW personal data, for the vault and for reading the address back to the caller over the phone only. */
+  revealContactParts(): { name?: string; phone?: string; address?: string };
+  /** The caller said the address was wrong: the addresses heard so far no longer count, so the next one they give replaces them. */
+  forgetAddress(): void;
   dialogue(): DialogueTurn[];
   limit(): LimitReason | null;
   dispose(): void;
@@ -115,6 +119,8 @@ export function createCallSession(config: SessionConfig): CallSession {
     turns(): number { return lines.length; },
     piiSummary(): PiiCount[] { return masker.summary(); },
     contactMissing(): string[] { return contactMissing(extractContact(masker.reveal())); },
+    revealContactParts(): { name?: string; phone?: string; address?: string } { return extractContact(masker.reveal()); },
+    forgetAddress(): void { masker.supersede('Address'); },
     revealContact(): Contact | undefined {
       const c = extractContact(masker.reveal());
       return c.name !== undefined && c.phone !== undefined && c.address !== undefined ? { name: c.name, phone: c.phone, address: c.address } : undefined;

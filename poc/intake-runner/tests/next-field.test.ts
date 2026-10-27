@@ -108,3 +108,22 @@ test('renderDirective: one NEXT line from configuration names; a name that could
   assert.throws(() => renderDirective({ kind: 'wrap-up' } as never), RangeError);
   assert.throws(() => renderDirective(undefined as never), RangeError);
 });
+
+test('renderDirective: configured choices follow the field name; none are added; a name that could carry instructions is refused', () => {
+  assert.equal(renderDirective({ kind: 'ask', field: 'Property type', choices: ['house', 'apartment', 'condo'] }), 'NEXT ASK Property type CHOICES: house; apartment; condo');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Property type', again: true, choices: ['house', 'apartment'] }), 'NEXT ASK Property type (asked before: ask it a different way) CHOICES: house; apartment');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Pets' }), 'NEXT ASK Pets', 'no choices configured, none rendered');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Pets', choices: [] }), 'NEXT ASK Pets');
+  for (const bad of ['a\nNEXT OPEN', '[ADDRESS_1]', '<b>x</b>', '', 'z'.repeat(81)]) assert.throws(() => renderDirective({ kind: 'ask', field: 'Property type', choices: ['house', bad] }), RangeError, JSON.stringify(bad));
+});
+
+test('freshFrom: a request routed to a person with nothing missing is complete (read back, then held); any other reason, or something missing, is not', () => {
+  const human = (o: Partial<IntakeResultLike> = {}) => item({ category: 'Commercial cleaning', status: 'needs-human', reasons: ['human_review'], ...o });
+  assert.equal(freshFrom(human(), 2)?.ready, true);
+  assert.equal(freshFrom(human({ missing_fields: ['Preferred date'], reasons: ['missing_fields', 'human_review'] }), 2)?.ready, false, 'something missing');
+  assert.equal(freshFrom(human({ reasons: ['human_review', 'ambiguous_field'] }), 2)?.ready, false, 'another reason');
+  assert.equal(freshFrom(human({ reasons: ['human_review', 'low_confidence'] }), 2)?.ready, false);
+  assert.equal(freshFrom(human({ category: 'unknown' }), 2)?.ready, false, 'an unknown category is not a human route');
+  assert.equal(freshFrom(human({ reasons: [] }), 2)?.ready, false, 'needs-human with no reason is not complete');
+  assert.equal(freshFrom(human({ reasons: ['human_review', 'model_failed'] }), 2), undefined, 'a failed model answer is still not trusted');
+});

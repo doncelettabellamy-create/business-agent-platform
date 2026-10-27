@@ -71,3 +71,36 @@ test('session: a correction replaces the callback number (the last usable one wi
   s.hear('My name is Priya Raman'); s.hear('The address is 42 Elm Street'); s.hear('My number is 555 010 0123'); s.hear('Sorry, my phone number is 555 010 0188');
   assert.equal(s.revealContact()?.phone, '5550100188');
 });
+
+test('masker.supersede: addresses set aside no longer count, a later one replaces them, other types are untouched, and dispose clears it all', () => {
+  const m = createMasker({ names: ['Sam Example'] });
+  m.mask('My name is Priya Raman and the address is 42 Elm Street'); m.mask('You can call me on 555 010 0123');
+  const before = m.reveal();
+  assert.ok(before.some((x) => x.type === 'Address') && before.some((x) => x.type === 'Person') && before.some((x) => x.type === 'Contact detail'));
+  m.supersede('Address');
+  const after = m.reveal();
+  assert.ok(!after.some((x) => x.type === 'Address'), 'the old address is gone');
+  assert.equal(after.filter((x) => x.type !== 'Address').length, before.filter((x) => x.type !== 'Address').length, 'the name and number are untouched');
+  m.mask('The address is 77 Oak Lane');
+  const now = m.reveal().filter((x) => x.type === 'Address');
+  assert.equal(now.length, 1);
+  assert.ok(/Oak/.test(now[0].raw) && !/Elm/.test(JSON.stringify(m.reveal())), 'only the corrected address remains');
+  m.dispose();
+  assert.deepEqual(m.reveal(), []);
+});
+
+test('session: forgetAddress makes the address missing again until a corrected one is given; revealContactParts shows what is usable', () => {
+  const s = session(); s.consent('yes');
+  s.hear('My name is Priya Raman'); s.hear('You can call me on 555 010 0123'); s.hear('The address is 42 Elm Street');
+  assert.ok(/Elm/.test(s.revealContactParts().address ?? ''));
+  s.forgetAddress();
+  assert.deepEqual(s.contactMissing(), [CONTACT_FIELDS.address]);
+  assert.equal(s.revealContact(), undefined, 'a contact without its address is not complete');
+  const parts = s.revealContactParts();
+  assert.deepEqual([parts.address, parts.phone, /Priya/.test(parts.name ?? '')], [undefined, '5550100123', true]);
+  s.hear('Sorry, the address is 77 Oak Lane');
+  assert.ok(/Oak/.test(s.revealContactParts().address ?? '') && !/Elm/.test(JSON.stringify(s.revealContactParts())));
+  assert.deepEqual(s.contactMissing(), []);
+  s.dispose();
+  assert.deepEqual(s.revealContactParts(), {});
+});

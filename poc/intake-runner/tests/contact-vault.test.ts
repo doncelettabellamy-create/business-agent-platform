@@ -150,7 +150,7 @@ test('lookup: --list shows which calls have a contact, never the contact; --show
 
   o = r.io(true);
   assert.equal(run(['--show', REF, '--config', r.cfg], { FOUNDER_CONTACT_KEY: r.key }, o.io), 0);
-  assert.deepEqual(o.out, ['Name:    Priya Raman', 'Phone:   5550100123', 'Address: 42 Elm Street']);
+  assert.deepEqual(o.out, ['Name:    Priya Raman', 'Phone:   5550100123', 'Address: 42 Elm Street', 'Address status: NOT confirmed by the caller']);
 
   for (const env of [{}, { FOUNDER_CONTACT_KEY: randomBytes(32).toString('base64') }, { FOUNDER_CONTACT_KEY: 'nope' }]) {
     o = r.io(true);
@@ -176,4 +176,77 @@ test('lookup: an expired contact shows nothing, and --new-key prints a valid key
   const piped = r.io(false);
   assert.equal(run(['--new-key'], {}, piped.io), 78);
   assert.deepEqual(piped.out, []);
+});
+
+test('address state: confirmed needs an address, refused must have none, unconfirmed may lack one, a contact without a state needs one, and each state reads back as stored', () => {
+  const a = make();
+  const base = { name: 'Priya Raman', phone: '5550100123' };
+  a.vault.put(T, REF, { ...base, address: '42 Elm Street', address_state: 'confirmed' });
+  a.vault.put(T, REF2, { ...base, address_state: 'refused' });
+  a.vault.put(T, 'ffffffffffffffff', { ...base, address_state: 'unconfirmed' });
+  a.vault.put(T, 'eeeeeeeeeeeeeeee', { ...base, address: '1 Oak Lane', address_state: 'unconfirmed' });
+  assert.deepEqual(a.vault.get(T, REF), { ...base, address: '42 Elm Street', address_state: 'confirmed' });
+  assert.deepEqual(a.vault.get(T, REF2), { ...base, address_state: 'refused' }, 'a refused address is not kept');
+  assert.equal(a.vault.get(T, 'ffffffffffffffff')?.address, undefined);
+  assert.equal(a.vault.get(T, 'eeeeeeeeeeeeeeee')?.address_state, 'unconfirmed');
+  const bad: Array<[string, unknown]> = [
+    ['confirmed without an address', { ...base, address_state: 'confirmed' }], ['refused with an address', { ...base, address: '42 Elm Street', address_state: 'refused' }],
+    ['no state and no address', base], ['unknown state', { ...base, address: 'x1', address_state: 'verified' }], ['validated is not a state', { ...base, address: 'x1', address_state: 'validated' }],
+    ['empty address', { ...base, address: '', address_state: 'unconfirmed' }], ['extra key', { ...base, address: 'x1', address_state: 'confirmed', postal: 'ok' }],
+  ];
+  for (const [name, v] of bad) assert.throws(() => a.vault.put(T, 'dddddddddddddddd', v as never), RangeError, name);
+  assert.equal(a.vault.list(T).length, 4, 'nothing refused was written');
+  a.vault.close();
+  const bytes = fileBytes(a.path);
+  for (const secret of ['Elm', 'Oak', 'confirmed', 'refused']) assert.ok(!bytes.includes(secret), `the vault file must not contain "${secret}"`);
+});
+
+test('lookup: the address status is stated plainly, never as a postal check, for each state, and an old contact reads as not confirmed', () => {
+  const key = randomBytes(32);
+  const dbPath = join(dir, `calls${++n}.sqlite`);
+  const cfg = join(dir, `cfg${n}.json`);
+  writeFileSync(cfg, JSON.stringify({ tenant: T, db_path: dbPath }));
+  const v = createContactVault({ path: contactsPathFor(dbPath), key, now: () => Date.now() });
+  const base = { name: 'Priya Raman', phone: '5550100123' };
+  v.put(T, REF, { ...base, address: '42 Elm Street', address_state: 'confirmed' });
+  v.put(T, REF2, { ...base, address_state: 'refused' });
+  v.put(T, 'ffffffffffffffff', { ...base, address: '1 Oak Lane', address_state: 'unconfirmed' });
+  v.close();
+  const show = (ref: string) => { const out: string[] = []; const err: string[] = []; const code = run(['--show', ref, '--config', cfg], { FOUNDER_CONTACT_KEY: key.toString('base64') }, { out: (l) => out.push(l), err: (l) => err.push(l), isTty: true }); return { code, out }; };
+  assert.deepEqual(show(REF).out.slice(2), ['Address: 42 Elm Street', 'Address status: read back to the caller and confirmed by them (not checked against any postal or address data)']);
+  assert.deepEqual(show(REF2).out.slice(2), ['Address: (none kept)', 'Address status: the caller declined to give an address (none kept)']);
+  assert.deepEqual(show('ffffffffffffffff').out.slice(2), ['Address: 1 Oak Lane', 'Address status: NOT confirmed by the caller']);
+  for (const ref of [REF, REF2, 'ffffffffffffffff']) assert.ok(!/valid|verified|postal code|usps/i.test(show(ref).out.join(' ').replace('not checked against any postal or address data', '')), 'never claims validation');
+});
+
+test('addressState: only the state comes back, for the same tenant and call; none, another tenant, expiry and tampering all fail closed', () => {
+  const a = make();
+  const base = { name: 'Priya Raman', phone: '5550100123' };
+  a.vault.put(T, REF, { ...base, address: '42 Elm Street', address_state: 'confirmed' });
+  a.vault.put(T, REF2, { ...base, address_state: 'refused' });
+  a.vault.put(T, 'ffffffffffffffff', C);   // an old contact, written with no state
+  assert.equal(a.vault.addressState(T, REF), 'confirmed');
+  assert.equal(a.vault.addressState(T, REF2), 'refused');
+  assert.equal(a.vault.addressState(T, 'ffffffffffffffff'), 'unconfirmed', 'an old contact reads as not confirmed');
+  assert.equal(a.vault.addressState(T, 'eeeeeeeeeeeeeeee'), undefined, 'no contact');
+  assert.equal(a.vault.addressState(OTHER, REF), undefined, 'another tenant sees nothing');
+  assert.ok(!JSON.stringify(a.vault.addressState(T, REF)).match(/Elm|Priya|555/), 'a state, never a value');
+  const db = new DatabaseSync(a.path);
+  const row = db.prepare('SELECT * FROM contacts WHERE call_ref = ?').get(REF) as any;
+  db.prepare('INSERT INTO contacts (tenant, call_ref, created_at, expires_at, nonce, ct) VALUES (?, ?, ?, ?, ?, ?)').run(T, 'dddddddddddddddd', row.created_at, row.expires_at, row.nonce, row.ct);   // moved to another call
+  db.close();
+  assert.throws(() => a.vault.addressState(T, 'dddddddddddddddd'), /unreadable/, 'a moved row cannot vouch for another call');
+  a.clock.t += 31 * DAY;
+  assert.equal(a.vault.addressState(T, REF), undefined, 'expired');
+});
+
+test('addressState: the same answer after a restart, and the wrong key cannot open the contact at all', () => {
+  const key = randomBytes(32);
+  const a = make({ key });
+  a.vault.put(T, REF, { name: 'Priya Raman', phone: '5550100123', address: '42 Elm Street', address_state: 'confirmed' });
+  a.vault.close();
+  const again = createContactVault({ path: a.path, key, now: () => a.clock.t });
+  assert.equal(again.addressState(T, REF), 'confirmed');
+  again.close();
+  assert.throws(() => createContactVault({ path: a.path, key: randomBytes(32), now: () => a.clock.t }), RangeError);
 });

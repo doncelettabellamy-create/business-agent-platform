@@ -298,3 +298,66 @@ test('server: setup is validated and the host cannot be chosen', () => {
   const code = readFileSync(new URL('../src/dashboard-server.ts', import.meta.url), 'utf8');
   assert.ok(/server\.listen\(p, '127\.0\.0\.1'/.test(code) && !/0\.0\.0\.0|'::'|hostname|options\.host/.test(code));
 });
+
+// ---------------------------------------------------------------- caller_confirmed: the durable status, the gate, and old records
+const CONFIRMED_ADDR: Partial<IntakeRecord> = { address_status: 'caller_confirmed' };
+const witness = (state: 'confirmed' | 'unconfirmed' | 'refused' | undefined) => ({ addressState: (_t: string, _c: string) => state });
+
+test('caller_confirmed: a confirmed request may carry it, with or without an address field; an unconfirmed one may not; a found address field is never none', () => {
+  const s = open();
+  assert.equal(s.put(A, rec(A, 'wi-c1', CONFIRMED_ADDR)), 'new', 'with an address field');
+  assert.equal(s.put(A, rec(A, 'wi-c2', { ...CONFIRMED_ADDR, fields: [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }] })), 'new', 'without one');
+  const bad: Array<[string, Partial<IntakeRecord>]> = [
+    ['unconfirmed but caller_confirmed', { ...CONFIRMED_ADDR, ...UNCONFIRMED }],
+    ['address field found but none', { address_status: 'none' }],
+    ['a made-up status', { address_status: 'validated' as never }], ['postal_verified is not a status', { address_status: 'postal_verified' as never }],
+  ];
+  bad.forEach(([name, over], i) => assert.throws(() => s.put(A, rec(A, `wi-cb${i}`, over)), RecordRefused, name));
+  assert.equal(s.list(A).length, 2, 'nothing refused was written');
+});
+
+test('caller_confirmed: the gate needs the encrypted contact for the same tenant and call to say confirmed; anything else, or any error, is not eligible', () => {
+  const r = rec(A, 'wi-g1', CONFIRMED_ADDR);
+  assert.equal(eligibleForProcessing(r, witness('confirmed')), true);
+  for (const state of ['unconfirmed', 'refused', undefined] as const) assert.equal(eligibleForProcessing(r, witness(state)), false, String(state));
+  assert.equal(eligibleForProcessing(r), false, 'no witness, no eligibility');
+  assert.equal(eligibleForProcessing(r, { addressState() { throw new Error('unreadable'); } }), false, 'a tampered or missing contact fails closed');
+  assert.equal(eligibleForProcessing(r, null as never), false);
+  // The witness is asked about THIS record's tenant and call, and nothing else.
+  const asked: Array<[string, string]> = [];
+  eligibleForProcessing(r, { addressState: (t, c) => { asked.push([t, c]); return 'confirmed'; } });
+  assert.deepEqual(asked, [[A, r.call_ref]]);
+  // The rest of the gate is unchanged, whatever the witness says.
+  const lying = witness('confirmed');
+  assert.equal(eligibleForProcessing(rec(A, 'wi-g2', { ...CONFIRMED_ADDR, ...UNCONFIRMED }), lying), false);
+  assert.equal(eligibleForProcessing(rec(A, 'wi-g3', { ...CONFIRMED_ADDR, handed_off: false }), lying), false);
+  assert.equal(eligibleForProcessing(rec(A, 'wi-g4', { ...CONFIRMED_ADDR, status: 'needs-human', handed_off: false }), lying), false);
+  // unverified never qualifies, and none always did.
+  assert.equal(eligibleForProcessing(rec(A, 'wi-g5', { address_status: 'unverified' }), lying), false, 'a witness cannot rescue an unverified address');
+  assert.equal(eligibleForProcessing(rec(A, 'wi-g6', { address_status: 'none', fields: [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }] }), witness(undefined)), true);
+});
+
+test('old records: records written before caller_confirmed existed (none or unverified) are read and judged exactly as before, in the same file format', () => {
+  const path = fileDb();
+  const a = createIntakeRecordStore({ path });
+  const jobOnly = [{ name: 'Job description', value: 'burst pipe', confidence: 0.8, found: true }];
+  a.put(A, rec(A, 'wi-old-none', { address_status: 'none', fields: jobOnly })); a.put(A, rec(A, 'wi-old-unv', { address_status: 'unverified' })); a.close();
+  const db = new DatabaseSync(path, { readOnly: true });
+  assert.equal((db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version') as { value: string }).value, '2', 'the file format version is unchanged');
+  db.close();
+  const b = open(path);
+  const byId = Object.fromEntries(b.list(A).map((r) => [r.item_id, r]));
+  assert.deepEqual([byId['wi-old-none'].address_status, byId['wi-old-unv'].address_status], ['none', 'unverified']);
+  assert.deepEqual([eligibleForProcessing(byId['wi-old-none']), eligibleForProcessing(byId['wi-old-unv'])], [true, false], 'no witness needed for them');
+  const view = toOwnerView(b.list(A), { fromIso: '2026-10-26T07:00:00Z', toIso: '2026-10-27T07:00:00Z' });
+  assert.equal(view.calls.length, 2, 'the owner page still lists them');
+});
+
+test('caller_confirmed: the status is durable across a restart', () => {
+  const path = fileDb();
+  const a = createIntakeRecordStore({ path }); a.put(A, rec(A, 'wi-d1', CONFIRMED_ADDR)); a.close();
+  const b = open(path);
+  const [r] = b.list(A);
+  assert.equal(r.address_status, 'caller_confirmed');
+  assert.equal(eligibleForProcessing(r, witness('confirmed')), true);
+});

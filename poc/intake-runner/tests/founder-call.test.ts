@@ -14,7 +14,7 @@ import { isSealedHandoff } from '../src/handoff-seal.ts';
 import { runCallIntake } from '../src/call-intake.ts';
 import { createTenantRegistry } from '../src/tenant-boundary.ts';
 import { createClaudeProvider } from '../src/claude-provider.ts';
-import { createClaudeDialogueModel } from '../src/dialogue-model.ts';
+import { createClaudeDialogueModel, renderDirective } from '../src/dialogue-model.ts';
 import type { DialogueModel } from '../src/dialogue-model.ts';
 import { mintExecutionContext } from '../src/execution-context.ts';
 import { callRefFor, createIntakeRecordStore, eligibleForProcessing, RecordRefused } from '../src/intake-record-store.ts';
@@ -25,6 +25,7 @@ import type { RelayConnection } from '../src/ws-server.ts';
 import { createRelayHandler, readBackText, redactSensitive, SAY, speechDelayMs } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
+import { loadFixture, quoteFromWorkItem } from '../src/pricing-fixture.ts';
 import type { ContactVault } from '../src/contact-vault.ts';
 import { randomBytes } from 'node:crypto';
 
@@ -46,7 +47,7 @@ const SECRETS = ['Sam Example', 'sam example', 'Elm Street', '42 Elm', '555 010 
 
 type RunHook = { delayMs?: number; fail?: boolean; ungrounded?: boolean };
 /** `run(n)`: how the n-th Intake run (n from 1, a run being a classify call and its extract call) behaves. */
-function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?: number; run?: (n: number) => RunHook; cleaning?: boolean; services?: boolean } = {}) {
+function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?: number; run?: (n: number) => RunHook; cleaning?: boolean; services?: boolean; stray?: boolean } = {}) {
   const sent: any[] = []; const counts = { intake: 0, dialogue: 0 }; let runN = 0;
   const client = {
     messages: {
@@ -69,7 +70,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
           ? { category: o.services ? (/deep clean/i.test(text) ? 'Deep cleaning' : /move out|moving out/i.test(text) ? 'Move-in or move-out cleaning' : /regular|weekly|maid/i.test(text) ? 'Standard cleaning' : null) : o.cleaning ? (/clean/i.test(text) ? 'Cleaning request' : null) : /burst pipe|leak|flood/i.test(text) ? 'Emergency leak' : null, confidence: 0.9 }
           : { fields: (data.fields as Array<{ name: string }>).map((f) => {
             const m = o.services
-              ? ({ 'Number of rooms': /\w+ rooms/i, 'Cleaning frequency': /every two weeks|weekly|one time/i, 'Last professional clean': /a year ago|never/i, 'Home empty': /empty/i, 'Preferred date': /tomorrow/i, 'Time window': /morning/i } as Record<string, RegExp>)[f.name]?.exec(text) ?? null
+              ? (f.name === 'First cleaning with us' && /^First cleaning with us: (.+)$/mi.test(text) ? ([/^First cleaning with us: (.+)$/mi.exec(text)![1]] as unknown as RegExpExecArray) : ({ 'Property type': /\b(?:house|apartment|condo|townhouse)\b/i, 'Number of bedrooms': /\w+ bedrooms?/i, 'Number of bathrooms': /\w+ bathrooms?/i, 'Number of rooms': /\w+ rooms/i, 'Pets': /no pets|one (?:dog|cat)|a (?:dog|cat)/i, 'Cleaning frequency': /every two weeks|weekly|one time/i, 'Last professional clean': /a year ago|never/i, 'Priority areas': /the kitchen|the bathrooms/i, 'Home empty': /empty/i, 'Extras': /no extras|the oven|the fridge/i, 'First cleaning with us': o.stray ? /not my first(?: cleaning)?|my first(?: cleaning)?|first time|second time|\byes\b|\bno\b/i : /not my first(?: cleaning)?|my first(?: cleaning)?|first time|second time/i, 'Preferred date': /tomorrow/i, 'Time window': /morning/i } as Record<string, RegExp>)[f.name]?.exec(text)) ?? null
               : o.cleaning
               ? (f.name === 'Job description' ? /cleaning/i : f.name === 'Number of rooms' ? /\w+ rooms/i : f.name === 'Preferred date' ? /tomorrow/i : /morning/i).exec(text)
               : f.name === 'Address' ? /\[ADDRESS_\d+\]/.exec(text) : f.name === 'Job description' ? /burst pipe|leak/i.exec(text) : /tomorrow morning/i.exec(text);
@@ -101,7 +102,9 @@ async function rig(o: RigOptions = {}) {
   });
   const handler = createRelayHandler({
     ...(o.confirmedHandoff === undefined ? {} : { confirmedHandoff: o.confirmedHandoff }),
-    numbers: new Map([[N1, T], [N2, OTHER]]), categoryNames: () => (o.skill ?? plumbing as any).categories.map((c: { name: string }) => c.name), previewBudgetMs: o.previewBudgetMs ?? 3000, intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
+    numbers: new Map([[N1, T], [N2, OTHER]]), categoryNames: () => (o.skill ?? plumbing as any).categories.map((c: { name: string }) => c.name),
+    choicesFor: (_t: string, field: string) => ((o.skill ?? plumbing) as any).fields?.find((x: any) => x.name === field)?.choices,
+    ...((): object => { const sk: any = o.skill ?? plumbing; const fc = sk.fields?.find((x: any) => x.role === 'first_clean'); return fc ? { firstClean: { field: fc.name, required: (_t: string, cat: string) => sk.categories.find((c: any) => c.name === cat)?.requires?.includes(fc.name) === true } } : {}; })(), previewBudgetMs: o.previewBudgetMs ?? 3000, intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
     async intakeContext(tenant, ref) {
       const r = await mintExecutionContext({ credential: 'test', agent: 'intake' }, { verify: () => ({ kind: 'system', id: 'founder-call-test' }), selectTenant: () => tenant, grants: () => ['intake:run'], newCorrelationId: () => `corr-founder-${ref}` });
       if (!r.ok) throw new Error('context');
@@ -880,6 +883,8 @@ const PRIYA = ['Priya', 'Raman', '5550100123', '555 010 0123', '0123', '42 Elm',
 const SPOKEN_NUMBER = '5 5 5 0 1 0 0 1 2 3';
 const noPriya = (what: string, hay: string) => { for (const x of PRIYA) assert.ok(!hay.includes(x), `${what} must not contain "${x}"`); };
 /** Consent, the job, then name+address, then the number: the turn after which the read-back comes. Returns the read-back. */
+/** With contact capture on, the first yes (to the read-back) is followed by the service-address question; this answers both. */
+async function confirmBoth(sim: Sim, r: Rig, second = 'yes') { say(sim, 'yes'); await reply(r, sim); say(sim, second); await ended(sim, r); }
 async function toContactReadback(r: Rig, sim: Sim, sid = SID(1)) {
   setup(sim, { sid }); say(sim, 'yes'); await reply(r, sim);
   say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
@@ -910,17 +915,22 @@ test('contacts: the number is read back to the caller only; a yes stores the con
   assert.match(rb.token, /^Let me check what I have\. Job description: burst pipe\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Is that correct\? Please say yes or no\.$/);
   assert.ok(!/Priya|Raman|Elm/.test(rb.token), 'the name and address are not spoken');
   assert.equal(r.store.list(T).length, 0);
+  say(sim, 'yes'); const addressQ = await reply(r, sim);
+  assert.equal(addressQ.token, 'I have your service address as 42 Elm Street. Is that correct? Please say yes or no.');
+  assert.equal(r.store.list(T).length, 0, 'nothing is saved until the address question is answered');
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.reasons], ['confirmed', 'ready', true, []]);
   assert.ok(r.logs.some((l) => l.code === 'CONTACT_STORED'));
   const c = r.vault?.get(T, rec.call_ref);
-  assert.ok(c !== undefined && c.phone === '5550100123' && /Priya/.test(c.name) && /Elm/.test(c.address), JSON.stringify(r.logs));
+  assert.ok(c !== undefined && c.phone === '5550100123' && /Priya/.test(c.name) && /Elm/.test(c.address ?? '') && c.address_state === 'confirmed', JSON.stringify(r.logs));
 
   // Where the values went, and where they did not.
   const phoneSees = sim.messages.filter((m) => typeof m.token === 'string' && m.token.includes(SPOKEN_NUMBER));
   assert.equal(phoneSees.length, 1, 'the digits were spoken once, in the read-back');
-  noPriya('the words said to the caller (other than the one read-back)', JSON.stringify(sim.messages.filter((m) => !phoneSees.includes(m))));
+  const addressSees = sim.messages.filter((m) => typeof m.token === 'string' && m.token.includes('42 Elm'));
+  assert.equal(addressSees.length, 1, 'the address was spoken once, in its own question');
+  noPriya('the words said to the caller (other than the read-back and the address question)', JSON.stringify(sim.messages.filter((m) => !phoneSees.includes(m) && !addressSees.includes(m))));
   noPriya('what Claude was sent', JSON.stringify(r.claude.sent));
   noPriya('the logs', JSON.stringify(r.logs));
   noPriya('the intake database', readFileSync(r.path).toString('latin1'));
@@ -940,7 +950,7 @@ test('contacts: the read-back words kept for the model never contain the number,
   assert.equal((await reply(r, sim)).token, SAY.correct);
   say(sim, 'sorry it is tomorrow morning'); const second = await reply(r, sim);
   assert.match(second.token, /Your callback number: 5 5 5 0 1 0 0 1 2 3\./);
-  say(sim, 'yes'); await ended(sim, r);
+  await confirmBoth(sim, r);
   noPriya('what the dialogue model was sent', JSON.stringify(r.claude.sent.filter((p) => p.stream)));
   noPriya('what Claude was sent', JSON.stringify(r.claude.sent));
   assert.equal(r.store.list(T)[0].confirmation, 'confirmed');
@@ -963,7 +973,7 @@ test('contacts: if the vault cannot store the contact the request is not actiona
   const r = await rig({ contacts: broken });
   const sim = await r.connect();
   await toContactReadback(r, sim);
-  say(sim, 'yes'); await ended(sim, r);
+  await confirmBoth(sim, r);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.reasons.includes('contact_missing'), rec.reasons.includes('not_confirmed'), eligibleForProcessing(rec)], ['unconfirmed', 'needs-human', false, true, true, false]);
   assert.ok(r.logs.some((l) => l.code === 'CONTACT_STORE_FAILED'));
@@ -998,20 +1008,22 @@ async function toCleaningReadback(r: Rig, sim: Sim) {
   return reply(r, sim);
 }
 
-test('address status (cleaning skill, no Address field): a confirmed call whose address is in the vault is unverified and not eligible, and the owner is told to verify it', async () => {
+test('address status (cleaning skill, no Address field): a confirmed call whose address the caller confirmed is caller_confirmed, eligible only against its encrypted contact, and the owner is told what that does and does not mean', async () => {
   const r = await cleaningRig({ contacts: true });
   const sim = await r.connect();
   const rb = await toCleaningReadback(r, sim);
   assert.match(rb.token, /^Let me check what I have\. .*Your callback number: 5 5 5 0 1 0 0 1 2 3\./);
-  say(sim, 'yes'); await ended(sim, r);
+  await confirmBoth(sim, r);
   const [rec] = r.store.list(T);
   assert.ok(!rec.fields.some((f) => /address/i.test(f.name)), 'the skill has no address field');
-  assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.handed_off, rec.address_status], ['Cleaning request', 'confirmed', 'ready', true, 'unverified']);
-  assert.equal(eligibleForProcessing(rec), false, 'an address nobody checked cannot pass the bridge test');
-  assert.ok(r.vault?.get(T, rec.call_ref)?.address.includes('Elm'), 'the address is in the vault');
+  assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.handed_off, rec.address_status], ['Cleaning request', 'confirmed', 'ready', true, 'caller_confirmed']);
+  assert.equal(eligibleForProcessing(rec), false, 'no witness, no eligibility');
+  assert.equal(eligibleForProcessing(rec, r.vault), true);
+  assert.ok(r.vault?.get(T, rec.call_ref)?.address?.includes('Elm'), 'the address is in the vault');
   const api: any = await (await r.dashGet('/api/owner')).json();
   assert.equal(api.calls[0].addressGiven, true);
-  assert.ok(api.calls[0].nextActions.includes('Verify the address with the caller.'));
+  assert.ok(!api.calls[0].nextActions.includes('Verify the address with the caller.'), 'the caller already confirmed it');
+  assert.deepEqual(api.calls[0].details.find((d: any) => d.label === 'Address'), { label: 'Address', value: 'Confirmed by the caller on the phone. Not checked against any address data.' });
   noPriya('the record', JSON.stringify(rec));
   noPriya('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(api));
   noPriya('what Claude was sent', JSON.stringify(r.claude.sent));
@@ -1033,7 +1045,7 @@ test('address status (cleaning skill): without the vault nothing changes: no add
 test('address status (failures): a vault write that fails, a hang-up and a silent read-back each leave an unconfirmed record that is not eligible and holds no address', async () => {
   const broken: ContactVault = { put() { throw new Error('disk full'); }, get() { return undefined; }, list() { return []; }, purgeExpired() { return 0; }, close() {} };
   const a = await cleaningRig({ contacts: broken });
-  const s1 = await a.connect(); await toCleaningReadback(a, s1); say(s1, 'yes'); await ended(s1, a);
+  const s1 = await a.connect(); await toCleaningReadback(a, s1); await confirmBoth(s1, a);
   let [rec] = a.store.list(T);
   assert.deepEqual([rec.confirmation, rec.address_status, rec.reasons.includes('contact_missing'), eligibleForProcessing(rec)], ['unconfirmed', 'none', true, false], 'nothing was stored, so there is no address to verify');
 
@@ -1050,11 +1062,12 @@ test('address status (failures): a vault write that fails, a hang-up and a silen
   assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec), c.vault?.list(T)], ['unconfirmed', 'none', false, []]);
 });
 
-test('address status (plumbing skill with an Address field): unchanged, still unverified and not eligible', async () => {
+test('address status (plumbing skill with an Address field): a confirmed address field is caller_confirmed too, never none', async () => {
   const r = await rig({ contacts: true });
-  const sim = await r.connect(); await toContactReadback(r, sim); say(sim, 'yes'); await ended(sim, r);
+  const sim = await r.connect(); await toContactReadback(r, sim); await confirmBoth(sim, r);
   const [rec] = r.store.list(T);
-  assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec)], ['confirmed', 'unverified', false]);
+  assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec, r.vault)], ['confirmed', 'caller_confirmed', true]);
+  assert.ok(rec.fields.some((f) => f.found && /address/i.test(f.name)), 'an address field was found, and the status is still not none');
 });
 
 // ---------------------------------------------------------------- the sealed handoff survives in memory, untouched, and goes nowhere
@@ -1087,7 +1100,7 @@ test('handoff: a confirmed call gives the seam the very sealed object that was r
   const { h: got, call } = h.calls[0];
   assert.ok(cap.issued.includes(got), 'the original object the Intake entry issued, not a copy');
   assert.ok(isSealedHandoff(got, got), 'still sealed and unchanged');
-  assert.deepEqual(call, { tenant: T, callRef: rec.call_ref });
+  assert.deepEqual(call, { tenant: T, callRef: rec.call_ref, addressConfirmed: false });
   assert.equal(got.workspace_id, T);
   assert.equal(got.item_id, rec.item_id, 'it is the handoff of the item that was read back and saved');
   assert.equal(rec.confirmation, 'confirmed');
@@ -1141,7 +1154,7 @@ test('handoff: no seam call for anything unconfirmed: hang-up, two noes, silence
   assert.deepEqual([h.calls.length, r.store.list(T)[0].confirmation], [0, 'unconfirmed']);
 
   const broken: ContactVault = { put() { throw new Error('disk full'); }, get() { return undefined; }, list() { return []; }, purgeExpired() { return 0; }, close() {} };
-  ({ r, h } = await mk({ contacts: broken })); sim = await r.connect(); await toContactReadback(r, sim); say(sim, 'yes'); await ended(sim, r);
+  ({ r, h } = await mk({ contacts: broken })); sim = await r.connect(); await toContactReadback(r, sim); await confirmBoth(sim, r);
   assert.deepEqual([h.calls.length, r.store.list(T)[0].confirmation], [0, 'unconfirmed'], 'a request that is not actionable is not handed on');
 });
 
@@ -1167,56 +1180,84 @@ test('handoff: the seam changes no rule: eligibility, the confirmation gate and 
   assert.throws(() => createRelayHandler({ ...({} as object), confirmedHandoff: 'no' } as never), RangeError);
 });
 
-// ---------------------------------------------------------------- the services skill on the phone path: only the questions that belong to the service are asked
+// ---------------------------------------------------------------- the services skill on the phone path: only the questions that belong to the service are asked, answers already given are kept
 const servicesSkill = JSON.parse(readFileSync(new URL('../examples/skill-cleaning-services.json', import.meta.url), 'utf8')).skill_config;
 const servicesRig = (o: RigOptions = {}) => rig({ skill: servicesSkill, claude: fakeClaude({ services: true }), ...o });
-const ALL_SERVICE_QUESTIONS = ['Cleaning frequency', 'Last professional clean', 'Home empty'];
+const SERVICE_ONLY = ['Cleaning frequency', 'Last professional clean', 'Priority areas', 'Home empty'];
+const asks = (r: Rig) => directives(r).filter((d) => d.startsWith('NEXT ASK ')).map((d) => d.slice('NEXT ASK '.length).split(' CHOICES:')[0].split(' (asked before')[0]);
 
-test('services (phone): each service asks only its own missing question, and the others are never asked', async () => {
-  const cases: Array<[string, string, string, string]> = [
-    ['deep', 'I need a deep clean for four rooms tomorrow morning', 'Last professional clean', 'it was a year ago'],
-    ['move', 'I need a move out clean for four rooms tomorrow morning', 'Home empty', 'yes it is empty'],
-    ['standard', 'I would like a regular cleaning for four rooms tomorrow morning', 'Cleaning frequency', 'every two weeks'],
-  ];
-  for (const [name, first, ask, answer] of cases) {
-    const r = await servicesRig();
-    const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
-    say(sim, first); await reply(r, sim);
-    assert.deepEqual(directives(r), ['NEXT OPEN', `NEXT ASK ${ask}`], name);
-    say(sim, answer);
-    const rb = await reply(r, sim);
-    assert.match(rb.token, new RegExp(`^Let me check what I have\\. .*${ask}: `), name);
-    for (const other of ALL_SERVICE_QUESTIONS.filter((q) => q !== ask)) assert.ok(!directives(r).some((d) => d.includes(other)) && !rb.token.includes(other), `${name} must not mention ${other}`);
-    sim.end(); await sim.closed; await r.handler.idle();
-  }
+test('services (phone, deep): a caller who volunteers the property details is asked only the deep-clean questions still missing, in order', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a deep clean for a house with three bedrooms and two bathrooms, one dog, tomorrow morning, and it is my first cleaning with you'); await reply(r, sim);
+  say(sim, 'the last one was a year ago'); await reply(r, sim);
+  say(sim, 'the kitchen matters most'); await reply(r, sim);
+  say(sim, 'no extras');
+  const rb = await reply(r, sim);
+  assert.deepEqual(asks(r), ['Last professional clean', 'Priority areas', 'Extras'], 'property type, bedrooms, bathrooms, pets, first cleaning, date and time window were given and are not asked again');
+  assert.match(rb.token, /^Let me check what I have\. .*Property type: house.*Number of bedrooms: three bedrooms.*Number of bathrooms: two bathrooms.*Pets: one dog.*Last professional clean: a year ago.*Priority areas: the kitchen.*Extras: no extras/);
+  assert.ok(!asks(r).some((q) => ['Cleaning frequency', 'Home empty', 'Pets', 'Number of bedrooms'].includes(q)));
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.missing_fields], ['Deep cleaning', 'confirmed', 'ready', []]);
 });
 
-test('services (phone): a request that names no service is clarified with the three service names, then the right questions follow', async () => {
+test('services (phone, standard): property questions come first in order, one answer can cover two questions, and frequency is asked only for a standard clean', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I would like a regular cleaning for an apartment tomorrow morning'); await reply(r, sim);
+  say(sim, 'two bedrooms and one bathroom'); await reply(r, sim);
+  say(sim, 'no pets'); await reply(r, sim);
+  assert.deepEqual(asks(r), ['Number of bedrooms', 'Pets', 'Cleaning frequency'], 'the bathrooms question was answered together with the bedrooms and is not asked');
+  say(sim, 'every two weeks'); await reply(r, sim);
+  assert.equal(asks(r)[3], 'Extras');
+  assert.ok(!asks(r).some((q) => ['Last professional clean', 'Priority areas', 'Home empty'].includes(q)));
+  sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.confirmation, rec.missing_fields], ['Standard cleaning', 'unconfirmed', ['Extras', 'First cleaning with us']], 'an incomplete request is kept unconfirmed with exactly what is missing');
+});
+
+test('services (phone, move-in or move-out): pets and whether the home is empty are asked, never assumed, and an unanswered one stays missing in the saved request', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a move out clean for a house with three bedrooms and two bathrooms tomorrow morning'); await reply(r, sim);
+  say(sim, 'no pets'); await reply(r, sim);
+  assert.deepEqual(asks(r), ['Pets', 'Home empty'], 'neither is assumed from the kind of job');
+  assert.ok(!asks(r).some((q) => ['Cleaning frequency', 'Last professional clean', 'Priority areas'].includes(q)));
+  sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.confirmation, rec.missing_fields], ['Move-in or move-out cleaning', 'unconfirmed', ['Home empty', 'Extras', 'First cleaning with us']], 'the pets answer was kept; the empty-home question is still open, not guessed');
+});
+
+test('services (phone): a request that names no service is clarified with the three service names, then only the right service\'s questions follow', async () => {
   const r = await servicesRig();
   const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
   say(sim, 'I need a cleaning for four rooms tomorrow morning'); await reply(r, sim);
-  assert.equal(directives(r)[1], 'NEXT CLARIFY: Standard cleaning; Deep cleaning; Move-in or move-out cleaning');
+  assert.equal(directives(r)[1], 'NEXT CLARIFY: Standard cleaning; Deep cleaning; Move-in or move-out cleaning; Commercial cleaning');
   say(sim, 'a deep clean please'); await reply(r, sim);
-  assert.equal(directives(r)[2], 'NEXT ASK Last professional clean', 'once the service is known, only its own question is asked');
-  assert.ok(!directives(r).some((d) => ALL_SERVICE_QUESTIONS.filter((q) => q !== 'Last professional clean').some((q) => d.includes(q))));
+  assert.equal(directives(r)[2], 'NEXT ASK Property type CHOICES: house; apartment; condo; townhouse', 'once the service is known, its own first missing question is asked, with the business\'s own choices');
+  assert.ok(!asks(r).some((q) => SERVICE_ONLY.filter((x) => !['Last professional clean', 'Priority areas'].includes(x)).includes(q)));
   sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
-  const [rec] = r.store.list(T);
-  assert.deepEqual([rec.category, rec.confirmation, rec.missing_fields], ['Deep cleaning', 'unconfirmed', ['Last professional clean']], 'an incomplete request is kept unconfirmed with exactly what is missing');
+  assert.equal(r.store.list(T)[0].category, 'Deep cleaning');
 });
 
-test('services (phone): the new skill keeps privacy and the records: nothing personal is stored, and the earlier records still list and display', async () => {
+test('services (phone): privacy and records hold, no price or special reaches a model or a record, and the dashboard still lists the call', async () => {
   const r = await servicesRig();
   const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
-  say(sim, 'My name is Sam Example, I need a deep clean for four rooms tomorrow morning at 42 Elm Street'); await reply(r, sim);
-  say(sim, 'it was a year ago'); await reply(r, sim);
+  say(sim, 'My name is Sam Example, I need a deep clean for a house with three bedrooms and two bathrooms, one dog, no extras, my first cleaning, tomorrow morning at 42 Elm Street'); await reply(r, sim);
+  say(sim, 'a year ago, the kitchen matters most');
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /^Let me check what I have\./);
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.category, rec.confirmation, rec.status], ['Deep cleaning', 'confirmed', 'ready']);
   noSecrets('what Claude was sent', JSON.stringify(r.claude.sent)); noSecrets('the record', JSON.stringify(rec)); noSecrets('the logs', JSON.stringify(r.logs));
-  noSecrets('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/owner')).json()));
   const api: any = await (await r.dashGet('/api/owner')).json();
+  noSecrets('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(api));
   assert.equal(api.calls.length, 1);
   assert.equal(api.calls[0].request, 'Deep cleaning');
+  for (const where of [JSON.stringify(r.claude.sent), JSON.stringify(rec), JSON.stringify(r.logs), JSON.stringify(api)]) assert.ok(!/25 cleaning special|\$/.test(where), 'no price or special is asked, stored or applied');
+  assert.ok(String(r.claude.sent.find((x) => x.stream)?.system).includes('never suggest options, examples, extras, services, specials or prices of your own'));
 });
 
 // ---------------------------------------------------------------- diagnostics: reply size and timing, refused writes, and how the connection ended (numbers and fixed words only)
@@ -1331,4 +1372,612 @@ test('diagnostics: when the handler ends the call the close line says HANDLER, a
   assert.deepEqual([d.by, d.code, d.failed_sends], ['HANDLER', 1000, 0]);
   assert.equal(diag(r, 'CALL_CLOSED').length, 1);
   shapeOk(r);
+});
+
+test('choices (phone): only the business-configured choices are offered, only on the field that has them, again on a repeat ask, and the caller\'s own words are still taken', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I would like a regular cleaning, three bedrooms and two bathrooms, every two weeks, no extras, my first cleaning, tomorrow morning'); await reply(r, sim);
+  say(sim, 'it is a townhome'); await reply(r, sim);          // the caller's own word, not one of the choices: heard, never forced onto a choice
+  say(sim, 'no pets'); await reply(r, sim);
+  const d = directives(r);
+  assert.equal(d[1], 'NEXT ASK Property type CHOICES: house; apartment; condo; townhouse');
+  assert.equal(d[2], 'NEXT ASK Pets', 'a field with no configured choices is asked with none');
+  assert.equal(d[3], 'NEXT ASK Property type (asked before: ask it a different way) CHOICES: house; apartment; condo; townhouse', 'the same configured choices again, none added');
+  for (const line of d) if (line.includes('CHOICES:')) assert.ok(/^NEXT ASK Property type/.test(line), 'only the property type has choices');
+  assert.ok(!JSON.stringify(r.claude.sent).includes('oven'), 'no extra, service or example the business did not configure reaches the model');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('choices (phone): the service clarification offers only the configured service names, and a skill with no choices offers none', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need some cleaning done'); await reply(r, sim);
+  assert.equal(directives(r)[1], 'NEXT CLARIFY: Standard cleaning; Deep cleaning; Move-in or move-out cleaning; Commercial cleaning');
+  sim.end(); await sim.closed; await r.handler.idle();
+  const p = await rig();   // the plumbing skill has no choices
+  const s2 = await p.connect(); setup(s2); say(s2, 'yes'); await reply(p, s2);
+  say(s2, 'the kitchen is flooding'); await reply(p, s2);
+  assert.ok(!directives(p).some((x) => x.includes('CHOICES')), 'no choices are configured, so none are offered');
+  s2.end(); await s2.closed; await p.handler.idle();
+});
+
+// ---------------------------------------------------------------- commercial requests on the phone: held for a person, never a residential service
+test('commercial (phone): office, restaurant and shop requests with standard, deep and move-out wording ask no residential question, are read back, and are saved CONFIRMED but held for a person, never handed off, never eligible', async () => {
+  const wordings = ['a regular cleaning', 'a deep clean', 'a move out clean'];
+  for (const place of ['our office', 'our restaurant', 'my shop']) for (const wording of wordings) {
+    const h = hookCalls();
+    const r = await servicesRig({ confirmedHandoff: h.hook });
+    const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+    say(sim, `I need ${wording} for ${place}`);
+    const rb = await reply(r, sim);
+    assert.match(rb.token, /^Let me check what I have\./, `${wording} for ${place}`);
+    assert.deepEqual(asks(r), [], 'no residential question is asked of a commercial request');
+    say(sim, 'yes'); await ended(sim, r);
+    const [rec] = r.store.list(T);
+    assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.handed_off, rec.reasons, rec.missing_fields], ['Commercial cleaning', 'confirmed', 'needs-human', false, ['human_review'], []], `${wording} for ${place}`);
+    assert.equal(eligibleForProcessing(rec), false, 'a commercial request cannot reach residential Processing or a residential quote');
+    assert.equal(h.calls.length, 0, 'the sealed handoff is never offered');
+    assert.ok(r.logs.some((l) => l.code === 'CONFIRMED_FOR_REVIEW') && !r.logs.some((l) => l.code === 'CONFIRMED'));
+    const api: any = await (await r.dashGet('/api/owner')).json();
+    assert.equal(api.calls[0].request, 'Commercial cleaning');
+    assert.equal(api.calls[0].needsFollowUp, true);
+  }
+});
+
+test('commercial (phone, contact capture on): only the contact is asked, the number is read back, the contact is stored, and the request is held for a person', async () => {
+  const h = hookCalls();
+  const r = await servicesRig({ contacts: true, confirmedHandoff: h.hook });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a regular cleaning for our office'); await reply(r, sim);
+  say(sim, 'My name is Sam Example'); await reply(r, sim);
+  say(sim, 'You can call me on 555 010 0123'); await reply(r, sim);
+  say(sim, 'The address is 42 Elm Street');
+  const rb = await reply(r, sim);
+  assert.deepEqual(directives(r), ['NEXT OPEN', 'NEXT ASK Customer name', 'NEXT ASK Callback phone number', 'NEXT ASK Service address']);
+  assert.match(rb.token, /Your callback number: 5 5 5 0 1 0 0 1 2 3\./);
+  await confirmBoth(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.handed_off, rec.reasons], ['Commercial cleaning', 'confirmed', 'needs-human', false, ['human_review']]);
+  assert.equal(eligibleForProcessing(rec), false);
+  assert.equal(h.calls.length, 0);
+  assert.ok(r.vault?.get(T, rec.call_ref)?.phone === '5550100123', 'the contact is stored so a person can follow up');
+  noSecrets('what Claude was sent', JSON.stringify(r.claude.sent)); noSecrets('the record', JSON.stringify(rec)); noSecrets('the logs', JSON.stringify(r.logs));
+});
+
+test('commercial (phone): a caller who says it mid-conversation is moved to the person route and no further residential question is asked; residential calls are unchanged', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I would like a regular cleaning for a house near the shopping centre'); await reply(r, sim);
+  assert.deepEqual(asks(r), ['Number of bedrooms'], 'ordinary residential wording is asked the residential questions');
+  say(sim, 'actually it is for our shop');
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /^Let me check what I have\./);
+  assert.deepEqual(asks(r), ['Number of bedrooms'], 'nothing residential is asked after the commercial wording');
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.status, rec.handed_off], ['Commercial cleaning', 'needs-human', false]);
+});
+
+// ---------------------------------------------------------------- the first-cleaning question on the phone
+test('first cleaning (phone): asked once with yes or no as the business\'s own choices, kept when volunteered, never asked again once answered, and a "no" or an unclear answer is saved as said', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I would like a regular cleaning, a house with two bedrooms and one bathroom, no pets, every two weeks, no extras, tomorrow morning'); await reply(r, sim);
+  assert.equal(directives(r)[1], 'NEXT ASK First cleaning with us CHOICES: yes; no');
+  say(sim, 'it is not my first cleaning');
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /First cleaning with us: it is not my first cleaning\./);
+  assert.deepEqual(asks(r), ['First cleaning with us'], 'asked exactly once');
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.fields.find((x) => x.name === 'First cleaning with us')?.value], ['Standard cleaning', 'confirmed', 'ready', 'it is not my first cleaning']);
+});
+
+test('first cleaning (phone): an unclear answer is not heard as a yes, the question is asked again, and the saved request stays incomplete and unconfirmed', async () => {
+  const r = await servicesRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I would like a regular cleaning, a house with two bedrooms and one bathroom, no pets, every two weeks, no extras, tomorrow morning'); await reply(r, sim);
+  say(sim, 'I am not really sure'); await reply(r, sim);
+  assert.deepEqual(directives(r).slice(1), ['NEXT ASK First cleaning with us CHOICES: yes; no', 'NEXT ASK First cleaning with us (asked before: ask it a different way) CHOICES: yes; no']);
+  assert.ok(!r.logs.some((l) => l.code === 'READBACK'), 'nothing is read back or confirmed without an answer');
+  sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.missing_fields, rec.handed_off], ['unconfirmed', 'needs-human', ['First cleaning with us'], false]);
+  assert.equal(eligibleForProcessing(rec), false);
+});
+
+// ---------------------------------------------------------------- first-cleaning capture: a plain yes or no counts only for the question it answers
+const FX = loadFixture(JSON.parse(readFileSync(new URL('../examples/pricing-fixture-drew-cleaning.json', import.meta.url), 'utf8')));
+const FIRST_Q = 'First cleaning with us';
+const strayRig = (o: RigOptions = {}) => servicesRig({ claude: fakeClaude({ services: true, stray: true }), ...o });
+const priceOf = (rec: any) => quoteFromWorkItem(FX, { category: rec.category, fields: rec.fields }, rec.confirmation === 'confirmed');
+const STD = 'I would like a regular cleaning, a house with two bedrooms and one bathroom, every two weeks, tomorrow morning';
+
+test('first cleaning (phone): a yes that answers another question is not heard as the first-cleaning answer; the question is still asked and only then is the discount available', async () => {
+  const r = await strayRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD); await reply(r, sim);                          // asks Pets first
+  say(sim, 'yes we have one dog'); await reply(r, sim);        // a yes for the pets question: the model attaches a stray yes to the first-cleaning field
+  say(sim, 'no extras'); await reply(r, sim);                  // a no for the extras question
+  assert.ok(r.logs.some((l) => l.code === 'FIRST_CLEAN_DROPPED'), 'the unattributed yes was dropped');
+  assert.deepEqual(asks(r), ['Pets', 'Extras', FIRST_Q], 'the first-cleaning question was still asked: the earlier yes and no were not its answer');
+  assert.ok(!r.logs.some((l) => l.code === 'READBACK'));
+  say(sim, 'yes');                                             // now it IS the answer
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /First cleaning with us: yes\./);
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.fields.find((x) => x.name === FIRST_Q)?.value], ['confirmed', 'ready', 'yes']);
+  const q = priceOf(rec);
+  assert.deepEqual([q.outcome, q.outcome === 'priced' ? q.total_cents : null], ['priced', 17499], 'a confirmed, attributed yes earns the simulated discount');
+});
+
+test('first cleaning (phone): explicit first-time wording given earlier is kept without the question being asked, even next to unrelated yes and no answers', async () => {
+  const r = await strayRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', and it is my first cleaning with you'); await reply(r, sim);   // asks Pets
+  say(sim, 'yes we have one dog'); await reply(r, sim);
+  say(sim, 'no extras');
+  const rb = await reply(r, sim);
+  assert.deepEqual(asks(r), ['Pets', 'Extras'], 'never asked: it was answered explicitly, and the later yes and no are not read over it');
+  assert.match(rb.token, /First cleaning with us: my first cleaning/);
+  say(sim, 'yes'); await ended(sim, r);
+  assert.equal(priceOf(r.store.list(T)[0]).outcome, 'priced');
+});
+
+test('first cleaning (phone): an unclear answer is not a yes, the question is asked again, and without an answer nothing is confirmed and no discount is possible', async () => {
+  const r = await strayRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras'); await reply(r, sim);   // everything but the first-cleaning answer
+  say(sim, 'I am not really sure'); await reply(r, sim);
+  assert.deepEqual(directives(r).slice(1), ['NEXT ASK First cleaning with us CHOICES: yes; no', 'NEXT ASK First cleaning with us (asked before: ask it a different way) CHOICES: yes; no']);
+  sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.missing_fields], ['unconfirmed', [FIRST_Q]]);
+  const q = priceOf(rec);
+  assert.equal(q.outcome, 'human-pricing');
+  assert.ok(!('total_cents' in q), 'no price and no discount');
+});
+
+test('first cleaning (phone): corrections: the newest attributable answer wins, whichever way it goes, and the price follows it', async () => {
+  // yes, then "no, that is wrong", then an explicit "it is not my first": the read-back and the record say not first, and there is no discount.
+  const a = await strayRig();
+  const s1 = await a.connect(); setup(s1); say(s1, 'yes'); await reply(a, s1);
+  say(s1, STD + ', no pets, no extras'); await reply(a, s1);
+  say(s1, 'yes');
+  const first = await reply(a, s1);
+  assert.match(first.token, /First cleaning with us: yes\./);
+  say(s1, 'no that is not right'); assert.equal((await reply(a, s1)).token, SAY.correct);
+  say(s1, 'actually it is not my first cleaning');
+  const second = await reply(a, s1);
+  assert.match(second.token, /First cleaning with us: actually it is not my first cleaning\./);
+  say(s1, 'yes'); await ended(s1, a);
+  const recA = a.store.list(T)[0];
+  assert.equal(recA.fields.find((x) => x.name === FIRST_Q)?.value, 'actually it is not my first cleaning');
+  const qa = priceOf(recA);
+  assert.deepEqual([qa.outcome, qa.outcome === 'human-pricing' ? qa.reasons : null], ['human-pricing', ['not_first_clean']]);
+
+  // not my first, volunteered, then corrected to a yes by explicit wording: the correction wins.
+  const b = await servicesRig();   // no stray yes/no extraction here: the explicit earlier statement is what the model finds
+  const s2 = await b.connect(); setup(s2); say(s2, 'yes'); await reply(b, s2);
+  say(s2, STD + ', no pets, no extras, and it is not my first cleaning'); const rb1 = await reply(b, s2);
+  assert.match(rb1.token, /First cleaning with us: not my first cleaning/);
+  say(s2, 'no that is wrong'); await reply(b, s2);
+  say(s2, 'sorry, it is my first cleaning with you');
+  const rb2 = await reply(b, s2);
+  assert.match(rb2.token, /First cleaning with us: sorry, it is my first cleaning with you/);
+  say(s2, 'yes'); await ended(s2, b);
+  assert.equal(priceOf(b.store.list(T)[0]).outcome, 'priced');
+});
+
+test('first cleaning (phone): the price gate: an unconfirmed call, a no, an unclear answer and a missing answer never get the discount, in the saved record or the quote', async () => {
+  // A hang-up before the read-back is answered: the details are not confirmed, so no price even if the first-cleaning answer was a clear yes.
+  const r = await strayRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras, my first cleaning'); await reply(r, sim);   // read-back asked
+  sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const rec = r.store.list(T)[0];
+  assert.equal(rec.confirmation, 'unconfirmed');
+  const q = priceOf(rec);
+  assert.equal(q.outcome, 'human-pricing');
+  assert.ok(q.outcome === 'human-pricing' && q.reasons.includes('not_confirmed'));
+});
+
+test('first cleaning (phone): a skill with no first-cleaning role behaves exactly as before: no guard, no labelled line, no drops', async () => {
+  const r = await rig();
+  const sim = await r.connect();
+  const rb = await toReadback(r, sim);
+  assert.match(rb.token, /^Let me check what I have\./);
+  assert.ok(!r.logs.some((l) => l.code === 'FIRST_CLEAN_DROPPED'));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+// ---------------------------------------------------------------- only a question that was actually delivered can make the next plain yes or no an answer to it
+const FIRST_FULL = 'Is this your first cleaning with us?';
+/** A dialogue stub: every reply is a short fixed line, except the first-cleaning question, whose delivery the test controls. */
+function questionStub(mode: 'normal' | 'slow-once' | 'empty-once') {
+  let asked = 0; let release!: () => void; const gate = new Promise<void>((res) => { release = res; });
+  const seen: string[] = [];   // every directive this model was given, in order (it replaces the Claude dialogue, so the request log cannot show them)
+  const model: DialogueModel = {
+    stats: { calls: 0, errors: [] },
+    async *reply(input) {
+      const d = input.directive;
+      seen.push(renderDirective(d));
+      if (d.kind === 'ask' && d.field === FIRST_Q) {
+        asked++;
+        if (mode === 'empty-once' && asked === 1) return;
+        if (mode === 'slow-once' && asked === 1) { yield 'Is this '; await gate; if (input.signal?.aborted) return; yield 'your first cleaning with us?'; return; }
+        yield FIRST_FULL; return;
+      }
+      yield 'Okay. ';
+    },
+  };
+  return { model, release, asked: () => asked, lines: () => seen };
+}
+const dropped = (r: Rig) => r.logs.filter((l) => l.code === 'FIRST_CLEAN_DROPPED').length;
+const REASK = ['NEXT ASK First cleaning with us CHOICES: yes; no', 'NEXT ASK First cleaning with us (asked before: ask it a different way) CHOICES: yes; no'];
+/** After the failed or cut-off question, a plain yes was said: it must not be an answer, the question must come again, and a later yes to the delivered question must be. */
+async function thenAnswered(r: Rig, sim: Sim, stub?: ReturnType<typeof questionStub>) {
+  const lines = (): string[] => (stub ? stub.lines() : directives(r));
+  const before = dropped(r);
+  say(sim, 'yes'); await reply(r, sim);
+  assert.equal(lines().filter((d) => d.startsWith('NEXT ASK First cleaning')).length, 2, 'the question came again: the yes was not taken as its answer');
+  assert.deepEqual(lines().slice(1, 3), REASK);
+  assert.ok(dropped(r) > before, 'the stray yes was dropped');
+  assert.ok(!r.logs.some((l) => l.code === 'READBACK'), 'nothing is read back on an answer that was never asked for');
+  if (stub) assert.equal(stub.asked(), 2);
+  say(sim, 'yes');                                              // the second, delivered question
+  const rb = await reply(r, sim);
+  assert.match(rb.token, /First cleaning with us: yes\./);
+  say(sim, 'yes'); await ended(sim, r);
+  const q = priceOf(r.store.list(T)[0]);
+  assert.deepEqual([q.outcome, q.outcome === 'priced' ? q.total_cents : null], ['priced', 17499]);
+}
+
+test('delivery: a first-cleaning question the caller interrupted mid-sentence cannot establish a pending answer', async () => {
+  const stub = questionStub('slow-once');
+  const r = await strayRig({ dialogue: stub.model });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras');
+  await sim.next((m) => m.type === 'text' && m.token === 'Is this ');
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'Is this', durationUntilInterruptMs: 200 });
+  await new Promise((res) => setTimeout(res, 40)); stub.release(); await r.handler.idle();
+  assert.ok(r.logs.some((l) => l.code === 'REPLY_INTERRUPTED'));
+  await thenAnswered(r, sim, stub);
+});
+
+test('delivery: a question whose writes were refused (never reached the phone provider) cannot establish a pending answer', async () => {
+  let failing = false;
+  const r = await strayRig({ connWrap: refusingWrites(() => failing) });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  failing = true;
+  say(sim, STD + ', no pets, no extras');
+  await waitFor(() => r.logs.some((l) => l.code === 'REPLY_SEND_FAILED'));
+  failing = false; await r.handler.idle();
+  await thenAnswered(r, sim);
+});
+
+test('delivery: an empty reply (no words produced) cannot establish a pending answer', async () => {
+  const stub = questionStub('empty-once');
+  const r = await strayRig({ dialogue: stub.model });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras'); await reply(r, sim);
+  assert.ok(r.logs.some((l) => l.code === 'REPLY_EMPTY'));
+  await thenAnswered(r, sim, stub);
+});
+
+test('delivery: a question that was sent in full but then talked over, with the phone provider reporting only part of it spoken, cannot establish a pending answer', async () => {
+  const stub = questionStub('normal');
+  const r = await strayRig({ dialogue: stub.model });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, STD + ', no pets, no extras'); await reply(r, sim);                    // delivered in full
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'Is this your', durationUntilInterruptMs: 300 });   // but the caller spoke over it
+  await new Promise((res) => setTimeout(res, 40));
+  await thenAnswered(r, sim, stub);
+});
+
+test('delivery: an interruption that reports the whole question was already spoken does not cancel it, and a missing report is treated as not heard', async () => {
+  const full = questionStub('normal');
+  const a = await strayRig({ dialogue: full.model });
+  const s1 = await a.connect(); setup(s1); say(s1, 'yes'); await reply(a, s1);
+  say(s1, STD + ', no pets, no extras'); await reply(a, s1);
+  s1.send({ type: 'interrupt', utteranceUntilInterrupt: FIRST_FULL, durationUntilInterruptMs: 4000 });   // all of it had been spoken
+  await new Promise((res) => setTimeout(res, 40));
+  say(s1, 'yes');
+  const rb = await reply(a, s1);
+  assert.match(rb.token, /First cleaning with us: yes\./, 'the question was heard in full, so the plain yes answers it');
+  assert.equal(full.asked(), 1);
+  s1.end(); await s1.closed; await a.handler.idle();
+
+  const none = questionStub('normal');
+  const b = await strayRig({ dialogue: none.model });
+  const s2 = await b.connect(); setup(s2); say(s2, 'yes'); await reply(b, s2);
+  say(s2, STD + ', no pets, no extras'); await reply(b, s2);
+  s2.send({ type: 'interrupt', durationUntilInterruptMs: 300 });                  // no report of what was spoken
+  await new Promise((res) => setTimeout(res, 40));
+  await thenAnswered(b, s2, none);
+});
+
+test('delivery: a successfully delivered question makes the next plain yes its answer; an unrelated answer to it does not', async () => {
+  const ok = questionStub('normal');
+  const a = await strayRig({ dialogue: ok.model });
+  const s1 = await a.connect(); setup(s1); say(s1, 'yes'); await reply(a, s1);
+  say(s1, STD + ', no pets, no extras'); await reply(a, s1);
+  assert.ok(a.logs.some((l) => l.code === 'REPLY_SENT'));
+  say(s1, 'yes');
+  const rb = await reply(a, s1);
+  assert.match(rb.token, /First cleaning with us: yes\./);
+  assert.equal(ok.asked(), 1, 'asked once and answered once');
+  s1.end(); await s1.closed; await a.handler.idle();
+
+  const un = questionStub('normal');
+  const b = await strayRig({ dialogue: un.model });
+  const s2 = await b.connect(); setup(s2); say(s2, 'yes'); await reply(b, s2);
+  say(s2, STD + ', no pets, no extras'); await reply(b, s2);
+  const before = dropped(b);
+  say(s2, 'yes we have one dog'); await reply(b, s2);                             // an answer about something else
+  assert.ok(dropped(b) > before);
+  assert.deepEqual(un.lines().slice(1, 3), REASK, 'asked again: nothing was captured');
+  assert.ok(!b.logs.some((l) => l.code === 'READBACK'));
+  s2.end(); await s2.closed; await b.handler.idle();
+  const rec = b.store.list(T)[0];
+  assert.deepEqual([rec.confirmation, rec.missing_fields], ['unconfirmed', [FIRST_Q]]);
+});
+
+// ---------------------------------------------------------------- the service address is read back, confirmed, corrected or refused (never postal validation)
+const ADDRESS_Q = 'I have your service address as 42 Elm Street. Is that correct? Please say yes or no.';
+const OAK = ['Oak', '77 Oak', 'Oak Lane'];
+const noOak = (what: string, hay: string) => { for (const x of OAK) assert.ok(!hay.includes(x), `${what} must not contain "${x}"`); };
+const addrLogs = (r: Rig) => r.logs.filter((l) => l.code.startsWith('ADDRESS_')).map((l) => l.code);
+
+test('address confirmation: the address is read back, a yes stores it as confirmed (not validated), the seam is told, and the saved record says caller_confirmed, which only the matching encrypted contact can make eligible', async () => {
+  const h = hookCalls();
+  const r = await rig({ contacts: true, confirmedHandoff: h.hook });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.equal(q.token, ADDRESS_Q);
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  const c = r.vault?.get(T, rec.call_ref);
+  assert.deepEqual([c?.address_state, /Elm/.test(c?.address ?? '')], ['confirmed', true]);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].call.addressConfirmed, true, 'in memory only: the bridge could use it');
+  assert.deepEqual([rec.confirmation, rec.address_status], ['confirmed', 'caller_confirmed']);
+  assert.equal(eligibleForProcessing(rec), false, 'with nothing to confirm it against, a caller_confirmed record is not eligible');
+  assert.equal(eligibleForProcessing(rec, r.vault), true, 'with the encrypted contact for this tenant and call saying confirmed, it is');
+  assert.deepEqual(addrLogs(r), ['ADDRESS_READBACK', 'ADDRESS_CONFIRMED']);
+  shapeOk(r);
+  noPriya('the logs', JSON.stringify(r.logs)); noPriya('what Claude was sent', JSON.stringify(r.claude.sent));
+  noPriya('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/owner')).json()));
+  noPriya('the record', JSON.stringify(rec));
+  noPriya('the intake database', readFileSync(r.path).toString('latin1'));
+});
+
+test('address confirmation: a wrong address is corrected: the old one is not kept or spoken again, the corrected one is read back and confirmed', async () => {
+  const h = hookCalls();
+  const r = await rig({ contacts: true, confirmedHandoff: h.hook });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); assert.equal((await reply(r, sim)).token, ADDRESS_Q);
+  say(sim, 'no that is wrong'); assert.equal((await reply(r, sim)).token, SAY.addressWrong);
+  say(sim, 'the address is 77 Oak Lane');
+  const second = await reply(r, sim);
+  assert.match(second.token, /^I have your service address as 77 Oak Lane\. Is that correct\? Please say yes or no\.$/);
+  assert.ok(!second.token.includes('Elm'), 'the address the caller said was wrong is not repeated');
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  const c = r.vault?.get(T, rec.call_ref);
+  assert.deepEqual([c?.address_state, /Oak/.test(c?.address ?? ''), /Elm/.test(c?.address ?? '')], ['confirmed', true, false]);
+  assert.deepEqual(addrLogs(r), ['ADDRESS_READBACK', 'ADDRESS_CORRECTION', 'ADDRESS_READBACK', 'ADDRESS_CONFIRMED']);
+  assert.equal(h.calls[0].call.addressConfirmed, true);
+  for (const [what, hay] of [['the logs', JSON.stringify(r.logs)], ['what Claude was sent', JSON.stringify(r.claude.sent)], ['the record', JSON.stringify(rec)], ['the intake database', readFileSync(r.path).toString('latin1')]] as const) { noPriya(what, hay); noOak(what, hay); }
+  noOak('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/owner')).json()));
+});
+
+test('address confirmation: three wrong addresses in a row end it unconfirmed with no address kept, and the call is not looped', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'no'); await reply(r, sim); say(sim, 'the address is 77 Oak Lane'); await reply(r, sim);
+  say(sim, 'no'); await reply(r, sim); say(sim, 'the address is 9 Pine Road'); await reply(r, sim);
+  say(sim, 'no'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  const c = r.vault?.get(T, rec.call_ref);
+  assert.deepEqual([c?.address_state, c?.address], ['unconfirmed', undefined], 'an address the caller called wrong is not kept');
+  assert.equal(rec.confirmation, 'confirmed', 'the job and the number were confirmed earlier');
+  assert.ok(r.logs.some((l) => l.code === 'ADDRESS_UNCONFIRMED'));
+});
+
+test('address confirmation: a refusal keeps no address, says so plainly, still keeps the name and number the caller confirmed, and never becomes eligible', async () => {
+  const h = hookCalls();
+  const r = await rig({ contacts: true, confirmedHandoff: h.hook });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); assert.equal((await reply(r, sim)).token, ADDRESS_Q);
+  say(sim, 'I would rather not give my address'); await ended(sim, r);
+  assert.ok(sim.messages.some((m) => m.token === SAY.addressRefused && m.interruptible === false));
+  const [rec] = r.store.list(T);
+  const c = r.vault?.get(T, rec.call_ref);
+  assert.deepEqual([c?.address_state, c?.address, c?.phone], ['refused', undefined, '5550100123']);
+  assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec), h.calls[0]?.call.addressConfirmed], ['confirmed', 'unverified', false, false]);
+  assert.ok(r.logs.some((l) => l.code === 'ADDRESS_REFUSED'));
+  noPriya('the logs', JSON.stringify(r.logs));
+  // A refusal after saying the first address was wrong is the same.
+  const r2 = await rig({ contacts: true });
+  const s2 = await r2.connect(); await toContactReadback(r2, s2);
+  say(s2, 'yes'); await reply(r2, s2); say(s2, 'no'); await reply(r2, s2);
+  say(s2, 'I do not want to give it'); await ended(s2, r2);
+  const c2 = r2.vault?.get(T, r2.store.list(T)[0].call_ref);
+  assert.deepEqual([c2?.address_state, c2?.address], ['refused', undefined]);
+});
+
+test('address confirmation: unclear answers are asked again once and then end unconfirmed with the address as heard, flagged not confirmed', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'hmm what was that'); assert.equal((await reply(r, sim)).token, ADDRESS_Q, 'the question is asked again with the address');
+  say(sim, 'banana'); await ended(sim, r);
+  const c = r.vault?.get(T, r.store.list(T)[0].call_ref);
+  assert.deepEqual([c?.address_state, /Elm/.test(c?.address ?? '')], ['unconfirmed', true]);
+});
+
+test('address confirmation: an interrupted question cannot be answered: a yes after being talked over is ignored and the question comes again; a full report or a later clean question works', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); await reply(r, sim);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'I have your service', durationUntilInterruptMs: 300 });
+  await new Promise((res) => setTimeout(res, 40));
+  say(sim, 'yes'); assert.equal((await reply(r, sim)).token, ADDRESS_Q, 'asked again: the yes was not taken as an answer');
+  assert.ok(r.logs.some((l) => l.code === 'ADDRESS_ANSWER_IGNORED') && !r.logs.some((l) => l.code === 'ADDRESS_CONFIRMED'));
+  assert.equal(r.vault?.list(T).length, 0);
+  say(sim, 'yes'); await ended(sim, r);
+  assert.equal(r.vault?.get(T, r.store.list(T)[0].call_ref)?.address_state, 'confirmed');
+
+  // The provider reports the whole question spoken before the caller answered: the yes counts.
+  const full = await rig({ contacts: true });
+  const s2 = await full.connect(); await toContactReadback(full, s2);
+  say(s2, 'yes'); await reply(full, s2);
+  s2.send({ type: 'interrupt', utteranceUntilInterrupt: ADDRESS_Q, durationUntilInterruptMs: 9000 });
+  await new Promise((res) => setTimeout(res, 40));
+  say(s2, 'yes'); await ended(s2, full);
+  assert.equal(full.vault?.get(T, full.store.list(T)[0].call_ref)?.address_state, 'confirmed');
+
+  // No report of what was spoken at all: not heard.
+  const none = await rig({ contacts: true });
+  const s3 = await none.connect(); await toContactReadback(none, s3);
+  say(s3, 'yes'); await reply(none, s3);
+  s3.send({ type: 'interrupt', durationUntilInterruptMs: 300 });
+  await new Promise((res) => setTimeout(res, 40));
+  say(s3, 'yes'); assert.equal((await reply(none, s3)).token, ADDRESS_Q);
+  s3.end(); await s3.closed; await none.handler.idle();
+});
+
+test('address confirmation: a question whose write was refused (never reached the phone provider) cannot be answered', async () => {
+  let failing = false;
+  const r = await rig({ contacts: true, connWrap: refusingWrites(() => failing) });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  failing = true;
+  say(sim, 'yes');
+  await waitFor(() => r.logs.some((l) => l.code === 'ADDRESS_READBACK'));
+  failing = false; await r.handler.idle();
+  say(sim, 'yes');                                              // the caller heard nothing, so this yes is not an answer to the address question
+  assert.equal((await reply(r, sim)).token, ADDRESS_Q);
+  assert.ok(r.logs.some((l) => l.code === 'ADDRESS_ANSWER_IGNORED') && !r.logs.some((l) => l.code === 'ADDRESS_CONFIRMED'));
+  assert.equal(r.store.list(T).length, 0);
+  say(sim, 'yes'); await ended(sim, r);
+  assert.equal(r.vault?.get(T, r.store.list(T)[0].call_ref)?.address_state, 'confirmed');
+});
+
+test('address confirmation: a call that ends during the address step keeps what the caller confirmed (job and number) with the address marked not confirmed, and a corrected-away address is not kept', async () => {
+  const h = hookCalls();
+  const a = await rig({ contacts: true, confirmedHandoff: h.hook });
+  const s1 = await a.connect(); await toContactReadback(a, s1);
+  say(s1, 'yes'); await reply(a, s1);
+  s1.end(); await s1.closed; await waitFor(() => a.store.list(T).length === 1); await a.handler.idle();
+  const ca = a.vault?.get(T, a.store.list(T)[0].call_ref);
+  assert.deepEqual([a.store.list(T)[0].confirmation, ca?.address_state, /Elm/.test(ca?.address ?? ''), ca?.phone, h.calls[0]?.call.addressConfirmed], ['confirmed', 'unconfirmed', true, '5550100123', false]);
+
+  const b = await rig({ contacts: true });
+  const s2 = await b.connect(); await toContactReadback(b, s2);
+  say(s2, 'yes'); await reply(b, s2); say(s2, 'no'); await reply(b, s2);   // the old address is wrong, the new one has not come
+  s2.end(); await s2.closed; await waitFor(() => b.store.list(T).length === 1); await b.handler.idle();
+  const cb = b.vault?.get(T, b.store.list(T)[0].call_ref);
+  assert.deepEqual([cb?.address_state, cb?.address, cb?.phone], ['unconfirmed', undefined, '5550100123']);
+
+  const q = await rig({ contacts: true, confirmWaitMs: 150 });
+  const s3 = await q.connect(); await toContactReadback(q, s3);
+  say(s3, 'yes'); await reply(q, s3);
+  await s3.next((m) => m.token === SAY.silence); await ended(s3, q);
+  assert.deepEqual([q.store.list(T)[0].confirmation, q.vault?.get(T, q.store.list(T)[0].call_ref)?.address_state], ['confirmed', 'unconfirmed']);
+});
+
+test('address confirmation: without contact capture nothing changes: no address question, the first yes ends the call as before', async () => {
+  const r = await rig();
+  const sim = await r.connect(); await toReadback(r, sim);
+  say(sim, 'yes'); await ended(sim, r);
+  assert.ok(!r.logs.some((l) => l.code.startsWith('ADDRESS_')));
+  assert.equal(r.store.list(T)[0].confirmation, 'confirmed');
+});
+
+// ---------------------------------------------------------------- caller_confirmed: the saved status and the encrypted contact for the same tenant and call agree
+const lyingWitness = { addressState: () => 'confirmed' as const };   // a witness that always says confirmed: the record's own status must still be right
+
+test('consistency: refused, unanswered, unconfirmed and cut-off addresses are saved unverified and never become eligible, even against a witness that says confirmed', async () => {
+  const runs: Array<[string, (r: Rig, s: Sim) => Promise<void>]> = [
+    ['refused', async (r, s) => { say(s, 'yes'); await reply(r, s); say(s, 'I would rather not give my address'); await ended(s, r); }],
+    ['unclear twice', async (r, s) => { say(s, 'yes'); await reply(r, s); say(s, 'hmm'); await reply(r, s); say(s, 'banana'); await ended(s, r); }],
+    ['hang-up during the address question', async (r, s) => { say(s, 'yes'); await reply(r, s); s.end(); await s.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle(); }],
+    ['corrected away, then hang-up', async (r, s) => { say(s, 'yes'); await reply(r, s); say(s, 'no'); await reply(r, s); s.end(); await s.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle(); }],
+    ['three wrong addresses', async (r, s) => { say(s, 'yes'); await reply(r, s); say(s, 'no'); await reply(r, s); say(s, 'the address is 77 Oak Lane'); await reply(r, s); say(s, 'no'); await reply(r, s); say(s, 'the address is 9 Pine Road'); await reply(r, s); say(s, 'no'); await ended(s, r); }],
+  ];
+  for (const [name, run] of runs) {
+    const r = await rig({ contacts: true });
+    const sim = await r.connect(); await toContactReadback(r, sim);
+    await run(r, sim);
+    const [rec] = r.store.list(T);
+    assert.equal(rec.address_status, 'unverified', name);
+    assert.equal(eligibleForProcessing(rec, lyingWitness), false, name);
+    assert.notEqual(r.vault?.addressState(T, rec.call_ref), 'confirmed', name);
+  }
+});
+
+test('consistency: a confirmed address is saved caller_confirmed exactly when the encrypted contact for this tenant and call says confirmed, including after a restart', async () => {
+  const key = randomBytes(32);
+  const vpath = join(dir, `restart-contacts-${Date.now()}.sqlite`);
+  const v1 = createContactVault({ path: vpath, key, now: () => Date.now() });
+  const r = await rig({ contacts: v1 });
+  const sim = await r.connect(); await toContactReadback(r, sim); await confirmBoth(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.address_status, rec.confirmation, v1.addressState(T, rec.call_ref)], ['caller_confirmed', 'confirmed', 'confirmed']);
+  assert.equal(eligibleForProcessing(rec, v1), true);
+  v1.close();
+
+  // After a restart: a new store and a new vault object over the same two files agree.
+  const store2 = createIntakeRecordStore({ path: r.path });
+  const v2 = createContactVault({ path: vpath, key, now: () => Date.now() });
+  const [again] = store2.list(T);
+  assert.deepEqual([again.address_status, eligibleForProcessing(again, v2)], ['caller_confirmed', true]);
+  // The wrong key cannot open the contacts at all: there is no witness, so there is no eligibility.
+  assert.throws(() => createContactVault({ path: vpath, key: randomBytes(32), now: () => Date.now() }), RangeError);
+  assert.equal(eligibleForProcessing(again), false);
+  // A vault file that does not hold this call (lost, replaced, or another tenant's) cannot vouch for it.
+  const empty = createContactVault({ path: join(dir, `empty-contacts-${Date.now()}.sqlite`), key, now: () => Date.now() });
+  assert.equal(eligibleForProcessing(again, empty), false, 'a record cannot be eligible on the strength of its own status alone');
+  const other = createContactVault({ path: join(dir, `other-contacts-${Date.now()}.sqlite`), key, now: () => Date.now() });
+  other.put('ws-founder-other', again.call_ref, { name: 'Priya Raman', phone: '5550100123', address: '42 Elm Street', address_state: 'confirmed' });
+  assert.equal(eligibleForProcessing(again, other), false, 'the same call reference under another tenant is not this call');
+  store2.close(); v2.close(); empty.close(); other.close();
+});
+
+test('consistency: if the vault write fails the record is never caller_confirmed, whatever a witness says; if the record write fails nothing is saved to be eligible and the contact expires on its own', async () => {
+  const broken: ContactVault = { put() { throw new Error('disk full CANARY-PROVIDER'); }, get() { return undefined; }, addressState() { return 'confirmed'; }, list() { return []; }, purgeExpired() { return 0; }, close() {} };
+  const a = await rig({ contacts: broken });
+  const s1 = await a.connect(); await toContactReadback(a, s1); await confirmBoth(s1, a);
+  const [rec] = a.store.list(T);
+  assert.notEqual(rec.address_status, 'caller_confirmed');
+  assert.deepEqual([rec.confirmation, eligibleForProcessing(rec, lyingWitness)], ['unconfirmed', false]);
+  assert.ok(a.logs.some((l) => l.code === 'CONTACT_STORE_FAILED'));
+  assert.ok(!JSON.stringify(a.logs).includes('CANARY'));
+
+  const real = createIntakeRecordStore({ path: join(dir, `rwf-${Date.now()}.sqlite`) });
+  const failingStore: IntakeRecordStore = { put() { throw new Error('disk full'); }, list: (t) => real.list(t), purge: (t, c) => real.purge(t, c), close: () => real.close() } as never;
+  const b = await rig({ contacts: true, store: failingStore });
+  const s2 = await b.connect(); await toContactReadback(b, s2); await confirmBoth(s2, b);
+  assert.ok(b.logs.some((l) => l.code === 'RECORD_FAILED'));
+  assert.deepEqual(real.list(T), [], 'no record, so nothing can be eligible');
+  assert.equal(b.vault?.list(T).length, 1, 'the confirmed contact was stored before the record write failed; it carries a 30-day expiry and is the only trace');
+  real.close();
+});
+
+test('consistency: the saved status and the vault state come from the same call, and neither the status nor the vault leaks the address', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); await toContactReadback(r, sim); await confirmBoth(sim, r);
+  const [rec] = r.store.list(T);
+  assert.equal(rec.call_ref, callRefFor(T, SID(1)));
+  assert.equal(r.vault?.addressState(T, rec.call_ref), 'confirmed');
+  assert.deepEqual(r.vault?.list(T).map((e) => e.call_ref), [rec.call_ref]);
+  noPriya('the record', JSON.stringify(rec)); noPriya('the logs', JSON.stringify(r.logs)); noPriya('what Claude was sent', JSON.stringify(r.claude.sent));
+  const api: any = await (await r.dashGet('/api/owner')).json();
+  noPriya('the dashboard', (await (await r.dashGet('/data.js')).text()) + JSON.stringify(api));
+  assert.equal(api.calls[0].addressGiven, true);
+  assert.ok(!api.calls[0].nextActions.includes('Verify the address with the caller.'));
 });

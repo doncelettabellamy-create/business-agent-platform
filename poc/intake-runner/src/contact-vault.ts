@@ -21,13 +21,20 @@ const KIND = 'founder-contact-vault';
 const VERSION = '1';
 const CHECK = 'vault-check';
 
-export interface StoredContact { name: string; phone: string; address: string }
+/**
+ * What is known about the address: `confirmed` (read back to the caller, who said yes; NOT checked against any postal or address data), `unconfirmed` (heard, not confirmed, or
+ * not answered), `refused` (the caller declined to give one; none is kept). A contact written without a state is `unconfirmed`.
+ */
+export type AddressState = 'confirmed' | 'unconfirmed' | 'refused';
+export interface StoredContact { name: string; phone: string; address?: string; address_state?: AddressState }
 export interface VaultEntry { call_ref: string; created_at: string; expires_at: string }
 export interface ContactVault {
   /** Stores one confirmed contact. Throws if the call already has one or the values are not usable. */
   put(tenant: string, callRef: string, contact: StoredContact): void;
   /** The decrypted contact, or undefined when there is none or it has expired. Throws if the row has been tampered with. */
   get(tenant: string, callRef: string): StoredContact | undefined;
+  /** The address state held for this call, and nothing else: no personal data. Undefined when there is no contact (or it has expired). Throws if the row has been tampered with. */
+  addressState(tenant: string, callRef: string): AddressState | undefined;
   /** Metadata only (no personal data), newest first. */
   list(tenant: string): VaultEntry[];
   purgeExpired(): number;
@@ -50,8 +57,14 @@ export function keyFromEnv(value: unknown): Buffer | undefined {
 const plain = (v: unknown, max: number): v is string => typeof v === 'string' && v.length >= 1 && v.length <= max && !/[\u0000-\u001f\u007f]/.test(v);
 function assertContact(c: unknown): asserts c is StoredContact {
   const x = c as Record<string, unknown> | null;
-  if (typeof x !== 'object' || x === null || Object.keys(x).sort().join(',') !== 'address,name,phone'
-    || !plain(x.name, 120) || !plain(x.address, 200) || typeof x.phone !== 'string' || !/^\d{10,15}$/.test(x.phone)) throw new RangeError('the contact is not usable');
+  const bad = (): never => { throw new RangeError('the contact is not usable'); };
+  if (typeof x !== 'object' || x === null || !Object.keys(x).every((k) => ['address', 'address_state', 'name', 'phone'].includes(k))) return bad();
+  if (!plain(x.name, 120) || typeof x.phone !== 'string' || !/^\d{10,15}$/.test(x.phone)) return bad();
+  const st = x.address_state;
+  if (st !== undefined && st !== 'confirmed' && st !== 'unconfirmed' && st !== 'refused') return bad();
+  if (st === 'refused') { if (x.address !== undefined) return bad(); }        // a refused address is not kept
+  else if (x.address === undefined) { if (st !== 'unconfirmed') return bad(); } // only an explicitly unconfirmed contact may lack one
+  else if (!plain(x.address, 200)) return bad();
 }
 
 export function createContactVault(config: { path: string; key: Buffer; now: () => number; retentionDays?: number }): ContactVault {
@@ -114,14 +127,14 @@ export function createContactVault(config: { path: string; key: Buffer; now: () 
   const purge = (): number => Number(db.prepare('DELETE FROM contacts WHERE expires_at <= ?').run(now()).changes);
   purge();
 
-  return Object.freeze({
+  const api: ContactVault = {
     put(tenant: string, callRef: string, contact: StoredContact): void {
       live();
       if (!okTenant(tenant) || !okRef(callRef)) throw new RangeError('tenant or call reference is not valid');
       assertContact(contact);
       purge();
       const created = now(); const expires = created + days * DAY_MS;
-      const s = seal(JSON.stringify({ n: contact.name, p: contact.phone, a: contact.address }), aadFor(tenant, callRef, expires));
+      const s = seal(JSON.stringify({ n: contact.name, p: contact.phone, ...(contact.address !== undefined ? { a: contact.address } : {}), ...(contact.address_state !== undefined ? { s: contact.address_state } : {}) }), aadFor(tenant, callRef, expires));
       try { db.prepare('INSERT INTO contacts (tenant, call_ref, created_at, expires_at, nonce, ct) VALUES (?, ?, ?, ?, ?, ?)').run(tenant, callRef, created, expires, s.nonce, s.ct); }
       catch { throw new Error('the contact could not be stored'); }
     },
@@ -132,8 +145,8 @@ export function createContactVault(config: { path: string; key: Buffer; now: () 
       const row = db.prepare('SELECT expires_at, nonce, ct FROM contacts WHERE tenant = ? AND call_ref = ?').get(tenant, callRef) as { expires_at: number; nonce: Uint8Array; ct: Uint8Array } | undefined;
       if (row === undefined) return undefined;
       try {
-        const p = JSON.parse(open(row.nonce, row.ct, aadFor(tenant, callRef, row.expires_at))) as { n: string; p: string; a: string };
-        const c = { name: p.n, phone: p.p, address: p.a };
+        const p = JSON.parse(open(row.nonce, row.ct, aadFor(tenant, callRef, row.expires_at))) as { n: string; p: string; a?: string; s?: AddressState };
+        const c: StoredContact = { name: p.n, phone: p.p, ...(p.a !== undefined ? { address: p.a } : {}), ...(p.s !== undefined ? { address_state: p.s } : {}) };
         assertContact(c);
         return c;
       } catch { throw new Error('the contact is unreadable'); }
@@ -145,7 +158,12 @@ export function createContactVault(config: { path: string; key: Buffer; now: () 
       const rows = db.prepare('SELECT call_ref, created_at, expires_at FROM contacts WHERE tenant = ? ORDER BY created_at DESC LIMIT 500').all(tenant) as unknown as { call_ref: string; created_at: number; expires_at: number }[];
       return rows.map((r) => ({ call_ref: r.call_ref, created_at: new Date(r.created_at).toISOString(), expires_at: new Date(r.expires_at).toISOString() }));
     },
+    addressState(tenant: string, callRef: string): AddressState | undefined {
+      const c = api.get(tenant, callRef);
+      return c === undefined ? undefined : c.address_state ?? 'unconfirmed';
+    },
     purgeExpired(): number { live(); return purge(); },
     close(): void { if (!closed) { closed = true; try { db.close(); } catch { /* already closed */ } } },
-  });
+  };
+  return Object.freeze(api);
 }

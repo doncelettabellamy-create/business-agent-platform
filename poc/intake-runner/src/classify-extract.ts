@@ -22,11 +22,14 @@
 import { checkKeys, isNonEmptyString, isRecord } from './contracts.ts';
 
 /** `requires` (optional) names fields that are required for this category in addition to every field with `required: true`. */
-export interface CategoryConfig { name: string; keywords: string[]; requires?: string[] }
+/** `route: 'human'` (optional): requests in this category always go to a person. They are never ready and never handed off, and a keyword match here outranks every other category (commercial wording is never treated as residential). */
+export interface CategoryConfig { name: string; keywords: string[]; requires?: string[]; route?: 'human' }
 export type ExtractorConfig =
   | { kind: 'label'; labels: string[] }
   | { kind: 'token'; token_type: string };
-export interface FieldConfig { name: string; required: boolean; extractor: ExtractorConfig }
+/** `role: 'first_clean'` (optional, at most one field): this field answers "is this the customer's first cleaning with the business?". A bare yes or no then counts for it only as the answer to that very question (relay-handler.ts). `choices` (optional): the business's own list of answers the assistant may OFFER when it asks for this field. It never limits what the caller can say and the assistant never adds to it. */
+export interface FieldConfig { name: string; required: boolean; extractor: ExtractorConfig; choices?: string[]; role?: 'first_clean' }
+export const MAX_CHOICES_PER_FIELD = 10;
 export interface SkillConfig { categories: CategoryConfig[]; fields: FieldConfig[] }
 
 export const LIMITS = {
@@ -70,7 +73,8 @@ export function validateSkillConfig(x: unknown, path = 'skill_config'): string[]
     x.categories.forEach((c: unknown, i: number) => {
       const cp = `${path}.categories[${i}]`;
       if (!isRecord(c)) { errors.push(`${cp}: expected object`); return; }
-      checkKeys(c, ['name', 'keywords'], cp, errors, ['requires']);
+      checkKeys(c, ['name', 'keywords'], cp, errors, ['requires', 'route']);
+      if ('route' in c && c.route !== 'human') errors.push(`${cp}.route: expected "human" or no route`);
       if (!shortText(c.name)) errors.push(`${cp}.name: expected short single-line string`);
       else if (c.name === 'unknown') errors.push(`${cp}.name: "unknown" is reserved`);
       else if (names.includes(c.name.toLowerCase())) errors.push(`${cp}.name: duplicate`);
@@ -92,10 +96,23 @@ export function validateSkillConfig(x: unknown, path = 'skill_config'): string[]
     errors.push(`${path}.fields: expected an array of at most ${LIMITS.fields} entries`);
   } else {
     const names: string[] = [];
+    let firstCleanRoles = 0;
     x.fields.forEach((f: unknown, i: number) => {
       const fp = `${path}.fields[${i}]`;
       if (!isRecord(f)) { errors.push(`${fp}: expected object`); return; }
-      checkKeys(f, ['name', 'required', 'extractor'], fp, errors);
+      checkKeys(f, ['name', 'required', 'extractor'], fp, errors, ['choices', 'role']);
+      if ('role' in f) { if (f.role !== 'first_clean') errors.push(`${fp}.role: expected "first_clean" or no role`); else if (++firstCleanRoles > 1) errors.push(`${fp}.role: only one field may have the role first_clean`); }
+      if ('choices' in f) {
+        if (!Array.isArray(f.choices) || f.choices.length < 1 || f.choices.length > MAX_CHOICES_PER_FIELD) errors.push(`${fp}.choices: expected 1 to ${MAX_CHOICES_PER_FIELD} entries`);
+        else {
+          const seenChoices: string[] = [];
+          f.choices.forEach((c: unknown, j: number) => {
+            if (!shortText(c)) errors.push(`${fp}.choices[${j}]: expected short single-line string`);
+            else if (seenChoices.includes(c.trim().toLowerCase())) errors.push(`${fp}.choices[${j}]: duplicate`);
+            else seenChoices.push(c.trim().toLowerCase());
+          });
+        }
+      }
       if (!shortText(f.name)) errors.push(`${fp}.name: expected short single-line string`);
       else if (names.includes(f.name)) errors.push(`${fp}.name: duplicate`);
       else names.push(f.name);
@@ -144,6 +161,7 @@ export function validateSkillConfig(x: unknown, path = 'skill_config'): string[]
 export function classifyRequest(text: string, categories: CategoryConfig[]): { outcome: CategoryOutcome; category: string | null } {
   let best = 0;
   let winners: string[] = [];
+  const hitsBy = new Map<string, number>();
   for (const c of categories) {
     let hits = 0;
     const seen = new Set<string>();
@@ -153,8 +171,16 @@ export function classifyRequest(text: string, categories: CategoryConfig[]): { o
       seen.add(key);
       if (new RegExp(`${WORD_BEFORE}${phrasePattern(k)}${WORD_AFTER}`, 'iu').test(text)) hits++;
     }
+    hitsBy.set(c.name, hits);
     if (hits > best) { best = hits; winners = [c.name]; }
     else if (hits === best && hits > 0) winners.push(c.name);
+  }
+  // A match in a human-route category outranks every other category, whatever else was said: such a request is never classified as an automated service.
+  const human = categories.filter((c) => c.route === 'human' && (hitsBy.get(c.name) ?? 0) > 0);
+  if (human.length > 0) {
+    const top = Math.max(...human.map((c) => hitsBy.get(c.name) as number));
+    const tops = human.filter((c) => hitsBy.get(c.name) === top);
+    return tops.length === 1 ? { outcome: 'matched', category: tops[0].name } : { outcome: 'ambiguous', category: null };
   }
   if (best === 0) return { outcome: 'none', category: null };
   if (winners.length > 1) return { outcome: 'ambiguous', category: null };

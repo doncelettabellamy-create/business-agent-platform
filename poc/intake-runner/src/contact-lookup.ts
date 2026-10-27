@@ -62,7 +62,10 @@ export function run(argv: readonly string[], env: Readonly<Record<string, string
     if (c === undefined) { io.err('No contact on file for that call (unknown, or past its 30-day retention).'); return 1; }
     io.out(`Name:    ${c.name}`);
     io.out(`Phone:   ${c.phone}`);
-    io.out(`Address: ${c.address}`);
+    io.out(`Address: ${c.address ?? '(none kept)'}`);
+    const state = c.address_state ?? 'unconfirmed';
+    io.out(state === 'confirmed' ? 'Address status: read back to the caller and confirmed by them (not checked against any postal or address data)'
+      : state === 'refused' ? 'Address status: the caller declined to give an address (none kept)' : 'Address status: NOT confirmed by the caller');
     return 0;
   } catch { io.err('refused: the contact could not be read'); return 1; }
   finally { vault.close(); }

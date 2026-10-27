@@ -113,6 +113,8 @@ export interface Masker {
    * capture of the cleaning pilot, which sends them only to the caller over the phone and to the encrypted contact vault). Empty after dispose().
    */
   reveal(): { type: PiiType; token: string; raw: string }[];
+  /** Sets aside every value of this type heard so far: reveal() no longer returns them, so a correction replaces rather than adds to them. Placeholders in text already masked stay. */
+  supersede(type: PiiType): void;
   /** Forgets every raw value. After this, mask() refuses. */
   dispose(): void;
 }
@@ -124,6 +126,7 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
   const counters: Record<PiiType, number> = { Person: 0, Address: 0, 'Contact detail': 0, Identifier: 0 };
   const counts: Record<PiiType, number> = { Person: 0, Address: 0, 'Contact detail': 0, Identifier: 0 };
   let known = new Map<string, string>();   // raw value (lower case) -> placeholder, for this call only
+  let ignored = new Set<string>();   // tokens set aside by supersede()
   let originals: { type: PiiType; token: string; raw: string }[] = [];   // the same values as first said, for reveal(); cleared by dispose()
   let disposed = false;
 
@@ -239,7 +242,8 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
     summary(): PiiCount[] {
       return PII_TYPES.filter((type) => counts[type] > 0).map((type) => ({ type, count: counts[type] }));
     },
-    reveal(): { type: PiiType; token: string; raw: string }[] { return disposed ? [] : originals.map((o) => ({ ...o })); },
-    dispose(): void { disposed = true; known = new Map(); originals = []; },
+    reveal(): { type: PiiType; token: string; raw: string }[] { return disposed ? [] : originals.filter((o) => !ignored.has(o.token)).map((o) => ({ ...o })); },
+    supersede(type: PiiType): void { for (const o of originals) if (o.type === type) ignored.add(o.token); },
+    dispose(): void { disposed = true; known = new Map(); originals = []; ignored = new Set(); },
   };
 }

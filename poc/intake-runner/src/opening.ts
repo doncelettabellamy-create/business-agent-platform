@@ -4,14 +4,18 @@
 // caller to say yes. This file builds that text. By default it is the original test notice, word for word. When the approved config carries an optional
 // `opening` block it is built from the business's own words instead:
 //
-//   1. the CONFIGURED BUSINESS and the AGENT are introduced by name;
-//   2. the DISCLOSURE is given (that this is an automated A I assistant, and what happens to speech); the business may replace the default disclosure wording;
-//   3. a SPECIAL is mentioned ONLY if the business put one in the config. Nothing here, and no model, ever writes, adds, completes or rewords a special:
-//      no `special` key means no special words at all.
+//   1. the CONFIGURED BUSINESS is introduced by name, as the automated A I assistant for it; the AGENT is named too if the config gives a name (none is ever
+//      invented: with no `agent_name` the introduction simply has no name);
+//   2. a SPECIAL is announced ONLY if the business put one in the config, word for word as written. Nothing here, and no model, ever writes, adds, completes
+//      or rewords a special or its terms: no `special` key means no special words at all. The code does not judge what a special says (a price, say); the
+//      business's approval of the config is the approval of its words;
+//   3. the DISCLOSURE is given (that speech is turned into text and personal details are masked); the business may replace the default disclosure wording,
+//      and without a replacement it is the original wording, unchanged;
+//   4. the request to say yes, unchanged.
 // Because the block is part of the config, it is part of the approval digest: changing a name, the disclosure or the special changes the digest, so the
 // founder must approve it again. The wording needs a legal check by the business. The model never sees or produces any of this.
 
-export interface Opening { business_name: string; agent_name: string; disclosure?: string; special?: string }
+export interface Opening { business_name: string; agent_name?: string; disclosure?: string; special?: string }
 
 /** The original notice, unchanged: used whenever the config has no `opening` block. */
 export const DEFAULT_CONSENT_NOTICE = 'Hello. This is an automated A I assistant, part of a test of a business phone line. We do not record the audio. Our phone provider turns your speech into text, and personal details are masked before an A I model reads it. Please say yes to continue, or hang up now.';
@@ -31,7 +35,7 @@ export function openingProblems(o: unknown): string[] {
   for (const k of Object.keys(x)) if (!KEYS.includes(k)) p.push('opening has an unexpected key');
   // An optional key that is present but undefined counts as absent (JSON cannot carry undefined; code may spread one).
   const has = (k: string): boolean => k in x && x[k] !== undefined;
-  for (const k of ['business_name', 'agent_name']) if (!has(k)) p.push(`opening.${k} is required`);
+  if (!has('business_name')) p.push('opening.business_name is required');
   for (const k of KEYS) {
     if (!has(k)) continue;
     const v = x[k];
@@ -50,10 +54,11 @@ const endSentence = (s: string): string => (/[.!?]$/.test(s) ? s : `${s}.`);
 export function consentNoticeFor(opening?: Opening): string {
   if (opening === undefined) return DEFAULT_CONSENT_NOTICE;
   if (openingProblems(opening).length > 0) throw new RangeError('the opening block is not valid');
-  const intro = `Hello. This is ${opening.agent_name}, the automated A I assistant for ${opening.business_name}.`;
-  const disclosure = endSentence(opening.disclosure ?? DEFAULT_DISCLOSURE);
+  const who = opening.agent_name === undefined ? 'the' : `${opening.agent_name}, the`;
+  const intro = `Hello. This is ${who} automated A I assistant for ${opening.business_name}.`;
   const special = opening.special === undefined ? '' : ` ${endSentence(opening.special)}`;
-  return `${intro} ${disclosure}${special} Please say yes to continue, or hang up now.`;
+  const disclosure = endSentence(opening.disclosure ?? DEFAULT_DISCLOSURE);
+  return `${intro}${special} ${disclosure} Please say yes to continue, or hang up now.`;
 }
 
 const xml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');

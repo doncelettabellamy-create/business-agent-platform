@@ -54,7 +54,10 @@ export function freshFrom(item: IntakeResultLike | undefined, covers: number): F
   if (typeof item.category !== 'string' || !Array.isArray(item.missing_fields) || !Array.isArray(item.reasons)) return undefined;
   if (item.missing_fields.some((m) => typeof m !== 'string')) return undefined;
   if (item.reasons.includes('model_failed')) return undefined;
-  return { covers, category: item.category, missing: [...item.missing_fields], ready: item.status === 'ready' };
+  // A request routed to a person (human_review) is never `ready`, but when that is its ONLY reason and nothing is missing it is complete: it is read back and
+  // confirmed like any other, and then held for a person. Any other reason keeps it from being complete.
+  const complete = item.status === 'ready' || (item.category !== 'unknown' && item.missing_fields.length === 0 && item.reasons.length > 0 && item.reasons.every((r) => r === 'human_review'));
+  return { covers, category: item.category, missing: [...item.missing_fields], ready: complete };
 }
 
 export function selectNext(fresh: Fresh | undefined, lines: number, history: AskHistory): Next {

@@ -8,8 +8,8 @@ export const WORK_ITEM_CONTRACT = 'work_item.v1';
 // ambiguous_category and ambiguous_field were added with the local classify-extract skill, and model_failed with the
 // model gateway (draft proposals, unapproved).
 export const REASON_CODES = [
-  'missing_fields', 'unknown_category', 'ambiguous_category', 'ambiguous_field', 'low_confidence', 'model_failed',
-] as const;
+  'missing_fields', 'unknown_category', 'ambiguous_category', 'ambiguous_field', 'low_confidence', 'model_failed', 'human_review',
+] as const;   // human_review: the category is configured to go to a person (route: 'human'); it is never handed off
 export type ReasonCode = (typeof REASON_CODES)[number];
 
 export const ITEM_STATUSES = ['ready', 'needs-human'] as const;

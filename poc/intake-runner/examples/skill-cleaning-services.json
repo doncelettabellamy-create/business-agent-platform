@@ -8,7 +8,7 @@
     "applied": true,
     "source": "synthetic-fixture"
   },
-  "masked_text": "Caller: I need a deep clean for four rooms.\nCaller: The last professional clean was a year ago.\nCaller: Tomorrow please, between 9 AM and 1 PM.",
+  "masked_text": "Caller: I need a deep clean for a house with three bedrooms and two bathrooms.\nCaller: We have one dog.\nCaller: The last professional clean was a year ago, and the kitchen matters most.\nCaller: No extras.\nCaller: Tomorrow please, between 9 AM and 1 PM.",
   "pii_summary": [],
   "skill_config": {
     "categories": [
@@ -29,8 +29,13 @@
           "home cleaning"
         ],
         "requires": [
-          "Number of rooms",
+          "Property type",
+          "Number of bedrooms",
+          "Number of bathrooms",
+          "Pets",
           "Cleaning frequency",
+          "Extras",
+          "First cleaning with us",
           "Preferred date",
           "Time window"
         ]
@@ -47,8 +52,14 @@
           "top to bottom clean"
         ],
         "requires": [
-          "Number of rooms",
+          "Property type",
+          "Number of bedrooms",
+          "Number of bathrooms",
+          "Pets",
           "Last professional clean",
+          "Priority areas",
+          "Extras",
+          "First cleaning with us",
           "Preferred date",
           "Time window"
         ]
@@ -66,11 +77,42 @@
           "end of tenancy clean"
         ],
         "requires": [
-          "Number of rooms",
+          "Property type",
+          "Number of bedrooms",
+          "Number of bathrooms",
+          "Pets",
           "Home empty",
+          "Extras",
+          "First cleaning with us",
           "Preferred date",
           "Time window"
         ]
+      },
+      {
+        "name": "Commercial cleaning",
+        "route": "human",
+        "keywords": [
+          "commercial cleaning",
+          "commercial clean",
+          "commercial",
+          "office cleaning",
+          "office",
+          "offices",
+          "restaurant",
+          "cafe",
+          "shop",
+          "store",
+          "retail",
+          "warehouse",
+          "clinic",
+          "school",
+          "church",
+          "hotel",
+          "salon",
+          "gym",
+          "business premises"
+        ],
+        "requires": []
       }
     ],
     "fields": [
@@ -85,6 +127,44 @@
         }
       },
       {
+        "name": "Property type",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "property type"
+          ]
+        },
+        "choices": [
+          "house",
+          "apartment",
+          "condo",
+          "townhouse"
+        ]
+      },
+      {
+        "name": "Number of bedrooms",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "number of bedrooms",
+            "bedrooms"
+          ]
+        }
+      },
+      {
+        "name": "Number of bathrooms",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "number of bathrooms",
+            "bathrooms"
+          ]
+        }
+      },
+      {
         "name": "Number of rooms",
         "required": false,
         "extractor": {
@@ -92,6 +172,16 @@
           "labels": [
             "number of rooms",
             "rooms"
+          ]
+        }
+      },
+      {
+        "name": "Pets",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "pets"
           ]
         }
       },
@@ -118,6 +208,17 @@
         }
       },
       {
+        "name": "Priority areas",
+        "required": false,
+        "extractor": {
+          "kind": "label",
+          "labels": [
+            "priority areas",
+            "priorities"
+          ]
+        }
+      },
+      {
         "name": "Home empty",
         "required": false,
         "extractor": {
@@ -129,25 +230,30 @@
         }
       },
       {
-        "name": "Pets",
+        "name": "Extras",
         "required": false,
         "extractor": {
           "kind": "label",
           "labels": [
-            "pets"
+            "extras"
           ]
         }
       },
       {
-        "name": "Add-ons",
+        "name": "First cleaning with us",
         "required": false,
         "extractor": {
           "kind": "label",
           "labels": [
-            "add-ons",
-            "add ons"
+            "first cleaning with us",
+            "first cleaning"
           ]
-        }
+        },
+        "choices": [
+          "yes",
+          "no"
+        ],
+        "role": "first_clean"
       },
       {
         "name": "Preferred date",

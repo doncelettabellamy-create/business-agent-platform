@@ -28,7 +28,7 @@ export interface DialogueClient {
  */
 export type Directive =
   | { kind: 'open' }
-  | { kind: 'ask'; field: string; again?: boolean }
+  | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[] }
   | { kind: 'clarify'; categories?: readonly string[] }
   | { kind: 'listen' };
 export interface DialogueInput {
@@ -47,8 +47,8 @@ export const DIALOGUE_INSTRUCTION = [
   'Speak in short, natural, friendly sentences: at most two per reply, and ask for only one thing at a time.',
   'The last line of this message starts with NEXT. Do exactly what it says and nothing else.',
   'NEXT OPEN: greet the caller briefly and ask how you can help.',
-  'NEXT ASK <item>: ask one short, plain question about that item only. If it says it was asked before, ask it a different way, briefly. Never ask about any other item.',
-  'NEXT CLARIFY with names: ask in plain words whether the caller is calling about one of those. NEXT CLARIFY with no names: ask the caller to say in a few words what they need.',
+  'NEXT ASK <item>: ask one short, plain question about that item only. If it says it was asked before, ask it a different way, briefly. Never ask about any other item. Ask the open question and accept the caller\'s own words: never suggest options, examples, extras, services, specials or prices of your own, except the CHOICES a NEXT line lists: when it lists CHOICES, offer exactly those, in that order, as the business\'s options, and still accept any other answer in the caller\'s own words.',
+  'NEXT CLARIFY with names: ask in plain words whether the caller is calling about one of those, offering only those names. NEXT CLARIFY with no names: ask the caller to say in a few words what they need.',
   'NEXT LISTEN: acknowledge briefly and invite the caller to go on. Do not ask for any specific item.',
   "Accept whatever words the caller uses. Never repeat the caller's answers, never read back personal details, and never say anything that appears in square brackets.",
   'Never say goodbye, never thank the caller for calling, and never say the request is recorded: only the system ends the call.',
@@ -80,7 +80,11 @@ export function renderDirective(d: Directive): string {
   const name = (s: unknown): string => { if (typeof s !== 'string' || !NAME.test(s)) throw new RangeError('a field or category name is not acceptable'); return s; };
   switch (d?.kind) {
     case 'open': return 'NEXT OPEN';
-    case 'ask': return `NEXT ASK ${name(d.field)}${d.again === true ? ' (asked before: ask it a different way)' : ''}`;
+    case 'ask': {
+      const again = d.again === true ? ' (asked before: ask it a different way)' : '';
+      const choices = d.choices === undefined || d.choices.length === 0 ? '' : ` CHOICES: ${d.choices.slice(0, 10).map(name).join('; ')}`;
+      return `NEXT ASK ${name(d.field)}${again}${choices}`;
+    }
     case 'clarify': return d.categories === undefined || d.categories.length === 0 ? 'NEXT CLARIFY' : `NEXT CLARIFY: ${d.categories.slice(0, 10).map(name).join('; ')}`;
     case 'listen': return 'NEXT LISTEN';
     default: throw new RangeError('unknown directive');

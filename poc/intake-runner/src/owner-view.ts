@@ -29,6 +29,8 @@ export const OWNER_TEXT = Object.freeze({
   notConfirmed: 'Not confirmed by the caller',
   followUpUnconfirmed: 'Follow up: the caller did not confirm the details.',
   verifyAddress: 'Verify the address with the caller.',
+  addressConfirmedLabel: 'Address',
+  addressConfirmedValue: 'Confirmed by the caller on the phone. Not checked against any address data.',
   decideKind: 'Decide what kind of request this is.',
   review: 'A person should review this request.',
   ready: 'Ready for follow-up.',
@@ -85,7 +87,7 @@ const isIso = (s: unknown): s is string => typeof s === 'string' && ISO.test(s) 
 function checkRecord(r: unknown): asserts r is IntakeRecord {
   const x = r as Record<string, unknown> | null;
   const ok = typeof x === 'object' && x !== null && isIso(x.received_at) && typeof x.category === 'string' && Array.isArray(x.fields) && Array.isArray(x.missing_fields)
-    && (x.confirmation === 'confirmed' || x.confirmation === 'unconfirmed') && (x.address_status === 'unverified' || x.address_status === 'none')
+    && (x.confirmation === 'confirmed' || x.confirmation === 'unconfirmed') && (x.address_status === 'unverified' || x.address_status === 'none' || x.address_status === 'caller_confirmed')
     && (x.status === 'ready' || x.status === 'needs-human') && typeof x.handed_off === 'boolean'
     && (x.fields as unknown[]).every((f) => typeof f === 'object' && f !== null && typeof (f as Record<string, unknown>).name === 'string');
   if (!ok) throw new RangeError('not an intake record');
@@ -120,6 +122,8 @@ export function toOwnerCall(record: IntakeRecord): OwnerCall {
     else if (summary === null && SUMMARY_NAME.test(f.name)) summary = value;
     else if (details.length < MAX_DETAILS) details.push({ label, value });
   }
+  // A caller-confirmed address is stated as exactly that, first so it is never cut off, and never as a check.
+  if (record.address_status === 'caller_confirmed') details.unshift({ label: OWNER_TEXT.addressConfirmedLabel, value: OWNER_TEXT.addressConfirmedValue });
   const { actions, needsFollowUp } = actionsFor(record);
   const category = record.category === 'unknown' ? null : showable(record.category, 80);
   return Object.freeze({
@@ -130,7 +134,7 @@ export function toOwnerCall(record: IntakeRecord): OwnerCall {
     statusText: record.confirmation === 'confirmed' ? OWNER_TEXT.confirmed : OWNER_TEXT.notConfirmed,
     needsFollowUp,
     nextActions: Object.freeze(actions) as string[],
-    addressGiven: record.address_status === 'unverified',
+    addressGiven: record.address_status === 'unverified' || record.address_status === 'caller_confirmed',
   });
 }
 
