@@ -21,3 +21,6 @@ founder-call.stop
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# Founder voice test: the private voice settings file is never committed.
+founder-voice.config.json

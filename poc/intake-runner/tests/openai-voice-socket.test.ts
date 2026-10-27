@@ -270,5 +270,5 @@ test('static: the file reads no environment, logs nothing, imports only a type, 
   assert.ok(/^import type \{ VoiceSocket \}/m.test(own), 'a type import only');
   assert.deepEqual([...own.matchAll(/wss?:\/\/[^'"`\s)]+/g)].map((m) => m[0]), ['wss://api.openai.com/v1/realtime'], 'one address, and it is OpenAI\'s');
   assert.ok(!/diag\((?!'VOICE_[A-Z_]+'\))/.test(own), 'every diagnostic is a fixed code literal, never a variable');
-  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'openai-voice-socket.ts')) assert.equal(/openai-voice-socket/.test(code(f)), f === 'founder-voice-entry.ts', `${f}: only the voice entry (not the live Claude entry) may use the voice socket`);
+  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'openai-voice-socket.ts')) assert.equal(/openai-voice-socket/.test(code(f)), ['founder-voice-entry.ts', 'founder-voice-check.ts'].includes(f), `${f}: only the voice entry and the check command (not the live Claude entry) may use the voice socket`);
 });

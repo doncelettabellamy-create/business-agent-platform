@@ -166,5 +166,5 @@ test('static: the client reads no environment and logs nothing; the dialogue mod
   assert.deepEqual([...own.matchAll(/https?:\/\/[^'"`\s)]+/g)].map((m) => m[0]), ['https://api.openai.com/v1/responses'], 'one address, and it is OpenAI\'s');
   const dlg = code('openai-dialogue-model.ts');
   for (const bad of [/process\./, /console\./, /fetch\s*\(/, /node:/, /@anthropic-ai|from 'openai'/]) assert.ok(!bad.test(dlg), String(bad));
-  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'openai-http-client.ts')) assert.equal(/openai-http-client/.test(code(f)), f === 'founder-voice-entry.ts', `${f}: only the voice entry may build the real OpenAI client`);
+  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'openai-http-client.ts')) assert.equal(/openai-http-client/.test(code(f)), ['founder-voice-entry.ts', 'founder-voice-check.ts'].includes(f), `${f}: only the voice entry and the check command may build the real OpenAI client`);
 });

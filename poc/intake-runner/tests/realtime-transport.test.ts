@@ -607,6 +607,18 @@ test('adapter: a hang-up does not wait forever for a reply that never finishes',
   await sim.waitFor(() => sim.hungUp, 1000);
 });
 
+test('adapter: sameSpeech treats "$25" and "twenty-five dollars" as the same words, a number in words as its numerals, and still refuses a different amount or digit', () => {
+  const asked = '$25 off a qualifying first standard cleaning';
+  for (const said of ['Twenty-five dollars off a qualifying first standard cleaning.', 'twenty five dollars off a qualifying first standard cleaning', '25 dollars off a qualifying first standard cleaning', '$25 off a qualifying first standard cleaning']) assert.ok(sameSpeech(asked, said), said);
+  for (const said of ['Twenty dollars off a qualifying first standard cleaning', 'Thirty-five dollars off a qualifying first standard cleaning', '$52 off a qualifying first standard cleaning', 'Twenty-five off a qualifying first standard cleaning', '$25 off a qualifying first deep cleaning', '']) assert.ok(!sameSpeech(asked, said), said);
+  assert.ok(sameSpeech('That is a $5 fee', 'that is a five dollar fee'));
+  assert.ok(sameSpeech('Is it 15 or 40?', 'is it fifteen or forty'));
+  assert.ok(!sameSpeech('Is it 15 or 40?', 'is it fifty or forty'));
+  // Amounts it does not fold fail closed (a call whose notice used one would end at the notice), which is the safe direction.
+  assert.ok(!sameSpeech('That costs $199.99', 'that costs one hundred ninety-nine dollars and ninety-nine cents'));
+  assert.ok(!sameSpeech('That costs $1,250', 'that costs one thousand two hundred fifty dollars'));
+});
+
 test('adapter: sameSpeech ignores case, punctuation and spacing and accepts a digit said as a word, but nothing else', () => {
   assert.ok(sameSpeech('Your callback number: 5 5 5 0 1 0 0 1 9 9.', 'your callback number five five five oh one zero zero one nine nine'));
   assert.ok(sameSpeech('Is that correct? Please say yes or no.', 'is that correct please say yes or no'));
@@ -633,8 +645,8 @@ test('boundary: the adapter imports only local files, holds no credential or net
   for (const banned of [/\bfetch\s*\(/, /process\./, /node:/, /console\./, /api[_-]?key/i, /authorization/i, /https?:\/\//, /wss?:\/\//, /from\s+'openai'/, /require\s*\(/, /\beval\s*\(/, /new Function/, /input_audio_buffer\.append/]) {
     assert.ok(!banned.test(adapter), `banned pattern in the adapter: ${banned}`);
   }
-  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'realtime-transport.ts' && n !== 'realtime-bridge.ts')) {   // the bridge (offline, itself unused) is the one file that joins it to a phone and a voice socket
-    assert.ok(!/realtime-transport/.test(code(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'))), `${f} must not import the Realtime adapter yet`);
+  for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'realtime-transport.ts' && n !== 'realtime-bridge.ts')) {   // the bridge joins it to a phone and a voice socket; the connection check drives the same adapter against the real service
+    assert.equal(/realtime-transport/.test(code(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'))), f === 'voice-check.ts', `${f}: only the connection check may import the Realtime adapter besides the bridge`);
   }
   const handler = code(src('relay-handler'));
   for (const name of ['response.create', 'response.done', 'speech_started', 'session.update', 'conversation.item', 'carrier.start', 'x_played_ms']) assert.ok(!handler.includes(name), `relay-handler.ts must not name ${name}`);

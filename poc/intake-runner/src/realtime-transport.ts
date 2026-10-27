@@ -60,12 +60,22 @@ export function wordsOf(instructions: string): string {
   const at = instructions.indexOf(SAY_PREFIX);
   return at < 0 ? instructions : instructions.slice(at + SAY_PREFIX.length);
 }
-const DIGITS: Readonly<Record<string, string>> = { zero: '0', oh: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9' };
+const UNITS: Readonly<Record<string, string>> = { zero: '0', oh: '0', one: '1', two: '2', three: '3', four: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9', ten: '10', eleven: '11', twelve: '12', thirteen: '13', fourteen: '14', fifteen: '15', sixteen: '16', seventeen: '17', eighteen: '18', nineteen: '19' };
+const TENS: Readonly<Record<string, string>> = { twenty: '2', thirty: '3', forty: '4', fifty: '5', sixty: '6', seventy: '7', eighty: '8', ninety: '9' };
 
-/** Whether two spoken texts are the same words: case, punctuation and spacing are ignored, and a digit may be said as a word ("five") or a numeral ("5"). Pure. */
+/** One canonical form for comparing what was asked with what was said: case, punctuation and spacing are ignored; a number may be said as words ("five", "twenty-five") or written as numerals ("5", "25"); "$25" and "twenty-five dollars" agree. Pure. */
+function spokenForm(s: string): string {
+  return s.toLowerCase()
+    .replace(/\$\s?(\d+(?:\.\d+)?)/g, '$1 dollars')   // "$25" -> "25 dollars" (a comma-grouped or spoken-hundreds amount is not folded, so it fails closed)
+    .replace(/\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)[\s-]+(one|two|three|four|five|six|seven|eight|nine)\b/g, (_m, tens: string, unit: string) => TENS[tens] + UNITS[unit])   // twenty-five -> 25
+    .replace(/\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b/g, (_m, tens: string) => `${TENS[tens]}0`)   // twenty -> 20
+    .replace(/\b(zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen)\b/g, (w: string) => UNITS[w])
+    .replace(/\bdollars?\b/g, 'dollar')
+    .replace(/[^a-z0-9]+/g, '');
+}
+/** Whether two spoken texts are the same words (see spokenForm). Nothing said is never a match. Pure. */
 export function sameSpeech(a: string, b: string): boolean {
-  const norm = (s: string): string => s.toLowerCase().replace(/\b(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)\b/g, (w) => DIGITS[w]).replace(/[^a-z0-9]+/g, '');
-  return typeof a === 'string' && typeof b === 'string' && norm(a).length > 0 && norm(a) === norm(b);
+  return typeof a === 'string' && typeof b === 'string' && spokenForm(a).length > 0 && spokenForm(a) === spokenForm(b);
 }
 
 const BENIGN: ReadonlySet<string> = new Set(['session.created', 'session.updated', 'input_audio_buffer.speech_stopped', 'input_audio_buffer.committed', 'conversation.item.created', 'conversation.item.added', 'conversation.item.done',

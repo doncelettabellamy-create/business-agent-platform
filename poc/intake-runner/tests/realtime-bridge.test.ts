@@ -469,6 +469,6 @@ test('static: the bridge opens no connection, reads no environment, holds no key
     assert.ok(!bad.test(own), String(bad));
   }
   for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((x) => x.endsWith('.ts') && x !== 'realtime-bridge.ts' && x !== 'openai-voice-socket.ts')) {   // the voice socket names the bridge's VoiceSocket type only
-    assert.equal(/realtime-bridge/.test(code(f)), f === 'founder-voice-service.ts', `${f}: only the voice service (not the live Claude entry) may use the bridge`);
+    assert.equal(/realtime-bridge/.test(code(f)), ['founder-voice-service.ts', 'voice-check.ts'].includes(f), `${f}: only the voice service and the connection check (not the live Claude entry) may use the bridge`);
   }
 });

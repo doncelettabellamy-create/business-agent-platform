@@ -8,7 +8,12 @@ import type { VoiceSocket } from '../../src/realtime-bridge.ts';
 import type { CloseInfo, RelayConnection } from '../../src/ws-server.ts';
 
 const WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
-export type Behaviour = 'exact' | 'words' | 'silent' | 'fail' | { say: string };
+export type Behaviour = 'exact' | 'words' | 'currency' | 'silent' | 'fail' | { say: string };
+const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+const numberWords = (n: number): string => (n < 20 ? ONES[n] : `${TENS[Math.floor(n / 10)]}${n % 10 === 0 ? '' : '-' + ONES[n % 10]}`);
+/** How a voice model reads an amount: "$25 off" becomes "twenty-five dollars off". */
+export const asSpokenCurrency = (s: string): string => s.replace(/\$(\d{1,2})\b/g, (_m, n: string) => `${numberWords(Number(n))} dollars`);
 const tick = (ms = 0): Promise<void> => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.(); });
 export const b64 = (bytes: number): string => Buffer.alloc(bytes, 0x7f).toString('base64');
 
@@ -121,12 +126,14 @@ export function createWireVoice(o: { msPerChar?: number; behave?: (text: string,
       play = undefined;
       let status = 'completed'; let transcript: string | undefined = p.text;
       if (p.b === 'words') transcript = asWords(p.text);
+      else if (p.b === 'currency') transcript = asSpokenCurrency(p.text);
       else if (p.b === 'silent') transcript = undefined;
       else if (p.b === 'fail') { status = 'failed'; transcript = undefined; }
       else if (typeof p.b === 'object') transcript = p.b.say;
       if (transcript !== undefined) deliver({ type: 'response.output_audio_transcript.done', response_id: p.rid, transcript });
       if (status === 'completed' && transcript !== undefined) spoken.push(transcript);
-      deliver({ type: 'response.done', response: { id: p.rid, status, metadata: { id: p.mid } } });
+      const audioTokens = Math.ceil((p.text.length * mpc) / 50);
+      deliver({ type: 'response.done', response: { id: p.rid, status, metadata: { id: p.mid }, usage: { input_tokens: 150, output_tokens: audioTokens, output_token_details: { audio_tokens: audioTokens, text_tokens: 0 } } } });
     };
     p.timer = setTimeout(step, 1); p.timer.unref?.();
   }
@@ -144,7 +151,7 @@ export function createWireVoice(o: { msPerChar?: number; behave?: (text: string,
       const m = JSON.parse(text);
       received.push(m);
       if (m.type === 'input_audio_buffer.append') appended++;
-      else if (m.type === 'session.update') { { const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return true; } } settings = m.session; const td = m.session?.audio?.input?.turn_detection; if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response; }
+      else if (m.type === 'session.update') { { const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return true; } } deliver({ type: 'session.updated', session: m.session }); settings = m.session; const td = m.session?.audio?.input?.turn_detection; if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response; }
       else if (m.type === 'response.create') { const why = refusalFor(m); if (why !== undefined) refuse(m, why, 'invalid_request_error'); else begin(m); }
       else if (m.type === 'response.cancel') {
         if (typeof m.response_id !== 'string') refused.push('response.cancel without response_id');   // not in the default conversation: it reaches nothing
