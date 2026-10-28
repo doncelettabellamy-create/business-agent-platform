@@ -37,6 +37,7 @@ What this means in practice for the order in section 3:
 5. **Commits, pushes, restarts, deployments, configuration or digest changes, and anything that touches live services** are each their own explicit request, never a side effect of finishing a task.
 6. **Scope stays small.** If a task turns out to need more than was approved (another file area, another agent, a dashboard change), stop and ask; do not widen it.
 7. **The dashboard constraint is part of every review.** A task that touches the dashboard states what existing behaviour it leaves unchanged (section 1a); the founder's review confirms it.
+8. **Researching a tool is not approval to implement it (founder rule, recorded 2026-10-28).** Reading a tool's documentation or source, comparing it with the current design, or proposing a design for it does not change the active direction and is not approval to build it. Before the active direction changes (for example from the current voice connection to GPT-Live), the effects are explained to the founder (what changes, what is kept, what is at risk, what it costs, what stops working) and the founder's explicit approval is obtained. Work begun ahead of that approval is paused and preserved separately, not finished. Example: the GPT-Live consent edits were paused on 2026-10-28 and saved outside the repository (unfinished, untested); the committed Intake memory checkpoint remains the active build.
 
 ## 2. Delivery strategy
 
