@@ -13,6 +13,9 @@ import { createMasker } from './pii-screen.ts';
 import type { PiiCount } from './pii-screen.ts';
 import { contactMissing, extractContact } from './contact-capture.ts';
 import type { Contact } from './contact-capture.ts';
+import { createContactState } from './call-state.ts';
+import type { CollectOutcome, ContactField, ContactStatus } from './call-state.ts';
+import type { PiiType } from './pii-screen.ts';
 
 export interface SessionLimits { maxTurns: number; maxMinutes: number; maxChars: number }
 export interface SessionConfig {
@@ -25,13 +28,19 @@ export interface SessionConfig {
   killed: () => boolean;
 }
 export type LimitReason = 'TURNS' | 'TIME' | 'CHARS' | 'KILLED';
-export type Hear = { ok: true; line: string } | { ok: false; code: 'TOO_LONG' | 'ODD_TEXT' | 'RESIDUAL' | 'ENDED' };
+/** What the server captured from this line for a contact item (the one just asked for, or one the caller volunteered with an explicit cue). Fixed words only: never the value. */
+export interface HeardContact { field: ContactField; outcome: CollectOutcome }
+export type Hear = { ok: true; line: string; contact?: HeardContact[] } | { ok: false; code: 'TOO_LONG' | 'ODD_TEXT' | 'RESIDUAL' | 'ENDED' };
 export interface DialogueTurn { role: 'user' | 'assistant'; text: string }
 export interface CallSession {
   readonly state: 'consent' | 'active' | 'ended';
   /** Judges the caller's answer to the consent notice. Anything but a plain yes is a no. */
   consent(raw: unknown): 'granted' | 'declined';
-  hear(raw: unknown): Hear;
+  /**
+   * Takes in one caller line. `expecting` is the contact item the assistant just asked for: the line is taken as its answer and validated by the server (call-state.ts), whether or not
+   * a masking rule would have recognised it. `correcting` makes an answer replace an earlier one. An explicit cue ("my name is ...") is always taken. Only the masked line is kept.
+   */
+  hear(raw: unknown, expecting?: ContactField, correcting?: boolean): Hear;
   /** Judges the caller's answer to the read-back (the MASKED line). A refusal wins over a yes, and a long answer is never a plain yes. */
   answer(line: unknown): 'yes' | 'no' | 'unclear';
   /** Records what the assistant said in full. */
@@ -44,6 +53,10 @@ export interface CallSession {
   piiSummary(): PiiCount[];
   /** The fixed names of the contact items (name, callback number, service address) the caller has not yet given in a usable form. No caller data. */
   contactMissing(): string[];
+  /** Which contact items are captured and which are missing, as fixed labels. No caller data. */
+  contactStatus(): ContactStatus;
+  /** A phone number heard in pieces, not yet complete. */
+  phonePending(): boolean;
   /**
    * The caller's name, callback number and service address, only when all three are usable. RAW personal data: for the spoken read-back of the number
    * and the encrypted contact vault, nowhere else.
@@ -74,6 +87,15 @@ export function createCallSession(config: SessionConfig): CallSession {
   }
   const started = config.now();
   const masker = createMasker({ names: config.names });
+  const contact = createContactState();
+  let seenPhone: string | undefined;
+  const TYPE: Record<ContactField, PiiType> = { name: 'Person', phone: 'Contact detail', address: 'Address' };
+  /** The server-captured items, with the masker's detections filling only what the server has not captured (a caller who volunteered details unasked). */
+  const parts = (): { name?: string; phone?: string; address?: string } => {
+    const seen = extractContact(masker.reveal());
+    for (const k of ['name', 'phone', 'address'] as const) contact.fallback(k, seen[k]);
+    return contact.parts();
+  };
   let state: 'consent' | 'active' | 'ended' = 'consent';
   let lines: string[] = [];
   let talk: DialogueTurn[] = [];
@@ -88,15 +110,28 @@ export function createCallSession(config: SessionConfig): CallSession {
       if (!ok) this.dispose();
       return ok ? 'granted' : 'declined';
     },
-    hear(raw: unknown): Hear {
+    hear(raw: unknown, expecting?: ContactField, correcting = false): Hear {
       if (state !== 'active') return { ok: false, code: 'ENDED' };
-      const m = masker.mask(raw);
+      // Capture first (server-validated), then mask: what was captured is taught to the masker so this line never carries it to a model.
+      const heardContact: HeardContact[] = [];
+      if (typeof raw === 'string' && raw.length <= 1000) {
+        const results = contact.volunteered(raw);
+        if (expecting !== undefined && !results.some((r) => r.field === expecting)) results.push(contact.collect(expecting, raw, correcting));
+        for (const r of results) { heardContact.push({ field: r.field, outcome: r.outcome }); for (const l of r.learn) masker.learn(TYPE[r.field], l); }
+      }
+      let m = masker.mask(raw);
+      // A contact answer the masker's own fail-closed rules would refuse (a number said in an odd way) is not lost and does not end the call: the server already holds it, and the
+      // line the model reads is only a placeholder.
+      if (!m.ok && (m.code === 'RESIDUAL') && expecting !== undefined && heardContact.some((h) => h.field === expecting && h.outcome !== 'unclear')) m = { ok: true, text: '[CONTACT_0]' };
       if (!m.ok) return { ok: false, code: m.code };
+      // A complete callback number the masker recognised in this line replaces an earlier one, whether or not it was asked for (the newest wins).
+      const seenNow = extractContact(masker.reveal()).phone;
+      if (seenNow !== undefined && seenNow !== seenPhone) { seenPhone = seenNow; contact.set('phone', seenNow); }
       lines.push(`Caller: ${m.text}`);
       chars += m.text.length + 8;
       talk.push({ role: 'user', text: m.text });
       if (talk.length > MAX_DIALOGUE) talk = talk.slice(-MAX_DIALOGUE);
-      return { ok: true, line: m.text };
+      return { ok: true, line: m.text, ...(heardContact.length > 0 ? { contact: heardContact } : {}) };
     },
     answer(line: unknown): 'yes' | 'no' | 'unclear' {
       if (typeof line !== 'string' || line.length === 0 || line.length > 400) return 'unclear';
@@ -118,11 +153,13 @@ export function createCallSession(config: SessionConfig): CallSession {
     maskedText(): string { return lines.join('\n'); },
     turns(): number { return lines.length; },
     piiSummary(): PiiCount[] { return masker.summary(); },
-    contactMissing(): string[] { return contactMissing(extractContact(masker.reveal())); },
-    revealContactParts(): { name?: string; phone?: string; address?: string } { return extractContact(masker.reveal()); },
-    forgetAddress(): void { masker.supersede('Address'); },
+    contactMissing(): string[] { return contactMissing(parts()); },
+    contactStatus(): ContactStatus { parts(); return contact.status(); },
+    phonePending(): boolean { return contact.pendingPhone(); },
+    revealContactParts(): { name?: string; phone?: string; address?: string } { return parts(); },
+    forgetAddress(): void { masker.supersede('Address'); contact.clear('address'); },
     revealContact(): Contact | undefined {
-      const c = extractContact(masker.reveal());
+      const c = parts();
       return c.name !== undefined && c.phone !== undefined && c.address !== undefined ? { name: c.name, phone: c.phone, address: c.address } : undefined;
     },
     dialogue(): DialogueTurn[] { return talk.map((t) => ({ ...t })); },
@@ -133,6 +170,6 @@ export function createCallSession(config: SessionConfig): CallSession {
       if (config.now() - started >= limits.maxMinutes * 60_000) return 'TIME';
       return null;
     },
-    dispose(): void { state = 'ended'; lines = []; talk = []; chars = 0; masker.dispose(); },
+    dispose(): void { state = 'ended'; lines = []; talk = []; chars = 0; contact.dispose(); masker.dispose(); },
   };
 }

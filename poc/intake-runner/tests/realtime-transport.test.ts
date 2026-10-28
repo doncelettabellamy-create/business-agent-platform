@@ -329,7 +329,10 @@ test('masking boundary: the raw transcript reaches the call logic only; nothing 
   }
   // The read-back is the one place the number is spoken, because the caller is read it back over the phone.
   assert.equal(SAYS(r.sim).filter((s) => s.includes('5 5 5 0 1 0 0 1 9 9')).length, 1);
-  assert.ok(!everything.includes('Sam Example') && !everything.includes('Elm Street'), 'neither the name nor the address was spoken back yet');
+  // The name is spoken back to the caller in the read-back (and only there); the address is not spoken back yet.
+  assert.equal(SAYS(r.sim).filter((s) => s.includes('Your name: Sam Example.')).length, 1);
+  assert.equal(r.sim.sent.filter((m) => raw(m).includes('Sam Example') && m.type !== 'response.create').length, 0, 'the name is in no message but the spoken read-back');
+  assert.ok(!everything.includes('Elm Street'), 'the address was not spoken back yet');
   assert.ok(r.sim.sent.filter((m) => m.type === 'conversation.item.delete').length >= 3, 'every transcript item is deleted from the voice service');
   assert.ok(r.sim.sent.every((m) => m.type !== 'input_audio_buffer.append'), 'the adapter never sends audio');
   assert.ok(r.sim.sent.filter((m) => m.type === 'response.create').every((m) => m.response.conversation === 'none'));

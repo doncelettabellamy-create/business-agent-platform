@@ -23,9 +23,11 @@ import type { CallSession, SessionLimits } from './call-session.ts';
 import { runCallIntake } from './call-intake.ts';
 import type { IntakeEntry } from './intake-entry.ts';
 import { fallbackText } from './dialogue-model.ts';
-import type { DialogueModel, Directive } from './dialogue-model.ts';
+import type { CallStatus, DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
-import { spokenDigits } from './contact-capture.ts';
+import { CONTACT_FIELDS, spokenDigits } from './contact-capture.ts';
+import { MAX_CLARIFICATIONS } from './call-state.ts';
+import type { ContactField } from './call-state.ts';
 import { isBareAnswer, parseFirstClean } from './first-clean.ts';
 import type { Contact } from './contact-capture.ts';
 import type { AddressState, ContactVault, StoredContact } from './contact-vault.ts';
@@ -51,6 +53,12 @@ export function redactSensitive(fields: readonly { name: string; value: string |
 }
 /** Reason on a confirmed request whose contact could not be stored: it is held for a person. */
 export const CONTACT_MISSING = 'contact_missing';
+/** Reason on a request saved after an item was asked for and still not obtained (the safe incomplete outcome): it is held for a person, never handed off. */
+export const INCOMPLETE = 'incomplete_call';
+/** The contact items by the fixed label the assistant is told to ask for. */
+const CONTACT_OF_LABEL: Readonly<Record<string, ContactField>> = Object.freeze({ [CONTACT_FIELDS.name]: 'name', [CONTACT_FIELDS.phone]: 'phone', [CONTACT_FIELDS.address]: 'address' });
+/** Consecutive caller turns on which the dialogue model failed outright (after one retry each) before the call is ended with the apology. */
+const MAX_MODEL_FAILURES = 3;
 
 export const SAY = Object.freeze({
   declined: 'No problem. This test line will not continue. Goodbye.',
@@ -67,6 +75,7 @@ export const SAY = Object.freeze({
   addressMissing: 'I did not catch an address. What is the service address?',
   addressRefused: 'Understood. I will not keep an address. Your request is recorded. Goodbye.',
   unconfirmed: 'Thank you. I could not confirm the details. Goodbye.',
+  incomplete: 'Thank you. I could not get all the details I need, so I cannot complete this request. Goodbye.',
 });
 
 /** How long a spoken line needs to play: a fixed pad plus a time per character, never more than the cap. Pure. */
@@ -153,7 +162,7 @@ interface Attempt { said: string; chars: number; parts: number; failed: number; 
 interface Preview { item: WorkItemV1; handedOff: boolean; handoff: HandoffEnvelopeV1 | null }
 
 /** The read-back, in fixed words: the non-address fields only. A placeholder is never spoken, and a value that still looks personal is left out. */
-export function readBackText(item: WorkItemV1, phone?: string): string {
+export function readBackText(item: WorkItemV1, phone?: string, name?: string): string {
   const parts: string[] = [];
   for (const f of item.fields) {
     if (!f.found || f.value === null || /address/i.test(f.name)) continue;
@@ -161,8 +170,9 @@ export function readBackText(item: WorkItemV1, phone?: string): string {
     if (v.length === 0 || piiProblems(v).length > 0) continue;
     parts.push(`${f.name}: ${v}.`);
   }
+  const who = name === undefined ? '' : ` Your name: ${name}.`;
   const callback = phone === undefined ? '' : ` Your callback number: ${spokenDigits(phone)}.`;
-  return `Let me check what I have. ${parts.length > 0 ? parts.join(' ') : 'I have your request.'}${callback} Is that correct? Please say yes or no.`;
+  return `Let me check what I have. ${parts.length > 0 ? parts.join(' ') : 'I have your request.'}${who}${callback} Is that correct? Please say yes or no.`;
 }
 
 export function createRelayHandler(deps: RelayDeps): RelayHandler {
@@ -212,6 +222,15 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     // The field the assistant asked about most recently, but ONLY once that question was cleanly delivered (words produced, every write accepted, not cut short by the caller
     // or the end of the call) and not since reported as talked over. Until the caller's next line is read. See speak() and the interrupt handler.
     let activeAsk: string | undefined;
+    // Current-call state beyond the rotation (call-state.ts holds the contact values themselves). The contact item just asked for, and whether the question was HEARD: the caller's next line is taken as its
+    // answer and validated by the server. How many times each item has been asked AND heard (a question talked over does not count), the model-failure run, and whether this is a correction turn.
+    let contactAsk: { field: ContactField; heard: boolean } | undefined;
+    let lastAsk: { field: string; prevAt: number | undefined; counted: boolean } | undefined;
+    const askCount = new Map<string, number>();
+    let modelFailures = 0;
+    let partialCredits = 0;
+    let correcting = false;
+    let incompleteCall = false;
     let lastReply = '';   // the full text of the assistant's most recent reply, to compare with what the phone provider says was spoken before an interruption
     let capture: { yes: boolean; text: string } | undefined;   // the caller's newest attributable first-cleaning answer (their own masked words)
     let phase: 'collect' | 'confirm' | 'address' | 'addressfix' = 'collect';
@@ -339,7 +358,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const record: IntakeRecord = {
         item_id: w.item_id, workspace_id: tenant, call_ref: ref, received_at: deps.nowIso(), category: w.category,
         status: ok ? w.status : 'needs-human',
-        reasons: ok || reviewed ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : [])])], missing_fields: [...w.missing_fields],
+        reasons: ok || reviewed ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : []), ...(incompleteCall ? [INCOMPLETE] : [])])], missing_fields: [...w.missing_fields],
         // A field that holds a person's name, number or e-mail never keeps its value in the record, even if the masker missed it (a lower-case name).
         fields: redactSensitive(w.fields),
         pii_summary: w.pii_summary.map((p) => ({ type: p.type, count: p.count })),
@@ -390,7 +409,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     }
 
     /** One try at a reply: streams the model's words to the phone as they come. Returns what happened, in counts. `limitMs` bounds the wait for the FIRST word only. */
-    async function attemptReply(directive: Directive, limitMs?: number): Promise<Attempt> {
+    async function attemptReply(directive: Directive, limitMs?: number, status?: CallStatus): Promise<Attempt> {
       const s = session as CallSession;
       const controller = new AbortController();
       streaming = controller;
@@ -403,7 +422,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const total = setTimeout(expire, replyTotalMs); total.unref?.();
       const stopped = new Promise<'stop'>((resolve) => { controller.signal.addEventListener('abort', () => resolve('stop'), { once: true }); });
       try {
-        const it = deps.dialogue.reply({ turns: s.dialogue(), directive, signal: controller.signal })[Symbol.asyncIterator]();
+        const it = deps.dialogue.reply({ turns: s.dialogue(), directive, ...(status === undefined ? {} : { status }), signal: controller.signal })[Symbol.asyncIterator]();
         for (;;) {
           const pending = it.next(); pending.catch(() => {});   // a model that fails after we stopped waiting must not become an unhandled rejection
           const n = await Promise.race([pending, stopped]);
@@ -434,7 +453,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
      * runs out of time, the server asks the same thing itself in fixed words (fallbackText). Nothing is retried once any word has been sent, so nothing is said twice, and
      * a caller who talks over the reply stops both the retry and the fallback.
      */
-    async function speak(directive: Directive): Promise<boolean> {
+    async function speak(directive: Directive, status?: CallStatus): Promise<boolean> {
       const s = session as CallSession;
       const began = deps.now();
       // What happened to a try, in numbers: how much was produced, how soon, whether any write was refused. Plus, for an empty try, how the model's stream ended (fixed word and numbers).
@@ -452,20 +471,37 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       };
       // A refusal is the model's own stop reason on a stream with no words (never inferred from text): retrying the same request is pointless, so it goes straight to the fixed wording.
       const refused = (x: Attempt): boolean => !x.threw && !x.timedOut && !x.stalled && !x.aborted && modelEnd().stop === 'REFUSAL';
-      let a = await attemptReply(directive, replyFirstWordMs);
+      // The model's own error, as fixed words and a status number (never its message).
+      const failure = (a: Attempt): Record<string, number | string> => {
+        const errs = deps.dialogue.stats?.errors;
+        const l = Array.isArray(errs) && errs.length > 0 ? errs[errs.length - 1] : undefined;
+        const name = l === undefined || l === null ? '' : String(l.name ?? '').replace(/[^A-Za-z]+/g, '_').toUpperCase().slice(0, 30);
+        return { chars: a.chars, parts: a.parts, failed_sends: a.failed, ...(/^[A-Z_]+$/.test(name) ? { error: name } : {}), ...(l !== undefined && l !== null && typeof l.status === 'number' ? { status: l.status } : {}) };
+      };
+      let a = await attemptReply(directive, replyFirstWordMs, status);
       let tries = 1;
-      if (!a.threw && (!a.aborted || a.timedOut) && !done && a.chars === 0 && !refused(a)) {
+      if (a.threw && a.chars === 0 && !a.aborted && !done) {
+        // A transient model error: nothing was said, so one more try is safe.
+        deps.log('DIALOGUE_FAILED', failure(a));
+        deps.log('REPLY_RETRY');
+        a = await attemptReply(directive, replyRetryMs, status);
+        tries = 2;
+      } else if (!a.threw && (!a.aborted || a.timedOut) && !done && a.chars === 0 && !refused(a)) {
         deps.log('REPLY_EMPTY', detailOf(a, { attempt: 1, timed_out: a.timedOut ? 1 : 0, ...modelEnd() }));
         deps.log('REPLY_RETRY');
-        a = await attemptReply(directive, replyRetryMs);
+        a = await attemptReply(directive, replyRetryMs, status);
         tries = 2;
       }
       replies++;
       if (a.threw) {
-        deps.log('DIALOGUE_FAILED', { chars: a.chars, parts: a.parts, failed_sends: a.failed });
-        if (!done) await farewell(SAY.trouble, true);
-        return false;
-      }
+        deps.log('DIALOGUE_FAILED', failure(a));
+        modelFailures++;
+        // The call goes on in the server's fixed words; only a run of failed turns ends it.
+        if (done || modelFailures >= MAX_MODEL_FAILURES) {
+          if (!done) await farewell(SAY.trouble, true);
+          return false;
+        }
+      } else if (a.chars > 0) modelFailures = 0;
       if (refused(a)) {
         // The model itself declined (its own stop reason, never inferred from text). The request is not retried and intake does not simply carry on: whatever words were produced
         // have been closed, a fixed goodbye with the emergency line is said, and the call is saved unconfirmed.
@@ -478,12 +514,13 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const detail = detailOf(a, { attempts: tries, ...(empty ? { attempt: tries, timed_out: a.timedOut ? 1 : 0, ...modelEnd() } : {}), ...(a.stalled ? { stalled: 1 } : {}) });
       if (a.aborted && !a.timedOut && !a.stalled) deps.log('REPLY_INTERRUPTED', detail);
       else if (done) deps.log('REPLY_CUT', detail);
+      else if (a.threw) { /* DIALOGUE_FAILED was logged above */ }
       else if (a.stalled) deps.log('REPLY_STALLED', detail);
       else if (empty) deps.log('REPLY_EMPTY', detail);
       else deps.log('REPLY_SENT', detail);
       if (a.failed > 0) deps.log('REPLY_SEND_FAILED', { failed_sends: a.failed });
       if (done) return false;
-      if (empty || a.stalled) {
+      if (empty || a.stalled || a.threw) {
         // Nothing was said, or the reply stopped part-way (its words are closed and are never repeated or kept as a question): the server asks the same thing in fixed words, and keeps only those in the dialogue history.
         const text = fallbackText(directive);
         if (!say(text)) {
@@ -523,7 +560,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       readBackContact = deps.contacts === undefined ? undefined : s.revealContact();
       // The caller hears the number; the dialogue history (which goes to the model on later turns) gets the same words WITHOUT it.
       // Words that could not be sent were never heard: a yes cannot confirm them, and the history does not claim they were said. The next answer sends them again (up to the same limit).
-      const sent = say(readBackText(item.item, readBackContact?.phone));
+      const sent = say(readBackText(item.item, readBackContact?.phone, readBackContact?.name));
       readBackLost = !sent;
       if (sent) s.said(readBackText(item.item));
       deps.log('READBACK', { n: readbacks });
@@ -603,6 +640,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (a === 'no') {
         if (readbacks >= MAX_READBACKS) return await farewell(SAY.unconfirmed, true);
         phase = 'collect'; readBack = undefined; readBackContact = undefined;   // the next turn makes a fresh Intake run over everything, correction included
+        correcting = true;   // a name, number or address the caller states next (with "my name is ...", "my number is ...") replaces the one read back
         say(SAY.correct); s.said(SAY.correct);
         return;
       }
@@ -623,11 +661,22 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const limit = s.limit();
       if (limit === 'KILLED') { await farewell(SAY.unavailable, false); return; }
       if (limit !== null) { await farewell(SAY.limit, true); return; }   // the cap is reached BEFORE this utterance is taken in
-      const heard = s.hear(raw);
+      // The caller's line is the answer to the contact question that was just asked (server-validated, whether or not a masking rule would recognise it).
+      const expecting: ContactField | undefined = phase === 'addressfix' ? 'address' : phase === 'collect' && deps.contacts !== undefined ? contactAsk?.field : undefined;
+      const heard = s.hear(raw, expecting, phase === 'collect' && correcting);
       if (!heard.ok) { deps.log('UTTERANCE_REFUSED', { code: heard.code }); await farewell(SAY.trouble, true); return; }
       if (phase === 'confirm') return onAnswer(heard.line);
       if (phase === 'address') return onAddressAnswer(heard.line);
       if (phase === 'addressfix') return onAddressFix(heard.line);
+      if (contactAsk !== undefined) {
+        const took = heard.contact?.find((c) => c.field === contactAsk?.field);
+        // A number said in pieces is progress, not a failed attempt: that question is not counted against the item.
+        // At most three pieces per call get this credit, so noise can never keep one question alive for ever.
+        if (took?.outcome === 'partial' && lastAsk?.counted && partialCredits++ < 3) askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1));
+        deps.log('CONTACT_ANSWER', { outcome: took === undefined ? 0 : took.outcome === 'captured' ? 1 : took.outcome === 'partial' ? 2 : 3, heard: contactAsk.heard ? 1 : 0 });
+        contactAsk = undefined;
+      }
+      correcting = false; lastAsk = undefined;
       if (deps.firstClean !== undefined) {
         // A plain yes or no is the answer to the first-cleaning question only if that was the question just asked; explicit wording counts anywhere. The newest one wins.
         const answer = parseFirstClean(heard.line);
@@ -646,11 +695,23 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const next = selectNext(fresh, covers, { lastAskedAt, clarified });
       if (next.kind === 'ready' && got !== undefined) return startReadback(got.preview);
       if (next.kind === 'ask') {
+        // An item asked and heard the first time plus MAX_CLARIFICATIONS more times and still not obtained: the call ends as a safe incomplete outcome, saved unconfirmed, never handed off.
+        if ((askCount.get(next.field) ?? 0) >= 1 + MAX_CLARIFICATIONS) {
+          deps.log('INCOMPLETE', { clarifications: MAX_CLARIFICATIONS, lines: covers });
+          incompleteCall = true;
+          await farewell(SAY.incomplete, true);
+          return;
+        }
+        const prevAt = lastAskedAt.get(next.field);
         lastAskedAt.set(next.field, covers);
         deps.log('ASK', { again: next.again ? 1 : 0, lines: covers });
         const choices = deps.choicesFor?.(tenant, next.field);
-        const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}) });
-        // Only a question that was actually produced and sent in full can make the caller's next plain yes or no an answer to it.
+        const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}) }, statusOf(s, got));
+        // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
+        if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
+        else { if (prevAt === undefined) lastAskedAt.delete(next.field); else lastAskedAt.set(next.field, prevAt); }
+        const contactField = deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field];
+        if (contactField !== undefined) contactAsk = { field: contactField, heard: delivered };
         activeAsk = delivered ? next.field : undefined;
         return;
       }
@@ -660,7 +721,16 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         return speak(next.first ? { kind: 'clarify', categories: deps.categoryNames(tenant).filter((c) => c !== 'unknown') } : { kind: 'clarify' });
       }
       deps.log('LISTEN', { lines: covers });
-      return speak({ kind: 'listen' });
+      return speak({ kind: 'listen' }, statusOf(s, got));
+    }
+
+    /** What the server holds and still needs, as field names only (never a value), for the voice: captured contact items and found Intake fields, and what is still missing. */
+    function statusOf(s: CallSession, got: { fresh: Fresh; preview: Preview } | undefined): CallStatus | undefined {
+      const contact = deps.contacts === undefined ? { captured: [] as string[], missing: [] as string[] } : s.contactStatus();
+      const found = got === undefined ? [] : got.preview.item.fields.filter((f) => f.found && !SENSITIVE_NAME.test(f.name)).map((f) => f.name);
+      const missing = [...(got === undefined ? [] : got.fresh.missing), ...contact.missing];
+      const captured = [...found, ...contact.captured];
+      return captured.length === 0 && missing.length === 0 ? undefined : { captured, missing: [...new Set(missing)] };
     }
 
     async function onSetup(m: Record<string, unknown>): Promise<void> {
@@ -692,7 +762,15 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         else {
           // The reply had been sent, but the caller talked over it. Unless the phone provider reports that all of it was spoken, the question cannot be assumed heard.
           const flat = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-          if (activeAsk !== undefined && !(flat(lastReply).length > 0 && flat(spoken).length >= flat(lastReply).length)) activeAsk = undefined;
+          const fully = flat(lastReply).length > 0 && flat(spoken).length >= flat(lastReply).length;
+          if (activeAsk !== undefined && !fully) activeAsk = undefined;
+          if (!fully && lastAsk !== undefined && lastAsk.counted) {
+            // The question was talked over before it was heard: it does not count as asked, and the rotation puts it back.
+            askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1));
+            if (lastAsk.prevAt === undefined) lastAskedAt.delete(lastAsk.field); else lastAskedAt.set(lastAsk.field, lastAsk.prevAt);
+            lastAsk.counted = false;
+            if (contactAsk !== undefined) contactAsk.heard = false;
+          }
           if (addressAsked && phase === 'address' && !(flat(lastAddressText).length > 0 && flat(spoken).length >= flat(lastAddressText).length)) addressAsked = false;
           session?.interrupted(spoken);
         }

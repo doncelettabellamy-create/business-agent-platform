@@ -33,9 +33,12 @@ export type Directive =
   | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[] }
   | { kind: 'clarify'; categories?: readonly string[] }
   | { kind: 'listen' };
+/** Which items the server already holds and which it still needs, as field names only (never a value). Given to the voice so it does not ask for what the caller has already said. */
+export interface CallStatus { captured: readonly string[]; missing: readonly string[] }
 export interface DialogueInput {
   turns: readonly DialogueTurn[];
   directive: Directive;
+  status?: CallStatus;
   signal?: AbortSignal;
 }
 /** How the newest model call ended, as a fixed word and numbers only: never any text the model produced. */
@@ -54,6 +57,7 @@ export const DIALOGUE_INSTRUCTION = [
   'NEXT ASK <item>: ask one short, plain question about that item only. If it says it was asked before, ask it a different way, briefly. Never ask about any other item. Ask the open question and accept the caller\'s own words: never suggest options, examples, extras, services, specials or prices of your own, except the CHOICES a NEXT line lists: when it lists CHOICES, offer exactly those, in that order, as the business\'s options, and still accept any other answer in the caller\'s own words.',
   'NEXT CLARIFY with names: ask in plain words whether the caller is calling about one of those, offering only those names. NEXT CLARIFY with no names: ask the caller to say in a few words what they need.',
   'NEXT LISTEN: acknowledge briefly and invite the caller to go on. Do not ask for any specific item.',
+  'A STATUS line may list the items already captured and the items still missing, by name only. Never ask about a captured item, and never ask about a missing item unless the NEXT line says to.',
   "Accept whatever words the caller uses. Never repeat the caller's answers, never read back personal details, and never say anything that appears in square brackets.",
   'Never say goodbye, never thank the caller for calling, and never say the request is recorded: only the system ends the call.',
   'Do not give prices, advice, diagnoses, availability or promises, and never say that anyone will call or follow up. Do not make up facts about the business.',
@@ -96,6 +100,16 @@ export function renderDirective(d: Directive): string {
   }
 }
 
+const STATUS_NAME = /^[^\r\n[\]<>]{1,80}$/;
+/** Pure: the STATUS line (field names only), or an empty string when there is nothing to say. It comes BEFORE the NEXT line, which stays last. */
+export function renderStatus(s: CallStatus | undefined): string {
+  if (s === undefined || s === null) return '';
+  const names = (a: readonly string[]): string => (Array.isArray(a) ? a : []).slice(0, 20).filter((n) => typeof n === 'string' && STATUS_NAME.test(n)).join('; ');
+  const captured = names(s.captured); const missing = names(s.missing);
+  if (captured === '' && missing === '') return '';
+  return `STATUS captured: ${captured === '' ? 'none' : captured}. still missing: ${missing === '' ? 'none' : missing}.\n`;
+}
+
 /** "a, b, or c" (two: "a or b"). */
 function orList(items: readonly string[]): string {
   if (items.length <= 1) return items.join('');
@@ -131,7 +145,7 @@ export function buildDialogueParams(input: DialogueInput, model: string, maxToke
   if (persona !== undefined && !isPersona(persona)) throw new RangeError('persona must be made by createPersona');
   const style = persona === undefined ? '' : `${dialogueStyle(persona)}\n`;
   return {
-    model, max_tokens: maxTokens, system: `${DIALOGUE_INSTRUCTION}\n${style}${renderDirective(input.directive)}`,
+    model, max_tokens: maxTokens, system: `${DIALOGUE_INSTRUCTION}\n${style}${renderStatus(input.status)}${renderDirective(input.directive)}`,
     messages: toMessages(input.turns), stream: true, output_config: { effort: 'low' },
   };
 }

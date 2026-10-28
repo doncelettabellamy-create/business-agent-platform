@@ -177,7 +177,7 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   const dialogue = r.text.seen.filter((p) => !p.text);
   assert.ok(dialogue.length >= 2, 'the opening question and the address question were worded by the text model');
   for (const p of dialogue) {
-    const lines = String(p.instructions).split('\n');
+    const lines = String(p.instructions).split('\n').filter((l) => !l.startsWith('STATUS '));   // the STATUS line (field names only) sits between the persona line and NEXT
     assert.equal(lines[lines.length - 2], dialogueStyle(persona));
     assert.ok(lines[lines.length - 1].startsWith('NEXT'));
     assert.equal(p.store, false);
@@ -351,14 +351,17 @@ test('failure: when the OpenAI text model answers with nothing, the caller is no
   sim.end(); await pause(20);
 });
 
-test('failure: when the OpenAI text model errors, the call ends with the fixed apology, saved unconfirmed with nothing handed on, and the stream is closed', async () => {
+test('failure: when the OpenAI text model keeps erroring, each turn is retried and answered in fixed words, and the third failed turn in a row ends the call with the fixed apology, saved unconfirmed with nothing handed on, and the stream closed', async () => {
   const r = await rig({ failDialogue: true });
   const sim = await r.connect(); r.start(sim);
   await until(() => r.has('CALL_STARTED'));
-  r.voices[0].hear('yes I agree');
+  await say(r, 'yes I agree', 2);
+  assert.equal(r.voices[0].spoken[1], fallbackText({ kind: 'open' }), 'the opening is said in the server\'s own words');
+  await say(r, 'I have a burst pipe', 3);
+  r.voices[0].hear('it is flooding');
   await sim.closed;
   await r.handler.idle();
-  assert.equal(r.voices[0].spoken[1], SAY.trouble);
+  assert.equal(r.voices[0].spoken[3], SAY.trouble);
   assert.equal(sim.closeCode(), 1000);
   assert.ok(r.store.list(T).every((x) => x.handed_off === false));
 });

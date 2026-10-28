@@ -7,7 +7,7 @@
 // words the Claude model reports: END_TURN, MAX_TOKENS, REFUSAL, OTHER (never any model text).
 // Like openai-provider.ts it imports no SDK, reads no environment and holds no credential: it is handed a client with `responses.create`. Errors are recorded as a class name and HTTP status only.
 
-import { DIALOGUE_INSTRUCTION, renderDirective, toMessages } from './dialogue-model.ts';
+import { DIALOGUE_INSTRUCTION, renderDirective, renderStatus, toMessages } from './dialogue-model.ts';
 import type { DialogueInput, DialogueModel, DialogueStats } from './dialogue-model.ts';
 import { dialogueStyle, isPersona } from './persona.ts';
 import type { Persona } from './persona.ts';
@@ -36,7 +36,7 @@ export function buildOpenAIDialogueParams(input: DialogueInput, model: string, m
   if (effort !== undefined && !EFFORTS.includes(effort)) throw new RangeError('effort must be none, minimal, low, medium, high, xhigh, or max');
   const style = persona === undefined ? '' : `${dialogueStyle(persona)}\n`;
   return {
-    model, instructions: `${DIALOGUE_INSTRUCTION}\n${style}${renderDirective(input.directive)}`, input: toMessages(input.turns),
+    model, instructions: `${DIALOGUE_INSTRUCTION}\n${style}${renderStatus(input.status)}${renderDirective(input.directive)}`, input: toMessages(input.turns),
     max_output_tokens: maxTokens, store: false, ...(effort === undefined ? {} : { reasoning: { effort } }),
   };
 }

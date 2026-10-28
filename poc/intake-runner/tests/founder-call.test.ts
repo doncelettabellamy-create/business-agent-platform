@@ -373,14 +373,36 @@ test('interruption mid-stream: the reply stops at once and only the spoken part 
 });
 
 // ---------------------------------------------------------------- failures
-test('a failing dialogue model ends the call with a fixed apology and leaks nothing the provider said', async () => {
+test('a dialogue model that keeps failing: each turn is retried once and answered in fixed words; three failed turns in a row end the call with a fixed apology and leak nothing the provider said', async () => {
   const r = await rig({ claude: fakeClaude({ failDialogue: true }) });
   const sim = await r.connect(); setup(sim); say(sim, 'yes');
+  assert.equal((await sim.next((m) => m.type === 'text' && m.token === fallbackText({ kind: 'open' }))).last, true, 'the opening is said in the server\'s own words');
+  say(sim, 'I have a burst pipe');
+  await sim.next((m) => m.type === 'text' && /^Sorry about the pause/.test(m.token));
+  assert.equal(sim.messages.some((m) => m.type === 'end'), false, 'a failed turn does not end the call');
+  say(sim, 'it is flooding');
   assert.equal((await sim.next((m) => m.type === 'text' && m.token === SAY.trouble)).last, true);
   await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
-  assert.deepEqual(r.store.list(T), []);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
   noSecrets('anything', allText(sim) + JSON.stringify(r.logs));
-  assert.ok(r.logs.some((l) => l.code === 'DIALOGUE_FAILED'));
+  const failed = r.logs.filter((l) => l.code === 'DIALOGUE_FAILED');
+  assert.equal(failed.length, 6, 'each of the three turns failed twice (one retry)');
+  assert.equal(failed[0].detail?.status, 500, 'the status is logged as a number, never the provider\'s message');
+});
+
+test('a transient dialogue error is retried once and the caller never hears an apology', async () => {
+  let n = 0;
+  const flaky: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply(input) { n++; if (n === 2 && input.directive.kind === 'ask') throw new Error('blip'); yield 'Okay. '; } };
+  const r = await rig({ dialogue: flaky });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe');
+  await reply(r, sim);
+  assert.ok(sim.messages.filter((x: any) => x.type === 'text').some((x: any) => x.token === 'Okay. ' && x !== sim.messages[0]));
+  assert.equal(diag(r, 'DIALOGUE_FAILED').length, 1);
+  assert.equal(diag(r, 'REPLY_RETRY').length, 1);
+  assert.equal(sim.messages.some((x) => x.token === SAY.trouble), false);
+  sim.end(); await sim.closed; await r.handler.idle();
 });
 
 test('a failing Intake model is never trusted: the record goes to a person (model_failed), is not handed off, and the dashboard says so', async () => {
@@ -853,25 +875,40 @@ test('option A: the model is only ever sent one NEXT line of field or category n
   for (const line of ['the kitchen is flooding', 'it is bad', 'I need cleaning']) { say(sim, line); await reply(r, sim); }
   for (const p of r.claude.sent.filter((x) => x.stream)) {
     const lines = String(p.system).split('\n');
-    assert.equal(lines.length, 2);
-    assert.match(lines[1], /^NEXT (OPEN|ASK [A-Za-z ]+( \(asked before: ask it a different way\))?|CLARIFY(: [A-Za-z ;]+)?|LISTEN)$/);
-    assert.ok(!/MISSING|\[|\]/.test(String(p.system)));
+    // The voice is told what is captured and what is missing as field NAMES only (a STATUS line before the NEXT line); the NEXT line is still last and the only instruction to ask.
+    assert.ok(lines.length === 2 || lines.length === 3);
+    assert.match(lines[lines.length - 1], /^NEXT (OPEN|ASK [A-Za-z ]+( \(asked before: ask it a different way\))?|CLARIFY(: [A-Za-z ;]+)?|LISTEN)$/);
+    if (lines.length === 3) assert.match(lines[1], /^STATUS captured: [A-Za-z ;]+\. still missing: [A-Za-z ;]+\.$/);
+    assert.ok(!/\[|\]/.test(String(p.system)));
     assert.ok(/never say that anyone will call or follow up/.test(lines[0]));
   }
   sim.end(); await sim.closed; await r.handler.idle();
   for (const k of ['trouble', 'limit', 'silence', 'unconfirmed'] as const) assert.ok(!FOLLOW_UP.test(SAY[k]), `${k}: ${SAY[k]}`);
 });
 
-test('option A: a repeated missing field does not end the call: only the approved global limit does, and the request is kept', async () => {
-  const r = await rig({ limits: { maxTurns: 5 } });
+test('option A: a missing field is asked once and clarified at most twice, then the call ends as a safe incomplete outcome and the request is kept unconfirmed', async () => {
+  const r = await rig();
   const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
-  say(sim, 'I have a burst pipe'); await reply(r, sim);
-  for (const line of ['no', 'not sure', 'maybe later', 'hmm']) { say(sim, line); await reply(r, sim); }
-  assert.equal(sim.messages.some((m) => m.type === 'end'), false, 'five unhelpful answers in a row did not end the call');
-  say(sim, 'and another'); await ended(sim, r);
-  assert.ok(sim.messages.some((m) => m.token === SAY.limit && m.interruptible === false));
+  say(sim, 'I have a burst pipe'); await reply(r, sim);                  // Address is asked (1)
+  for (const line of ['no', 'not sure']) { say(sim, line); await reply(r, sim); }   // asked again (2) and again (3)
+  assert.equal(sim.messages.some((m) => m.type === 'end'), false, 'one ask and two clarifications did not end the call');
+  say(sim, 'maybe later'); await ended(sim, r);                           // a fourth ask would exceed the cap
+  assert.ok(sim.messages.some((m) => m.token === SAY.incomplete && m.interruptible === false));
+  assert.equal(diag(r, 'INCOMPLETE').length, 1);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.missing_fields], ['unconfirmed', 'needs-human', false, ['Address']]);
+  assert.ok(rec.reasons.includes('incomplete_call') && rec.reasons.includes('not_confirmed'));
+  assert.equal(asks(r).filter((a) => a === 'Address').length, 3, 'asked three times in all');
+});
+
+test('option A: the approved global limit still ends a call that keeps getting different answers', async () => {
+  const r = await rig({ limits: { maxTurns: 3 } });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe'); await reply(r, sim);
+  say(sim, 'no'); await reply(r, sim);
+  say(sim, 'not sure'); await reply(r, sim);
+  say(sim, 'and another'); await ended(sim, r);
+  assert.ok(sim.messages.some((m) => m.token === SAY.limit && m.interruptible === false));
 });
 
 // ---------------------------------------------------------------- closing line and preview safety
@@ -953,8 +990,8 @@ test('contacts: the number is read back to the caller only; a yes stores the con
   const r = await rig({ contacts: true });
   const sim = await r.connect();
   const rb = await toContactReadback(r, sim);
-  assert.match(rb.token, /^Let me check what I have\. Job description: burst pipe\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Is that correct\? Please say yes or no\.$/);
-  assert.ok(!/Priya|Raman|Elm/.test(rb.token), 'the name and address are not spoken');
+  assert.match(rb.token, /^Let me check what I have\. Job description: burst pipe\. Your name: Priya Raman\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Is that correct\? Please say yes or no\.$/);
+  assert.ok(!/Elm/.test(rb.token), 'the address is not in the job read-back (it has its own question)');
   assert.equal(r.store.list(T).length, 0);
   say(sim, 'yes'); const addressQ = await reply(r, sim);
   assert.equal(addressQ.token, 'I have your service address as 42 Elm Street. Is that correct? Please say yes or no.');
@@ -1662,7 +1699,8 @@ function questionStub(mode: 'normal' | 'slow-once' | 'empty-once') {
   return { model, release, asked: () => asked, lines: () => seen };
 }
 const dropped = (r: Rig) => r.logs.filter((l) => l.code === 'FIRST_CLEAN_DROPPED').length;
-const REASK = ['NEXT ASK First cleaning with us CHOICES: yes; no', 'NEXT ASK First cleaning with us (asked before: ask it a different way) CHOICES: yes; no'];
+// A question that was not delivered (refused writes) or not heard (talked over) does not count as asked, so its second try is not worded "asked before".
+const REASK = ['NEXT ASK First cleaning with us CHOICES: yes; no', 'NEXT ASK First cleaning with us CHOICES: yes; no'];
 /** After the failed or cut-off question, a plain yes was said: it must not be an answer, the question must come again, and a later yes to the delivered question must be. */
 async function thenAnswered(r: Rig, sim: Sim, stub?: ReturnType<typeof questionStub>) {
   const lines = (): string[] => (stub ? stub.lines() : directives(r));
@@ -1797,7 +1835,7 @@ test('delivery: a successfully delivered question makes the next plain yes its a
   const before = dropped(b);
   say(s2, 'yes we have one dog'); await reply(b, s2);                             // an answer about something else
   assert.ok(dropped(b) > before);
-  assert.deepEqual(un.lines().slice(1, 3), REASK, 'asked again: nothing was captured');
+  assert.deepEqual(un.lines().slice(1, 3), ['NEXT ASK First cleaning with us CHOICES: yes; no', 'NEXT ASK First cleaning with us (asked before: ask it a different way) CHOICES: yes; no'], 'asked again: nothing was captured');
   assert.ok(!b.logs.some((l) => l.code === 'READBACK'));
   s2.end(); await s2.closed; await b.handler.idle();
   const rec = b.store.list(T)[0];
@@ -2171,15 +2209,16 @@ test('empty replies: the fixed wording is kept in the history, so the model sees
   sim.end(); await sim.closed; await r.handler.idle();
 });
 
-test('empty replies: a failure (not an empty stream) is still an error and ends the call; it is not retried', async () => {
+test('empty replies: a failure (not an empty stream) is retried once, then the server speaks its fixed words; only three failed turns in a row end the call', async () => {
   let calls = 0;
   const bad: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply() { calls++; throw new Error('dialogue model failed'); } };
   const r = await rig({ dialogue: bad });
   const sim = await r.connect(); setup(sim); say(sim, 'yes');
-  await sim.next((m) => m.type === 'end'); await sim.closed; await r.handler.idle();
-  assert.equal(calls, 1);
-  assert.equal(diag(r, 'DIALOGUE_FAILED').length, 1);
-  assert.equal(diag(r, 'REPLY_RETRY').length + diag(r, 'REPLY_FALLBACK_SENT').length, 0);
+  await waitFor(() => diag(r, 'REPLY_FALLBACK_SENT').length === 1);
+  assert.equal(calls, 2, 'one try and one retry');
+  assert.equal(diag(r, 'DIALOGUE_FAILED').length, 2);
+  assert.equal(diag(r, 'REPLY_RETRY').length, 1);
+  sim.end(); await sim.closed; await r.handler.idle();
 });
 
 test('empty replies: if even the fixed wording cannot be sent, the request is saved unconfirmed and the call is ended', async () => {
@@ -2404,4 +2443,44 @@ test('stalled reply: the gap and whole-reply limits must be positive whole numbe
 
 test('stalled first try: the first-word limit must be a positive whole number', () => {
   for (const bad of [0, -1, 1.5, Number.NaN]) assert.throws(() => createRelayHandler({ replyFirstWordMs: bad } as never), RangeError);
+});
+
+// ---------------------------------------------------------------- current-call state checkpoint: contact answers bound to the question asked
+test('REGRESSION contacts by question: a lower-case name and a number said in pieces are captured from the answers to their questions, nothing repeats beyond the bound, the name is read back to the caller only, and nothing is handed off before the yes', async () => {
+  const hook = hookCalls();
+  const r = await rig({ contacts: true, confirmedHandoff: hook.hook });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  const phoneParts = ['five five five', 'zero one zero', 'zero one two three'];
+  let p = 0;
+  for (let i = 0; i < 14 && !r.logs.some((l) => l.code === 'READBACK'); i++) {
+    const last = asks(r).at(-1);
+    const answer = last === 'Customer name' ? 'priya raman' : last === 'Callback phone number' ? phoneParts[Math.min(p++, phoneParts.length - 1)] : last === 'Service address' ? 'twelve Oak Lane' : last === 'Address' ? '42 Elm Street' : 'the pipe is burst';
+    say(sim, answer); await reply(r, sim);
+  }
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), 'the read-back was reached: ' + JSON.stringify(asks(r)));
+  assert.equal(diag(r, 'INCOMPLETE').length, 0);
+  for (const f of ['Customer name', 'Callback phone number', 'Service address']) assert.ok(asks(r).filter((a) => a === f).length <= 3, `${f} asked at most once plus two clarifications`);
+  assert.equal(asks(r).filter((a) => a === 'Customer name').length, 1, 'a bare lower-case name answered the name question the first time');
+  assert.equal(hook.calls.length, 0, 'nothing is handed off before the caller confirms');
+  const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
+  assert.match(rb, /Your name: Priya Raman\. Your callback number: 5 5 5 0 1 0 0 1 2 3\./);
+  noPriya('the model requests', JSON.stringify(r.claude.sent) );
+  noPriya('the logs', JSON.stringify(r.logs));
+  assert.ok(!/priya|raman/i.test(JSON.stringify(r.claude.sent)), 'no lower-case form of the name reached a model');
+  sim.end(); await sim.closed; await r.handler.idle();
+  assert.equal(hook.calls.length, 0, 'an unconfirmed call is never handed off');
+});
+
+test('REGRESSION safe incomplete outcome: an item still missing after one ask and two clarifications ends the call, saved unconfirmed and never handed off', async () => {
+  const hook = hookCalls();
+  const r = await rig({ confirmedHandoff: hook.hook });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe'); await reply(r, sim);
+  for (const l of ['no', 'not sure']) { say(sim, l); await reply(r, sim); }
+  say(sim, 'maybe later'); await ended(sim, r);
+  assert.equal(diag(r, 'INCOMPLETE').length, 1);
+  assert.equal(hook.calls.length, 0);
+  const text = JSON.stringify(sim.messages);
+  assert.ok(!/\$\d|price|quote|book|appointment|schedule/i.test(text.replace(SAY.incomplete, '')), 'no price, quote or booking was spoken');
 });

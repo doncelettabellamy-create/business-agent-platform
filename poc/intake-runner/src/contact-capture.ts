@@ -23,8 +23,8 @@ const WORD: Readonly<Record<string, string>> = { zero: '0', oh: '0', one: '1', t
 const REPEAT: Readonly<Record<string, number>> = { double: 2, triple: 3, treble: 3 };
 const MAX_PART = 120;
 
-/** The digits of a spoken or written phone number, or undefined when it is not a usable one (10 to 15 digits, no e-mail). */
-export function phoneDigits(raw: string): string | undefined {
+/** The digits in spoken or written words, however many (a piece of a phone number included), or undefined for an e-mail or text that is too long. */
+export function digitsOf(raw: string): string | undefined {
   if (typeof raw !== 'string' || raw.length > 200 || raw.includes('@') || /\bdot\b/i.test(raw)) return undefined;
   let digits = '';
   let last = '';
@@ -39,7 +39,13 @@ export function phoneDigits(raw: string): string | undefined {
   // A spoken "oh" at the very end of a run ("... nine nine oh well") is often the interjection, not a zero: when it makes a US-style number one digit too long, it is dropped.
   // The read-back to the caller is what settles any doubt left.
   if (last === 'oh' && digits.length === 11 && /^[2-9]/.test(digits)) digits = digits.slice(0, -1);
-  return /^\d{10,15}$/.test(digits) ? digits : undefined;
+  return digits;
+}
+
+/** The digits of a spoken or written phone number, or undefined when it is not a usable one (10 to 15 digits, no e-mail). */
+export function phoneDigits(raw: string): string | undefined {
+  const digits = digitsOf(raw);
+  return digits !== undefined && /^\d{10,15}$/.test(digits) ? digits : undefined;
 }
 
 const clean = (s: string): string => s.replace(/\s+/g, ' ').trim().slice(0, MAX_PART);

@@ -132,6 +132,11 @@ export interface Masker {
    * capture of the cleaning pilot, which sends them only to the caller over the phone and to the encrypted contact vault). Empty after dispose().
    */
   reveal(): { type: PiiType; token: string; raw: string }[];
+  /**
+   * Teaches the masker a value the server has already captured as a contact detail (call-state.ts), so it is masked in this line and every later one even when no rule would
+   * recognise it (a bare first name, a lower-case place). Each word of a multi-word name is masked too. Counts as one placeholder of that type.
+   */
+  learn(type: PiiType, raw: string): void;
   /** Sets aside every value of this type heard so far: reveal() no longer returns them, so a correction replaces rather than adds to them. Placeholders in text already masked stay. */
   supersede(type: PiiType): void;
   /** Forgets every raw value. After this, mask() refuses. */
@@ -263,6 +268,11 @@ export function createMasker(options: { names?: readonly string[] } = {}): Maske
       return PII_TYPES.filter((type) => counts[type] > 0).map((type) => ({ type, count: counts[type] }));
     },
     reveal(): { type: PiiType; token: string; raw: string }[] { return disposed ? [] : originals.filter((o) => !ignored.has(o.token)).map((o) => ({ ...o })); },
+    learn(type: PiiType, raw: string): void {
+      if (disposed || typeof raw !== 'string' || raw.trim().length < 2 || raw.length > 200) return;
+      const token = tokenFor(type, raw);
+      if (type === 'Person') for (const w of raw.trim().split(/\s+/)) { const k = w.toLowerCase(); if (w.length >= 3 && !known.has(k)) known.set(k, token); }
+    },
     supersede(type: PiiType): void { for (const o of originals) if (o.type === type) ignored.add(o.token); },
     dispose(): void { disposed = true; known = new Map(); originals = []; ignored = new Set(); },
   };
