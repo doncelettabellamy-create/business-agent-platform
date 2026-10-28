@@ -1,0 +1,35 @@
+# Runs the project's existing automated test suite on every push and every pull request.
+#
+# Safe by construction: no secret, token or key is read (no `secrets.*`), the job has read-only repository access, and the tests are offline (synthetic data, stand-in models, local sockets only).
+# No live call, no Twilio, no OpenAI and no Anthropic request is made. The test suite itself refuses live paths. Node 24 is what `poc/intake-runner/package.json` requires ("engines": ">=24").
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: poc/intake-runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: poc/intake-runner/package-lock.json
+      - name: Install the locked dependencies (no keys involved)
+        run: npm ci
+      - name: Full test suite
+        run: npm test

@@ -25,3 +25,12 @@ founder-call.stop
 # Founder voice test: the private voice settings file is never committed.
 founder-voice.config.json
 founder-voice-call.config.json
+
+# Backups, wrapped keys and encrypted archives are private and never committed (see docs/PRIVATE_BACKUP_AND_RESTORE.md).
+*.dpapi
+*.bak
+*.bak-*
+*.enc
+*.backup
+founder-call-backups/
+preserved-work/
