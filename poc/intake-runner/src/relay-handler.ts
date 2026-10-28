@@ -53,6 +53,8 @@ export function redactSensitive(fields: readonly { name: string; value: string |
 }
 /** Reason on a confirmed request whose contact could not be stored: it is held for a person. */
 export const CONTACT_MISSING = 'contact_missing';
+/** Reason on a request saved when the business only serves residential properties and the request is (or was left) commercial: it is held for a person and never handed on. */
+export const COMMERCIAL_DECLINED = 'commercial_declined';
 /** Reason on a request saved after an item was asked for and still not obtained (the safe incomplete outcome): it is held for a person, never handed off. */
 export const INCOMPLETE = 'incomplete_call';
 /** The contact items by the fixed label the assistant is told to ask for. */
@@ -81,6 +83,31 @@ export const SAY = Object.freeze({
   incomplete: 'Thank you. I could not get all the details I need, so I cannot complete this request. Goodbye.',
 });
 
+/**
+ * The caller's answer to "Is your request for a residential property?" (their MASKED words), by fixed rules: a plain yes is residential, a plain no is commercial, a residential word alone is residential,
+ * a commercial word alone is commercial, and anything that mixes the two or says neither is unclear. "No, it's my house" and "yes, it's my office" contradict themselves, so they are unclear too. Pure.
+ */
+export function residentialAnswer(line: string, commercialWords: readonly string[] = []): 'residential' | 'commercial' | 'unclear' {
+  if (typeof line !== 'string' || line.length === 0 || line.length > 400) return 'unclear';
+  const t = line.toLowerCase();
+  const esc = (s: string): string => s.trim().toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+  const RES = /\b(?:residential|house|houses|home|apartment|apartments|condo|condos|condominium|townhouse|townhome|flat|duplex)\b/;
+  const NEG = /\b(?:not|isn't|isnt|is not|aren't|no)\b[^.]{0,20}\b(?:residential|house|home|apartment|condo|townhouse)\b/;
+  const COM = new RegExp(`(?<![a-z0-9])(?:commercial|business|company|${commercialWords.map(esc).filter((w) => w.length > 0).join('|') || 'commercial'})(?![a-z0-9])`);
+  const neg = NEG.test(t);
+  const res = RES.test(t) && !neg;
+  const com = COM.test(t) || neg;
+  if (/^\s*(?:no|nope|nah)\b/.test(t)) {
+    // The leading no is the answer; what follows may contradict it ("no, it's my house").
+    const rest = t.replace(/^\s*(?:no|nope|nah)\b[,.\s]*/, '');
+    return RES.test(rest) && !NEG.test(rest) && !COM.test(rest) ? 'unclear' : 'commercial';
+  }
+  if (/^\s*(?:yes|yeah|yep|yup|correct|right|exactly|sure|that's right|that is right)\b/.test(t)) return neg || COM.test(t) ? 'unclear' : 'residential';   // "yes, it's my office" contradicts itself
+  if (res && !com) return 'residential';
+  if (com && !res) return 'commercial';
+  return 'unclear';
+}
+
 /** How long a spoken line needs to play: a fixed pad plus a time per character, never more than the cap. Pure. */
 export function speechDelayMs(text: string, msPerChar = 70, padMs = 1500): number {
   return Math.min(MAX_SPEECH_WAIT_MS, padMs + text.length * msPerChar);
@@ -108,6 +135,13 @@ export interface RelayDeps {
   names: readonly string[];
   /** Calls this handler will accept in its lifetime. Setups after that are refused, which bounds what a leaked path and signature could do. */
   maxCalls: number;
+  /**
+   * RESIDENTIAL-ONLY routing (Drew Cleaning). The categories in `declined` are not offered as services (they are never named in a clarifying question). When Intake classifies a request into one of
+   * them the caller is asked the fixed `question` and nothing else happens until they answer: a confirmed residential answer goes on (the words in `keywords` that triggered the commercial
+   * classification are neutralised for Intake, so a "home office" is not read as commercial); a commercial answer, or one that stays unclear after a second try, ends the call with the fixed
+   * `declineLine`. A declined request is saved unconfirmed with the reason commercial_declined, is never read back, never priced or booked, and never handed on.
+   */
+  residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string };
   now(): number;
   nowIso(): string;
   killed(): boolean;
@@ -188,6 +222,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     || (deps.replyRetryMs !== undefined && (!Number.isInteger(deps.replyRetryMs) || deps.replyRetryMs < 1))
     || (deps.setupTimeoutMs !== undefined && (!Number.isInteger(deps.setupTimeoutMs) || deps.setupTimeoutMs < 1000 || deps.setupTimeoutMs > 300_000))
     || (deps.confirmedHandoff !== undefined && typeof deps.confirmedHandoff !== 'function')
+    || (deps.residential !== undefined && (!isRecord(deps.residential) || !Array.isArray(deps.residential.declined) || deps.residential.declined.length < 1 || !deps.residential.declined.every((c) => typeof c === 'string' && c.length > 0)
+      || !Array.isArray(deps.residential.keywords) || !deps.residential.keywords.every((k) => typeof k === 'string' && k.trim().length > 0 && k.length <= 64)
+      || typeof deps.residential.question !== 'string' || deps.residential.question.length < 10 || deps.residential.question.length > 400
+      || typeof deps.residential.declineLine !== 'string' || deps.residential.declineLine.length < 10 || deps.residential.declineLine.length > 400))
     || (deps.contacts !== undefined && (!isRecord(deps.contacts) || typeof deps.contacts.put !== 'function'))
     || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
     throw new RangeError('the relay handler needs every dependency');
@@ -260,7 +298,17 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
 
     /** `final` lines end the call, so the caller cannot talk over them. */
     /** What Intake reads: the masked conversation, plus the caller's attributable first-cleaning answer on its own labelled line. */
-    const intakeText = (s: CallSession): string => s.maskedText() + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '');
+    // Residential-only routing state: nothing asked yet, the question asked and unanswered, or the caller confirmed a residential property.
+    let residential: 'none' | 'asked' | 'residential' = 'none';
+    let residentialUnclear = 0;
+    let commercialDeclined = false;
+    const declined = new Set(deps.residential?.declined ?? []);
+    const isDeclined = (category: string): boolean => declined.has(category);
+    // The words that made the request look commercial, longest first. After the caller confirms a residential property they are neutralised for Intake ("home office" is a room of a home).
+    const trigger = deps.residential === undefined || deps.residential.keywords.length === 0 ? undefined
+      : new RegExp(`(?<![A-Za-z0-9])(?:${[...deps.residential.keywords].sort((a, b) => b.length - a.length).map((k) => k.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')).join('|')})(?![A-Za-z0-9])`, 'gi');
+    const neutral = (text: string): string => (residential === 'residential' && trigger !== undefined ? text.replace(trigger, 'property') : text);
+    const intakeText = (s: CallSession): string => neutral(s.maskedText()) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '');
     /**
      * The first-cleaning guard. A value for the first-cleaning field survives only if it is the caller's newest attributable answer, or explicit wording said with no newer
      * attributable answer. A plain yes or no that no first-cleaning question was asked for, and anything that disagrees with the newest attributable answer, is dropped:
@@ -325,6 +373,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const parts = s.revealContactParts();   // RAW: used only to build the stored contact below
       // A call that ends while the address is being confirmed keeps what the caller already confirmed (the job and the number), with the address marked unconfirmed.
       if (confirmed === undefined && (phase === 'address' || phase === 'addressfix') && readBack !== undefined) { confirmed = readBack; addressState = addressState ?? 'unconfirmed'; }
+      // Defence in depth: a request in a category the business does not serve is never saved as confirmed, whatever happened before.
+      if (confirmed !== undefined && deps.residential !== undefined && isDeclined(confirmed.item.category)) { deps.log('COMMERCIAL_CONFIRM_BLOCKED'); confirmed = undefined; commercialDeclined = true; }
       let contact: StoredContact | undefined;
       if (confirmed !== undefined && confirmedContact !== undefined) {
         const st: AddressState = addressState ?? 'unconfirmed';
@@ -362,7 +412,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const record: IntakeRecord = {
         item_id: w.item_id, workspace_id: tenant, call_ref: ref, received_at: deps.nowIso(), category: w.category,
         status: ok ? w.status : 'needs-human',
-        reasons: ok || reviewed ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : []), ...(incompleteCall ? [INCOMPLETE] : [])])], missing_fields: [...w.missing_fields],
+        reasons: ok || reviewed ? [...w.reasons] : [...new Set([...w.reasons, NOT_CONFIRMED, ...(confirmed !== undefined && !contactOk ? [CONTACT_MISSING] : []), ...(incompleteCall ? [INCOMPLETE] : []), ...(commercialDeclined || (deps.residential !== undefined && isDeclined(w.category) && residential !== 'residential') ? [COMMERCIAL_DECLINED] : [])])], missing_fields: [...w.missing_fields],
         // A field that holds a person's name, number or e-mail never keeps its value in the record, even if the masker missed it (a lower-case name).
         fields: redactSensitive(w.fields),
         pii_summary: w.pii_summary.map((p) => ({ type: p.type, count: p.count })),
@@ -702,6 +752,17 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         contactAsk = undefined;
       }
       correcting = false; lastAsk = undefined;
+      // Residential-only routing: the answer to the residential question is read before anything else happens on this turn.
+      if (deps.residential !== undefined && residential === 'asked') {
+        const verdict = residentialAnswer(heard.line, deps.residential.keywords);
+        if (verdict === 'commercial') return await declineCommercial('COMMERCIAL_CONFIRMED');
+        if (verdict === 'unclear') {
+          if (++residentialUnclear > 1) return await declineCommercial('COMMERCIAL_UNRESOLVED');
+          deps.log('RESIDENTIAL_REASK');
+          askResidential(); return;
+        }
+        residential = 'residential'; deps.log('RESIDENTIAL_CONFIRMED');
+      }
       if (deps.firstClean !== undefined) {
         // A plain yes or no is the answer to the first-cleaning question only if that was the question just asked; explicit wording counts anywhere. The newest one wins.
         const answer = parseFirstClean(heard.line);
@@ -716,6 +777,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (fresh !== undefined && deps.contacts !== undefined) {
         const need = s.contactMissing();
         fresh = { ...fresh, missing: [...fresh.missing, ...need], ready: fresh.ready && need.length === 0 };
+      }
+      // A request Intake classified into a category the business does not serve. Until the caller confirms a residential property nothing else is asked, read back, priced, booked or handed on. If it is
+      // still that category after they have confirmed (the wording could not be neutralised), it is declined rather than guessed at.
+      if (deps.residential !== undefined && fresh !== undefined && fresh.covers === covers && isDeclined(fresh.category)) {
+        if (residential === 'residential') return await declineCommercial('COMMERCIAL_REMAINS');
+        if (residential === 'none') { residential = 'asked'; deps.log('RESIDENTIAL_ASK'); askResidential(); return; }
       }
       const next = selectNext(fresh, covers, { lastAskedAt, clarified });
       if (next.kind === 'ready' && got !== undefined) return startReadback(got.preview);
@@ -743,10 +810,23 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (next.kind === 'clarify') {
         clarified = true;
         deps.log('CLARIFY', { first: next.first ? 1 : 0, lines: covers });
-        return speak(next.first ? { kind: 'clarify', categories: deps.categoryNames(tenant).filter((c) => c !== 'unknown') } : { kind: 'clarify' });
+        return speak(next.first ? { kind: 'clarify', categories: deps.categoryNames(tenant).filter((c) => c !== 'unknown' && !isDeclined(c)) } : { kind: 'clarify' });
       }
       deps.log('LISTEN', { lines: covers });
       return speak({ kind: 'listen' }, statusOf(s, got));
+    }
+
+    /** The fixed residential question, in exactly the configured words. Nothing else is said on this turn. */
+    function askResidential(): void {
+      const s = session as CallSession;
+      const q = (deps.residential as NonNullable<RelayDeps['residential']>).question;
+      say(q); s.said(q); lastReply = q;
+    }
+    /** Ends the call because the request is commercial (or could not be confirmed residential): a fixed goodbye, saved unconfirmed with the reason, never read back, priced, booked or handed on. */
+    async function declineCommercial(code: string): Promise<void> {
+      deps.log(code);
+      commercialDeclined = true;
+      await farewell((deps.residential as NonNullable<RelayDeps['residential']>).declineLine, true);
     }
 
     /**

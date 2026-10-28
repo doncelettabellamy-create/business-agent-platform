@@ -58,10 +58,25 @@ export interface VoiceService {
   notice: string;
 }
 
+/**
+ * Residential-only routing from the skill: every category routed to a person (commercial cleaning) is declined, never offered, and a request that lands in one is asked the fixed question first.
+ * Undefined when the skill has no such category. The question is the founder's exact wording; the decline line promises nothing.
+ */
+export function residentialRouting(categories: readonly { name: string; route?: string; keywords?: readonly string[] }[], businessName: string): { declined: string[]; keywords: string[]; question: string; declineLine: string } | undefined {
+  const declined = categories.filter((c) => c.route === 'human');
+  if (declined.length === 0) return undefined;
+  return {
+    declined: declined.map((c) => c.name),
+    keywords: declined.flatMap((c) => [...(c.keywords ?? [])]),
+    question: `${businessName} cleans houses, apartments, condos and townhouses. We don’t offer commercial cleaning. Is your request for a residential property?`,
+    declineLine: `Thank you. ${businessName} only cleans residential properties, so I can't help with this request. Goodbye.`,
+  };
+}
+
 export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService {
   const { config, voice } = deps;
   const tenant = config.tenant;
-  const skill = config.skill_config as { categories: { name: string; requires?: string[] }[]; fields: { name: string; choices?: string[]; role?: string }[] };
+  const skill = config.skill_config as { categories: { name: string; requires?: string[]; route?: string; keywords?: string[] }[]; fields: { name: string; choices?: string[]; role?: string }[] };
   const firstCleanField = skill.fields.find((f) => f.role === 'first_clean')?.name;
   const persona = createPersona(voice.persona);
   const settings = effectiveVoiceSettings(voice);
@@ -71,10 +86,14 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     limits: { maxOutputTokens: 1024, timeoutMs: 30_000, maxAttempts: 1 }, channelRef: 'channel-founder-phone', now: deps.nowIso, founderTest: { tenant },
   });
   const dialogue = createOpenAIDialogueModel(deps.textClient, { model: voice.openai_model, persona, effort: settings.textReasoning });
+  // RESIDENTIAL-ONLY (Drew Cleaning): a category the skill routes to a person (commercial cleaning) is not a service Drew offers. It is never named to a caller; a request that lands in it is asked the fixed
+  // residential question and, unless the caller confirms a residential property, is declined (relay-handler.ts `residential`).
+  const residential = residentialRouting(skill.categories, voice.persona.business_name);
   const setupTimeoutMs = Math.min(300_000, Math.max(5000, Math.ceil(notice.length * 70) + 30_000));
   const handler = createRelayHandler({
     numbers: new Map(config.numbers.map((n) => [n, tenant])),
-    categoryNames: () => skill.categories.map((c) => c.name),
+    categoryNames: () => skill.categories.filter((c) => c.route !== 'human').map((c) => c.name),
+    ...(residential === undefined ? {} : { residential }),
     choicesFor: (_t, field) => skill.fields.find((f) => f.name === field)?.choices,
     ...(firstCleanField === undefined ? {} : { firstClean: { field: firstCleanField, required: (_t: string, category: string) => skill.categories.find((c) => c.name === category)?.requires?.includes(firstCleanField) === true } }),
     intake,

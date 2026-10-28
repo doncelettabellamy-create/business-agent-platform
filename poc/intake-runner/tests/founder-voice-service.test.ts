@@ -10,7 +10,7 @@ import { createRelayWsServer } from '../src/ws-server.ts';
 import { signedUrlCandidates } from '../src/founder-call-gate.ts';
 import type { FounderCallConfig } from '../src/founder-call-gate.ts';
 import type { FounderVoiceConfig } from '../src/founder-voice-gate.ts';
-import { createFounderVoiceService } from '../src/founder-voice-service.ts';
+import { createFounderVoiceService, residentialRouting } from '../src/founder-voice-service.ts';
 import { createOpenAiVoiceSocket } from '../src/openai-voice-socket.ts';
 import type { WebSocketLike } from '../src/openai-voice-socket.ts';
 import { createIntakeRecordStore } from '../src/intake-record-store.ts';
@@ -391,4 +391,15 @@ test('native conversation (voice config conversation: "native"): the voice is of
   assert.equal(n.voices[0].spoken[0], n.notice, 'the consent notice is exact');
   assert.deepEqual(n.voices[0].refused, []);
   c1.end(); await pause(20);
+});
+
+test('residential-only wiring: Drew\'s service declines the skill\'s person-routed (commercial) category with the founder\'s exact question, and a skill without one is unchanged', () => {
+  const cleaning = JSON.parse(readFileSync(new URL('../examples/skill-cleaning-services.json', import.meta.url), 'utf8')).skill_config;
+  const r = residentialRouting(cleaning.categories, 'Drew Cleaning');
+  assert.ok(r !== undefined);
+  assert.deepEqual(r.declined, ['Commercial cleaning']);
+  assert.equal(r.question, 'Drew Cleaning cleans houses, apartments, condos and townhouses. We don’t offer commercial cleaning. Is your request for a residential property?');
+  assert.ok(r.keywords.includes('office') && r.keywords.includes('commercial'));
+  assert.ok(!/call|follow|contact/i.test(r.declineLine));
+  assert.equal(residentialRouting(plumbing.categories, 'Drew Cleaning'), undefined);
 });

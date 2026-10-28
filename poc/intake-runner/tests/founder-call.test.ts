@@ -22,7 +22,7 @@ import type { IntakeRecordStore } from '../src/intake-record-store.ts';
 import { createDashboardServer } from '../src/dashboard-server.ts';
 import { createRelayWsServer } from '../src/ws-server.ts';
 import type { RelayConnection } from '../src/ws-server.ts';
-import { createRelayHandler, readBackText, redactSensitive, SAY, speechDelayMs } from '../src/relay-handler.ts';
+import { createRelayHandler, readBackText, redactSensitive, residentialAnswer, SAY, speechDelayMs } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
 import { loadFixture, quoteFromWorkItem } from '../src/pricing-fixture.ts';
@@ -83,7 +83,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -102,6 +102,7 @@ async function rig(o: RigOptions = {}) {
   });
   const handler = createRelayHandler({
     ...(o.confirmedHandoff === undefined ? {} : { confirmedHandoff: o.confirmedHandoff }),
+    ...(o.residential === undefined ? {} : { residential: o.residential }),
     numbers: new Map([[N1, T], [N2, OTHER]]), categoryNames: () => (o.skill ?? plumbing as any).categories.map((c: { name: string }) => c.name),
     choicesFor: (_t: string, field: string) => ((o.skill ?? plumbing) as any).fields?.find((x: any) => x.name === field)?.choices,
     ...((): object => { const sk: any = o.skill ?? plumbing; const fc = sk.fields?.find((x: any) => x.role === 'first_clean'); return fc ? { firstClean: { field: fc.name, required: (_t: string, cat: string) => sk.categories.find((c: any) => c.name === cat)?.requires?.includes(fc.name) === true } } : {}; })(), previewBudgetMs: o.previewBudgetMs ?? 3000, ...(o.replyRetryMs === undefined ? {} : { replyRetryMs: o.replyRetryMs }), ...(o.replyFirstWordMs === undefined ? {} : { replyFirstWordMs: o.replyFirstWordMs }), ...(o.replyGapMs === undefined ? {} : { replyGapMs: o.replyGapMs }), ...(o.replyTotalMs === undefined ? {} : { replyTotalMs: o.replyTotalMs }), intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
@@ -2483,4 +2484,99 @@ test('REGRESSION safe incomplete outcome: an item still missing after one ask an
   assert.equal(hook.calls.length, 0);
   const text = JSON.stringify(sim.messages);
   assert.ok(!/\$\d|price|quote|book|appointment|schedule/i.test(text.replace(SAY.incomplete, '')), 'no price, quote or booking was spoken');
+});
+
+// ---------------------------------------------------------------- residential-only Drew: commercial is not a service, and a commercial request never reaches pricing, booking or Processing
+const RES_Q = 'Drew Cleaning cleans houses, apartments, condos and townhouses. We don\u2019t offer commercial cleaning. Is your request for a residential property?';
+const RES_NO = "Thank you. Drew Cleaning only cleans residential properties, so I can't help with this request. Goodbye.";
+const residentialOnly = () => ({ declined: ['Commercial cleaning'], keywords: (servicesSkill as any).categories.find((c: any) => c.route === 'human').keywords as string[], question: RES_Q, declineLine: RES_NO });
+const resRig = (o: RigOptions = {}) => servicesRig({ residential: residentialOnly(), ...o });
+const spokenTokens = (sim: Sim) => sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token as string);
+
+test('residential-only: the question is the exact wording, and the decline promises no follow-up', () => {
+  assert.equal(RES_Q, 'Drew Cleaning cleans houses, apartments, condos and townhouses. We don\u2019t offer commercial cleaning. Is your request for a residential property?');
+  assert.ok(!FOLLOW_UP.test(RES_NO), 'the decline promises no follow-up');
+});
+
+test('residential-only: residential requests are untouched — no residential question, the usual questions, and Commercial is never offered in a clarifying question', async () => {
+  const r = await resRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a cleaning for four rooms tomorrow morning'); await reply(r, sim);
+  assert.equal(directives(r)[1], 'NEXT CLARIFY: Standard cleaning; Deep cleaning; Move-in or move-out cleaning', 'Commercial is not offered as a service');
+  say(sim, 'a deep clean of my house please'); await reply(r, sim);
+  assert.ok(!spokenTokens(sim).includes(RES_Q));
+  assert.equal(diag(r, 'RESIDENTIAL_ASK').length, 0);
+  assert.ok(directives(r).slice(2).every((d) => !/Commercial/.test(d)));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('residential-only: a commercial request is asked the fixed question; a no ends the call with the fixed line, saved unconfirmed, never read back, never priced, booked or handed on', async () => {
+  const h = hookCalls();
+  const r = await resRig({ confirmedHandoff: h.hook, contacts: true });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a regular cleaning for our office'); await reply(r, sim);
+  assert.equal(spokenTokens(sim).filter((t) => t === RES_Q).length, 1);
+  assert.deepEqual(asks(r), [], 'no question about the job was asked');
+  assert.equal(diag(r, 'READBACK').length, 0);
+  say(sim, 'no, it is an office'); await ended(sim, r);
+  assert.ok(sim.messages.some((m: any) => m.token === RES_NO && m.interruptible === false));
+  assert.equal(diag(r, 'COMMERCIAL_CONFIRMED').length, 1);
+  assert.equal(diag(r, 'READBACK').length + diag(r, 'CONTACT_STORED').length, 0);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.category, rec.confirmation, rec.status, rec.handed_off, eligibleForProcessing(rec)], ['Commercial cleaning', 'unconfirmed', 'needs-human', false, false]);
+  assert.ok(rec.reasons.includes('commercial_declined') && rec.reasons.includes('not_confirmed'));
+  assert.equal(h.calls.length, 0, 'nothing reached Processing');
+  assert.notEqual(priceOf(rec).outcome, 'priced', 'a commercial request is never priced');
+  const api: any = await (await r.dashGet('/api/owner')).json();
+  assert.notEqual(api.calls[0].statusText, 'Confirmed by the caller');
+});
+
+test('residential-only: an ambiguous request ("home office") is asked, and a residential answer carries on as residential with the commercial word neutralised for Intake', async () => {
+  const h = hookCalls();
+  const r = await resRig({ confirmedHandoff: h.hook });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a deep clean of my home office'); await reply(r, sim);
+  assert.equal(spokenTokens(sim).filter((t) => t === RES_Q).length, 1);
+  say(sim, 'yes, it is my home'); await reply(r, sim);
+  assert.equal(diag(r, 'RESIDENTIAL_CONFIRMED').length, 1);
+  assert.ok(!sim.messages.some((m: any) => m.token === RES_NO));
+  const intakeAfter = r.claude.sent.filter((p) => !p.stream).map((p) => String(p.messages[0].content));
+  assert.ok(intakeAfter.slice(-2).every((c) => !/office/i.test(c)), 'the commercial word no longer reaches Intake once the caller said the property is residential');
+  assert.ok(directives(r).some((d) => d.startsWith('NEXT ASK')), 'the usual questions go on');
+  assert.ok(directives(r).slice(1).every((d) => !/Commercial/.test(d)));
+  assert.equal(h.calls.length, 0);
+  sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
+  const [rec] = r.store.list(T);
+  assert.notEqual(rec.category, 'Commercial cleaning');
+  assert.ok(!rec.reasons.includes('commercial_declined'));
+});
+
+test('residential-only: an answer that stays unclear after one more try ends the call as declined; a hang-up before any answer is saved declined too', async () => {
+  const r = await resRig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need cleaning for our office'); await reply(r, sim);
+  say(sim, 'hmm well maybe'); await reply(r, sim);
+  assert.equal(spokenTokens(sim).filter((t) => t === RES_Q).length, 2, 'asked once more');
+  say(sim, 'I am not sure'); await ended(sim, r);
+  assert.equal(diag(r, 'COMMERCIAL_UNRESOLVED').length, 1);
+  assert.ok(sim.messages.some((m: any) => m.token === RES_NO));
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
+  const r2 = await resRig();
+  const s2 = await r2.connect(); setup(s2, { sid: SID(2) }); say(s2, 'yes'); await reply(r2, s2);
+  say(s2, 'I need a deep clean for my restaurant'); await reply(r2, s2);
+  s2.end(); await s2.closed; await waitFor(() => r2.store.list(T).length === 1); await r2.handler.idle();
+  const [rec2] = r2.store.list(T);
+  assert.deepEqual([rec2.confirmation, rec2.handed_off, rec2.reasons.includes('commercial_declined')], ['unconfirmed', false, true]);
+});
+
+test('residential-only: residentialAnswer reads plain, mixed and contradictory answers by fixed rules', () => {
+  const kw = ['office', 'restaurant', 'shop'];
+  const cases: Array<[string, string]> = [
+    ['yes', 'residential'], ['yes it is', 'residential'], ['yeah my house', 'residential'], ['it is a condo', 'residential'], ['a townhouse', 'residential'], ['residential', 'residential'],
+    ['no', 'commercial'], ['nope', 'commercial'], ['it is an office', 'commercial'], ['a restaurant', 'commercial'], ['it is a business', 'commercial'], ['not residential', 'commercial'], ['it is not a house', 'commercial'],
+    ['no, it is my house', 'unclear'], ['yes, it is my office', 'unclear'], ['my home office', 'unclear'], ['maybe', 'unclear'], ['I am not sure', 'unclear'], ['', 'unclear'],
+  ];
+  for (const [line, want] of cases) assert.equal(residentialAnswer(line, kw), want, line);
+  assert.equal(residentialAnswer('x'.repeat(401), kw), 'unclear');
 });
