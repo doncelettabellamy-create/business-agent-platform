@@ -74,14 +74,15 @@ function plausible(field: string, kind: FieldKind, v: string): boolean {
   if (v.length === 0 || AMBIGUOUS.test(v)) return false;
   switch (kind) {
     case 'count': {
-      if (countOf(v) === undefined) return false;
+      const n = countOf(v);
+      if (n === undefined || n > 20 || DATE.test(v) || TIME.test(v)) return false;   // a day of the month or a time of day is not a number of rooms
       const own = unitOf(field);
       const others = UNITS.filter(([name, re]) => name !== own && re.test(v) && !(own !== undefined && new RegExp(`\\b${own}s?\\b`, 'i').test(v)));
       return others.length === 0;
     }
     case 'polarity':
       if (polarityOf(v) !== undefined) return true;
-      if (FREQUENCY.test(v) || DEFLECT.test(v)) return false;   // "just this one time" is not an answer about extras or pets
+      if (FREQUENCY.test(v) || DATE.test(v) || TIME.test(v) || DEFLECT.test(v)) return false;   // "just this one time", "October 22" or "in the morning" is not an answer about extras or pets
       return content(v).length >= 2;
     case 'frequency': return FREQUENCY.test(v) && !DEFLECT.test(v);
     case 'date': return DATE.test(v) && !DEFLECT.test(v);

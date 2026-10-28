@@ -25,6 +25,8 @@ import type { RelayConnection } from '../src/ws-server.ts';
 import { createRelayHandler, readBackText, redactSensitive, residentialAnswer, SAY, speechDelayMs } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
+import { createConversationRelayTransport } from '../src/call-transport.ts';
+import type { CallTransport } from '../src/call-transport.ts';
 import { loadFixture, quoteFromWorkItem } from '../src/pricing-fixture.ts';
 import type { ContactVault } from '../src/contact-vault.ts';
 import { randomBytes } from 'node:crypto';
@@ -86,7 +88,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -116,9 +118,9 @@ async function rig(o: RigOptions = {}) {
     },
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
     limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
-    killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
+    killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(o.playbackMaxMs === undefined ? {} : { playbackMaxMs: o.playbackMaxMs }), ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
   });
-  const ws = createRelayWsServer({ path: SECRET_PATH, authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, lockout: { failures: 100, windowMs: 60_000 }, onConnection: (c) => handler.handle(o.connWrap ? o.connWrap(c) : c) });
+  const ws = createRelayWsServer({ path: SECRET_PATH, authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, lockout: { failures: 100, windowMs: 60_000 }, onConnection: (c) => (o.transportWrap ? handler.serve(o.transportWrap(createConversationRelayTransport(o.connWrap ? o.connWrap(c) : c))) : handler.handle(o.connWrap ? o.connWrap(c) : c)) });
   const port = await ws.listen(0);
   closers.push(() => ws.close());
   const dash = createDashboardServer({ store: realStore, tenant: T, staticDir });
@@ -2901,4 +2903,114 @@ test('CLEANING STATE the incomplete ending names the field and category and the 
   assert.ok(rec.reasons.includes('incomplete_call'));
   assert.ok(!/maybe|not sure/i.test(JSON.stringify(r.logs)), 'no word of the caller is logged');
   shapeOk(r);
+});
+
+// ---------------------------------------------------------------- 2026-10-28 3:02 PM call: a date taken for phone digits, answers to the wrong question, and a read-back that must match the record
+/** Drives the services skill with contacts through the real scripted path: `says[question]` are the answers in order (the last repeats), everything else is answered plainly. */
+async function driveServices(r: Rig, sim: Sim, says: Record<string, string[]> = {}, max = 30) {
+  const PLAIN: Record<string, string> = { 'Pets': 'no pets', 'Cleaning frequency': 'just one time', 'Extras': 'no extras', 'First cleaning with us': 'this is my first time', 'Preferred date': 'tomorrow', 'Time window': 'morning', 'Customer name': 'priya raman', 'Callback phone number': 'two one two five five five zero one four two', 'Service address': '742 Evergreen Terrace' };
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a regular cleaning for my house, two bedrooms and two bathrooms'); await reply(r, sim);
+  const used: Record<string, number> = {};
+  for (let i = 0; i < max && !r.logs.some((l) => l.code === 'READBACK' || l.code === 'INCOMPLETE'); i++) {
+    const q = asks(r).at(-1) ?? '';
+    const list = says[q];
+    const ans = list !== undefined ? list[Math.min(used[q] = (used[q] ?? 0) + 1, list.length) - 1] : PLAIN[q] ?? 'ok';
+    say(sim, ans); await reply(r, sim);
+    if (sim.messages.some((m: any) => m.type === 'end')) break;
+  }
+}
+const phoneAnswers = (r: Rig) => diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'PHONE').map((l) => `${l.detail?.reason}${l.detail?.digits !== undefined ? '(' + l.detail.digits + '=' + l.detail.held + ')' : ''}`);
+const callerLines = (r: Rig) => (r.claude.sent.filter((p) => !p.stream).map((p) => JSON.parse(p.messages[0].content)).filter((m) => m.task === 'classify_request').map((m) => m.data.masked_text as string).at(-1) ?? '').split('\n');
+
+test('DATE AS PHONE a date said to the phone question is not phone digits: nothing is taken, the question is asked again, the date reaches Intake intact, and the number read back is only what was said as digits', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveServices(r, sim, { 'Callback phone number': ['October 22', 'six months', 'five five five zero', 'one four two nine', 'two one'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(asks(r)));
+  assert.deepEqual(phoneAnswers(r), ['NOT_DIGITS(0=0)', 'NOT_DIGITS(0=0)', 'PIECE(4=4)', 'PIECE(4=8)', 'CAPTURED(2=10)']);
+  assert.ok(callerLines(r).includes('Caller: October 22'), 'an ordinary date stays a date in what Intake reads: ' + JSON.stringify(callerLines(r)));
+  assert.ok(!callerLines(r).some((l) => /\[CONTACT_/.test(l) && /October/.test(l)), 'the date is not withheld');
+  const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
+  assert.match(rb, /Your callback number: 5 5 5 0 1 4 2 9 2 1\./, 'the number read back is exactly the digit pieces said, in order: no date digits');
+  assert.ok(!/five five five zero|one four two nine/.test(callerLines(r).join('\n')), 'the accepted phone pieces are still masked from Intake');
+  shapeOk(r);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('SPLIT PHONE pieces still join; a repeated prefix restarts; a time or a duration between pieces is refused without disturbing them', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveServices(r, sim, { 'Callback phone number': ['two one two', 'nine thirty', 'five five five', 'in the morning', 'zero one four two'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.deepEqual(phoneAnswers(r), ['PIECE(3=3)', 'NOT_DIGITS(0=3)', 'PIECE(3=6)', 'NOT_DIGITS(0=6)', 'CAPTURED(4=10)']);
+  const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
+  assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('LONG DIGITS in a refused line are still protected: only short runs (a day of the month) are left alone', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveServices(r, sim, { 'Callback phone number': ['on October 22 call 5550142 tomorrow morning', 'two one two five five five zero one four two'] });
+  assert.equal(phoneAnswers(r)[0], 'NOT_DIGITS(0=0)');
+  const text = callerLines(r).join('\n');
+  assert.ok(!/5550142/.test(text), 'the long digit run never reached Intake: ' + text);
+  assert.ok(/October 22/.test(text), 'while the date in the same line stayed intact');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('WRONG-FIELD ANSWERS a date, a time or a frequency said to a yes/no or count question is not stored as its answer; the question is asked again within the limits; the plain answer then binds', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveServices(r, sim, { 'Pets': ['October 22', 'no pets'], 'Cleaning frequency': ['in the morning', 'just one time'], 'Preferred date': ['just one time', 'tomorrow'] });
+  const results = diag(r, 'FIELD_ANSWER').map((l) => `${l.detail?.field}:${l.detail?.result}`);
+  for (const x of ['PETS:AMBIGUOUS', 'PETS:BOUND', 'CLEANING_FREQUENCY:AMBIGUOUS', 'PREFERRED_DATE:AMBIGUOUS', 'PREFERRED_DATE:BOUND']) assert.ok(results.includes(x), `${x} in ${results.join(' ')}`);
+  assert.ok(callerLines(r).every((l) => !/^Pets: October/.test(l) && !/^Cleaning frequency: in the morning/.test(l) && !/^Preferred date: just one time/.test(l)), 'no mismatched answer was fed to Intake as a labelled answer');
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(asks(r)));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('READ-BACK AGREES WITH THE RECORD every labelled detail read to the caller is the value saved, the spoken number is the stored number, and a confirmed call is not held', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveServices(r, sim);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(asks(r)));
+  const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
+  const spoken = Object.fromEntries([...rb.slice(rb.indexOf('Let me check')).matchAll(/([A-Z][A-Za-z ]+): ([^.]+)\./g)].map((m) => [m[1], m[2]]));
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.match(q.token, /^I have your service address as 742 Evergreen Terrace\./);
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  for (const f of rec.fields.filter((x) => x.found && spoken[x.name] !== undefined)) assert.equal(f.value, spoken[f.name], `${f.name}: read back "${spoken[f.name]}", saved "${f.value}"`);
+  assert.ok(Object.keys(spoken).length >= 5, 'the read-back carried the details: ' + Object.keys(spoken).join(', '));
+  assert.deepEqual([rec.confirmation, rec.status, rec.missing_fields, rec.address_status], ['confirmed', 'ready', [], 'caller_confirmed']);
+  const c = r.vault?.get(T, rec.call_ref);
+  assert.equal(c?.phone, '2125550142'); assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./);
+  assert.ok(!/2125550142|priya|evergreen/i.test(JSON.stringify(rec) + JSON.stringify(r.logs)));
+});
+
+test('BOUNDED PLAYBACK WAIT a carrier that never reports playback does not hold the confirmation open: the handler bounds the wait itself, then the silence wait runs and the call ends unconfirmed', async () => {
+  const r = await servicesRig({ contacts: true, confirmWaitMs: 150, playbackMaxMs: 300, transportWrap: (inner) => {
+    const w: CallTransport = { onEvent: () => {}, onClose: () => {}, speak: (t, l, o) => inner.speak(t, l, o), endCall: () => inner.endCall(), close: (c) => inner.close(c), playbackDone: () => new Promise(() => {}) };
+    inner.onEvent = (e) => w.onEvent(e); inner.onClose = (i) => w.onClose(i);
+    return w;
+  } });
+  const sim = await r.connect();
+  await driveServices(r, sim);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  await ended(sim, r);
+  const settled = diag(r, 'PLAYBACK_SETTLED')[0];
+  assert.equal(settled?.detail?.outcome, 'TIMEOUT');
+  assert.ok(r.logs.some((l) => l.code === 'CONFIRM_TIMEOUT'));
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
+});
+
+// Known gaps, recorded as todo so they are reported and do not pass silently (see the roadmap, section 5a-10).
+test('FIRST-CLEANING POLARITY the question is worded by the text model, so a differently phrased question ("have you used us before?") reverses what a plain yes or no means', { todo: 'the first-cleaning question has no fixed wording; needs a founder-approved fixed line' }, () => {
+  assert.fail('not implemented');
+});
+test('UNSUPPORTED OPTIONAL FIELDS a field the category does not require and nobody asked about (last professional clean, home empty) can be filled by Intake from other words and is then read back and saved', { todo: 'needs a decision: read back and save only required, asked or volunteered fields' }, () => {
+  assert.fail('not implemented');
 });

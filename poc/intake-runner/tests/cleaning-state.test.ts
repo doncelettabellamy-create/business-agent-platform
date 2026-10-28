@@ -108,3 +108,18 @@ test('log codes are fixed capital-letter tokens built from configured names only
   assert.equal(codeOf(''), 'NONE'); assert.equal(codeOf(undefined), 'NONE');
   assert.ok(/^[A-Z_]+$/.test(codeOf('Last professional clean')));
 });
+
+// ---------------------------------------------------------------- 2026-10-28: clearly mismatched answers are not stored
+test('bind: a date, a time of day or a frequency is not an answer to a yes/no, count, frequency, date or time question for another field', () => {
+  const s = createCleaningState();
+  for (const [f, v] of [['Pets', 'October 22'], ['Pets', 'in the morning'], ['Pets', 'once a month'], ['Extras', 'next Tuesday'], ['Home empty', 'tomorrow afternoon'], ['Number of bedrooms', 'October 22'], ['Number of bedrooms', 'at 9:30'], ['Number of bedrooms', '22'],
+    ['Cleaning frequency', 'in the morning'], ['Cleaning frequency', 'October 22'], ['Preferred date', 'once a month'], ['Preferred date', 'in the morning'], ['Time window', 'October 22'], ['Time window', 'weekly']] as const) assert.equal(s.bind(f, v), 'ambiguous', `${f}: ${v}`);
+  assert.deepEqual(s.lines(), []);
+  for (const [f, v] of [['Pets', 'no pets'], ['Pets', 'two dogs'], ['Extras', 'yes the oven please'], ['Number of bedrooms', 'three bedrooms'], ['Cleaning frequency', 'every two weeks'], ['Preferred date', 'October 22'], ['Time window', 'in the morning']] as const) assert.equal(s.bind(f, v), 'bound', `${f}: ${v}`);
+});
+
+test('merge: a mismatched reading Intake produced (a date in an extras field) is not accepted', () => {
+  const s = createCleaningState();
+  const out = s.merge(item([fe('Extras', 'October 22'), fe('Pets', 'in the morning'), fe('Preferred date', 'October 22')]), 'October 22');
+  assert.deepEqual(out.accepted, ['Preferred date']);
+});

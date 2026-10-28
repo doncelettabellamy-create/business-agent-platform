@@ -46,6 +46,7 @@ const MAX_READBACKS = 2;
 /** A caller declining to give the address (not merely correcting it). */
 const ADDRESS_REFUSAL = /\b(?:rather not|prefer not|not comfortable|refuse|decline)\b|\b(?:do not|don't|dont) want to (?:give|share|say|tell)\b|\b(?:won't|will not|am not going to|not going to|not gonna) (?:give|share|say|tell)\b|\bnot (?:giving|sharing)\b/i;
 const MAX_SPEECH_WAIT_MS = 15_000;
+const PLAYBACK_MAX_MS = 90_000;
 const PLACEHOLDER = /\[[A-Z]+_\d{1,3}\]/g;
 const SENSITIVE_NAME = /\b(?:name|phone|mobile|cell|e-?mail|callback|contact)\b/i;
 /** The record's fields with every name, phone, mobile or e-mail field's value replaced by a placeholder. Pure. */
@@ -154,8 +155,10 @@ export interface RelayDeps {
   afterSpeechMs: number;
   /** How long a line needs to play, in milliseconds (see speechDelayMs). The call is not ended before this has passed (capped at 15 s). */
   speechMs(text: string): number;
-  /** How long to wait for the caller's yes or no after a read-back before ending the call unconfirmed. */
+  /** How long to wait for the caller's yes or no after a read-back before ending the call unconfirmed. It runs from the END of the read-back's playback when the carrier verifies playback, otherwise from the estimated end of its speech. */
   confirmWaitMs: number;
+  /** The longest to wait for the carrier to report that a read-back finished playing (a bounded failure timeout). Default 90 seconds. */
+  playbackMaxMs?: number;
   /** The longest to wait for the Intake run of a turn. A result that misses it chooses nothing; the assistant just listens. */
   previewBudgetMs: number;
   /** The longest the one retry of an EMPTY model reply waits for its first word, in milliseconds (default 4000). After that the server asks in fixed words. */
@@ -221,6 +224,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
   const fns = ['categoryNames', 'intakeContext', 'now', 'nowIso', 'killed', 'log', 'speechMs'] as const;
   if (!isRecord(deps) || !(deps.numbers instanceof Map) || !isRecord(deps.intake) || !isRecord(deps.dialogue) || !isRecord(deps.store) || !isRecord(deps.limits)
     || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !Number.isInteger(deps.confirmWaitMs) || deps.confirmWaitMs < 1 || !Number.isInteger(deps.previewBudgetMs) || deps.previewBudgetMs < 1 || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1
+    || (deps.playbackMaxMs !== undefined && (!Number.isInteger(deps.playbackMaxMs) || deps.playbackMaxMs < 1))
     || (deps.replyFirstWordMs !== undefined && (!Number.isInteger(deps.replyFirstWordMs) || deps.replyFirstWordMs < 1))
     || (deps.replyGapMs !== undefined && (!Number.isInteger(deps.replyGapMs) || deps.replyGapMs < 1))
     || (deps.replyTotalMs !== undefined && (!Number.isInteger(deps.replyTotalMs) || deps.replyTotalMs < 1))
@@ -344,8 +348,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
 
     /** Every outgoing message goes through here so a refused write (the peer gone or too slow) is counted, never silently lost. */
     const tally = (ok: boolean): boolean => { if (!ok) failedSends++; return ok; };
-    const say = (text: string, final = false): boolean => tally(final ? carrier.speak(text, true, { interruptible: false }) : carrier.speak(text, true));
-    const clearConfirmTimer = (): void => { if (confirmTimer !== undefined) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
+    let lastSay = '';   // the words of the newest fixed line sent (for the speech estimate when the carrier cannot verify playback)
+    let confirmGen = 0;   // bumps whenever the confirmation wait is cleared or re-armed, so a late playback report cannot start a stale timer
+    const say = (text: string, final = false): boolean => { lastSay = text; return tally(final ? carrier.speak(text, true, { interruptible: false }) : carrier.speak(text, true)); };
+    const clearConfirmTimer = (): void => { confirmGen++; if (confirmTimer !== undefined) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
     function release(): void {
       clearTimeout(setupTimer);
       clearConfirmTimer();
@@ -636,17 +642,39 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     }
     let interruptedText = '';
 
+    /**
+     * Waits for the caller's yes or no. The wait is for SILENCE after the question: it starts when the question has finished playing (verified by the carrier when it can say so, bounded by
+     * playbackMaxMs; otherwise from the estimated end of its speech), never while the caller is still being read to. A caller who speaks clears it (onPrompt).
+     */
     function armConfirmTimer(): void {
       clearConfirmTimer();
-      confirmTimer = setTimeout(() => {
-        chain = chain.then(async () => {
-          if (done || phase === 'collect') return;
-          deps.log('CONFIRM_TIMEOUT');
-          await farewell(SAY.silence, true);
-        }).catch(() => deps.log('HANDLER_ERROR'));
-        void track(chain);
-      }, deps.confirmWaitMs);
-      confirmTimer.unref?.();
+      const gen = confirmGen;
+      const begin = (waitMs: number): void => {
+        if (gen !== confirmGen || done) return;
+        confirmTimer = setTimeout(() => {
+          chain = chain.then(async () => {
+            if (done || phase === 'collect') return;
+            deps.log('CONFIRM_TIMEOUT');
+            await farewell(SAY.silence, true);
+          }).catch(() => deps.log('HANDLER_ERROR'));
+          void track(chain);
+        }, waitMs);
+        confirmTimer.unref?.();
+      };
+      if (typeof carrier.playbackDone === 'function') {
+        // The carrier bounds its own report; this bound is the handler's own, so a carrier that never answers cannot hold the call open either.
+        const max = deps.playbackMaxMs ?? PLAYBACK_MAX_MS;
+        let guard: ReturnType<typeof setTimeout> | undefined;
+        const bounded = Promise.race([carrier.playbackDone(max), new Promise<'timeout'>((resolve) => { guard = setTimeout(() => resolve('timeout'), max + 500); guard.unref?.(); })]);
+        bounded.then((outcome) => {
+          if (guard !== undefined) clearTimeout(guard);
+          if (gen !== confirmGen || done) return;
+          deps.log('PLAYBACK_SETTLED', { outcome: outcome === 'played' ? 'PLAYED' : outcome === 'cut' ? 'CUT' : 'TIMEOUT' });
+          begin(deps.confirmWaitMs);
+        }, () => { if (guard !== undefined) clearTimeout(guard); begin(deps.confirmWaitMs); });
+        return;
+      }
+      begin(deps.confirmWaitMs + (lastSay === '' ? 0 : Math.min(MAX_SPEECH_WAIT_MS, Math.max(0, deps.speechMs(lastSay)))));
     }
 
     function startReadback(item: Preview): void {

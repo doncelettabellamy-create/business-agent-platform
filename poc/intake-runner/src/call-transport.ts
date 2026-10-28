@@ -65,6 +65,12 @@ export interface CallTransport {
   converse?(request: ConverseRequest): Promise<ConverseResult>;
   /** Native conversation only: answers a `tool` event. False when it could not be sent. */
   toolResult?(callId: string, output: string): boolean;
+  /**
+   * Optional. Resolves when everything handed to speak() has finished playing as the carrier verifies it ('played'), was cut short or failed or the call ended ('cut'), or has not settled within `maxMs`
+   * ('timeout': a bounded failure, so a carrier that never reports cannot hold the call open). The call logic starts its wait for the caller's yes or no only then, so a long read-back is not hung up on
+   * while it is still being spoken. A carrier that cannot tell (ConversationRelay) does not have this method.
+   */
+  playbackDone?(maxMs: number): Promise<'played' | 'cut' | 'timeout'>;
   /** Tells the carrier to end the call. False when it could not be sent. */
   endCall(): boolean;
   close(code?: number): void;

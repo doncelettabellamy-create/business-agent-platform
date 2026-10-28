@@ -263,3 +263,38 @@ test('ADDRESS the directive names only the missing part, in one fixed line, and 
   assert.equal(fallbackText({ kind: 'ask', field: 'Service address', part: 'street name' }), 'Sorry about the pause. What is the street name?');
   assert.ok(!/[\r\n[\]<>]/.test(renderDirective({ kind: 'ask', field: 'Service address', part: 'house number' })));
 });
+
+// ---------------------------------------------------------------- 2026-10-28: dates, times and durations are not phone digits
+test('PHONE a date, a time, a duration or a quantity is never phone digits: nothing is taken, held pieces stay as they were, and a long digit run in the line is still taught to the masker', () => {
+  const s = createContactState();
+  s.collect('phone', 'two one two five five five');
+  for (const bad of ['October 22', 'on the 22nd', 'six months ago', '9:30', '10 am', 'nine thirty', 'twenty two', 'tomorrow morning at nine', 'three bedrooms', 'two weeks']) {
+    const r = s.collect('phone', bad);
+    assert.deepEqual([r.outcome, r.reason, r.digits, s.pendingDigits()], ['unclear', 'NOT_DIGITS', 0, 6], bad);
+    assert.deepEqual(r.learn, [], `${bad}: a short run (a day, an hour) is left alone`);
+  }
+  const long = s.collect('phone', 'on October 22 call 5550142 tomorrow');
+  assert.deepEqual([long.reason, long.learn.length], ['NOT_DIGITS', 1], 'the seven digit run is taught to the masker so it stays protected');
+  assert.equal(s.collect('phone', 'zero one four two').reason, 'CAPTURED');
+  assert.equal(s.value('phone'), '2125550142');
+});
+
+test('PHONE ordinary spoken or written numbers still count, with filler words around them', () => {
+  for (const [line, digits] of [['212 555 0142', '2125550142'], ['my number is two one two five five five zero one four two', '2125550142'], ['sorry, it is one two one two five five five zero one four two', '12125550142'], ['area code two one two', undefined]] as const) {
+    const t = createContactState(); const r = t.collect('phone', line);
+    assert.equal(t.value('phone'), digits, line);
+    assert.notEqual(r.reason, 'NOT_DIGITS', line);
+  }
+});
+
+test('masking: an ordinary date stays intact when no phone piece was accepted, and an ACCEPTED piece is still masked wherever it is said next', () => {
+  const s = session();
+  const a = s.hear('October 22', 'phone');
+  assert.ok(a.ok && a.line === 'October 22' && a.contact?.[0].reason === 'NOT_DIGITS', JSON.stringify(a));
+  const b = s.hear('five five five zero', 'phone');
+  assert.ok(b.ok && /^\[CONTACT_\d\]$/.test(b.line) && b.contact?.[0].reason === 'PIECE', JSON.stringify(b));
+  const c = s.hear('it was five five five zero', 'phone');
+  assert.ok(c.ok && !/five/.test(c.line), 'the piece is masked again later: ' + JSON.stringify(c));
+  assert.ok(/October 22/.test(s.maskedText()), 'the date is still in what a model reads');
+  assert.ok(!/five five five zero/.test(s.maskedText()));
+});

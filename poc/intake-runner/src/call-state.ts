@@ -28,12 +28,13 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   CAPTURED          the item was taken.            PIECE            a phone piece was joined to the digits held so far.
  *   RESTART           the pieces could not make a phone number (a repeated prefix, a stray digit word): the held digits were dropped and this piece started over.
  *   CORRECTED_LAST4   "the last four are ...": the final four digits of the number held were replaced.
+ *   NOT_DIGITS        the line carries a date, a time, a duration or another quantity ("October 22", "six months", "9:30"): its digits are not phone digits and are not taken.
  *   NO_DIGITS         the line held no digit words.   TOO_MANY         more than fifteen digits: start over.
  *   NOT_A_NAME        not a usable name.              NO_STREET_NUMBER an address line without a street number.   NOT_AN_ADDRESS  not a usable address.
  *   NEED_STREET       a house number was heard without a street name: it is held and only the street name is asked.   NEED_NUMBER   a street name without a house number.   JOINED   the held part and the new part made the address.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'JOINED' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'JOINED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -68,6 +69,17 @@ const DIGIT_TOKEN = '(?:(?:double|triple|treble)[\\s-]+)?(?:zero|oh|one|two|thre
 /** The stretches of a line that are digits said or written ("five five five 0 1 double 0"), so only those are taught to the masker, not the words around them. */
 const DIGIT_RUNS = new RegExp(`\\b${DIGIT_TOKEN}(?:[\\s,.-]+${DIGIT_TOKEN})*\\b`, 'gi');
 export function digitRuns(raw: string): string[] { return [...raw.matchAll(DIGIT_RUNS)].map((m) => m[0]).filter((s) => s.length > 0); }
+/** The digit runs of five or more digits (never a day of the month, a count or a year). */
+function longDigitRuns(raw: string): string[] { return digitRuns(raw).filter((r) => (digitsOf(r) ?? '').length >= 5); }
+const NOT_PHONE_WORDS = new Set(['january', 'february', 'april', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
+  'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'today', 'tomorrow', 'tonight', 'morning', 'afternoon', 'evening', 'noon', 'midnight', 'week', 'weeks', 'month', 'months', 'year', 'years', 'day', 'days',
+  'hour', 'hours', 'minute', 'minutes', 'am', 'pm', "o'clock", 'bedroom', 'bedrooms', 'bathroom', 'bathrooms', 'room', 'rooms', 'dollars', 'dollar', 'percent', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
+  'hundred', 'thousand', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen']);
+/** Whether the line is a date, a time, a duration or another quantity rather than phone digits. A phone number is spoken digit by digit, so ordinals, tens words, clock times and calendar words rule a line out. */
+function looksLikeDateOrQuantity(raw: string): boolean {
+  if (/\b\d{1,2}:\d{2}\b/.test(raw) || /\b\d{1,2}\s?(?:a\.?m\.?|p\.?m\.?)(?![a-z])/i.test(raw)) return true;
+  return raw.toLowerCase().split(/[^a-z0-9']+/).some((t) => NOT_PHONE_WORDS.has(t) || /^\d+(?:st|nd|rd|th)$/.test(t));
+}
 
 /** The name in a caller's words, or undefined when it is not a usable name. Pure. */
 export function nameFrom(raw: unknown): string | undefined {
@@ -162,6 +174,9 @@ export function createContactState(): ContactState {
   const held = (): number => (values.phone !== undefined ? values.phone.length : pending.length);
 
   function setPhone(raw: string, replace: boolean): CollectResult {
+    // A date, a time or a duration is not a phone number whatever digits it holds ("October 22" answered to the phone question once became the first two digits of the number). Nothing is taken, the held
+    // pieces stay as they were, and a long run of digits in such a line is still taught to the masker (so it is protected) while short ones (a day of the month) are left alone.
+    if (looksLikeDateOrQuantity(raw)) return { field: 'phone', outcome: 'unclear', learn: longDigitRuns(raw), reason: 'NOT_DIGITS', digits: 0, total: held() };
     const learn = digitRuns(raw);
     const whole = phoneDigits(raw);
     if (whole !== undefined) { values.phone = whole; pending = ''; return { field: 'phone', outcome: 'captured', learn, reason: 'CAPTURED', digits: whole.length, total: whole.length }; }

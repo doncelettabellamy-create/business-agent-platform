@@ -141,6 +141,11 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
   let seq = 0;
   let current: Out | undefined;
   let queue: Out[] = [];
+  // Playback is VERIFIED by the bridge: a reply's `response.done` reaches here only after the phone provider has acknowledged the audio (or it was cleared), so "nothing current and nothing queued" means
+  // everything handed to speak() has been played, cut or failed. `playbackDone` lets the call logic wait for exactly that.
+  let lastPlayback: 'played' | 'cut' = 'played';
+  const playWaiters = new Set<(r: 'played' | 'cut') => void>();
+  const settlePlayback = (): void => { for (const w of [...playWaiters]) w(lastPlayback); };
   let buffer = '';
   let interruptOff = false;
   let hangupWanted = false;
@@ -241,6 +246,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
   }
   /** Every native reply still waiting (playing or queued) is answered as failed: the call is over or the link is gone. */
   function dropNative(): void {
+    lastPlayback = 'cut'; settlePlayback();
     if (current !== undefined && current.kind === 'converse') finishConverse(current, { failed: true });
     for (const q of queue) if (q.kind === 'converse') finishConverse(q, { failed: true });
   }
@@ -256,7 +262,8 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
   function pump(): void {
     if (current !== undefined || phase === 'ended') return;
     const next = queue.shift();
-    if (next !== undefined) { if (!dispatch(next)) { if (next.kind === 'converse') finishConverse(next, { failed: true }); else emit({ kind: 'reply_failed' }); pump(); } return; }
+    if (next !== undefined) { if (!dispatch(next)) { if (next.kind === 'converse') finishConverse(next, { failed: true }); else emit({ kind: 'reply_failed' }); lastPlayback = 'cut'; pump(); } return; }
+    settlePlayback();
     if (hangupWanted) doHangup();
   }
   function noticeFailed(reason: string): void {
@@ -334,6 +341,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         const played = r.status === 'completed' && typeof done.transcript === 'string' && sameSpeech(done.transcript, done.text);
         const status = typeof r.status === 'string' && /^[a-z_]{1,32}$/.test(r.status) ? r.status : 'other';
         const why = r.status !== 'completed' ? `status_${status}` : typeof done.transcript !== 'string' ? 'no_transcript' : 'transcript_differs';
+        lastPlayback = played && done.interrupted !== true ? 'played' : 'cut';
         diag('ADAPTER_REPLY_DONE', { kind: done.kind, status, played, interrupted: done.interrupted === true, requestedChars: done.text.length, transcriptChars: typeof done.transcript === 'string' ? done.transcript.length : 0 });
         if (done.interrupted) { /* the caller took the floor: nothing failed */ }
         else if (!played) { if (done.kind === 'notice') { noticeFailed(why); return; } diag('ADAPTER_REPLY_FAILED', { reason: why }); emit({ kind: 'reply_failed' }); }
@@ -393,6 +401,16 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
       const out: Out = { id: `r${++seq}`, text, kind: 'reply', interruptible: opts?.interruptible !== false };
       if (current !== undefined) { queue.push(out); return true; }
       return dispatch(out);
+    },
+    playbackDone(maxMs: number): Promise<'played' | 'cut' | 'timeout'> {
+      return new Promise((resolve) => {
+        if (phase === 'ended') { resolve('cut'); return; }
+        if (current === undefined && queue.length === 0) { resolve(lastPlayback); return; }
+        const timer = setTimeout(() => { playWaiters.delete(waiter); resolve('timeout'); }, Math.max(1, Math.floor(maxMs)));
+        timer.unref?.();
+        const waiter = (r: 'played' | 'cut'): void => { clearTimeout(timer); playWaiters.delete(waiter); resolve(r); };
+        playWaiters.add(waiter);
+      });
     },
     endCall(): boolean {
       if (phase === 'ended') return false;
