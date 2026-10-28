@@ -130,6 +130,19 @@ test('run: against healthy mocks every check passes, the "$25" greeting is verif
   for (const s of [FAKE_KEY, 'Drew Cleaning', 'burst', '[PERSON_1]', 'two bedroom', 'OpenAI', 'qualifying']) assert.ok(!out.includes(s), `the report holds: ${s}`);
 });
 
+test('run: a connection that opens while the text requests are still running does not lose its open event (the defect behind the first paid check CONNECTION_FAILED)', async () => {
+  const slowFetch = (async (_u: string, init: RequestInit) => {
+    await new Promise((r) => setTimeout(r, 150));   // real text requests take seconds; the connection opens long before the bridge exists
+    const params = JSON.parse(String(init.body));
+    const answer = (text: string) => ({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text }] }], usage: { input_tokens: 300, output_tokens: 20 } });
+    return new Response(JSON.stringify(params.text?.format ? answer(JSON.stringify({ category: 'Standard cleaning', confidence: 0.9 })) : answer('Hello, how can I help you today?')), { status: 200 });
+  }) as unknown as typeof globalThis.fetch;
+  const voice = mockVoice();                          // the socket is created now and opens within a few milliseconds
+  const report = await runCheck({ plan: planOf(), voice: voiceConfig(), textClient: createOpenAIHttpClient({ getKey: () => FAKE_KEY, fetch: slowFetch }), voiceSocket: voice.socket, now: () => Date.now() });
+  assert.deepEqual(report.checks.map((c) => [c.name, c.ok]), [['text_structured', true], ['text_wording', true], ['session_accepted', true], ['notice_verified', true], ['speech_verified', true], ['cancel_by_id', true], ['audio_flowed', true], ['cleanup', true]], JSON.stringify(report.checks));
+  assert.ok(report.allPassed);
+});
+
 test('run: a notice the voice reads in other words fails the check rather than passing it, and nothing further is spoken', async () => {
   for (const behave of [(_t: string, n: number): Behaviour => (n === 1 ? { say: 'Hi, how can I help you today?' } : 'exact'), (_t: string, n: number): Behaviour => (n === 1 ? 'fail' : 'exact'), (_t: string, n: number): Behaviour => (n === 1 ? 'silent' : 'exact')]) {
     const voice = mockVoice({ behave });

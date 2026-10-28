@@ -191,6 +191,42 @@ test('cancel: closing before the connection has opened stops the timer and the c
   assert.ok(!r.diags.includes('VOICE_CONNECT_TIMEOUT'));
 });
 
+// ================================================================ handlers attached after the connection is already open
+test('late handlers: a connection that opens before the bridge has attached its handlers still tells the bridge it is open, and no message is lost (the defect behind the first paid check CONNECTION_FAILED)', async () => {
+  const r = rig();                       // the factory made the connection; the test attaches handlers only later, as the check does after its text requests
+  const late = createOpenAiVoiceSocket({ model: MODEL, getKey: () => FAKE_KEY, connectTimeoutMs: 5000, factory: (url, init) => { const w = new FakeWs(url, init.headers); r.made.push(w); return w; } });
+  const ws = r.made[r.made.length - 1];
+  ws.open();                             // opens, and the first messages arrive, with no handler attached
+  ws.message('{"type":"session.created"}');
+  ws.message('{"type":"session.updated"}');
+  await pause(30);
+  const got = { opens: 0, messages: [] as string[], closes: 0 };
+  late.onOpen = () => { got.opens++; };
+  late.onMessage = (t) => { got.messages.push(t); };
+  late.onClose = () => { got.closes++; };
+  await pause(10);
+  assert.equal(got.opens, 1, 'told it is open, once, although it opened before it was listening');
+  assert.deepEqual(got.messages, ['{"type":"session.created"}', '{"type":"session.updated"}'], 'nothing lost, in order');
+  ws.message('{"type":"x"}');
+  assert.equal(got.messages.length, 3, 'later messages come straight through');
+  assert.equal(late.send('{"type":"y"}'), true);
+});
+
+test('late handlers: a connection that closed before anyone was listening still reports the close, once; the queue of unheard messages is bounded', async () => {
+  const made: FakeWs[] = [];
+  const s = createOpenAiVoiceSocket({ model: MODEL, getKey: () => FAKE_KEY, connectTimeoutMs: 5000, factory: (url, init) => { const w = new FakeWs(url, init.headers); made.push(w); return w; } });
+  made[0].open();
+  for (let i = 0; i < 300; i++) made[0].message(`{"n":${i}}`);
+  made[0].remoteClose();
+  await pause(10);
+  const got = { messages: [] as string[], closes: 0, opens: 0 };
+  s.onOpen = () => { got.opens++; }; s.onMessage = (t) => { got.messages.push(t); }; s.onClose = () => { got.closes++; };
+  await pause(10);
+  assert.deepEqual([got.closes, got.messages.length <= 100], [1, true]);
+  assert.equal(got.messages[got.messages.length - 1], '{"n":299}', 'the newest messages are the ones kept');
+  assert.equal(s.send('{}'), false);
+});
+
 // ================================================================ under the voice bridge
 function underBridge(key: () => string | undefined = () => FAKE_KEY) {
   const made: FakeWs[] = [];

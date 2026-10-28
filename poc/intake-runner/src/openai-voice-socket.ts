@@ -81,8 +81,33 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
   let finished = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  // What the connection does before the bridge is listening is KEPT, not lost: the open, the messages (the newest 100) and the close wait in a queue and are delivered, in order, as soon as the matching handler is
+  // attached. This matters because the connection starts the moment the socket is made, and the first paid check made it before its text requests, which take seconds; the bridge attached its handlers only
+  // afterwards, never heard "open", and gave up (CONNECTION_FAILED, opened:false) although the service had accepted the connection.
+  type Ev = { k: 'open' } | { k: 'message'; text: string } | { k: 'close' };
+  const queue: Ev[] = [];
+  let hOpen: (() => void) | undefined; let hMessage: ((text: string) => void) | undefined; let hClose: (() => void) | undefined;
+  const MAX_UNHEARD = 100;
+  function drain(): void {
+    while (queue.length > 0) {
+      const ev = queue[0];
+      if (ev.k === 'open' ? hOpen === undefined : ev.k === 'message' ? hMessage === undefined : hClose === undefined) return;   // in order: wait for the handler this one needs
+      queue.shift();
+      try { if (ev.k === 'open') hOpen?.(); else if (ev.k === 'message') hMessage?.(ev.text); else hClose?.(); } catch { /* the bridge never throws into the socket */ }
+    }
+  }
+  function push(ev: Ev): void {
+    queue.push(ev);
+    const heard = queue.filter((e) => e.k === 'message');
+    if (heard.length > MAX_UNHEARD) queue.splice(queue.indexOf(heard[0]), 1);   // only the newest are kept when nobody is listening
+    drain();
+  }
+  const attach = (): void => { queueMicrotask(drain); };   // deliver what was waiting, but never from inside the assignment itself
+
   const v: VoiceSocket = {
-    onOpen: () => {}, onMessage: () => {}, onClose: () => {},
+    get onOpen() { return hOpen ?? (() => {}); }, set onOpen(fn: () => void) { hOpen = fn; attach(); },
+    get onMessage() { return hMessage ?? (() => {}); }, set onMessage(fn: (text: string) => void) { hMessage = fn; attach(); },
+    get onClose() { return hClose ?? (() => {}); }, set onClose(fn: () => void) { hClose = fn; attach(); },
     send(text: string): boolean {
       if (!open || ws === undefined || typeof text !== 'string' || ws.readyState !== OPEN) return false;
       if (ws.bufferedAmount > maxBuffered) { diag('VOICE_SEND_REFUSED'); return false; }
@@ -105,7 +130,7 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
       s.onopen = null; s.onmessage = null; s.onclose = null; s.onerror = null;   // a late event from a socket that has been let go does nothing
       try { s.close(code === 1000 || (typeof code === 'number' && code >= 3000 && code <= 4999) ? code : 1000); } catch { /* already gone */ }
     }
-    if (report) { diag('VOICE_CLOSED'); try { v.onClose(); } catch { /* the bridge never throws into the socket */ } }
+    if (report) { diag('VOICE_CLOSED'); push({ k: 'close' }); } else queue.length = 0;   // when the bridge itself closed it, nothing more is delivered
   }
 
   // ---- connect (once; never retried)
@@ -132,12 +157,12 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
   diag('VOICE_CONNECT_STARTED');
   timer = setTimeout(() => { timer = undefined; if (!open) { diag('VOICE_CONNECT_TIMEOUT'); end(1000, true); } }, connectTimeoutMs);
   timer.unref?.();
-  ws.onopen = (): void => { if (finished) return; open = true; if (timer !== undefined) { clearTimeout(timer); timer = undefined; } diag('VOICE_OPEN'); try { v.onOpen(); } catch { /* never into the socket */ } };
+  ws.onopen = (): void => { if (finished) return; open = true; if (timer !== undefined) { clearTimeout(timer); timer = undefined; } diag('VOICE_OPEN'); push({ k: 'open' }); };
   ws.onmessage = (ev: { data: unknown }): void => {
     if (finished) return;
     if (typeof ev?.data !== 'string') { diag('VOICE_BINARY_DROPPED'); return; }
     if (ev.data.length > maxChars) { diag('VOICE_OVERSIZE_DROPPED'); return; }
-    try { v.onMessage(ev.data); } catch { /* never into the socket */ }
+    push({ k: 'message', text: ev.data });
   };
   ws.onerror = (): void => { if (finished) return; if (!open) diag('VOICE_CONNECT_FAILED'); /* the close that follows is what ends the call */ };
   ws.onclose = (): void => { end(1000, true); };
