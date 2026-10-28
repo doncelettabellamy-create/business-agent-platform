@@ -60,6 +60,8 @@ export interface RelayWsConfig {
   /** After `failures` refused handshakes within `windowMs`, every upgrade is refused (503) until the window clears. Default 8 in 60 s. */
   lockout?: { failures: number; windowMs: number };
   onConnection(conn: RelayConnection): void;
+  /** Called with the HTTP status of every handshake this server refuses (a number only: never a header, a path or an address), so a log can show that a call never got in. */
+  onRefuse?(status: number): void;
 }
 export interface RelayWsServer {
   listen(port: number): Promise<number>;
@@ -90,6 +92,7 @@ export function encodeFrame(opcode: number, payload: Buffer): Buffer {
 
 export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
   const { path, authToken, urls, onConnection } = config;
+  const refused = (socket: Duplex, status: number): void => { try { config.onRefuse?.(status); } catch { /* a log must not break the server */ } refuseSocket(socket, status); };
   if (typeof path !== 'string' || !/^\/[A-Za-z0-9_./-]{0,127}$/.test(path)) throw new RangeError('path must be an absolute path');
   if (typeof authToken !== 'string' || authToken.length < 8) throw new RangeError('authToken is required');
   if (!Array.isArray(urls) || urls.length === 0 || !urls.every((u) => typeof u === 'string' && /^(wss|https):\/\//.test(u))) throw new RangeError('urls must be wss:// or https:// addresses');
@@ -115,18 +118,18 @@ export function createRelayWsServer(config: RelayWsConfig): RelayWsServer {
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     try {
       const h = req.headers;
-      if (locked()) return refuseSocket(socket, 503);
-      const refuse = (status: number): void => { refusals.push(Date.now()); if (refusals.length > 1000) refusals.shift(); refuseSocket(socket, status); };
+      if (locked()) return refused(socket, 503);
+      const refuse = (status: number): void => { refusals.push(Date.now()); if (refusals.length > 1000) refusals.shift(); refused(socket, status); };
       const pathOnly = String(req.url ?? '');
       if (req.method !== 'GET' || !sameText(pathOnly, path)) return refuse(404);
       if (String(h.upgrade ?? '').toLowerCase() !== 'websocket' || !String(h.connection ?? '').toLowerCase().split(',').map((s) => s.trim()).includes('upgrade')) return refuse(426);
       if (h['sec-websocket-version'] !== '13' || typeof h['sec-websocket-key'] !== 'string' || !KEY.test(h['sec-websocket-key'])) return refuse(400);
       if (!signatureMatches(authToken, h['x-twilio-signature'], urls)) return refuse(403);
-      if (sockets.size >= maxConnections) return refuseSocket(socket, 503);
+      if (sockets.size >= maxConnections) return refused(socket, 503);
       const accept = createHash('sha1').update(h['sec-websocket-key'] + GUID).digest('base64');
       socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
       accepted(socket, head);
-    } catch { refuseSocket(socket, 400); }
+    } catch { refused(socket, 400); }
   });
 
   function accepted(socket: Duplex, head: Buffer): void {

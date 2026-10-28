@@ -33,7 +33,7 @@ export interface WebSocketLike {
 export type WebSocketFactory = (url: string, init: { headers: Record<string, string> }) => WebSocketLike;
 
 /** Fixed codes only. */
-export type VoiceCode = 'VOICE_KEY_MISSING' | 'VOICE_CONNECT_STARTED' | 'VOICE_OPEN' | 'VOICE_CONNECT_TIMEOUT' | 'VOICE_CONNECT_FAILED' | 'VOICE_CLOSED' | 'VOICE_SEND_REFUSED' | 'VOICE_BINARY_DROPPED' | 'VOICE_OVERSIZE_DROPPED' | 'VOICE_CLOSE_REQUESTED';
+export type VoiceCode = 'VOICE_REMOTE_CLOSE' | 'VOICE_KEY_MISSING' | 'VOICE_CONNECT_STARTED' | 'VOICE_OPEN' | 'VOICE_CONNECT_TIMEOUT' | 'VOICE_CONNECT_FAILED' | 'VOICE_CLOSED' | 'VOICE_SEND_REFUSED' | 'VOICE_BINARY_DROPPED' | 'VOICE_OVERSIZE_DROPPED' | 'VOICE_CLOSE_REQUESTED';
 
 export interface OpenAiVoiceOptions {
   /** The exact model id, chosen by the founder. No default. */
@@ -50,8 +50,8 @@ export interface OpenAiVoiceOptions {
   maxBufferedBytes?: number;
   /** The longest text frame accepted. Default 1048576. */
   maxMessageChars?: number;
-  /** Fixed codes only. */
-  diag?: (code: VoiceCode) => void;
+  /** Fixed codes, with numbers only as detail (the close code a remote end sent, the milliseconds the connect took). */
+  diag?: (code: VoiceCode, detail?: Record<string, number | string | boolean>) => void;
 }
 
 export const REALTIME_URL = 'wss://api.openai.com/v1/realtime';
@@ -74,8 +74,9 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
   }
   const connectTimeoutMs = options.connectTimeoutMs ?? 5000;
   const maxBuffered = options.maxBufferedBytes ?? 262_144;
-  const maxChars = options.maxMessageChars ?? 1_048_576;
-  const diag = (code: VoiceCode): void => { try { options.diag?.(code); } catch { /* diagnostics never throw into the call */ } };
+  const maxChars = options.maxMessageChars ?? 8_388_608;
+  const diag = (code: VoiceCode, detail?: Record<string, number | string | boolean>): void => { try { options.diag?.(code, detail); } catch { /* diagnostics never throw into the call */ } };
+  const createdAt = Date.now();
   let ws: WebSocketLike | undefined;
   let open = false;
   let finished = false;
@@ -115,7 +116,7 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
     },
     close(code?: number): void {
       if (finished) return;
-      diag('VOICE_CLOSE_REQUESTED');
+      diag('VOICE_CLOSE_REQUESTED', { closeCode: typeof code === 'number' ? code : 1000, wasOpen: open, afterMs: Date.now() - createdAt });
       end(code, false);
     },
   };
@@ -155,9 +156,9 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
   }
   key = undefined;   // not needed again
   diag('VOICE_CONNECT_STARTED');
-  timer = setTimeout(() => { timer = undefined; if (!open) { diag('VOICE_CONNECT_TIMEOUT'); end(1000, true); } }, connectTimeoutMs);
+  timer = setTimeout(() => { timer = undefined; if (!open) { diag('VOICE_CONNECT_TIMEOUT', { waitMs: connectTimeoutMs }); end(1000, true); } }, connectTimeoutMs);
   timer.unref?.();
-  ws.onopen = (): void => { if (finished) return; open = true; if (timer !== undefined) { clearTimeout(timer); timer = undefined; } diag('VOICE_OPEN'); push({ k: 'open' }); };
+  ws.onopen = (): void => { if (finished) return; open = true; if (timer !== undefined) { clearTimeout(timer); timer = undefined; } diag('VOICE_OPEN', { connectMs: Date.now() - createdAt }); push({ k: 'open' }); };
   ws.onmessage = (ev: { data: unknown }): void => {
     if (finished) return;
     if (typeof ev?.data !== 'string') { diag('VOICE_BINARY_DROPPED'); return; }
@@ -165,6 +166,6 @@ export function createOpenAiVoiceSocket(options: OpenAiVoiceOptions): VoiceSocke
     push({ k: 'message', text: ev.data });
   };
   ws.onerror = (): void => { if (finished) return; if (!open) diag('VOICE_CONNECT_FAILED'); /* the close that follows is what ends the call */ };
-  ws.onclose = (): void => { end(1000, true); };
+  ws.onclose = (ev: unknown): void => { if (!finished) diag('VOICE_REMOTE_CLOSE', { closeCode: typeof (ev as { code?: unknown })?.code === 'number' ? (ev as { code: number }).code : 0, wasOpen: open, afterMs: Date.now() - createdAt }); end(1000, true); };
   return v;
 }

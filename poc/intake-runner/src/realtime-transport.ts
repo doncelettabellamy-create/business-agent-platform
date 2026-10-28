@@ -19,6 +19,8 @@ import type { CallTransport, TransportEvent } from './call-transport.ts';
 import type { CloseInfo } from './ws-server.ts';
 import { isPersona, voiceManner } from './persona.ts';
 import { isRealtimeEffort, transcriptionHintProblems } from './realtime-settings.ts';
+import { noDiag } from './call-diag.ts';
+import type { DiagSink } from './call-diag.ts';
 import type { RealtimeEffort, RealtimeTranscription } from './realtime-settings.ts';
 import type { Persona } from './persona.ts';
 
@@ -51,6 +53,8 @@ export interface RealtimeOptions {
   reasoningEffort?: RealtimeEffort;
   /** Hints for the live transcriber (languages, keywords), sent only when set. Valid only for the transcribers that document them (the voice gate checks that). */
   transcription?: RealtimeTranscription;
+  /** Fixed-code diagnostics (call-diag.ts): the notice requested, played or failed (and why), each reply's end, interruptions, and the hang-up and close paths. Codes and numbers only. */
+  diag?: DiagSink;
 }
 
 export const SPEAK_ONLY = 'You are only a voice on a phone line. Never speak on your own. When you are asked to say words, say exactly those words and nothing else: no greeting, no comment, no change of wording, and every digit exactly as given.';
@@ -94,6 +98,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     || (options.transcription !== undefined && transcriptionHintProblems(options.transcription).length > 0)) {
     throw new RangeError('the realtime transport needs a notice, a transcription model, a voice, and sane timings');
   }
+  const diag = options.diag ?? noDiag;
   const msPerChar = options.msPerChar ?? 70;
   const endWaitMs = options.endWaitMs ?? 3000;
   const reasoning = options.reasoningEffort === undefined ? {} : { reasoning: { effort: options.reasoningEffort } };
@@ -138,7 +143,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     ask('cancel', { type: 'response.cancel', response_id: o.responseId });
     if (cancelTimer === undefined) {
       // If the voice service never closes the reply, the call must not wait for it for ever: after a while the reply is given up and the next line may go, and the late reply (if it ever speaks) is dropped by the phone layer.
-      cancelTimer = setTimeout(() => { cancelTimer = undefined; if (current === o) { current = undefined; pump(); } }, endWaitMs);
+      cancelTimer = setTimeout(() => { cancelTimer = undefined; if (current === o) { diag('ADAPTER_CANCEL_GAVE_UP', { waitMs: endWaitMs }); current = undefined; pump(); } }, endWaitMs);
       cancelTimer.unref?.();
     }
   }
@@ -157,6 +162,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     if (phase === 'ended') return false;
     phase = 'ended';
     const ok = link.hangup();
+    diag('ADAPTER_HANGUP', { ok, closeCode: closeCode ?? 0 });
     if (closeCode !== undefined) link.close(closeCode);
     return ok;
   }
@@ -166,10 +172,11 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     if (next !== undefined) { if (!dispatch(next)) { emit({ kind: 'reply_failed' }); pump(); } return; }
     if (hangupWanted) doHangup();
   }
-  function noticeFailed(): void {
+  function noticeFailed(reason: string): void {
     clearTimers();
     if (phase === 'ended') return;
     phase = 'ended';
+    diag('ADAPTER_NOTICE_FAILED', { reason });   // the call ends here: the caller did not hear the consent notice as it was written
     link.hangup();
     transport.onClose({ cause: 'PROTOCOL', code: 1011 });
   }
@@ -190,8 +197,10 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         if (phase !== 'idle') { emit({ kind: 'other' }); return; }
         start = { to: m.to, callSid: m.callSid };
         phase = 'notice';
-        if (!link.send(session(true))) { noticeFailed(); return; }
-        if (!dispatch({ id: 'notice', text: options.notice, kind: 'notice', interruptible: false })) noticeFailed();
+        diag('ADAPTER_CALL_START', { noticeChars: options.notice.length });
+        if (!link.send(session(true))) { noticeFailed('send_failed'); return; }
+        if (!dispatch({ id: 'notice', text: options.notice, kind: 'notice', interruptible: false })) noticeFailed('send_failed');
+        else diag('ADAPTER_NOTICE_REQUESTED');
         return;
       }
       case 'response.created': {
@@ -213,9 +222,12 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         current = undefined;
         if (cancelTimer !== undefined) { clearTimeout(cancelTimer); cancelTimer = undefined; }
         const played = r.status === 'completed' && typeof done.transcript === 'string' && sameSpeech(done.transcript, done.text);
+        const status = typeof r.status === 'string' && /^[a-z_]{1,32}$/.test(r.status) ? r.status : 'other';
+        const why = r.status !== 'completed' ? `status_${status}` : typeof done.transcript !== 'string' ? 'no_transcript' : 'transcript_differs';
+        diag('ADAPTER_REPLY_DONE', { kind: done.kind, status, played, interrupted: done.interrupted === true, requestedChars: done.text.length, transcriptChars: typeof done.transcript === 'string' ? done.transcript.length : 0 });
         if (done.interrupted) { /* the caller took the floor: nothing failed */ }
-        else if (!played) { if (done.kind === 'notice') { noticeFailed(); return; } emit({ kind: 'reply_failed' }); }
-        else if (done.kind === 'notice') { phase = 'live'; emit({ kind: 'setup', to: start?.to, callSid: start?.callSid }); }
+        else if (!played) { if (done.kind === 'notice') { noticeFailed(why); return; } diag('ADAPTER_REPLY_FAILED', { reason: why }); emit({ kind: 'reply_failed' }); }
+        else if (done.kind === 'notice') { phase = 'live'; diag('ADAPTER_NOTICE_PLAYED'); diag('ADAPTER_SETUP_EMITTED'); emit({ kind: 'setup', to: start?.to, callSid: start?.callSid }); }
         pump();
         return;
       }
@@ -225,7 +237,9 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         o.interrupted = true;
         queue = queue.filter((q) => !q.interruptible);   // nothing queued is spoken over the caller
         cancelReply(o);
-        emit({ kind: 'interrupt', spoken: spokenOf(o, m.x_played_ms) });
+        const spoken = spokenOf(o, m.x_played_ms);
+        diag('ADAPTER_INTERRUPT', { spokenChars: spoken.length, known: typeof m.x_played_ms === 'number' });
+        emit({ kind: 'interrupt', spoken });
         return;
       }
       case 'conversation.item.input_audio_transcription.completed': {
@@ -243,6 +257,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         // An error that answers one of our own cancel or delete requests (the reply had just finished; the item was already gone) is not a fault of the call.
         const cause = isObj(m.error) && typeof m.error.event_id === 'string' ? m.error.event_id : undefined;
         if (cause !== undefined && asked.delete(cause)) return;
+        diag('ADAPTER_VOICE_ERROR_EVENT', { phase });
         emit({ kind: 'error' });
         return;
       }
@@ -268,12 +283,14 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     endCall(): boolean {
       if (phase === 'ended') return false;
       hangupWanted = true;
+      diag('ADAPTER_END_REQUESTED', { replyPlaying: current !== undefined, queued: queue.length });
       if (current === undefined && queue.length === 0) return doHangup();
       if (hangupTimer === undefined) { hangupTimer = setTimeout(() => { doHangup(); }, endWaitMs); hangupTimer.unref?.(); }
       return true;
     },
     close(code?: number): void {
       if (hangupWanted && phase !== 'ended') { closeCode = code ?? 1000; return; }
+      diag('ADAPTER_CLOSE', { closeCode: code ?? 1000, waitingForHangup: hangupWanted && phase !== 'ended' });
       clearTimers(); phase = 'ended'; link.close(code);
     },
   };

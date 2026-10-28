@@ -84,7 +84,7 @@ function wsOver(v: WireVoice): WebSocketLike {
   return ws;
 }
 
-async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig> } = {}) {
+async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig>; voiceMsPerChar?: number; realTimePlayout?: boolean } = {}) {
   const callConfig: FounderCallConfig = {
     approval_id: 'voice-test', tenant: T, numbers: [N1], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'],
     kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
@@ -95,12 +95,14 @@ async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; 
   const text = mockOpenAiText({ failDialogue: o.failDialogue, emptyDialogue: o.emptyDialogue });
   const voices: WireVoice[] = []; const handshakes: Array<{ url: string; headers: Record<string, string> }> = [];
   const logs: Array<{ code: string; detail?: Record<string, unknown> }> = [];
+  const diagLines: Array<{ code: string; [k: string]: unknown }> = [];
   const service = createFounderVoiceService({
+    diag: (code, detail) => { diagLines.push({ code, ...detail }); },
     config: callConfig, voice: voiceConfig,
     textClient: createOpenAIHttpClient({ getKey: () => FAKE_KEY, fetch: text.fetch }),
-    openVoice: () => createOpenAiVoiceSocket({
-      model: voiceConfig.realtime_model, getKey: o.key ?? (() => FAKE_KEY), connectTimeoutMs: 3000,
-      factory: (url, init) => { handshakes.push({ url, headers: init.headers }); const v = createWireVoice({ msPerChar: 1, autoOpen: false }); voices.push(v); return wsOver(v); },
+    openVoice: (d) => createOpenAiVoiceSocket({
+      model: voiceConfig.realtime_model, getKey: o.key ?? (() => FAKE_KEY), connectTimeoutMs: 3000, diag: (code, detail) => { d(code as never, detail); },
+      factory: (url, init) => { handshakes.push({ url, headers: init.headers }); const v = createWireVoice({ msPerChar: o.voiceMsPerChar ?? 1, autoOpen: false }); voices.push(v); return wsOver(v); },
     }),
     store,
     async intakeContext(tenant, ref) {
@@ -116,15 +118,21 @@ async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; 
   const connect = async (over: Record<string, unknown> = {}): Promise<Sim> => {
     const sim = await connectRelay({ port, token: TOKEN, url: URL_WSS, path: PATH, ...over } as never);
     if (sim.status === 101) {
-      let seen = 0;   // the phone side: echoes every marker once the audio would have played
-      const timer = setInterval(() => { for (; seen < sim.messages.length; seen++) { const m = sim.messages[seen]; if (m.event === 'mark') sim.send({ event: 'mark', streamSid: m.streamSid, mark: { name: m.mark.name } }); } }, 5);
+      let seen = 0; let playEnd = Date.now();   // the phone side: echoes every marker once the audio would have played (at once, or in REAL TIME like a phone line when asked to)
+      const timer = setInterval(() => {
+        for (; seen < sim.messages.length; seen++) {
+          const m = sim.messages[seen];
+          if (m.event === 'media' && o.realTimePlayout) playEnd = Math.max(Date.now(), playEnd) + Buffer.from(m.media.payload, 'base64').length / 8;
+          else if (m.event === 'mark') { const send = () => { try { sim.send({ event: 'mark', streamSid: m.streamSid, mark: { name: m.mark.name } }); } catch { /* closed */ } }; if (o.realTimePlayout) { const t = setTimeout(send, Math.max(0, playEnd - Date.now())); t.unref?.(); } else send(); }
+        }
+      }, 5);
       timer.unref?.(); void sim.closed.then(() => clearInterval(timer));
     }
     return sim;
   };
   const start = (sim: Sim, to = N1) => { sim.send({ event: 'connected', protocol: 'Call', version: '1.0.0' }); sim.send({ event: 'start', sequenceNumber: '1', start: { streamSid: 'MZ1', callSid: SID, tracks: ['inbound'], customParameters: { to }, mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } }, streamSid: 'MZ1' }); };
   const has = (code: string) => logs.some((l) => l.code === code);
-  return { service, store, text, voices, handshakes, logs, connect, start, has, handler: service.handler, notice: service.notice };
+  return { service, store, text, voices, handshakes, logs, diagLines, connect, start, has, handler: service.handler, notice: service.notice };
 }
 type Rig = Awaited<ReturnType<typeof rig>>;
 const spokenCount = (r: Rig) => r.voices[0]?.spoken.length ?? 0;
@@ -213,6 +221,39 @@ test('settings: a transcriber that documents hints gets English by default, and 
   assert.deepEqual(e.voices[0].refused, []);
   s2.end(); await pause(20);
 });
+
+test('diagnostics: the voice service logs each call from the moment the stream is accepted, with the wait it allows for the notice, and every line belongs to its call', async () => {
+  const r = await rig();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'));
+  await say(r, 'yes I agree', 2);
+  const codes = r.diagLines.map((l) => l.code);
+  for (const c of ['CALL_STREAM_ACCEPTED', 'VOICE_CONNECT_STARTED', 'VOICE_OPEN', 'BRIDGE_PHONE_START', 'BRIDGE_ANNOUNCED', 'ADAPTER_NOTICE_REQUESTED', 'BRIDGE_FIRST_AUDIO_OUT', 'BRIDGE_NOTICE_HEARD', 'ADAPTER_SETUP_EMITTED']) assert.ok(codes.includes(c), `${c} missing from: ${codes.join(' ')}`);
+  assert.equal(codes[0], 'CALL_STREAM_ACCEPTED');
+  assert.ok(r.diagLines.every((l) => l.call === 1 && typeof l.ms === 'number'));
+  const accepted = r.diagLines[0];
+  assert.equal(accepted.noticeChars, r.notice.length);
+  assert.equal(accepted.setupWaitMs, Math.min(300_000, Math.max(5000, Math.ceil(r.notice.length * 70) + 30_000)), 'the call logic waits for the notice, not for 5 seconds');
+  assert.ok((accepted.setupWaitMs as number) > r.notice.length * 70, 'longer than the notice takes to say');
+  const out = JSON.stringify(r.diagLines);
+  for (const s of [FAKE_KEY, 'yes I agree', r.notice.slice(0, 30), 'wss://', 'relay/']) assert.ok(!out.includes(s), `a diagnostic holds: ${s}`);
+  const second = await r.connect(); r.start(second);   // a second call is numbered 2
+  await until(() => r.diagLines.some((l) => l.call === 2 && l.code === 'CALL_STREAM_ACCEPTED'));
+  sim.end(); second.end(); await pause(30);
+});
+
+test('a consent notice that takes longer than 5 seconds to say (as the real one does, about 28 seconds) does not end the call: the call logic waits for the notice to be heard, not for 5 seconds', async () => {
+  const r = await rig({ voiceMsPerChar: 30, realTimePlayout: true });      // the default notice is about 280 characters: about 8 seconds of speech here, played in real time like a phone line (the real one takes 28 s)
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 15_000);
+  const closedEarly = sim.closeCode() !== undefined;
+  await until(() => r.has('CALL_STARTED') || r.has('SETUP_TIMEOUT'), 15_000, () => where(r, sim));
+  assert.ok(!r.has('SETUP_TIMEOUT'), 'the call logic gave up on the carrier after 5 seconds, while the notice was still being said');
+  assert.ok(!closedEarly && r.has('CALL_STARTED'));
+  await say(r, 'yes I agree', 2);
+  assert.equal(r.voices[0].spoken[1], OPENING);
+  sim.end(); await pause(30);
+}, { timeout: 60_000 });
 
 test('privacy: the raw caller words never reach the OpenAI text model, the key is only in the handshake, and no log line holds speech', async () => {
   const r = await rig();

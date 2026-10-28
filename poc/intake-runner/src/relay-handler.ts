@@ -116,6 +116,12 @@ export interface RelayDeps {
   /** The longest a whole reply may take, in milliseconds (default 15000), however steadily it arrives. */
   replyTotalMs?: number;
   /**
+   * How long to wait for the carrier's `setup` before giving up on the call, in milliseconds (default 5000, right for ConversationRelay, which sends setup at once). A carrier that speaks the consent notice itself
+   * (the OpenAI voice route) sends setup only AFTER the notice has been heard, which takes as long as the notice is long (about 28 seconds for Drew's); with the default the call logic would hang up on a notice
+   * that is still being said, after exactly 5 seconds, so that carrier's composition sets this from the notice's length.
+   */
+  setupTimeoutMs?: number;
+  /**
    * The cleaning pilot's encrypted contact vault. When present, a name, a usable callback number and a service address are required before a request
    * is ready, the number is read back with the job, and a yes stores the contact (and only then can the request be handed off). When absent, nothing
    * about contacts changes.
@@ -167,6 +173,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     || (deps.replyGapMs !== undefined && (!Number.isInteger(deps.replyGapMs) || deps.replyGapMs < 1))
     || (deps.replyTotalMs !== undefined && (!Number.isInteger(deps.replyTotalMs) || deps.replyTotalMs < 1))
     || (deps.replyRetryMs !== undefined && (!Number.isInteger(deps.replyRetryMs) || deps.replyRetryMs < 1))
+    || (deps.setupTimeoutMs !== undefined && (!Number.isInteger(deps.setupTimeoutMs) || deps.setupTimeoutMs < 1000 || deps.setupTimeoutMs > 300_000))
     || (deps.confirmedHandoff !== undefined && typeof deps.confirmedHandoff !== 'function')
     || (deps.contacts !== undefined && (!isRecord(deps.contacts) || typeof deps.contacts.put !== 'function'))
     || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
@@ -176,6 +183,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
   const replyFirstWordMs = deps.replyFirstWordMs ?? 5000;
   const replyGapMs = deps.replyGapMs ?? 4000;
   const replyTotalMs = deps.replyTotalMs ?? 15_000;
+  const setupTimeoutMs = deps.setupTimeoutMs ?? 5000;
   let active = 0;
   let accepted = 0;
   const seen = new Set<string>();
@@ -224,7 +232,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let lastPromptAt: number | undefined;   // when the newest FINAL caller utterance arrived
     let lastReplyEndAt: number | undefined; // when the assistant last finished (or stopped) a reply
     let replies = 0; let failedSends = 0; let partialPrompts = 0; let interrupts = 0; let otherFrames = 0;
-    const setupTimer = setTimeout(() => { if (session === undefined) { deps.log('SETUP_TIMEOUT'); carrier.close(1008); } }, 5000);
+    const setupTimer = setTimeout(() => { if (session === undefined) { deps.log('SETUP_TIMEOUT', { waitMs: setupTimeoutMs }); carrier.close(1008); } }, setupTimeoutMs);
     setupTimer.unref?.();
 
     /** `final` lines end the call, so the caller cannot talk over them. */

@@ -25,6 +25,8 @@ import type { FounderCallConfig } from './founder-call-gate.ts';
 import { effectiveVoiceSettings } from './founder-voice-gate.ts';
 import type { FounderVoiceConfig } from './founder-voice-gate.ts';
 import type { RelayConnection } from './ws-server.ts';
+import { noDiag, scopedDiag } from './call-diag.ts';
+import type { DiagSink } from './call-diag.ts';
 import type { IntakeRecordStore } from './intake-record-store.ts';
 import type { ContactVault } from './contact-vault.ts';
 
@@ -33,8 +35,8 @@ export interface VoiceServiceDeps {
   voice: FounderVoiceConfig;
   /** The OpenAI text client (already limited to the approved number of calls by the caller). */
   textClient: OpenAITextClient;
-  /** Opens the connection to the voice service for ONE call. Called once per stream. */
-  openVoice(): VoiceSocket;
+  /** Opens the connection to the voice service for ONE call. Called once per stream, with that call's diagnostics (the voice socket reports its connection codes through it). */
+  openVoice(diag: (code: never, detail?: Record<string, number | string | boolean>) => void): VoiceSocket;
   store: IntakeRecordStore;
   contacts?: ContactVault;
   /** Mints the Intake context for a call (the composition root mints it; this file never does). */
@@ -44,6 +46,8 @@ export interface VoiceServiceDeps {
   killed(): boolean;
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number>): void;
+  /** Durable fixed-code diagnostics for every call (call-diag.ts): the entry writes them to a git-ignored file. Default: none. */
+  diag?: DiagSink;
 }
 export interface VoiceService {
   handler: RelayHandler;
@@ -66,6 +70,7 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     limits: { maxOutputTokens: 1024, timeoutMs: 30_000, maxAttempts: 1 }, channelRef: 'channel-founder-phone', now: deps.nowIso, founderTest: { tenant },
   });
   const dialogue = createOpenAIDialogueModel(deps.textClient, { model: voice.openai_model, persona, effort: settings.textReasoning });
+  const setupTimeoutMs = Math.min(300_000, Math.max(5000, Math.ceil(notice.length * 70) + 30_000));
   const handler = createRelayHandler({
     numbers: new Map(config.numbers.map((n) => [n, tenant])),
     categoryNames: () => skill.categories.map((c) => c.name),
@@ -76,16 +81,23 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     dialogue, store: deps.store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,
     now: deps.now, nowIso: deps.nowIso, killed: deps.killed, afterSpeechMs: config.after_speech_ms,
     // The voice transport itself waits for a reply to finish playing before it hangs up, so no extra time per line is added here.
-    speechMs: () => 0, confirmWaitMs: 20_000, previewBudgetMs: 8000, ...(deps.contacts === undefined ? {} : { contacts: deps.contacts }),
+    speechMs: () => 0, confirmWaitMs: 20_000, previewBudgetMs: 8000,
+    // The notice is spoken BEFORE the carrier reports `setup`, so the call logic must wait for it to be heard, not for 5 seconds (that wait hung up on the first founder call, after "Hello"). The bridge has its own, tighter
+    // protections for a notice that does not play (the voice must open within its wait, and the audio must be confirmed played within its length plus a grace).
+    setupTimeoutMs, ...(deps.contacts === undefined ? {} : { contacts: deps.contacts }),
     log: deps.log,
   });
+  const sink = deps.diag ?? noDiag;
+  let calls = 0;
   return {
     handler, notice,
     handleStream(conn: RelayConnection): void {
-      startRealtimeCall(conn, deps.openVoice(), (t) => handler.serve(t), {
-        notice, transcriptionModel: voice.transcription_model, voice: voice.voice, persona, reasoningEffort: settings.realtimeReasoning,
+      const d = scopedDiag(sink, ++calls);
+      d('CALL_STREAM_ACCEPTED', { noticeChars: notice.length, setupWaitMs: setupTimeoutMs });
+      startRealtimeCall(conn, deps.openVoice(d as never), (t) => handler.serve(t), {
+        notice, transcriptionModel: voice.transcription_model, voice: voice.voice, persona, reasoningEffort: settings.realtimeReasoning, diag: d,
         ...(settings.transcription === undefined ? {} : { transcription: settings.transcription }),
-      }, { maxCallMs: config.max_minutes * 60_000 + 30_000 });
+      }, { maxCallMs: config.max_minutes * 60_000 + 30_000, diag: d });
     },
   };
 }
