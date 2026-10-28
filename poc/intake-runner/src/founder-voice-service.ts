@@ -74,6 +74,11 @@ export function residentialRouting(categories: readonly { name: string; route?: 
   };
 }
 
+/** The quiet that ends a fragment of a number or an address (milliseconds), and the longest one such wait may last: speech cannot hold the call open longer than this. */
+export const VOICE_CONTACT_SETTLE_MS = 1500;
+export const VOICE_CONTACT_COLLECT_MAX_MS = 8000;
+/** Questions spoken in exactly these words (founder-approved 2026-10-28). They offer no weekday, no availability and no confirmation. */
+export const FIXED_QUESTIONS: Readonly<Record<string, string>> = Object.freeze({ 'Preferred date': 'What date would you prefer for the cleaning?', 'Time window': 'What time of day would you prefer?' });
 /** The first-cleaning question, in the exact approved words (2026-10-28). Yes means first cleaning; no means returning customer. */
 export const firstCleanQuestion = (business: string): string => `Is this your first cleaning with ${business}?`;
 
@@ -101,6 +106,10 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     choicesFor: (_t, field) => skill.fields.find((f) => f.name === field)?.choices,
     ...(firstCleanField === undefined ? {} : { firstClean: { field: firstCleanField, required: (_t: string, category: string) => skill.categories.find((c) => c.name === category)?.requires?.includes(firstCleanField) === true, question: firstCleanQuestion(voice.persona.business_name) } }),
     requiredFields: (_t: string, category: string) => requiredFieldsOf(skill, category),
+    // Contact collection: wait for the caller to finish a number or an address (1.5 s of quiet, at most 8 s per wait) instead of answering each fragment and talking over them.
+    contactSettleMs: VOICE_CONTACT_SETTLE_MS, contactCollectMaxMs: VOICE_CONTACT_COLLECT_MAX_MS,
+    // Fixed questions (founder-approved, 2026-10-28): the date and the time of day are asked in exactly these words, never worded by the model, and only for skills that have those fields.
+    fixedQuestions: Object.fromEntries(Object.entries(FIXED_QUESTIONS).filter(([field]) => skill.fields.some((f) => f.name === field))),
     intake,
     intakeContext: deps.intakeContext,
     dialogue, store: deps.store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,

@@ -26,7 +26,7 @@ import { createRelayHandler, readBackText, redactSensitive, residentialAnswer, S
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
 import { requiredFieldsOf } from '../src/cleaning-state.ts';
-import { firstCleanQuestion } from '../src/founder-voice-service.ts';
+import { firstCleanQuestion, FIXED_QUESTIONS, VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS } from '../src/founder-voice-service.ts';
 import { parseFirstClean } from '../src/first-clean.ts';
 import { createConversationRelayTransport } from '../src/call-transport.ts';
 import type { CallTransport } from '../src/call-transport.ts';
@@ -91,7 +91,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -121,7 +121,7 @@ async function rig(o: RigOptions = {}) {
     },
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
     limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
-    killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(o.playbackMaxMs === undefined ? {} : { playbackMaxMs: o.playbackMaxMs }), ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
+    killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(o.contactSettleMs === undefined ? {} : { contactSettleMs: o.contactSettleMs }), ...(o.contactCollectMaxMs === undefined ? {} : { contactCollectMaxMs: o.contactCollectMaxMs }), ...(o.fixedQuestions === undefined ? {} : { fixedQuestions: o.fixedQuestions }), ...(o.playbackMaxMs === undefined ? {} : { playbackMaxMs: o.playbackMaxMs }), ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
   });
   const ws = createRelayWsServer({ path: SECRET_PATH, authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, lockout: { failures: 100, windowMs: 60_000 }, onConnection: (c) => (o.transportWrap ? handler.serve(o.transportWrap(createConversationRelayTransport(o.connWrap ? o.connWrap(c) : c))) : handler.handle(o.connWrap ? o.connWrap(c) : c)) });
   const port = await ws.listen(0);
@@ -3195,7 +3195,8 @@ test('PARTIAL FIELD KEPT until it is whole, declined or its existing limit ends 
   s1.end(); await s1.closed; await d.handler.idle();
   const n = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
   const s2 = await n.connect();
-  await driveByAsk(n, s2, OPEN_C, { CALLBACK_PHONE_NUMBER: ['five', 'five', 'five', 'five', 'five'] }, 40);
+  // One piece, then a caller who only hesitates: no progress, so the usual limit applies. (A caller who keeps ADDING digits is not a failed attempt; see the settle-window tests.)
+  await driveByAsk(n, s2, OPEN_C, { CALLBACK_PHONE_NUMBER: ['two one two', 'um I am not sure'] }, 40);
   if (!s2.messages.some((m: any) => m.type === 'end')) await ended(s2, n);
   assert.equal(diag(n, 'INCOMPLETE').length, 1);
   assert.equal(diag(n, 'INCOMPLETE')[0].detail?.item, 'PHONE', 'the limit ended it on the field being completed');
@@ -3222,4 +3223,158 @@ test('ADDRESS a street name said to another question is not an address: the mask
   say(sim, 'yes'); const q = await reply(r, sim);
   assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Is that correct? Please say yes or no.');
   sim.end(); await sim.closed; await r.handler.idle();
+});
+
+// ---------------------------------------------------------------- 2026-10-28 5:15 PM call: the contact settle window, progress that is not a failed attempt, and the fixed date and time questions
+const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+const asksSpoken = (sim: Sim) => sim.messages.filter((m: any) => m.type === 'text' && m.last === true).length;
+const partial = (sim: Sim, text: string) => sim.send({ type: 'prompt', voicePrompt: text, lang: 'en-US', last: false });
+const SETTLE = { contactSettleMs: 250, contactCollectMaxMs: 1500 };
+/** Answers questions plainly until the newest ASK is for `code` (the number or address being collected), without answering it. */
+async function driveUntilAsk(r: Rig, sim: Sim, code: string, opening = OPEN_C) {
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, opening); await reply(r, sim);
+  for (let i = 0; i < 30 && String(diag(r, 'ASK').at(-1)?.detail?.field) !== code; i++) { const c = String(diag(r, 'ASK').at(-1)?.detail?.field ?? ''); say(sim, BY_CODE[c] ?? 'ok'); await reply(r, sim); }
+  assert.equal(String(diag(r, 'ASK').at(-1)?.detail?.field), code);
+}
+const phoneEvents = (r: Rig) => diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'PHONE').map((l) => `${l.detail?.reason}(+${l.detail?.digits}=${l.detail?.held})`);
+const phoneAsks = (r: Rig) => diag(r, 'ASK').filter((l) => l.detail?.field === 'CALLBACK_PHONE_NUMBER').map((l) => `n${l.detail?.n}/need${l.detail?.need ?? '-'}`);
+
+test('SETTLE fragments of one number that arrive back to back are merged: ONE question follows, asking only for the digits still needed; no question is asked between them', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, ...SETTLE });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim);
+  for (const f of ['two one two', 'five', 'five', 'zero one four two']) say(sim, f);   // the live call's fragments: 3, 1, 1, 4 digits
+  await reply(r, sim); await sleep(500);
+  assert.equal(asksSpoken(sim) - before, 1, 'exactly one question after the whole burst');
+  assert.deepEqual(phoneEvents(r), ['PIECE(+3=3)', 'PIECE(+1=4)', 'PIECE(+1=5)', 'PIECE(+4=9)']);
+  assert.deepEqual(phoneAsks(r), ['n1/need-', 'n1/need1'], 'the one new question asks for the single digit still needed');
+  assert.deepEqual(diag(r, 'CONTACT_SETTLE').map((l) => String(l.detail?.outcome)), ['MORE', 'MORE', 'MORE', 'QUIET']);
+  assert.equal(diag(r, 'INCOMPLETE').length, 0);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('SETTLE the live sequence with restatement, pauses and a talk-over: the whole number said again corrects it, the address in two bursts is joined, the full read-back and the saved record agree', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, ...SETTLE });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  say(sim, 'two one two'); await reply(r, sim);                         // a pause: Drew asks for the 7 digits still needed
+  assert.match(phoneAsks(r).at(-1) ?? '', /need7/);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'What are', durationUntilInterruptMs: 150 });   // the caller talks over that question
+  for (const f of ['five', 'five', 'zero one four two']) say(sim, f);   // 1, 1, 4 digits: nine in all, one digit lost
+  await reply(r, sim);
+  assert.match(phoneAsks(r).at(-1) ?? '', /need1/);
+  say(sim, 'two one two five five five zero one four two'); await reply(r, sim);   // the whole number said again, as one line, and the address question follows
+  assert.deepEqual(phoneEvents(r).slice(-1), ['CAPTURED(+10=10)']);
+  assert.equal(String(diag(r, 'ASK').at(-1)?.detail?.field), 'SERVICE_ADDRESS');
+  say(sim, 'seven four two'); say(sim, 'Evergreen Terrace');             // the address in two bursts
+  await reply(r, sim);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(diag(r, 'ASK').map((l) => l.detail?.field)));
+  assert.ok(directives(r).every((d) => !/ask only for the street name/.test(d)), 'no question was asked between the two parts of the address');
+  const rb = textTokens(sim).join(' ');
+  assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./);
+  const spoken = Object.fromEntries([...rb.slice(rb.indexOf('Let me check')).matchAll(/([A-Z][A-Za-z ]+): ([^.]+)\./g)].map((m) => [m[1], m[2]]));
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.equal(q.token, 'I have your service address as seven four two Evergreen Terrace. Is that correct? Please say yes or no.');
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  for (const f of rec.fields.filter((x) => x.found && spoken[x.name] !== undefined)) assert.equal(f.value, spoken[f.name], `${f.name}: read back "${spoken[f.name]}", saved "${f.value}"`);
+  assert.deepEqual([rec.confirmation, rec.status, rec.missing_fields, rec.address_status], ['confirmed', 'ready', [], 'caller_confirmed']);
+  assert.equal(r.vault?.get(T, rec.call_ref)?.phone, '2125550142');
+  assert.equal(diag(r, 'INCOMPLETE').length, 0); assert.ok(!r.logs.some((l) => l.code === 'CONFIRM_TIMEOUT'));
+  assert.ok(!/\d{4,}|evergreen|priya/i.test(JSON.stringify(r.logs.map((l) => l.detail))), 'no digit string, name or address in any log');
+});
+
+test('SETTLE silence after a fragment: the question comes once the caller has been quiet for the window, not before', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, contactSettleMs: 400, contactCollectMaxMs: 3000 });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim);
+  const t0 = Date.now(); say(sim, 'two one two five five five');
+  let askAt = 0; for (let i = 0; i < 400 && askAt === 0; i++) { if (asksSpoken(sim) > before) askAt = Date.now(); else await sleep(10); }
+  assert.ok(askAt > 0, 'a question came');
+  assert.ok(askAt - t0 >= 380, `the question waited for the quiet (${askAt - t0} ms, window 400)`);
+  assert.equal(diag(r, 'CONTACT_SETTLE').at(-1)?.detail?.outcome, 'QUIET');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('SETTLE speech that keeps arriving cannot hold the call open: the wait is bounded by the maximum, then the question is asked', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, contactSettleMs: 300, contactCollectMaxMs: 800 });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim);
+  const t0 = Date.now(); say(sim, 'two one two five five five');
+  let askAt = 0;
+  for (let i = 0; i < 60 && askAt === 0; i++) { partial(sim, 'um'); if (asksSpoken(sim) > before) askAt = Date.now(); else await sleep(100); }   // interim results every 100 ms for up to six seconds
+  assert.ok(askAt > 0, 'a question came although speech never stopped');
+  assert.ok(askAt - t0 < 4500, `bounded: ${askAt - t0} ms`);
+  assert.equal(diag(r, 'CONTACT_SETTLE').at(-1)?.detail?.outcome, 'MAX');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('PROGRESS fragments that add digits are not failed attempts: a call that is given the number in many small pieces is never ended on one of them, while hesitations still end it', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });   // no settle window: every piece is answered, as on the live call
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { CALLBACK_PHONE_NUMBER: ['two', 'one', 'two', 'five', 'five', 'five', 'zero', 'one', 'four', 'two'] });
+  assert.equal(diag(r, 'INCOMPLETE').length, 0, 'ten one-digit pieces were not ten failed attempts');
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(phoneAsks(r)));
+  assert.equal(phoneEvents(r).length, 10); assert.equal(phoneEvents(r).at(-1), 'CAPTURED(+1=10)');
+  sim.end(); await sim.closed; await r.handler.idle();
+  const h = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const s2 = await h.connect();
+  await driveByAsk(h, s2, OPEN_C, { CALLBACK_PHONE_NUMBER: ['two one two', 'um I am not sure', 'um I am not sure', 'um I am not sure', 'um I am not sure'] }, 40);
+  if (!s2.messages.some((m: any) => m.type === 'end')) await ended(s2, h);
+  assert.equal(diag(h, 'INCOMPLETE')[0]?.detail?.item, 'PHONE', 'no-progress retries stay bounded');
+});
+
+test('ADDRESS PARTS in two bursts: the house number and the street name that follow each other are joined without a question between them', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, ...SETTLE });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'SERVICE_ADDRESS');
+  say(sim, 'seven four two'); say(sim, 'Evergreen Terrace');
+  await reply(r, sim);
+  assert.deepEqual(diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'ADDRESS').map((l) => l.detail?.reason), ['NEED_STREET', 'JOINED']);
+  assert.ok(directives(r).every((d) => !d.includes('ask only for the street name')));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('FIXED QUESTIONS the date and the time of day are asked in exactly the approved words, never worded by the model, with no weekday, availability or confirmation', async () => {
+  const D = 'What date would you prefer for the cleaning?'; const TM = 'What time of day would you prefer?';
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, fixedQuestions: { 'Preferred date': D, 'Time window': TM } });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  const tokens = textTokens(sim);
+  assert.equal(tokens.filter((x) => x === D).length, 1); assert.equal(tokens.filter((x) => x === TM).length, 1);
+  assert.ok(!directives(r).some((d) => /Preferred date|Time window/.test(d)), 'the model was never asked to word them');
+  assert.ok(![D, TM].some((q) => /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|available|availability|booked|confirmed|appointment)\b/i.test(q)));
+  assert.equal(diag(r, 'FIXED_QUESTION_ASKED').length, 2);
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual(['Preferred date', 'Time window'].map((n) => rec.fields.find((f) => f.name === n)?.found), [true, true]);
+  assert.equal(rec.confirmation, 'confirmed');
+});
+
+test('FIXED QUESTIONS a date question the caller talked over is asked again in the same words', async () => {
+  const D = 'What date would you prefer for the cleaning?';
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, fixedQuestions: { 'Preferred date': D } });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, OPEN_C); await reply(r, sim);
+  for (let i = 0; i < 12 && String(diag(r, 'ASK').at(-1)?.detail?.field) !== 'PREFERRED_DATE'; i++) { say(sim, BY_CODE[String(diag(r, 'ASK').at(-1)?.detail?.field ?? '')] ?? 'ok'); await reply(r, sim); }
+  assert.equal(textTokens(sim).filter((x) => x === D).length, 1);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'What date', durationUntilInterruptMs: 150 });
+  await sleep(40); say(sim, 'sorry, what was that'); await reply(r, sim);   // not an answer
+  assert.equal(textTokens(sim).filter((x) => x === D).length, 2, 'asked again, word for word, because the first asking was talked over');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('SETTLE settings are validated: a negative or fractional window, or a maximum of zero, is refused at start', () => {
+  for (const bad of [{ contactSettleMs: -1 }, { contactSettleMs: 1.5 }, { contactSettleMs: 20_000 }, { contactCollectMaxMs: 0 }, { contactCollectMaxMs: 60_000 }, { fixedQuestions: { 'Preferred date': '' } }, { fixedQuestions: { 'Preferred date': 'bad [bracket] question' } }]) assert.throws(() => createRelayHandler(bad as never), RangeError);
+});
+
+test('VOICE SERVICE settings: the approved fixed questions, a 1.5 second quiet and an 8 second maximum', () => {
+  assert.deepEqual({ ...FIXED_QUESTIONS }, { 'Preferred date': 'What date would you prefer for the cleaning?', 'Time window': 'What time of day would you prefer?' });
+  assert.deepEqual([VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS], [1500, 8000]);
+  assert.ok(VOICE_CONTACT_COLLECT_MAX_MS > VOICE_CONTACT_SETTLE_MS && VOICE_CONTACT_COLLECT_MAX_MS <= 30_000, 'the maximum bounds the wait');
 });

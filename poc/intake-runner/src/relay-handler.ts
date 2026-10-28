@@ -48,6 +48,11 @@ const MAX_READBACKS = 2;
 const ADDRESS_REFUSAL = /\b(?:rather not|prefer not|not comfortable|refuse|decline)\b|\b(?:do not|don't|dont) want to (?:give|share|say|tell)\b|\b(?:won't|will not|am not going to|not going to|not gonna) (?:give|share|say|tell)\b|\bnot (?:giving|sharing)\b/i;
 const MAX_SPEECH_WAIT_MS = 15_000;
 const PLAYBACK_MAX_MS = 90_000;
+/** The longest one wait for a caller to finish a number or an address may last, and how many turns in a row may skip their question for more speech. */
+const DEFAULT_COLLECT_MAX_MS = 8000;
+const MAX_SETTLE_SKIPS = 6;
+/** Asks forgiven per call because the answer added digits or an address part (a phone number has at most ten digits, so this cannot be exceeded by one number). */
+const MAX_PROGRESS_CREDITS = 20;
 const PLACEHOLDER = /\[[A-Z]+_\d{1,3}\]/g;
 const SENSITIVE_NAME = /\b(?:name|phone|mobile|cell|e-?mail|callback|contact)\b/i;
 /** The record's fields with every name, phone, mobile or e-mail field's value replaced by a placeholder. Pure. */
@@ -169,6 +174,16 @@ export interface RelayDeps {
   requiredFields?(tenant: string, category: string): readonly string[];
   /** The longest to wait for the carrier to report that a read-back finished playing (a bounded failure timeout). Default 90 seconds. */
   playbackMaxMs?: number;
+  /**
+   * CONTACT COLLECTION SETTLE WINDOW. After a piece of a phone number or an address was heard (one more piece may follow), the call waits until the caller has been quiet for this many milliseconds
+   * before it asks again, and asks nothing while a later fragment is already waiting. A caller who says a number in bursts is therefore not talked over, and fragments of one number are merged
+   * instead of each being answered. 0 (the default) turns the wait off.
+   */
+  contactSettleMs?: number;
+  /** The longest ONE such wait may last, however much speech keeps arriving (so activity can never hold the call open). Default 8000 ms. */
+  contactCollectMaxMs?: number;
+  /** Questions spoken in EXACTLY these words (never worded by the text model), by field name; the first-cleaning question is `firstClean.question`. */
+  fixedQuestions?: Readonly<Record<string, string>>;
   /** The longest to wait for the Intake run of a turn. A result that misses it chooses nothing; the assistant just listens. */
   previewBudgetMs: number;
   /** The longest the one retry of an EMPTY model reply waits for its first word, in milliseconds (default 4000). After that the server asks in fixed words. */
@@ -235,6 +250,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
   if (!isRecord(deps) || !(deps.numbers instanceof Map) || !isRecord(deps.intake) || !isRecord(deps.dialogue) || !isRecord(deps.store) || !isRecord(deps.limits)
     || !Array.isArray(deps.names) || !Number.isInteger(deps.afterSpeechMs) || !Number.isInteger(deps.confirmWaitMs) || deps.confirmWaitMs < 1 || !Number.isInteger(deps.previewBudgetMs) || deps.previewBudgetMs < 1 || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1
     || (deps.playbackMaxMs !== undefined && (!Number.isInteger(deps.playbackMaxMs) || deps.playbackMaxMs < 1))
+    || (deps.contactSettleMs !== undefined && (!Number.isInteger(deps.contactSettleMs) || deps.contactSettleMs < 0 || deps.contactSettleMs > 10_000))
+    || (deps.contactCollectMaxMs !== undefined && (!Number.isInteger(deps.contactCollectMaxMs) || deps.contactCollectMaxMs < 1 || deps.contactCollectMaxMs > 30_000))
+    || (deps.fixedQuestions !== undefined && (typeof deps.fixedQuestions !== 'object' || deps.fixedQuestions === null || Object.values(deps.fixedQuestions).some((q) => typeof q !== 'string' || q.length < 5 || q.length > 200 || /[\r\n[\]<>]/.test(q))))
     || (deps.replyFirstWordMs !== undefined && (!Number.isInteger(deps.replyFirstWordMs) || deps.replyFirstWordMs < 1))
     || (deps.replyGapMs !== undefined && (!Number.isInteger(deps.replyGapMs) || deps.replyGapMs < 1))
     || (deps.replyTotalMs !== undefined && (!Number.isInteger(deps.replyTotalMs) || deps.replyTotalMs < 1))
@@ -290,7 +308,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     const askCount = new Map<string, number>();
     let modelFailures = 0;
     let toolCalls = 0; let toolRefused = 0;   // native conversation: tool calls the voice made, and how many were refused
-    let partialCredits = 0;
+    let progressCredits = 0;   // asks forgiven because the caller's answer added to what was being collected (at most MAX_PROGRESS_CREDITS per call, so noise cannot keep a question alive for ever)
+    let utteranceSeq = 0;   // utterances received so far (a later one waiting means this turn must not talk over it)
+    let lastSpeechAt = 0;   // the newest sign that the caller is speaking: an interim result, an utterance or a talk-over
+    let settleSkips = 0;   // consecutive turns whose ask was skipped for more speech (bounded)
     let correcting = false;
     let incompleteCall = false;
     let lastReply = '';   // the full text of the assistant's most recent reply, to compare with what the phone provider says was spoken before an interruption
@@ -793,7 +814,27 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       armConfirmTimer();
     }
 
-    async function onPrompt(raw: unknown): Promise<void> {
+    /**
+     * Waits until the caller has been quiet for `contactSettleMs` after the newest sign of speech, for at most `contactCollectMaxMs`. Returns 'MORE' at once when a later utterance is already waiting or
+     * arrives meanwhile (that turn is handled next and nothing is asked now), 'QUIET' when the caller stopped, 'MAX' when the bound was reached while speech kept coming.
+     */
+    async function settleForMoreSpeech(idx: number): Promise<'MORE' | 'QUIET' | 'MAX'> {
+      const settle = deps.contactSettleMs ?? 0;
+      if (settle <= 0) return 'QUIET';
+      const max = deps.contactCollectMaxMs ?? DEFAULT_COLLECT_MAX_MS;
+      const began = deps.now();
+      for (;;) {
+        if (done) return 'QUIET';
+        if (utteranceSeq !== idx) return 'MORE';
+        const now = deps.now();
+        const quietFor = now - lastSpeechAt;
+        if (quietFor >= settle) return 'QUIET';
+        if (now - began >= max) return 'MAX';
+        await new Promise<void>((resolve) => { const t = setTimeout(resolve, Math.max(1, Math.min(settle - quietFor, max - (now - began), 100))); t.unref?.(); });
+      }
+    }
+
+    async function onPrompt(raw: unknown, idx = utteranceSeq): Promise<void> {
       const s = session;
       if (s === undefined || done) return;
       clearConfirmTimer();
@@ -812,11 +853,13 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (phase === 'confirm') return onAnswer(heard.line);
       if (phase === 'address') return onAddressAnswer(heard.line);
       if (phase === 'addressfix') return onAddressFix(heard.line);
+      let madeProgress = false;   // this turn ADDED to what is being collected (more digits, or the missing part of an address): it is never a failed attempt
+      const askedBefore = contactAsk;
       if (contactAsk !== undefined) {
         const took = heard.contact?.find((c) => c.field === contactAsk?.field);
-        // A number said in pieces is progress, not a failed attempt: that question is not counted against the item.
-        // At most three pieces per call get this credit, so noise can never keep one question alive for ever.
-        if (took?.outcome === 'partial' && lastAsk?.counted && partialCredits++ < 3) askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1));
+        madeProgress = took?.outcome === 'partial' && (took.reason === 'PIECE' || took.reason === 'NEED_STREET' || took.reason === 'NEED_NUMBER');
+        // A number said in pieces is progress, not a failed attempt: the question is not counted against the item (once per ask; the credits per call are bounded, and a piece that adds nothing earns none).
+        if (madeProgress && lastAsk?.counted && progressCredits < MAX_PROGRESS_CREDITS) { progressCredits++; askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1)); lastAsk.counted = false; }
         // Privacy-safe: the item's label, a fixed reason code and digit COUNTS (this line, and held after it). Never a value, a word of the caller's or a transcript.
         deps.log('CONTACT_ANSWER', { field: contactAsk.field.toUpperCase(), outcome: took === undefined ? 0 : took.outcome === 'captured' ? 1 : took.outcome === 'partial' ? 2 : 3, reason: took?.reason ?? 'NOT_HEARD', heard: contactAsk.heard ? 1 : 0, ...(contactAsk.field === 'phone' ? { digits: took?.digits ?? 0, held: took?.total ?? s.contactDiag().phoneDigits } : {}), n: askCount.get(CONTACT_FIELDS[contactAsk.field]) ?? 0 });
         // A caller who declines to go on with that item ("I'd rather not give my number") ends its completion: the pieces held are forgotten, and the item goes back to the ordinary rotation and its limit.
@@ -824,6 +867,15 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         contactAsk = undefined;
       }
       partialLabel = s.phoneNeed() !== undefined && s.contactDiag().phoneDigits > 0 ? CONTACT_FIELDS.phone : s.addressPart() !== undefined ? CONTACT_FIELDS.address : s.phoneNeed() === 'restate' ? CONTACT_FIELDS.phone : undefined;
+      // The caller added to a number or an address that is not whole yet: wait for them to finish before asking again (bounded). Later speech already waiting, or arriving meanwhile, is handled next
+      // and nothing is said now; the same item stays the one being answered.
+      if (madeProgress && partialLabel !== undefined && deps.contactSettleMs !== undefined && deps.contactSettleMs > 0) {
+        const waited = await settleForMoreSpeech(idx);
+        if (done) return;
+        if (waited === 'MORE' && settleSkips < MAX_SETTLE_SKIPS) { settleSkips++; contactAsk = askedBefore; deps.log('CONTACT_SETTLE', { outcome: 'MORE', skips: settleSkips }); return; }
+        deps.log('CONTACT_SETTLE', { outcome: waited === 'MORE' ? 'MAX' : waited, skips: settleSkips });
+        settleSkips = 0;
+      } else settleSkips = 0;
       correcting = false; lastAsk = undefined;
       // Residential-only routing: the answer to the residential question is read before anything else happens on this turn.
       if (deps.residential !== undefined && residential === 'asked') {
@@ -882,7 +934,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (next.kind === 'ready' && got !== undefined) return startReadback(got.preview);
       if (next.kind === 'ask') {
         // An item asked and heard the first time plus MAX_CLARIFICATIONS more times and still not obtained: the call ends as a safe incomplete outcome, saved unconfirmed, never handed off.
-        if ((askCount.get(next.field) ?? 0) >= 1 + MAX_CLARIFICATIONS) {
+        if (!madeProgress && (askCount.get(next.field) ?? 0) >= 1 + MAX_CLARIFICATIONS) {
           const gone = fresh?.missing ?? [];
           deps.log('INCOMPLETE', { clarifications: MAX_CLARIFICATIONS, lines: covers, item: (CONTACT_OF_LABEL[next.field] ?? 'content').toUpperCase(), field: codeOf(next.field), cat: codeOf(fresh?.category), miss: gone.length, ...(gone[0] !== undefined ? { m1: codeOf(gone[0]) } : {}), ...(gone[1] !== undefined ? { m2: codeOf(gone[1]) } : {}), ...(gone[2] !== undefined ? { m3: codeOf(gone[2]) } : {}), ...contactFlags(s) });
           if (got !== undefined) incompleteSnap = { item: got.preview.item, covers };
@@ -898,12 +950,13 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const part = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'address' ? s.addressPart() : undefined;
         // Part of a phone number was heard: the question asks for the digits still needed (a COUNT, never a digit), or for the whole number again when the pieces did not fit together.
         const phoneNeed = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'phone' ? s.phoneNeed() : undefined;
-        const fixed = deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined;
+        const fixed = deps.fixedQuestions?.[next.field] ?? (deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined);
         let delivered: boolean;
         if (fixed !== undefined) {
-          // The first-cleaning question is never reworded: the same words on every ask (a repeat does not become a different question), spoken as written, kept in the dialogue history as said.
+          // A fixed question is never reworded: the same words on every ask (a repeat does not become a different question), spoken as written, kept in the dialogue history as said. It offers no
+          // weekday, no availability and no confirmation: it only asks.
           delivered = say(fixed);
-          if (delivered) { s.said(fixed); lastReply = fixed; deps.log('FIRST_CLEAN_ASKED'); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
+          if (delivered) { s.said(fixed); lastReply = fixed; deps.log(deps.firstClean !== undefined && next.field === deps.firstClean.field ? 'FIRST_CLEAN_ASKED' : 'FIXED_QUESTION_ASKED', { field: codeOf(next.field) }); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
         } else delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}) }, statusOf(s, got));
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
         if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
@@ -986,7 +1039,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     carrier.onEvent = (ev: TransportEvent): void => {
       if (ev.kind === 'malformed') { if (++bad > 5) carrier.close(1008); return; }
       if (ev.kind === 'interrupt') {
-        interrupts++;
+        interrupts++; lastSpeechAt = deps.now();
         const spoken = ev.spoken;
         if (streaming !== undefined) { interruptedText = spoken; streaming.abort(); }
         else {
@@ -1017,12 +1070,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (phase === 'confirm' && readBack !== undefined) readBackLost = true;
         return;
       }
-      if (ev.kind === 'partial') { partialPrompts++; return; }   // a partial result is not acted on, but it is counted
+      if (ev.kind === 'partial') { partialPrompts++; lastSpeechAt = deps.now(); return; }   // a partial result is not acted on, but it is counted, and it shows the caller is still speaking
       if (ev.kind === 'utterance') {
-        lastPromptAt = deps.now();
-        const heard = ev.text;
+        lastPromptAt = deps.now(); lastSpeechAt = lastPromptAt;
+        const heard = ev.text; const idx = ++utteranceSeq;
         clearConfirmTimer();   // an answer is on its way: the silence timer must not win the race against it
-        chain = chain.then(() => onPrompt(heard)).catch(() => deps.log('HANDLER_ERROR'));
+        chain = chain.then(() => onPrompt(heard, idx)).catch(() => deps.log('HANDLER_ERROR'));
         void track(chain);
         return;
       }

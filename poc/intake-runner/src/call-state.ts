@@ -246,6 +246,8 @@ export function createContactState(): ContactState {
           if (joined !== undefined) { values.address = joined; pendNumber = ''; pendStreet = ''; return { field, outcome: 'captured', learn: [joined], reason: 'JOINED' }; }
         }
         // A lone small number word ("two") is not taught to the masker on its own: it would mask the same word in "two bedrooms". The whole address is taught when it is joined.
+        // The same part said again adds nothing: it is a restatement (no progress, so it is not forgiven as one).
+        if ((piece.kind === 'number' && pendNumber === piece.text) || (piece.kind === 'street' && pendStreet === piece.text)) return { field, outcome: 'partial', learn: [], reason: 'SAME' };
         if (piece.kind === 'number') { pendNumber = piece.text; return { field, outcome: 'partial', learn: /\d{3,}/.test(piece.text) || piece.text.split(' ').length >= 2 ? [piece.text] : [], reason: 'NEED_STREET' }; }
         pendStreet = piece.text; return { field, outcome: 'partial', learn: [piece.text], reason: 'NEED_NUMBER' };
       }
