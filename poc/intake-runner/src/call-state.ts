@@ -30,9 +30,10 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   CORRECTED_LAST4   "the last four are ...": the final four digits of the number held were replaced.
  *   NO_DIGITS         the line held no digit words.   TOO_MANY         more than fifteen digits: start over.
  *   NOT_A_NAME        not a usable name.              NO_STREET_NUMBER an address line without a street number.   NOT_AN_ADDRESS  not a usable address.
+ *   NEED_STREET       a house number was heard without a street name: it is held and only the street name is asked.   NEED_NUMBER   a street name without a house number.   JOINED   the held part and the new part made the address.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'JOINED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -80,15 +81,46 @@ export function nameFrom(raw: unknown): string | undefined {
   return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
-/** The address in a caller's words, or undefined when it has no street number plus another word (or a PO box). Never a postal check. Pure. */
+// Address words. A STREET word is a word of two or more letters that is not a number word and not only a unit designator ("apartment 4" is not a street). No particular street suffix is required.
+const NUMBER_WORD_ONLY = new RegExp(`^${NUM_WORD}$`, 'i');
+const UNIT_WORD = new Set(['apartment', 'apt', 'unit', 'suite', 'ste', 'floor', 'fl', 'room', 'rm', 'number', 'no', 'lot', 'building', 'bldg', 'house', 'address', 'service', 'the', 'my', 'at', 'is', 'it', "it's", 'a', 'an', 'and']);
+const isStreetWord = (w: string): boolean => /^\p{L}{2,}[\p{L}'’.-]*$/u.test(w) && !NUMBER_WORD_ONLY.test(w) && !UNIT_WORD.has(w.toLowerCase());
+
+/** The address in a caller's words, or undefined when it has no street number plus a street name (or a PO box). A house number alone is NOT an address. Never a postal check. Pure. */
 export function addressFrom(raw: unknown): string | undefined {
   if (typeof raw !== 'string' || raw.length > 300) return undefined;
   let t = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim();
   if (t.length < 5 || t.length > 120 || /[@\[\]<>]/.test(t)) return undefined;
   const words = t.split(' ').filter((w) => /[\p{L}\d]/u.test(w));
   if (PO_BOX.test(t)) return t;
-  if (!ADDRESS_NUMBER.test(t) || words.length < 2 || !words.some((w) => /\p{L}{2,}/u.test(w))) return undefined;
+  if (!ADDRESS_NUMBER.test(t) || words.length < 2 || !words.some((w) => isStreetWord(w) && !NOT_A_STREET.has(w.toLowerCase()))) return undefined;
   return t;
+}
+
+// One component of an address, said on its own: the HOUSE NUMBER ("742", "seven four two") or the STREET NAME ("Evergreen Terrace"). Each is held across turns and joined to the other; nothing is invented.
+const HOUSE_NUMBER_LEAD = /^(?:the\s+)?(?:house|street)\s+number\s+(?:is\s+)?/i;
+/** Words of conversation (not of a street name): a line holding one is never taken for a street name on its own. */
+const NOT_A_STREET = new Set(['about', 'price', 'quote', 'cost', 'talk', 'want', 'need', 'like', 'have', 'get', 'tell', 'ask', 'say', 'think', 'maybe', 'later', 'also', 'just', 'really', 'thing', 'something', 'anything', 'everything', 'here', 'there', 'where', 'when', 'which', 'who', 'from', 'in', 'on', 'of', 'and', 'but', 'or', 'so', 'because', 'if', 'then', 'than', 'are', 'was', 'were', 'be', 'been', 'am', 'let', 'me', 'check', 'look', 'find', 'give', 'hold', 'hang', 'moment', 'second', 'minute', 'repeat', 'pardon', 'hmm', 'yeah', 'yep', 'nope', 'nah', 'house', 'apartment', 'apt', 'unit', 'suite', 'floor', 'room', 'a']);
+/** Generic road words: they may be part of a street name ("Elm Street") but are not a street name by themselves. No suffix is ever REQUIRED. */
+const ROAD_WORD = new Set(['street', 'st', 'avenue', 'ave', 'road', 'rd', 'lane', 'ln', 'drive', 'dr', 'court', 'ct', 'way', 'place', 'pl', 'terrace', 'boulevard', 'blvd']);
+export type AddressPiece = { readonly kind: 'number' | 'street'; readonly text: string };
+const numericWord = (w: string): boolean => /^\d{1,6}[a-z]?$/i.test(w) || NUMBER_WORD_ONLY.test(w) || /^(?:oh|double|triple|treble)$/i.test(w);
+/** A house number alone, or a street name alone, from a caller's line; undefined for anything else (a whole address is addressFrom's). Pure. */
+export function addressPiece(raw: unknown): AddressPiece | undefined {
+  if (typeof raw !== 'string' || raw.length > 200) return undefined;
+  const t = clean(raw).replace(ADDRESS_LEAD, '').replace(HOUSE_NUMBER_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '');
+  if (t.length < 1 || t.length > 80 || /[@\[\]<>]/.test(t)) return undefined;
+  const words = t.split(/[\s,]+/).filter((w) => w.length > 0);
+  if (words.length === 0 || words.length > 4) return undefined;
+  if (words.every(numericWord)) {
+    const digitChars = words.filter((w) => /^\d/.test(w)).join('').length;
+    return digitChars <= 6 ? { kind: 'number', text: words.join(' ') } : undefined;
+  }
+  const lower = words.map((w) => w.toLowerCase());
+  if (!words.every((w) => /^\p{L}[\p{L}'’.-]*$/u.test(w))) return undefined;
+  if (words.some((w, i) => numericWord(w) || FILLER.has(lower[i]) || NOT_A_STREET.has(lower[i]))) return undefined;
+  if (lower.every((w) => ROAD_WORD.has(w))) return undefined;   // "street" alone is not a street name
+  return { kind: 'street', text: words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ') };
 }
 
 // Volunteered details: explicit cues only, so a stray sentence is never taken for a contact detail. The latest cue wins (a correction).
@@ -113,6 +145,8 @@ export interface ContactState {
   pendingPhone(): boolean;
   /** How many digits of a number heard in pieces are held (a count only; zero once a number is held). */
   pendingDigits(): number;
+  /** Which part of the service address is still needed after one part was heard (never the part itself): the street name, the house number, or none. */
+  addressPart(): 'street name' | 'house number' | undefined;
   status(): ContactStatus;
   dispose(): void;
 }
@@ -120,6 +154,7 @@ export interface ContactState {
 export function createContactState(): ContactState {
   let values: { name?: string; phone?: string; address?: string } = {};
   let pending = '';   // digits of a phone number heard in pieces
+  let pendNumber = ''; let pendStreet = '';   // one part of a service address heard on its own, held until the other arrives
   let disposed = false;
 
   /** Digits joined from pieces make a number only at the usual length: ten, or eleven with a leading 1. (A whole line of 10 to 15 digits is still taken as said.) */
@@ -166,9 +201,21 @@ export function createContactState(): ContactState {
         values.name = n; return { field, outcome: 'captured', learn: [n], reason: 'CAPTURED' };
       }
       if (field === 'address') {
+        if (replace) { pendNumber = ''; pendStreet = ''; }
         const a = addressFrom(raw);
-        if (a === undefined) return { field, outcome: 'unclear', learn: [], reason: ADDRESS_NUMBER.test(raw) ? 'NOT_AN_ADDRESS' : 'NO_STREET_NUMBER' };
-        values.address = a; return { field, outcome: 'captured', learn: [a], reason: 'CAPTURED' };
+        if (a !== undefined) { values.address = a; pendNumber = ''; pendStreet = ''; return { field, outcome: 'captured', learn: [a], reason: 'CAPTURED' }; }
+        const piece = addressPiece(raw);
+        if (piece === undefined) return { field, outcome: 'unclear', learn: [], reason: ADDRESS_NUMBER.test(raw) ? 'NOT_AN_ADDRESS' : 'NO_STREET_NUMBER' };
+        // A part said on its own is progress, never a complete address: it is held, joined to the other part when that arrives, and the caller then confirms the whole address aloud.
+        const number = piece.kind === 'number' ? piece.text : pendNumber;
+        const street = piece.kind === 'street' ? piece.text : pendStreet;
+        if (number !== '' && street !== '') {
+          const joined = addressFrom(`${number} ${street}`);
+          if (joined !== undefined) { values.address = joined; pendNumber = ''; pendStreet = ''; return { field, outcome: 'captured', learn: [joined], reason: 'JOINED' }; }
+        }
+        // A lone small number word ("two") is not taught to the masker on its own: it would mask the same word in "two bedrooms". The whole address is taught when it is joined.
+        if (piece.kind === 'number') { pendNumber = piece.text; return { field, outcome: 'partial', learn: /\d{3,}/.test(piece.text) || piece.text.split(' ').length >= 2 ? [piece.text] : [], reason: 'NEED_STREET' }; }
+        pendStreet = piece.text; return { field, outcome: 'partial', learn: [piece.text], reason: 'NEED_NUMBER' };
       }
       return setPhone(raw, replace);
     },
@@ -185,19 +232,20 @@ export function createContactState(): ContactState {
       if (ad !== null) { const r = this.collect('address', ad[1], true); if (r.outcome !== 'unclear') out.push(r); }
       return out;
     },
-    clear(field) { delete values[field]; if (field === 'phone') pending = ''; },
-    set(field, value) { if (disposed) return; values[field] = value; if (field === 'phone') pending = ''; },
+    clear(field) { delete values[field]; if (field === 'phone') pending = ''; if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
+    set(field, value) { if (disposed) return; values[field] = value; if (field === 'phone') pending = ''; if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
     fallback(field, value) { if (!disposed && values[field] === undefined && typeof value === 'string' && value.length > 0) values[field] = value; },
     value(field) { return disposed ? undefined : values[field]; },
     parts() { return disposed ? {} : { ...values }; },
     pendingPhone() { return !disposed && pending.length > 0 && values.phone === undefined; },
     pendingDigits() { return disposed || values.phone !== undefined ? 0 : pending.length; },
+    addressPart() { return disposed || values.address !== undefined ? undefined : pendNumber !== '' ? 'street name' : pendStreet !== '' ? 'house number' : undefined; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);
       return { captured, missing };
     },
-    dispose() { disposed = true; values = {}; pending = ''; },
+    dispose() { disposed = true; values = {}; pending = ''; pendNumber = ''; pendStreet = ''; },
   };
 }
 

@@ -2624,3 +2624,115 @@ test('DIAGNOSTICS the incomplete ending names the item that ran out of asks and 
   assert.ok(diag(r, 'CONTACT_ANSWER').some((l) => l.detail?.field === 'NAME' && l.detail?.reason === 'NOT_A_NAME'));
   assert.ok(!/\d{7,}|maybe|elm/i.test(JSON.stringify(r.logs)));
 });
+
+// ---------------------------------------------------------------- service address collected in parts (2026-10-28): a house number without a street name is kept, only the missing part is asked, the parts are joined and confirmed
+/** Drives the contact questions with the given answer for each; the address answers are taken in order. Stops at the read-back or after `max` turns. */
+async function driveContacts(r: Rig, sim: Sim, addressAnswers: string[], max = 16) {
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a regular cleaning for our office'); await reply(r, sim);
+  let a = 0;
+  for (let i = 0; i < max && !r.logs.some((l) => l.code === 'READBACK' || l.code === 'INCOMPLETE'); i++) {
+    const last = asks(r).at(-1);
+    const answer = last === 'Customer name' ? 'priya raman' : last === 'Callback phone number' ? 'two one two five five five zero one four two' : last === 'Service address' ? addressAnswers[Math.min(a++, addressAnswers.length - 1)] : last === 'Address' ? '42 Elm Street' : 'the pipe is burst';
+    say(sim, answer); await reply(r, sim);
+    if (sim.messages.some((m: any) => m.type === 'end')) break;
+  }
+}
+const addressAnswers = (r: Rig) => diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'ADDRESS').map((l) => l.detail?.reason);
+
+test('ADDRESS PARTS a house number alone is kept, only the street name is asked for next, the parts are joined, read back and confirmed; nothing personal is logged', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveContacts(r, sim, ['742', 'Evergreen Terrace']);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), 'the read-back was reached: ' + JSON.stringify(asks(r)));
+  assert.deepEqual(addressAnswers(r), ['NEED_STREET', 'JOINED']);
+  const second = directives(r).filter((d) => d.startsWith('NEXT ASK Service address'));
+  assert.equal(second.length, 2);
+  assert.equal(second[0], 'NEXT ASK Service address', 'the first ask is the whole question');
+  assert.ok(second[1].endsWith('(the house number is already heard: ask only for the street name)'), 'the second ask names only the missing part: ' + second[1]);
+  const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
+  assert.ok(/Your name: Priya Raman\. Your callback number: 2 1 2 5 5 5 0 1 4 2\./.test(rb));
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Is that correct? Please say yes or no.', 'the joined address is read back to the caller only');
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  const c = r.vault?.get(T, rec.call_ref);
+  assert.deepEqual([c?.address_state, c?.address], ['confirmed', '742 Evergreen Terrace']);
+  assert.equal(rec.address_status, 'caller_confirmed');
+  assert.ok(!/742|evergreen/i.test(JSON.stringify(r.logs) + JSON.stringify(r.claude.sent) + JSON.stringify(rec)), 'no part of the address is in a log, a model request or the record');
+  assert.ok(!/742|evergreen/i.test((await (await r.dashGet('/data.js')).text()) + JSON.stringify(await (await r.dashGet('/api/owner')).json())), 'nor on the dashboard');
+  shapeOk(r);
+});
+
+test('ADDRESS PARTS a street name first, then the house number, joins in either order; a number spoken in words is a house number too', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  await driveContacts(r, sim, ['Evergreen Terrace', 'seven forty two']);
+  assert.deepEqual(addressAnswers(r), ['NEED_NUMBER', 'JOINED']);
+  assert.ok(directives(r).some((d) => d.includes('(the street name is already heard: ask only for the house number)')));
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.equal(q.token, 'I have your service address as seven forty two Evergreen Terrace. Is that correct? Please say yes or no.');
+  say(sim, 'yes'); await ended(sim, r);
+});
+
+test('ADDRESS PARTS a house number that never gets a street name ends as the safe incomplete outcome: bounded, saved unconfirmed, never read back, never handed off', async () => {
+  const hook = hookCalls();
+  const r = await servicesRig({ contacts: true, confirmedHandoff: hook.hook });
+  const sim = await r.connect();
+  await driveContacts(r, sim, ['742'], 24);
+  if (!sim.messages.some((m: any) => m.type === 'end')) await ended(sim, r);
+  assert.equal(diag(r, 'INCOMPLETE').length, 1, JSON.stringify(asks(r)));
+  assert.equal(diag(r, 'INCOMPLETE')[0].detail?.item, 'ADDRESS');
+  assert.ok(!r.logs.some((l) => l.code === 'READBACK'), 'a number alone was never read back as an address');
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.address_status], ['unconfirmed', false, 'none']);
+  assert.ok(rec.reasons.includes('incomplete_call'));
+  assert.equal(hook.calls.length, 0);
+  assert.equal(r.vault?.list(T).length, 0, 'no address (and no contact) was stored');
+  assert.ok(asks(r).filter((a) => a === 'Service address').length <= 3 + 3, 'the asks stayed within the clarification limit plus the three part credits');
+});
+
+test('ADDRESS PARTS a talked-over question does not lose the part already heard: the street name that follows still joins it', async () => {
+  const r = await servicesRig({ contacts: true });
+  const sim = await r.connect();
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I need a regular cleaning for our office'); await reply(r, sim);
+  let phase = 0;
+  for (let i = 0; i < 16 && !r.logs.some((l) => l.code === 'READBACK' || l.code === 'INCOMPLETE'); i++) {
+    const last = asks(r).at(-1);
+    if (last === 'Service address' && phase === 0) { say(sim, '742'); phase = 1; await reply(r, sim); sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'What is', durationUntilInterruptMs: 200 }); await new Promise((res) => setTimeout(res, 40)); continue; }
+    const answer = last === 'Customer name' ? 'priya raman' : last === 'Callback phone number' ? 'two one two five five five zero one four two' : last === 'Service address' ? 'Evergreen Terrace' : last === 'Address' ? '42 Elm Street' : 'the pipe is burst';
+    say(sim, answer); await reply(r, sim);
+  }
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(asks(r)));
+  assert.ok(addressAnswers(r).includes('NEED_STREET') && addressAnswers(r).includes('JOINED'), JSON.stringify(addressAnswers(r)));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('ADDRESS PARTS in the correction step a number alone is kept and only the street name is asked for, in fixed words; the old address is not repeated', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); assert.equal((await reply(r, sim)).token, ADDRESS_Q);
+  say(sim, 'no that is wrong'); assert.equal((await reply(r, sim)).token, SAY.addressWrong);
+  say(sim, 'seven twenty four'); const ask = await reply(r, sim);
+  assert.equal(ask.token, SAY.addressStreet, 'only the street name is asked for');
+  say(sim, 'Oak Lane'); const second = await reply(r, sim);
+  assert.equal(second.token, 'I have your service address as seven twenty four Oak Lane. Is that correct? Please say yes or no.');
+  assert.ok(!second.token.includes('Elm'));
+  say(sim, 'yes'); await ended(sim, r);
+  const c = r.vault?.get(T, r.store.list(T)[0].call_ref);
+  assert.deepEqual([c?.address_state, c?.address], ['confirmed', 'seven twenty four Oak Lane']);
+});
+
+test('ADDRESS PARTS a refusal in the correction step keeps nothing, says so, and a half-given address is not stored', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); await toContactReadback(r, sim);
+  say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'no that is wrong'); await reply(r, sim);
+  say(sim, 'seven twenty four'); assert.equal((await reply(r, sim)).token, SAY.addressStreet);
+  say(sim, 'I would rather not say'); await ended(sim, r);
+  assert.ok(sim.messages.some((m: any) => m.token === SAY.addressRefused));
+  const c = r.vault?.get(T, r.store.list(T)[0].call_ref);
+  assert.ok(c === undefined || c.address === undefined || c.address_state !== 'confirmed');
+  assert.ok(!/twenty|724/i.test(JSON.stringify(r.logs) + JSON.stringify(r.store.list(T))));
+});

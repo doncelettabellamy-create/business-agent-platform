@@ -66,6 +66,8 @@ export interface CallSession {
   phonePending(): boolean;
   /** Diagnostics only, counts and flags (never a value): which contact items are held, and how many digits of a number heard in pieces. */
   contactDiag(): { name: boolean; phone: boolean; address: boolean; phoneDigits: number };
+  /** Which part of the service address is still needed after one part was heard (a fixed word, never the part): the street name, the house number, or none. */
+  addressPart(): 'street name' | 'house number' | undefined;
   /**
    * The caller's name, callback number and service address, only when all three are usable. RAW personal data: for the spoken read-back of the number
    * and the encrypted contact vault, nowhere else.
@@ -127,7 +129,7 @@ export function createCallSession(config: SessionConfig): CallSession {
       if (typeof raw === 'string' && raw.length <= 1000) {
         const results = contact.volunteered(raw);
         if (expecting !== undefined && !results.some((r) => r.field === expecting)) results.push(contact.collect(expecting, raw, correcting));
-        for (const r of results) { heardContact.push({ field: r.field, outcome: r.outcome, ...(r.reason !== undefined ? { reason: r.reason } : {}), ...(r.digits !== undefined ? { digits: r.digits } : {}), ...(r.total !== undefined ? { total: r.total } : {}) }); for (const l of r.learn) masker.learn(TYPE[r.field], l); }
+        for (const r of results) { heardContact.push({ field: r.field, outcome: r.outcome, ...(r.reason !== undefined ? { reason: r.reason } : {}), ...(r.digits !== undefined ? { digits: r.digits } : {}), ...(r.total !== undefined ? { total: r.total } : {}) }); for (const l of r.learn) masker.learn(r.field === 'address' && r.outcome === 'partial' ? 'Contact detail' : TYPE[r.field], l); }
       }
       let m = masker.mask(raw);
       // A contact answer the masker's own fail-closed rules would refuse (a number said in an odd way) is not lost and does not end the call: the server already holds it, and the
@@ -181,6 +183,7 @@ export function createCallSession(config: SessionConfig): CallSession {
     contactMissing(): string[] { return contactMissing(parts()); },
     contactStatus(): ContactStatus { parts(); return contact.status(); },
     phonePending(): boolean { return contact.pendingPhone(); },
+    addressPart() { return contact.addressPart(); },
     contactDiag() { parts(); return { name: contact.value('name') !== undefined, phone: contact.value('phone') !== undefined, address: contact.value('address') !== undefined, phoneDigits: contact.pendingDigits() }; },
     revealContactParts(): { name?: string; phone?: string; address?: string } { return parts(); },
     forgetAddress(): void { masker.supersede('Address'); contact.clear('address'); },

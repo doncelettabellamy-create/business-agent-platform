@@ -28,9 +28,11 @@ export interface DialogueClient {
  * What the assistant is told to do next. Chosen by code from a fresh Intake result (next-field.ts); the model never sees the list of missing
  * fields and never chooses the field. Field and category names come from the skill configuration.
  */
+/** Which part of a service address is still needed after the other was heard: a fixed word, never part of the address itself. */
+export type AddressPart = 'street name' | 'house number';
 export type Directive =
   | { kind: 'open' }
-  | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[] }
+  | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[]; part?: AddressPart }
   | { kind: 'clarify'; categories?: readonly string[] }
   | { kind: 'listen' };
 /** Which items the server already holds and which it still needs, as field names only (never a value). Given to the voice so it does not ask for what the caller has already said. */
@@ -92,7 +94,8 @@ export function renderDirective(d: Directive): string {
     case 'ask': {
       const again = d.again === true ? ' (asked before: ask it a different way)' : '';
       const choices = d.choices === undefined || d.choices.length === 0 ? '' : ` CHOICES: ${d.choices.slice(0, 10).map(name).join('; ')}`;
-      return `NEXT ASK ${name(d.field)}${again}${choices}`;
+      const part = d.part === 'street name' || d.part === 'house number' ? ` (the ${d.part === 'street name' ? 'house number' : 'street name'} is already heard: ask only for the ${d.part})` : '';
+      return `NEXT ASK ${name(d.field)}${again}${part}${choices}`;
     }
     case 'clarify': return d.categories === undefined || d.categories.length === 0 ? 'NEXT CLARIFY' : `NEXT CLARIFY: ${d.categories.slice(0, 10).map(name).join('; ')}`;
     case 'listen': return 'NEXT LISTEN';
@@ -127,6 +130,7 @@ export function fallbackText(d: Directive): string {
     case 'ask': {
       const choices = (d.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
       const offer = choices.length > 0 ? ` You can say ${orList(choices)}, or tell me in your own words.` : '';
+      if (d.part === 'street name' || d.part === 'house number') return `Sorry about the pause. What is the ${d.part}?`;
       return good(d.field) ? `Sorry about the pause. Can you tell me about ${d.field.trim().toLowerCase()}?${offer}` : 'Sorry about the pause. Could you say that again?';
     }
     case 'clarify': {

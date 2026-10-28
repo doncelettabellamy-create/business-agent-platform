@@ -80,6 +80,8 @@ export const SAY = Object.freeze({
   addressAsk: 'I have your service address. Is that correct? Please say yes or no.',   // what the dialogue history keeps: the address itself is never in it
   addressWrong: 'Sorry about that. What is the correct service address?',
   addressMissing: 'I did not catch an address. What is the service address?',
+  addressStreet: 'Thank you. What is the street name?',
+  addressNumber: 'Thank you. What is the house number?',
   addressRefused: 'Understood. I will not keep an address. Your request is recorded. Goodbye.',
   unconfirmed: 'Thank you. I could not confirm the details. Goodbye.',
   incomplete: 'Thank you. I could not get all the details I need, so I cannot complete this request. Goodbye.',
@@ -280,6 +282,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let phase: 'collect' | 'confirm' | 'address' | 'addressfix' = 'collect';
     // The service-address confirmation that follows the first yes when contact capture is on.
     let addressState: AddressState | undefined; let addressTries = 0; let addressUnclear = 0;
+    let addressParts = 0;   // how many times only the missing part of the address was asked for after the confirmation step (bounded)
     let addressAsked = false;   // the address question was sent in full and has not since been reported talked over: only then can a yes or no answer it
     let lastAddressText = '';
     let readbacks = 0;
@@ -691,6 +694,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const s = session as CallSession;
       if (ADDRESS_REFUSAL.test(line)) return await finishAddress('refused');
       if (s.revealContactParts().address !== undefined) { addressUnclear = 0; askAddress(); return; }
+      // One part of the address was heard on its own: it is kept and only the missing part is asked for (a few times at most, so this can never go on for ever).
+      const part = s.addressPart();
+      if (part !== undefined && ++addressParts <= 3) { const line = part === 'street name' ? SAY.addressStreet : SAY.addressNumber; say(line); s.said(line); armConfirmTimer(); return; }
       if (++addressUnclear > 1) return await finishAddress('unconfirmed');
       say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer();
     }
@@ -801,7 +807,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         lastAskedAt.set(next.field, covers);
         deps.log('ASK', { again: next.again ? 1 : 0, lines: covers, item: ((deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field]) ?? 'content').toUpperCase(), n: (askCount.get(next.field) ?? 0) + 1 });
         const choices = deps.choicesFor?.(tenant, next.field);
-        const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}) }, statusOf(s, got));
+        // After one part of the service address was heard (a house number without a street name, or the reverse) only the missing part is asked for.
+        const part = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'address' ? s.addressPart() : undefined;
+        const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}) }, statusOf(s, got));
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
         if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
         else { if (prevAt === undefined) lastAskedAt.delete(next.field); else lastAskedAt.set(next.field, prevAt); }

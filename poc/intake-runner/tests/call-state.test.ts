@@ -1,10 +1,10 @@
 // call-state.ts and the session capture behind it: server-validated current-call contact state, kept apart from privacy masking. Invented people only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createContactState, runContactTool, nameFrom, addressFrom, CONTACT_TOOL_NAMES, CONTACT_TOOL_DEFINITIONS, MAX_CLARIFICATIONS } from '../src/call-state.ts';
+import { createContactState, runContactTool, nameFrom, addressFrom, addressPiece, CONTACT_TOOL_NAMES, CONTACT_TOOL_DEFINITIONS, MAX_CLARIFICATIONS } from '../src/call-state.ts';
 import { createCallSession } from '../src/call-session.ts';
 import { CONTACT_FIELDS } from '../src/contact-capture.ts';
-import { renderStatus, renderDirective, DIALOGUE_INSTRUCTION } from '../src/dialogue-model.ts';
+import { renderStatus, renderDirective, fallbackText, DIALOGUE_INSTRUCTION } from '../src/dialogue-model.ts';
 import { createMasker } from '../src/pii-screen.ts';
 
 const session = () => { const s = createCallSession({ limits: { maxTurns: 30, maxMinutes: 8, maxChars: 4000 }, names: [], now: () => 0, killed: () => false }); assert.equal(s.consent('yes'), 'granted'); return s; };
@@ -168,9 +168,98 @@ test('every collect result carries a fixed reason and counts, never a value', ()
   const t = createContactState();
   assert.equal(t.collect('name', 'maybe later').reason, 'NOT_A_NAME');
   assert.equal(t.collect('name', 'Priya Raman').reason, 'CAPTURED');
-  assert.equal(t.collect('address', 'Maple Grove').reason, 'NO_STREET_NUMBER');
+  assert.equal(t.collect('address', 'I would rather not say').reason, 'NO_STREET_NUMBER');
   assert.equal(t.collect('address', '42 Elm Street').reason, 'CAPTURED');
   assert.equal(t.collect('phone', 'hello there').reason, 'NO_DIGITS');
   assert.equal(t.collect('phone', 'five five five').reason, 'PIECE');
   assert.equal(t.pendingDigits(), 3);
+});
+
+// ---------------------------------------------------------------- 2026-10-28 service address in parts
+test('ADDRESS a house number alone is never an address, however it is said; a street name needs no particular suffix; unit-only text is not a street', () => {
+  for (const bad of ['742', '742.', 'it is 742', 'the address is 742', 'seven four two', 'seven forty two', 'forty two', 'apartment 4', 'unit 4', '4 B', '']) assert.equal(addressFrom(bad), undefined, bad);
+  for (const [ok, want] of [['742 Evergreen', '742 Evergreen'], ['742 Evergreen Terrace', '742 Evergreen Terrace'], ['forty two Oak Lane', 'forty two Oak Lane'], ['Maple Grove Apartments unit 4', 'Maple Grove Apartments unit 4'], ['PO Box 12', 'PO Box 12'], ['Evergreen Terrace 742', 'Evergreen Terrace 742'], ['my address is 5 Broadway', '5 Broadway']] as const) assert.equal(addressFrom(ok), want, ok);
+});
+
+test('ADDRESS pieces: a house number (digits or number words) and a street name are told apart; conversation, a road word alone and a phone-length number are neither', () => {
+  assert.deepEqual(addressPiece('742'), { kind: 'number', text: '742' });
+  assert.deepEqual(addressPiece('it is 742.'), { kind: 'number', text: '742' });
+  assert.deepEqual(addressPiece('seven four two'), { kind: 'number', text: 'seven four two' });
+  assert.deepEqual(addressPiece('the house number is forty two'), { kind: 'number', text: 'forty two' });
+  assert.deepEqual(addressPiece('Evergreen Terrace.'), { kind: 'street', text: 'Evergreen Terrace' });
+  assert.deepEqual(addressPiece('evergreen'), { kind: 'street', text: 'Evergreen' });
+  assert.deepEqual(addressPiece("it's Maple Grove"), { kind: 'street', text: 'Maple Grove' });
+  for (const none of ['street', 'Avenue', 'let me check', 'hold on', 'one moment', 'yes', 'no', 'I would rather not say', 'about the price', 'I do not know', '212 555 0142', 'two one two five five five zero one four two', 'apartment 4', '']) assert.equal(addressPiece(none), undefined, none);
+});
+
+test('ADDRESS a house number then a street name are held across turns and joined; the parts are masked, never reach a model, and the caller confirms the whole aloud', () => {
+  const s = session();
+  const a = s.hear('742', 'address');
+  assert.ok(a.ok && a.contact?.[0].outcome === 'partial' && a.contact[0].reason === 'NEED_STREET', JSON.stringify(a));
+  assert.equal(s.addressPart(), 'street name');
+  assert.ok(s.contactMissing().includes(CONTACT_FIELDS.address), 'a number alone does not satisfy the address');
+  assert.equal(s.revealContactParts().address, undefined);
+  const b = s.hear('Evergreen Terrace', 'address');
+  assert.ok(b.ok && b.contact?.[0].outcome === 'captured' && b.contact[0].reason === 'JOINED', JSON.stringify(b));
+  assert.equal(s.revealContactParts().address, '742 Evergreen Terrace');
+  assert.equal(s.addressPart(), undefined);
+  assert.ok(!/742|evergreen/i.test(s.maskedText() + JSON.stringify(s.dialogue())), 'no part of the address is in what a model reads');
+  assert.equal(s.contactDiag().address, true);
+});
+
+test('ADDRESS a street name first and then the house number joins the other way round; written or spoken numbers both join', () => {
+  const t = createContactState();
+  assert.deepEqual([t.collect('address', 'Oak Lane').outcome, t.addressPart()], ['partial', 'house number']);
+  assert.deepEqual([t.collect('address', 'forty two').reason, t.value('address')], ['JOINED', 'forty two Oak Lane']);
+  const u = createContactState();
+  u.collect('address', 'Evergreen'); assert.equal(u.collect('address', '742').reason, 'JOINED'); assert.equal(u.value('address'), '742 Evergreen');
+  const v = createContactState();
+  v.collect('address', 'seven four two'); assert.equal(v.collect('address', 'Evergreen Terrace').reason, 'JOINED'); assert.equal(v.value('address'), 'seven four two Evergreen Terrace');
+});
+
+test('ADDRESS corrections: a different number replaces the held one, a correction clears held parts, a whole address replaces them, and a wrong address leaves nothing behind', () => {
+  const t = createContactState();
+  t.collect('address', '742'); t.collect('address', '724');
+  assert.equal(t.collect('address', 'Evergreen Terrace').reason, 'JOINED'); assert.equal(t.value('address'), '724 Evergreen Terrace');
+  const u = createContactState();
+  u.collect('address', '742'); assert.equal(u.addressPart(), 'street name');
+  const w = u.collect('address', 'Oak Lane', true);   // a correction starts over: the held number is dropped, so a street alone is only a street
+  assert.deepEqual([w.outcome, w.reason, u.addressPart()], ['partial', 'NEED_NUMBER', 'house number']);
+  u.collect('address', '9 Birch Road'); assert.deepEqual([u.value('address'), u.addressPart()], ['9 Birch Road', undefined]);
+  const x = createContactState();
+  x.collect('address', '742'); x.clear('address'); assert.equal(x.addressPart(), undefined);
+  x.collect('address', '742'); x.set('address', '1 Main Street'); assert.equal(x.addressPart(), undefined);
+  const s = session();
+  s.hear('742', 'address'); s.hear('Evergreen Terrace', 'address'); s.forgetAddress();
+  assert.equal(s.revealContactParts().address, undefined); assert.equal(s.addressPart(), undefined);
+  s.hear('Oak Lane', 'address'); s.forgetAddress(); assert.equal(s.addressPart(), undefined, 'a held part does not survive "that is wrong"');
+});
+
+test('ADDRESS refusal, noise and an incomplete address: nothing is invented, a held number stays only a number, and a different call never sees it', () => {
+  const t = createContactState();
+  t.collect('address', '742');
+  for (const noise of ['I would rather not say', 'let me check', 'one moment', 'about the price', 'hello']) assert.equal(t.collect('address', noise).outcome, 'unclear', noise);
+  assert.equal(t.value('address'), undefined);
+  assert.equal(t.addressPart(), 'street name', 'the held number survives noise but is still not an address');
+  assert.deepEqual(t.status().missing.includes(CONTACT_FIELDS.address), true);
+  const other = createContactState();
+  assert.equal(other.addressPart(), undefined, 'state is per call');
+  t.dispose(); assert.equal(t.addressPart(), undefined); assert.equal(t.collect('address', 'Evergreen').outcome, 'unclear');
+});
+
+test('ADDRESS the native tools take the same parts and report only labels and a fixed outcome', () => {
+  const t = createContactState();
+  const a = runContactTool(t, 'collect_address', { heard: '742' });
+  assert.ok(a.ok && a.outcome === 'partial' && a.missing.includes(CONTACT_FIELDS.address));
+  const b = runContactTool(t, 'collect_address', { heard: 'Evergreen Terrace' });
+  assert.ok(b.ok && b.outcome === 'captured' && b.captured.includes(CONTACT_FIELDS.address));
+  assert.equal(t.value('address'), '742 Evergreen Terrace');
+});
+
+test('ADDRESS the directive names only the missing part, in one fixed line, and the spoken fallback asks only for it', () => {
+  assert.equal(renderDirective({ kind: 'ask', field: 'Service address', part: 'street name' }), 'NEXT ASK Service address (the house number is already heard: ask only for the street name)');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Service address', part: 'house number', again: true }), 'NEXT ASK Service address (asked before: ask it a different way) (the street name is already heard: ask only for the house number)');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Service address' }), 'NEXT ASK Service address');
+  assert.equal(fallbackText({ kind: 'ask', field: 'Service address', part: 'street name' }), 'Sorry about the pause. What is the street name?');
+  assert.ok(!/[\r\n[\]<>]/.test(renderDirective({ kind: 'ask', field: 'Service address', part: 'house number' })));
 });
