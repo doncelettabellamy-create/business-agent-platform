@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { createOpenAIHttpClient } from './openai-http-client.ts';
 import { createOpenAiVoiceSocket } from './openai-voice-socket.ts';
-import { looksLikeKey, readSecret } from './hidden-prompt.ts';
+import { looksLikeKey, normalizeKeyEntry, readSecret } from './hidden-prompt.ts';
 import { CHECK_LIMITS, CHECK_PRICES_AS_OF, planCheck, runCheck } from './voice-check.ts';
 import { DREW_TEST_OPENING } from './drew-test-opening.ts';
 import type { FounderVoiceConfig } from './founder-voice-gate.ts';
@@ -66,7 +66,18 @@ const typed: string = await new Promise((resolve) => rl.question(`Type ${plan.ce
 rl.close();
 if (typed.trim() !== plan.ceilingUsd.toFixed(2)) { console.error('spend refused: the amount was not confirmed. Nothing was sent.'); process.exit(78); }
 
-let key: string | undefined = flag('--key-from-env') ? process.env.OPENAI_API_KEY : await readSecret(process.stdin, process.stdout, 'Enter the OpenAI key (nothing will be shown): ');
+const WHY: Record<string, string> = { empty: 'nothing was received', too_short: 'it is too short to be a key', too_long: 'it is too long to be a key', bad_characters: 'it holds characters a key does not have (for example a space inside it)' };
+let key: string | undefined;
+for (let attempt = 1; attempt <= 3 && key === undefined; attempt++) {
+  const raw = flag('--key-from-env') ? process.env.OPENAI_API_KEY : await readSecret(process.stdin, process.stdout, 'Enter the OpenAI key (nothing will be shown; paste with a right-click, then press Enter; Esc cancels): ');
+  if (raw === undefined && !flag('--key-from-env')) { console.error('spend refused: the key entry was cancelled. Nothing was sent.'); process.exit(78); }
+  const entry = normalizeKeyEntry(raw);   // cleans a paste (spaces, quotes, line ends); on a problem it says the kind and the length, never a character
+  if (entry.key !== undefined) key = entry.key;
+  else {
+    console.error(`That entry (${entry.length} characters) is not usable: ${WHY[entry.problem ?? 'empty']}.${attempt < 3 && !flag('--key-from-env') ? ' Try again.' : ''}`);
+    if (flag('--key-from-env')) break;
+  }
+}
 if (!looksLikeKey(key)) { console.error('spend refused: no usable key was entered. Nothing was sent.'); process.exit(78); }
 const getKey = (): string | undefined => key;
 console.log('Running the check...');

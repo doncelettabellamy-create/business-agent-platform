@@ -11,7 +11,7 @@ import { CHECK_LIMITS, planCheck, runCheck } from '../src/voice-check.ts';
 import type { CheckPlan } from '../src/voice-check.ts';
 import { DREW_TEST_OPENING, DREW_TEST_SPECIAL } from '../src/drew-test-opening.ts';
 import { consentNoticeFor, openingProblems } from '../src/opening.ts';
-import { looksLikeKey, readSecret } from '../src/hidden-prompt.ts';
+import { looksLikeKey, normalizeKeyEntry, PASTE_HINT, readSecret } from '../src/hidden-prompt.ts';
 import { createOpenAiVoiceSocket } from '../src/openai-voice-socket.ts';
 import type { WebSocketLike } from '../src/openai-voice-socket.ts';
 import { createOpenAIHttpClient } from '../src/openai-http-client.ts';
@@ -191,6 +191,8 @@ class FakeTty {
   send(s: string | Buffer) { for (const l of [...this.listeners]) l(s); }
 }
 const outputOf = () => { const writes: string[] = []; return { writes, write: (t: string) => { writes.push(t); } }; };
+const REAL_SHAPE = 'sk-proj-' + 'Ab3_dE-fGh1.JkLm'.repeat(10);   // an invented key of the shape and length of a real project key (about 160 characters)
+const settle = () => new Promise<void>((r) => setImmediate(r));
 
 test('key entry: the key is read without being shown, comes back in memory only, and the terminal is restored', async () => {
   const tty = new FakeTty(); const out = outputOf();
@@ -204,27 +206,96 @@ test('key entry: the key is read without being shown, comes back in memory only,
   tty.send('more'); // nothing listens any more
 });
 
-test('key entry: backspace, control keys, a pasted chunk and the length cap behave', async () => {
+test('key entry: a stray Enter left over from the previous prompt is not an answer (the likely cause of "no usable key" on Windows), and a hint is written once', async () => {
+  for (const stray of ['\n', '\r', '\r\n', '\n\n']) {
+    const tty = new FakeTty(); const out = outputOf();
+    const p = readSecret(tty, out, '> ');
+    tty.send(stray);                       // the Enter that ended the confirmation, arriving late
+    await settle();
+    tty.send(REAL_SHAPE + '\r');
+    assert.equal(await p, REAL_SHAPE, JSON.stringify(stray));
+    assert.deepEqual(out.writes.filter((w) => w !== '> ' && w !== '\n'), [PASTE_HINT], 'one fixed hint, no secret');
+  }
+  const t = new FakeTty(); const pending = readSecret(t, outputOf(), '> ');
+  t.send('\r'); t.send('\r'); t.send('\r');
+  let settled = false; void pending.then(() => { settled = true; });
+  await settle();
+  assert.equal(settled, false, 'Enter on an empty entry never ends the prompt');
+  t.send('\u0003');
+  assert.equal(await pending, undefined);
+});
+
+test('key entry: a paste in one chunk, with line ends, bracketed-paste markers, or one character at a time, all come back as the same key', async () => {
+  const cases: Array<[string, string[]]> = [
+    ['one chunk then CRLF', [REAL_SHAPE + '\r\n']], ['one chunk with LF', [REAL_SHAPE + '\n']], ['CR only', [REAL_SHAPE + '\r']],
+    ['bracketed paste', ['\u001b[200~' + REAL_SHAPE + '\u001b[201~\r']], ['bracketed paste in pieces', ['\u001b[20', '0~', REAL_SHAPE.slice(0, 50), REAL_SHAPE.slice(50), '\u001b[201~', '\r']],
+    ['leading Enter then paste', ['\r\n', REAL_SHAPE, '\r']], ['character by character', [...REAL_SHAPE, '\r']],
+    ['arrow keys in the middle', [REAL_SHAPE.slice(0, 20), '\u001b[D\u001b[C\u001b[A\u001bOA', REAL_SHAPE.slice(20), '\r']],
+  ];
+  for (const [name, chunks] of cases) {
+    const tty = new FakeTty(); const out = outputOf();
+    const p = readSecret(tty, out, '> ');
+    for (const c of chunks) tty.send(c);
+    const got = await p;
+    assert.equal(got, REAL_SHAPE, name);
+    assert.ok(!out.writes.join('').includes(REAL_SHAPE.slice(10, 20)), `${name}: nothing of the key is written`);
+  }
+});
+
+test('key entry: Ctrl+V arrives as a control key and pastes nothing, so a hint is written and the entry carries on', async () => {
+  const tty = new FakeTty(); const out = outputOf();
+  const p = readSecret(tty, out, '> ');
+  tty.send('\u0016'); tty.send('\u0016');
+  tty.send(FAKE_KEY + '\r');
+  assert.equal(await p, FAKE_KEY);
+  assert.deepEqual(out.writes.filter((w) => w === PASTE_HINT).length, 1, 'said once');
+});
+
+test('key entry: backspace, other control keys and a too-long paste behave; a lone Escape or Ctrl-C cancels and drops what was typed', async () => {
   const a = new FakeTty(); const pa = readSecret(a, outputOf(), '> ');
   a.send('abcXY'); a.send('\u007f\u007f'); a.send('d\u0001\u0002ef\n');
   assert.equal(await pa, 'abcdef');
   const b = new FakeTty(); const pb = readSecret(b, outputOf(), '> ');
-  b.send(Buffer.from('x'.repeat(400) + '\r'));
-  assert.equal((await pb)?.length, 300);
-  const c = new FakeTty(); const pc = readSecret(c, outputOf(), '> ');
-  c.send('ab\u007f\u007f\u007f\u007f\r');
-  assert.equal(await pc, undefined, 'an empty entry is no entry');
-});
-
-test('key entry: Ctrl-C or Escape cancels, and anything typed so far is dropped', async () => {
+  b.send(Buffer.from('x'.repeat(1200) + '\r'));
+  assert.equal((await pb)?.length, 1000, 'kept up to 1000 so that a too-long paste is reported as too long');
   for (const cancel of ['\u0003', '\u001b']) {
     const t = new FakeTty(); const out = outputOf();
     const p = readSecret(t, out, '> ');
-    t.send(FAKE_KEY.slice(0, 12) + cancel + FAKE_KEY.slice(12) + '\r');
-    assert.equal(await p, undefined);
+    t.send(FAKE_KEY.slice(0, 12)); t.send(cancel); t.send(FAKE_KEY.slice(12) + '\r');
+    assert.equal(await p, undefined, JSON.stringify(cancel));
     assert.ok(!out.writes.join('').includes(FAKE_KEY.slice(0, 6)));
     assert.deepEqual(t.raw, [true, false]);
   }
+});
+
+test('key entry: it works straight after a readline prompt on the same stream, as in the command line (the confirmation, then the key)', async () => {
+  const { PassThrough } = await import('node:stream');
+  const { createInterface } = await import('node:readline');
+  class TtyStream extends PassThrough { isTTY = true; raw: boolean[] = []; setRawMode(on: boolean) { this.raw.push(on); return this; } }
+  const input = new TtyStream(); const sink = outputOf();
+  const rl = createInterface({ input, output: { write: () => true } as never, terminal: false });
+  const typed = await new Promise<string>((resolve) => { rl.question('Type 0.14: ', resolve); input.write('0.14\r\n'); });
+  rl.close();
+  assert.equal(typed.trim(), '0.14');
+  const p = readSecret(input as never, sink, 'Enter the key: ');
+  input.write('\n');                                  // a late Enter, as some Windows consoles send after the line
+  await settle();
+  input.write('  "' + REAL_SHAPE + '"  \r\n');          // pasted with spaces and quotes
+  const raw = await p;
+  assert.equal(normalizeKeyEntry(raw).key, REAL_SHAPE);
+  assert.deepEqual(input.raw, [true, false]);
+  assert.ok(!sink.writes.join('').includes(REAL_SHAPE.slice(10, 20)));
+});
+
+test('key entry: a paste is cleaned (spaces, quotes, zero-width characters), and a bad entry is reported by its kind and length only, never a character', () => {
+  for (const raw of [REAL_SHAPE, ` ${REAL_SHAPE} `, `"${REAL_SHAPE}"`, `'${REAL_SHAPE}'`, `﻿${REAL_SHAPE}`, `${REAL_SHAPE}​`, `  "${REAL_SHAPE}"\r\n`, REAL_SHAPE + '\u0000']) assert.deepEqual(normalizeKeyEntry(raw), { key: REAL_SHAPE, length: REAL_SHAPE.length }, JSON.stringify(raw.slice(0, 12)));
+  const bad: Array<[unknown, string, number]> = [['', 'empty', 0], ['   ', 'empty', 0], [undefined, 'empty', 0], [12, 'empty', 0], ['""', 'empty', 0], ['short', 'too_short', 5], ['has a space inside the key 123', 'bad_characters', 30], ['sk-proj-ab/cd+ef=gh1234', 'bad_characters', 23], ['x'.repeat(301), 'too_long', 301], [`sk-${CANARY}%`, 'bad_characters', 3 + CANARY.length + 1]];
+  for (const [raw, problem, length] of bad) {
+    const r = normalizeKeyEntry(raw);
+    assert.deepEqual([r.key, r.problem, r.length], [undefined, problem, length], String(raw).slice(0, 12));
+    assert.ok(!JSON.stringify(r).includes(CANARY) && !JSON.stringify(r).includes('inside'), 'no character of the entry is reported');
+  }
+  assert.deepEqual([looksLikeKey(REAL_SHAPE), looksLikeKey('short'), looksLikeKey('has space in it 12345'), looksLikeKey('x'.repeat(301)), looksLikeKey(undefined), looksLikeKey(5)], [true, false, false, false, false, false]);
 });
 
 test('key entry: with no interactive terminal nothing is read, so a key cannot be piped in', async () => {
@@ -233,7 +304,6 @@ test('key entry: with no interactive terminal nothing is read, so a key cannot b
   assert.deepEqual([t.raw, t.listeners.length, t.resumed], [[], 0, 0]);
   const noRaw = new FakeTty() as unknown as Record<string, unknown>; noRaw.setRawMode = undefined;
   assert.equal(await readSecret(noRaw as never, outputOf(), '> '), undefined);
-  assert.deepEqual([looksLikeKey(FAKE_KEY), looksLikeKey('short'), looksLikeKey('has space in it 12345'), looksLikeKey('x'.repeat(301)), looksLikeKey(undefined), looksLikeKey(5)], [true, false, false, false, false, false]);
 });
 
 // ================================================================ the command line (plan mode and refused spends only)
