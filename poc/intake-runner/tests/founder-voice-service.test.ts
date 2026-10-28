@@ -154,7 +154,7 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   assert.equal(r.voices[0].spoken[0], r.notice);
   assert.equal(r.notice, consentNoticeFor(undefined), 'the notice is the one the existing call logic uses');
   sim.send({ event: 'media', media: { payload: b64(160) } });
-  await until(() => r.voices[0].appended() === 1);
+  await until(() => r.voices[0].appended() === 1, 20_000, () => where(r, sim));
   await say(r, 'yes I agree', 2);
   assert.equal(r.voices[0].spoken[1], OPENING);
   assert.ok(r.has('CONSENT_GRANTED'));
@@ -295,7 +295,7 @@ test('consent-before-audio, as it is: the answer to the consent question is audi
   const sim = await r.connect(); r.start(sim);
   await until(() => r.has('CALL_STARTED'));
   sim.send({ event: 'media', media: { payload: b64(160) } });   // the caller's "no", as audio
-  await until(() => r.voices[0].appended() === 1);
+  await until(() => r.voices[0].appended() === 1, 20_000, () => where(r, sim));
   assert.equal(r.voices[0].appended(), 1, 'THE OPEN GAP: closing it needs consent collected on the phone side first');
   sim.end(); await pause(20);
 });
