@@ -2,6 +2,9 @@
 #
 # Safe by construction: no secret, token or key is read (no `secrets.*`), the job has read-only repository access, and the tests are offline (synthetic data, stand-in models, local sockets only).
 # No live call, no Twilio, no OpenAI and no Anthropic request is made. The test suite itself refuses live paths. Node 24 is what `poc/intake-runner/package.json` requires ("engines": ">=24").
+#
+# The suite's output is kept for the run page without needing a GitHub sign-in: the counts and the names of failing tests go to the job summary, and the first failures become annotations.
+# (The raw log needs a sign-in even for a public repository.) The output holds synthetic test data only.
 name: tests
 
 on:
@@ -32,4 +35,22 @@ jobs:
       - name: Install the locked dependencies (no keys involved)
         run: npm ci
       - name: Full test suite
-        run: npm test
+        shell: bash
+        run: |
+          set +e
+          out="$RUNNER_TEMP/test-output.txt"
+          npm test > "$out" 2>&1
+          code=$?
+          {
+            echo "## Test summary (exit code $code)"
+            grep -E '^ℹ (tests|pass|fail|cancelled|skipped|todo)' "$out"
+            echo
+            echo "### Failing tests (first 40)"
+            grep -E '^✖' "$out" | sort -u | head -40
+            echo
+            echo "### First assertion and error lines (first 40)"
+            grep -E 'AssertionError|Error:|ERR_[A-Z_]+|ENOENT|EADDR|timed out|Cannot find' "$out" | head -40 | cut -c1-300
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^✖' "$out" | sort -u | head -10 | while IFS= read -r line; do echo "::error::${line:0:300}"; done
+          grep -E 'AssertionError|Error:|ERR_[A-Z_]+|ENOENT|EADDR|Cannot find' "$out" | head -10 | while IFS= read -r line; do echo "::warning::${line:0:300}"; done
+          exit $code
