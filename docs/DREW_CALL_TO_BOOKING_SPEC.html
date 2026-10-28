@@ -345,7 +345,7 @@ svg { width:100%; height:auto; max-width:1000px; } svg text { fill:var(--fg); fo
 </ul></td></tr>
 </table></div>
 <h3>14.3 Not recommended: adopting Twilio Agent Connect as the platform</h3>
-<p>Agent Connect's <code>GPTLiveProvider</code> takes over audio streaming, turn-taking and interruption handling. That is what we would have to keep control of (consent, masking, the vault, the four-agent boundaries), it needs package installs (not approved), and its source was not read. It is useful as a reference implementation only.</p>
+<p>Agent Connect's <code>GPTLiveProvider</code> takes over audio streaming, turn-taking and interruption handling. That is what we would have to keep control of (consent, masking, the vault, the four-agent boundaries), and it needs package installs (not approved). <strong>Its TypeScript source has since been read (section 15):</strong> it has no consent, no playback clearing and no tool validation, so it is a reference for the wire protocol only.</p>
 <h3>14.4 The smallest implementation step (offline; no key, no live change, no Twilio change)</h3>
 <ol>
 <li><strong>A GPT-Live dialect adapter at the existing link seam</strong> (one new file, pure translation): it speaks GPT-Live to the voice socket and the <em>existing</em> link vocabulary to <code>realtime-transport.ts</code>, so the transport, call logic, current-call state, tools, vault and dashboard do not change. It sends one strict <code>session.start</code>; turns caller transcript deltas into one utterance after a silence threshold; turns output audio and transcript into reply start and end; maps tool calls from delegation to the existing validated tool path and answers with <code>function_call_output</code> then <code>response.create</code>; maps barge-in to the existing clear; closes with <code>session.close</code>.</li>
@@ -364,6 +364,83 @@ svg { width:100%; height:auto; max-width:1000px; } svg text { fill:var(--fg); fo
 <li>Twilio, <a href="https://www.twilio.com/en-us/blog/developers/tutorials/integrations/voice-ai-assistant-openai-gpt-live-1-node">Build an AI Voice Assistant with Twilio Voice and Media Streams, OpenAI's GPT-Live API, and Node.js</a>; Twilio, <a href="https://www.twilio.com/en-us/blog/developers/twilio-openai-gpt-live-1-api-resources">GPT-Live-1 resources (Twilio Agent Connect)</a>.</li>
 <li>OpenAI, <a href="https://developers.openai.com/api/docs/guides/live-conversations">Managing GPT-Live sessions</a>; <a href="https://developers.openai.com/api/docs/guides/live-delegation">Delegation and tools in GPT-Live</a>; <a href="https://developers.openai.com/api/docs/guides/voice-server-controls">Server-side controls</a>; <a href="https://developers.openai.com/api/docs/guides/live-partner-integrations">GPT-Live partner integrations</a>.</li>
 <li><strong>Gaps:</strong> turn-detection settings, input-transcription settings and session duration limits are not documented on the pages read; no barge-in or clear event is documented; the Twilio package versions, the Agent Connect source, OpenAI's Connections, audio-format and Telephony guides, and pricing were not read. The tutorial's code was summarised by a fetch tool, not run. Treat every event name above as unverified until a free access check and an offline-to-live comparison.</li>
+</ul>
+<h2>15. Twilio's GPT-Live source review, and the proposed consent and read-back design (documentation only, 2026-10-27)</h2>
+<div class="box"><strong>Decisions preserved.</strong> <em>Full duplex:</em> GPT-Live keeps conversational control (it listens and speaks at the same time and decides its own wording and timing); the old server-driven speaking loop is not recreated. <em>Residential-only Drew:</em> commercial cleaning is not offered; the fixed residential question and the approved decline line stand unchanged (section 4 and roadmap section 5a-4). The server enforces business rules through validated state and tools, and speaks itself only at the two checkpoints below.</div>
+<p>This section separates four kinds of statement, and each row says which kind it is. <span class="tag built">VERIFIED</span> = read in a vendor page or source file on 2026-10-27 (never run). <span class="tag missing">UNREAD</span> = not read. <span class="tag sim">PROPOSAL</span> = my design, not built. <span class="tag undec">ASSUMPTION</span> = unresolved, to be proven before it is relied on. The source was read through a summarising fetch tool, not a local checkout, so quotations and details are second-hand until someone reads the files directly.</p>
+
+<h3>15.1 Verified: what Twilio Agent Connect's GPT-Live provider does</h3>
+<p>Repository <code>twilio/twilio-agent-connect-typescript</code>, branch main. Files read: <code>media-streams/gpt-live/provider.ts</code>, <code>config.ts</code>, <code>state.ts</code>; <code>media-streams/shared/openai-provider.ts</code>; <code>media-streams/twiml.ts</code>; <code>packages/server/src/lib/server.ts</code>; <code>tests/gpt-live-provider.test.ts</code>; <code>getting_started/examples/gpt-live/src/index.ts</code>.</p>
+<div class="wrap"><table>
+<tr><th>Area</th><th><span class="tag built">VERIFIED</span> behavior</th><th>What it means for us</th></tr>
+<tr><td>Consent, disclosure</td><td>None in the provider, the TwiML builder or the example. The builder emits only <code>&lt;Connect&gt;&lt;Stream&gt;</code> with <code>&lt;Parameter&gt;</code> children (no Say, Gather, Play, Start, Pause or Hangup). The only opening is an optional <code>welcomeInstruction</code>, sent as <code>session.commentary.append</code> after <code>session.started</code> (the model paraphrases it).</td><td>It does not bypass consent; it has none. We must provide consent ourselves.</td></tr>
+<tr><td>Playback and interruption</td><td>No <code>mark</code>, no Twilio <code>clear</code>, no playback tracking, no truncation. The provider relies on GPT-Live handling interruption server-side. No test covers barge-in.</td><td>On a phone line, audio already queued at Twilio can keep playing after a barge-in. Our bridge already tracks marks and sends <code>clear</code>; keep it.</td></tr>
+<tr><td>Audio</td><td>Twilio <code>media.payload</code> goes to <code>session.input_audio.append</code> unchanged; <code>session.output_audio.delta</code> goes back as a <code>media</code> event. Caller frames are held until the model is ready. The session config must have <code>audio.format</code> equal to <code>{ type: 'audio/pcmu', rate: 8000 }</code> and a <code>model</code>.</td><td>Same format as our bridge.</td></tr>
+<tr><td>Session control</td><td>Socket <code>wss://api.openai.com/v1/live/sessions</code> with bearer and User-Agent headers; <code>session.start</code> on open. Teardown sends <code>session.close</code> and waits up to 5 s for <code>session.closed</code>. A model-side close or error closes the Twilio leg. Twilio <code>stop</code> closes the model. Hang-up is closing the WebSocket (no Twilio REST hang-up). No connect timeout in the provider.</td><td>A close handshake we would reuse as a pattern.</td></tr>
+<tr><td>Tool calls</td><td>Calls arrive as <code>response.event</code> wrapping <code>response.output_item.done</code> (only items with status completed run). Execution is a name lookup (<code>toolsByName</code>): unknown names are refused, arguments are parsed with <code>JSON.parse</code> with no schema check, no timeout, no approve or deny hook, and the tool receives only the arguments (no call, session or state). The result is returned as <code>function_call_output</code> then <code>response.create</code>. A call with no <code>call_id</code> is dropped; one with no name gets an error answer.</td><td>Far weaker than our server-side validation (<code>session.tool()</code>). We would not use its tool path.</td></tr>
+<tr><td>Transcripts, storage</td><td>Deltas merge by speaker into <code>session.metadata.transcript</code> (a new turn when the speaker changes); held in memory; not logged. Audio is not stored. Phone numbers are masked in logs; tool arguments and results are not logged.</td><td>A speaker change is usable as a turn boundary.</td></tr>
+<tr><td>Endpoint security</td><td>HTTP routes validate <code>X-Twilio-Signature</code>. The WebSocket route validates a signature over query parameters, with no secret path or token. No rate limit, connection cap, body or message size limit, heartbeat or replay protection in that file. Forwarded headers are trusted as read.</td><td>Our <code>ws-server</code> (secret path, signature, connection limits, lockout) is stronger.</td></tr>
+<tr><td>Dependencies</td><td>The package uses its own server framework and needs installs.</td><td>Not approved; and see below.</td></tr>
+</table></div>
+<p><strong>Conclusion (verified, not assumed):</strong> Agent Connect's GPT-Live provider neither implements nor bypasses our safeguards; it simply lacks consent, masking, a vault, playback clearing and tool validation. Adopting it as the platform would drop them. It is a reference for the wire protocol only.</p>
+
+<h3>15.2 Verified: Twilio behaviours the design relies on (Twilio docs, read 2026-10-27)</h3>
+<ul>
+<li><code>&lt;Connect&gt;&lt;Stream&gt;</code> is bidirectional; later TwiML does not run until <em>the server closes the WebSocket</em>, after which the remaining TwiML resumes. A stream can also be ended by updating the call with new TwiML through the REST API.</li>
+<li><code>&lt;Connect&gt;</code> has <code>action</code> and <code>method</code>: "when the Connect verb ends, Twilio sends an HTTP request to this URL".</li>
+<li><code>&lt;Stream&gt;</code> takes only <code>wss</code>; the URL does not support query strings; custom data goes in <code>&lt;Parameter&gt;</code> (under 500 characters per name and value together).</li>
+<li><code>&lt;Gather input="speech"&gt;</code> posts <code>SpeechResult</code> (and <code>Confidence</code>) to <code>action</code>; supports <code>speechTimeout</code>, <code>timeout</code> (default 5), <code>hints</code> and <code>actionOnEmptyResult</code>; a <code>&lt;Say&gt;</code> nested inside can be interrupted by the caller.</li>
+</ul>
+
+<h3>15.3 Unread</h3>
+<ul>
+<li><span class="tag missing">UNREAD</span> The Python repository (<code>twilio-agent-connect-python</code>); the base-class methods that the summaries said are "not in this file" (<code>handleModelMessage</code>, <code>registerCall</code>, <code>cleanupCall</code>, the Twilio-message handler, the default WebSocket URL builder); <code>MediaStreamsOpenAIProviderConfig</code>; the full text of the Twilio and OpenAI pages beyond what the fetch tool returned.</li>
+<li><span class="tag missing">UNREAD</span> OpenAI's Connections, audio-format and Telephony and SIP guides; Twilio's WebSocket-messages page (so the <code>mark</code> and <code>clear</code> messages are known to us from earlier work, not re-read here); GPT-Live pricing, rate limits and session duration limit.</li>
+<li><span class="tag missing">UNREAD</span> Any behavior of the real service: nothing was run.</li>
+</ul>
+
+<h3>15.4 Proposal: consent before any audio reaches OpenAI <span class="tag sim">PROPOSAL</span></h3>
+<ol>
+<li>Twilio's incoming-call webhook (signature-checked, as now) returns <code>&lt;Say&gt;</code> with the exact notice (Drew's introduction, the special, the OpenAI disclosure), then <code>&lt;Gather input="speech" action="/consent" actionOnEmptyResult="true"&gt;</code>. Keeping the notice outside the Gather means it cannot be talked over; a nested Say can.</li>
+<li>The <code>/consent</code> webhook (signature-checked) applies the existing yes-and-not-no rule to <code>SpeechResult</code>, and writes the CallSid to an in-memory <em>consent ledger</em>. On yes it returns <code>&lt;Connect&gt;&lt;Stream&gt;</code>; on no, silence or anything else it returns a <code>&lt;Say&gt;</code> goodbye and <code>&lt;Hangup&gt;</code>.</li>
+<li>When the stream opens, the call logic refuses any CallSid with no ledger entry (fail closed; a second factor beside the secret path and signature).</li>
+<li>The caller's yes or no is heard by Twilio only. Consent-before-audio, an open gap today, is closed. This is independent of GPT-Live and also works with the current engine.</li>
+<li>The notice is read in Twilio's voice, not Drew's marin voice (persona difference accepted for now; pre-rendered audio is a later option).</li>
+</ol>
+
+<h3>15.5 Proposal: read-back and confirmation during the call <span class="tag sim">PROPOSAL</span></h3>
+<ol>
+<li>GPT-Live converses (full duplex). It reports what it hears through validated tools (the five contact tools; the server validates every call) and may call <code>call_status</code> and a gated <code>begin_confirmation</code>. The server also gives it captured and missing field names as unspoken context (<code>session.thinking.append</code>), never as commands to speak.</li>
+<li><code>begin_confirmation</code> succeeds only when consent is on record, Intake is ready, the contacts are captured, and the residential question is settled. Only then does the server act.</li>
+<li>The server lets the model finish its sentence, closes the stream (after the close handshake) and Twilio resumes the TwiML: a <code>&lt;Say&gt;</code> with the exact read-back (job, name, callback number) and <code>&lt;Gather input="speech"&gt;</code> for yes or no; on yes, the address read-back the same way; on yes again, thanks and <code>&lt;Hangup&gt;</code>. Exact words stay exact (they are Twilio's text-to-speech, not the model's).</li>
+<li>On no, a new GPT-Live session is opened, seeded with the masked history through <code>session.start</code>'s <code>input</code>, told that the caller wants to change something, and the cycle repeats within the existing limit of two read-backs.</li>
+<li>Limits and the clarification bound are enforced by the server ending the stream, not by scripted questions.</li>
+<li>Alternative, unproven: let GPT-Live speak the read-back, buffering its audio, checking its transcript against the text, and releasing or discarding it (OpenAI's own suggestion).</li>
+</ol>
+<p><strong>Costs, stated:</strong> the read-back is in Twilio's voice; the raw name, number and address travel in the TwiML to Twilio and may appear in Twilio's request logs (acceptable for invented details; real customers need a data decision); the call logic currently treats a repeated CallSid as a replay and needs a resume case; the voice-side context after a restart is only the seeded masked history.</p>
+
+<h3>15.6 Proposed build order (each step separately approved) <span class="tag sim">PROPOSAL</span></h3>
+<ol>
+<li><strong>Twilio consent webhook and ledger</strong> (offline-tested; independent of GPT-Live; closes consent-before-audio).</li>
+<li><strong>GPT-Live dialect adapter</strong> at the link seam, with an offline stand-in and tests, behind a voice-config <code>engine</code> setting that defaults to the current engine.</li>
+<li><strong>Live-call orchestrator</strong> reusing the call state, tools, masker and Intake; record saving is inside <code>relay-handler</code>'s <code>finish()</code> and would first be extracted (a mechanical refactor of tested code).</li>
+<li><strong>Twilio confirmation leg</strong> with stream resume.</li>
+</ol>
+
+<h3>15.7 Unresolved assumptions <span class="tag undec">ASSUMPTION</span></h3>
+<ul>
+<li>That Twilio resumes TwiML (or calls <code>&lt;Connect action&gt;</code>) when our server closes the Stream. The Stream page says later TwiML resumes after the WebSocket closes; the Connect page does not say the <code>action</code> fires for a Stream. Fallback: a <code>&lt;Redirect&gt;</code> after the Connect, or the REST call update. Needs a real call to prove.</li>
+<li>That GPT-Live's delegated tools receive the caller's exact words, so <code>collect_*</code> gets the right <code>heard</code> text. Undocumented. If not, capture must come from the transcript.</li>
+<li>That a speaker change (or the <code>start_ms</code> and <code>end_ms</code> on deltas) separates turns reliably when the caller and the model overlap. Untested upstream.</li>
+<li>That <code>session.start</code>'s <code>input</code> seeding carries enough context after a restart; that session latency and tool rounds are acceptable; that the key has access to <code>gpt-live-1</code> and the delegation model; pricing. A free access check would answer the access question.</li>
+<li>That a stream restart does not break limits, the vault write or the dashboard record (needs the resume case and tests).</li>
+<li>That the disclosure wording fits GPT-Live (<code>store</code> defaults to false; recordings are kept 30 days when stored).</li>
+</ul>
+<h3>15.8 Sources</h3>
+<ul>
+<li>Twilio Agent Connect source (GitHub, read 2026-10-27): <a href="https://github.com/twilio/twilio-agent-connect-typescript/blob/main/packages/core/src/channels/voice/media-streams/gpt-live/provider.ts">gpt-live/provider.ts</a>, <a href="https://github.com/twilio/twilio-agent-connect-typescript/blob/main/packages/core/src/channels/voice/media-streams/shared/openai-provider.ts">shared/openai-provider.ts</a>, <a href="https://github.com/twilio/twilio-agent-connect-typescript/blob/main/packages/core/src/channels/voice/media-streams/twiml.ts">media-streams/twiml.ts</a>, <a href="https://github.com/twilio/twilio-agent-connect-typescript/blob/main/packages/server/src/lib/server.ts">server.ts</a>, <a href="https://github.com/twilio/twilio-agent-connect-typescript/blob/main/tests/gpt-live-provider.test.ts">gpt-live-provider.test.ts</a>.</li>
+<li>Twilio docs: <a href="https://www.twilio.com/docs/voice/twiml/connect">Connect</a>, <a href="https://www.twilio.com/docs/voice/twiml/stream">Stream</a>, <a href="https://www.twilio.com/docs/voice/twiml/gather">Gather</a>; Twilio blog: <a href="https://www.twilio.com/en-us/blog/developers/tutorials/integrations/voice-ai-assistant-openai-gpt-live-1-node">GPT-Live Node tutorial</a>, <a href="https://www.twilio.com/en-us/blog/developers/twilio-openai-gpt-live-1-api-resources">GPT-Live-1 resources</a>.</li>
+<li>OpenAI: <a href="https://developers.openai.com/api/docs/guides/live-conversations">Managing GPT-Live sessions</a>, <a href="https://developers.openai.com/api/docs/guides/live-delegation">Delegation and tools</a>, <a href="https://developers.openai.com/api/docs/guides/voice-server-controls">Server-side controls</a>, <a href="https://developers.openai.com/api/docs/guides/live-partner-integrations">Partner integrations</a>.</li>
 </ul>
 </main>
 </body>
