@@ -26,6 +26,7 @@ import { fallbackText } from './dialogue-model.ts';
 import type { CallStatus, DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
 import { CONTACT_FIELDS, spokenDigits } from './contact-capture.ts';
+import { createCleaningState, codeOf } from './cleaning-state.ts';
 import { MAX_CLARIFICATIONS } from './call-state.ts';
 import type { ContactField } from './call-state.ts';
 import { isBareAnswer, parseFirstClean } from './first-clean.ts';
@@ -279,6 +280,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let incompleteCall = false;
     let lastReply = '';   // the full text of the assistant's most recent reply, to compare with what the phone provider says was spoken before an interruption
     let capture: { yes: boolean; text: string } | undefined;   // the caller's newest attributable first-cleaning answer (their own masked words)
+    // The cleaning answers accepted so far (cleaning-state.ts): shared by the question choice and the saved record, so a detail once given is never asked for again, a correction replaces it, and a
+    // contradiction is asked about instead of the stale value being kept.
+    const cleaning = createCleaningState({ exclude: deps.firstClean === undefined ? [] : [deps.firstClean.field] });
+    let lastCategory = '';
+    let incompleteSnap: { item: WorkItemV1; covers: number } | undefined;   // the very pass whose missing list ended the call: the saved record is that pass, so the two agree
     let phase: 'collect' | 'confirm' | 'address' | 'addressfix' = 'collect';
     // The service-address confirmation that follows the first yes when contact capture is on.
     let addressState: AddressState | undefined; let addressTries = 0; let addressUnclear = 0;
@@ -313,7 +319,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     const trigger = deps.residential === undefined || deps.residential.keywords.length === 0 ? undefined
       : new RegExp(`(?<![A-Za-z0-9])(?:${[...deps.residential.keywords].sort((a, b) => b.length - a.length).map((k) => k.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')).join('|')})(?![A-Za-z0-9])`, 'gi');
     const neutral = (text: string): string => (residential === 'residential' && trigger !== undefined ? text.replace(trigger, 'property') : text);
-    const intakeText = (s: CallSession): string => neutral(s.maskedText()) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '');
+    const intakeText = (s: CallSession): string => { const held = cleaning.lines(); return neutral(s.maskedText() + (held.length > 0 ? `\n${held.join('\n')}` : '')) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : ''); };
     /**
      * The first-cleaning guard. A value for the first-cleaning field survives only if it is the caller's newest attributable answer, or explicit wording said with no newer
      * attributable answer. A plain yes or no that no first-cleaning question was asked for, and anything that disagrees with the newest attributable answer, is dropped:
@@ -367,6 +373,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
      * said yes to; otherwise one final Intake run is made, and the record is held for a person whatever that run says.
      */
     async function finish(save: boolean, confirmed?: Preview): Promise<void> {
+      try { await finishCall(save, confirmed); } finally { cleaning.dispose(); }
+    }
+    async function finishCall(save: boolean, confirmed?: Preview): Promise<void> {
       if (done) return;
       done = true;
       release();
@@ -391,9 +400,15 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       let w: WorkItemV1; let handedOff: boolean;
       const sealed = confirmed?.handoff ?? null;   // the original object of the confirmed read-back; used only for the confirmedHandoff seam below
       if (confirmed !== undefined) { w = confirmed.item; handedOff = confirmed.handedOff; }
+      else if (incompleteSnap !== undefined && incompleteSnap.covers === turns) { w = incompleteSnap.item; handedOff = false; deps.log('FINAL_FROM_LAST_PASS'); }
       else {
         const r = await runCallIntake(deps.intake, ctx, { tenant, callId, tag: 'final', maskedText: text, pii });
-        if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) { const g = guardFirstClean(r.item, r.handoff, r.handedOff); w = g.item; handedOff = g.handedOff; }
+        if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) {
+          const g = guardFirstClean(r.item, r.handoff, r.handedOff);
+          // The same accepted answers that steered the call: one an extraction pass omitted is put back, a contradicted one is taken out, and the record is then held for a person (never handed off).
+          const ov = cleaning.overlay(g.item);
+          if (ov.changed) { deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length }); w = ov.item; handedOff = false; } else { w = g.item; handedOff = g.handedOff; }
+        }
         else if (fallback !== undefined) {
           // The final run failed or was not validated (`model_failed`). An earlier validated run is still better than a guess or losing the request; it is saved unconfirmed like any other.
           deps.log('FINAL_INTAKE_FAILED', { code: r.ok ? 0 : r.code }); deps.log('FALLBACK_RECORD', { turns });
@@ -777,10 +792,29 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const answer = parseFirstClean(heard.line);
         if (answer !== null && (activeAsk === deps.firstClean.field || !isBareAnswer(heard.line))) capture = { yes: answer, text: heard.line.trim().slice(0, 80) };
       }
+      // The caller's line is the answer to the cleaning question that was just asked and cleanly delivered, when it plausibly is one (a vague or off-topic reply is not stored and the question is asked again).
+      if (activeAsk !== undefined && CONTACT_OF_LABEL[activeAsk] === undefined && activeAsk !== deps.firstClean?.field) {
+        const b = cleaning.bind(activeAsk, heard.line);
+        deps.log('FIELD_ANSWER', { field: codeOf(activeAsk), result: b === 'bound' ? 'BOUND' : b === 'ambiguous' ? 'AMBIGUOUS' : 'UNCHECKED' });
+      }
       activeAsk = undefined;
       const covers = s.turns();
-      const got = await freshPreview(covers);
+      let got = await freshPreview(covers);
       if (done) return;
+      if (got !== undefined) {
+        const m = cleaning.merge(got.preview.item, heard.line);
+        if (m.corrected.length > 0) deps.log('FIELD_CORRECTED', { n: m.corrected.length, f1: codeOf(m.corrected[0]) });
+        if (m.conflicts.length > 0) deps.log('FIELD_CONFLICT', { n: m.conflicts.length, f1: codeOf(m.conflicts[0]) });
+        const cat = got.preview.item.category;
+        if (cat !== lastCategory) { deps.log('CATEGORY', { to: codeOf(cat), from: codeOf(lastCategory) }); lastCategory = cat; }
+        const ov = cleaning.overlay(got.preview.item);
+        if (ov.changed) {
+          deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length });
+          const patched: Preview = { item: ov.item, handedOff: false, handoff: null };
+          const nf = freshFrom(ov.item, covers);
+          if (nf !== undefined) { got = { fresh: nf, preview: patched }; if (covers >= lastValidCovers) { lastValid = patched; lastValidCovers = covers; } }
+        }
+      }
       // With the contact vault on, the three contact items are required too: they are added to what is missing, by code, from this turn's lines.
       let fresh = got?.fresh;
       if (fresh !== undefined && deps.contacts !== undefined) {
@@ -798,14 +832,16 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (next.kind === 'ask') {
         // An item asked and heard the first time plus MAX_CLARIFICATIONS more times and still not obtained: the call ends as a safe incomplete outcome, saved unconfirmed, never handed off.
         if ((askCount.get(next.field) ?? 0) >= 1 + MAX_CLARIFICATIONS) {
-          deps.log('INCOMPLETE', { clarifications: MAX_CLARIFICATIONS, lines: covers, item: (CONTACT_OF_LABEL[next.field] ?? 'content').toUpperCase(), ...contactFlags(s) });
+          const gone = fresh?.missing ?? [];
+          deps.log('INCOMPLETE', { clarifications: MAX_CLARIFICATIONS, lines: covers, item: (CONTACT_OF_LABEL[next.field] ?? 'content').toUpperCase(), field: codeOf(next.field), cat: codeOf(fresh?.category), miss: gone.length, ...(gone[0] !== undefined ? { m1: codeOf(gone[0]) } : {}), ...(gone[1] !== undefined ? { m2: codeOf(gone[1]) } : {}), ...(gone[2] !== undefined ? { m3: codeOf(gone[2]) } : {}), ...contactFlags(s) });
+          if (got !== undefined) incompleteSnap = { item: got.preview.item, covers };
           incompleteCall = true;
           await farewell(SAY.incomplete, true);
           return;
         }
         const prevAt = lastAskedAt.get(next.field);
         lastAskedAt.set(next.field, covers);
-        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers, item: ((deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field]) ?? 'content').toUpperCase(), n: (askCount.get(next.field) ?? 0) + 1 });
+        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers, item: ((deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field]) ?? 'content').toUpperCase(), n: (askCount.get(next.field) ?? 0) + 1, field: codeOf(next.field), cat: codeOf(fresh?.category) });
         const choices = deps.choicesFor?.(tenant, next.field);
         // After one part of the service address was heard (a house number without a street name, or the reverse) only the missing part is asked for.
         const part = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'address' ? s.addressPart() : undefined;
