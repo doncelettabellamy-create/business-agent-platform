@@ -3,8 +3,8 @@
 # Safe by construction: no secret, token or key is read (no `secrets.*`), the job has read-only repository access, and the tests are offline (synthetic data, stand-in models, local sockets only).
 # No live call, no Twilio, no OpenAI and no Anthropic request is made. The test suite itself refuses live paths. Node 24 is what `poc/intake-runner/package.json` requires ("engines": ">=24").
 #
-# The suite's output is kept for the run page without needing a GitHub sign-in: the counts and the names of failing tests go to the job summary, and the first failures become annotations.
-# (The raw log needs a sign-in even for a public repository.) The output holds synthetic test data only.
+# The suite's output is kept for the run page without needing a GitHub sign-in: the counts and the names of failing tests go to the job summary, and each failing test becomes an annotation
+# carrying the first lines of its own failure message. (The raw log needs a sign-in even for a public repository.) The output holds synthetic test data only.
 name: tests
 
 on:
@@ -47,10 +47,16 @@ jobs:
             echo
             echo "### Failing tests (first 40)"
             grep -E '^✖' "$out" | sort -u | head -40
-            echo
-            echo "### First assertion and error lines (first 40)"
-            grep -E 'AssertionError|Error:|ERR_[A-Z_]+|ENOENT|EADDR|timed out|Cannot find' "$out" | head -40 | cut -c1-300
           } >> "$GITHUB_STEP_SUMMARY"
-          grep -E '^✖' "$out" | sort -u | head -10 | while IFS= read -r line; do echo "::error::${line:0:300}"; done
-          grep -E 'AssertionError|Error:|ERR_[A-Z_]+|ENOENT|EADDR|Cannot find' "$out" | head -10 | while IFS= read -r line; do echo "::warning::${line:0:300}"; done
+          # One annotation per failing test (up to 8) with the first lines of its own failure message: the runner prints them in its closing "failing tests" section.
+          node -e '
+            const s = require("fs").readFileSync(process.argv[1], "utf8");
+            const i = s.indexOf("✖ failing tests:");
+            if (i < 0) process.exit(0);
+            const blocks = s.slice(i).split("\ntest at ").slice(1, 9);
+            for (const b of blocks) {
+              const lines = b.split("\n").map((l) => l.trimEnd().slice(0, 240)).filter((l) => l.trim() !== "").slice(0, 9);
+              console.log("::error::" + lines.join("%0A"));
+            }
+          ' "$out"
           exit $code

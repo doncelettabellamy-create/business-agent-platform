@@ -147,12 +147,16 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   const sim = await r.connect();
   assert.equal(sim.status, 101);
   r.start(sim);
-  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 20_000, () => where(r, sim));
+  // The notice has been REQUESTED but is certainly not yet heard (it is still being played): sound now is sound during the notice. (Waiting for the notice to finish first made this a race: on a fast machine the
+  // notice could already count as heard when the sound was handled, and that sound was then rightly forwarded.)
+  await until(() => r.voices.length === 1 && r.voices[0].received.some((m: { type: string }) => m.type === 'response.create'), 20_000, () => where(r, sim));
   sim.send({ event: 'media', media: { payload: b64(160) } });   // sound during the notice
+  await pause(30);
   assert.equal(r.voices[0].appended(), 0, 'no caller audio reaches the voice service before the notice has been played');
   await until(() => r.has('CALL_STARTED'), 20_000, () => where(r, sim));
   assert.equal(r.voices[0].spoken[0], r.notice);
   assert.equal(r.notice, consentNoticeFor(undefined), 'the notice is the one the existing call logic uses');
+  assert.equal(r.voices[0].appended(), 0, 'what was said during the notice is never forwarded afterwards either');
   sim.send({ event: 'media', media: { payload: b64(160) } });
   await until(() => r.voices[0].appended() === 1, 20_000, () => where(r, sim));
   await say(r, 'yes I agree', 2);
