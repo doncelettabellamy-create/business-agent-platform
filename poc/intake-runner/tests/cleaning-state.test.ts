@@ -1,7 +1,7 @@
 // cleaning-state.ts: the validated current-call cleaning answers shared by the question choice and the saved record. Invented words only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createCleaningState, kindOf, countOf, polarityOf, codeOf } from '../src/cleaning-state.ts';
+import { createCleaningState, kindOf, countOf, polarityOf, codeOf, requiredFieldsOf } from '../src/cleaning-state.ts';
 import type { WorkItemV1, FieldEntry } from '../src/contracts.ts';
 
 const fe = (name: string, value: string | null): FieldEntry => ({ name, value, confidence: value === null ? null : 0.9, found: value !== null });
@@ -35,10 +35,10 @@ test('bind: a plausible answer to the question asked is context for Intake; vagu
 test('merge: an accepted answer survives later passes that omit it; an older or different reading of old lines does not replace it', () => {
   const s = createCleaningState();
   assert.deepEqual(s.merge(item([fe('Pets', 'No.'), fe('Number of bedrooms', 'two bedrooms')]), 'no').accepted, ['Pets', 'Number of bedrooms']);
-  assert.deepEqual(s.merge(item([fe('Pets', null), fe('Number of bedrooms', null)], ['Pets', 'Number of bedrooms'], ['missing_fields'], 'needs-human'), 'next line'), { accepted: [], corrected: [], conflicts: [] });
+  assert.deepEqual(s.merge(item([fe('Pets', null), fe('Number of bedrooms', null)], ['Pets', 'Number of bedrooms'], ['missing_fields'], 'needs-human'), 'next line'), { accepted: [], corrected: [], conflicts: [], unsupported: [] });
   assert.ok(s.has('Pets') && s.has('Number of bedrooms'));
   const older = s.merge(item([fe('Number of bedrooms', 'three bedrooms')]), 'something unrelated');
-  assert.deepEqual(older, { accepted: [], corrected: [], conflicts: [] }, 'a reading that is not in the newest line is an older reading: ignored');
+  assert.deepEqual(older, { accepted: [], corrected: [], conflicts: [], unsupported: [] }, 'a reading that is not in the newest line is an older reading: ignored');
   assert.ok(s.lines().includes('Number of bedrooms: two bedrooms'));
   assert.deepEqual(s.merge(item([fe('Number of bedrooms', '2 bedrooms')]), 'it is 2 bedrooms').corrected, [], 'the same answer in other words is not a change');
 });
@@ -122,4 +122,47 @@ test('merge: a mismatched reading Intake produced (a date in an extras field) is
   const s = createCleaningState();
   const out = s.merge(item([fe('Extras', 'October 22'), fe('Pets', 'in the morning'), fe('Preferred date', 'October 22')]), 'October 22');
   assert.deepEqual(out.accepted, ['Preferred date']);
+});
+
+// ---------------------------------------------------------------- 2026-10-28: optional fields are kept only with the caller's own evidence
+const lines = (...l: string[]) => ({ required: new Set(['Pets', 'Cleaning frequency']), lines: l });
+
+test('evidence: an optional field with a known topic is dropped when only unrelated lines contain its value, kept when a caller line about the topic does, or the value names it', () => {
+  const s = createCleaningState();
+  const ctx = lines('Caller: just one time', 'yes', 'once a month');
+  assert.deepEqual(s.merge(item([fe('Home empty', 'Yes'), fe('Last professional clean', 'A month'), fe('Priority areas', 'The two')]), 'x', ctx).unsupported.sort(), ['Home empty', 'Last professional clean', 'Priority areas']);
+  const o = s.overlay(item([fe('Home empty', 'Yes'), fe('Last professional clean', 'A month'), fe('Pets', 'No')], [], [], 'ready'), ctx);
+  assert.deepEqual([o.dropped.sort(), o.item.fields.map((f) => f.found), o.item.missing_fields, o.item.status], [['Home empty', 'Last professional clean'], [false, false, true], [], 'ready']);
+  const good = createCleaningState();
+  const c2 = lines('yes the house is empty', 'my last professional clean was six months ago', 'the kitchen mostly');
+  assert.deepEqual(good.merge(item([fe('Home empty', 'yes'), fe('Last professional clean', 'six months ago'), fe('Priority areas', 'the kitchen')]), 'x', c2).accepted.sort(), ['Home empty', 'Last professional clean', 'Priority areas']);
+  assert.equal(good.overlay(item([fe('Home empty', 'yes')]), c2).changed, false);
+});
+
+test('evidence: a required field and a field with no known topic are never policed, and no context means no policing', () => {
+  const s = createCleaningState();
+  const ctx = { required: new Set(['Home empty', 'Last professional clean']), lines: ['yes', 'once a month'] };
+  assert.deepEqual(s.merge(item([fe('Home empty', 'yes'), fe('Last professional clean', 'a month'), fe('Preferred date', 'tomorrow')]), 'x', ctx).unsupported, []);
+  assert.deepEqual(createCleaningState().merge(item([fe('Home empty', 'yes')]), 'x').unsupported, []);
+  assert.equal(createCleaningState().overlay(item([fe('Home empty', 'yes')])).changed, false);
+});
+
+test('evidence: being asked is not evidence; a plausible answer bound in context is, a vague one is not', () => {
+  const s = createCleaningState();
+  const ctx = lines('maybe', 'yes');
+  assert.equal(s.bind('Home empty', 'maybe'), 'ambiguous');
+  assert.deepEqual(s.merge(item([fe('Home empty', 'yes')]), 'x', ctx).unsupported, ['Home empty'], 'asked and not answered: no evidence');
+  assert.equal(s.bind('Home empty', 'yes'), 'bound');
+  assert.deepEqual(s.merge(item([fe('Home empty', 'yes')]), 'x', ctx).accepted, ['Home empty'], 'answered in context: evidence');
+});
+
+test('"clean" alone is not about a professional clean: a frequency said with the word clean does not support last professional clean', () => {
+  const s = createCleaningState();
+  assert.deepEqual(s.merge(item([fe('Last professional clean', 'a month')]), 'x', lines('I clean it myself about once a month')).unsupported, ['Last professional clean']);
+});
+
+test('requiredFieldsOf: fields marked required plus the category list', () => {
+  const skill = { fields: [{ name: 'Job description', required: true }, { name: 'Pets' }], categories: [{ name: 'Standard cleaning', requires: ['Pets', 'Extras'] }] };
+  assert.deepEqual(requiredFieldsOf(skill, 'Standard cleaning'), ['Job description', 'Pets', 'Extras']);
+  assert.deepEqual(requiredFieldsOf(skill, 'Unknown'), ['Job description']);
 });

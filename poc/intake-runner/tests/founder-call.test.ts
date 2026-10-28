@@ -25,6 +25,9 @@ import type { RelayConnection } from '../src/ws-server.ts';
 import { createRelayHandler, readBackText, redactSensitive, residentialAnswer, SAY, speechDelayMs } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
+import { requiredFieldsOf } from '../src/cleaning-state.ts';
+import { firstCleanQuestion } from '../src/founder-voice-service.ts';
+import { parseFirstClean } from '../src/first-clean.ts';
 import { createConversationRelayTransport } from '../src/call-transport.ts';
 import type { CallTransport } from '../src/call-transport.ts';
 import { loadFixture, quoteFromWorkItem } from '../src/pricing-fixture.ts';
@@ -88,7 +91,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -110,7 +113,7 @@ async function rig(o: RigOptions = {}) {
     ...(o.residential === undefined ? {} : { residential: o.residential }),
     numbers: new Map([[N1, T], [N2, OTHER]]), categoryNames: () => (o.skill ?? plumbing as any).categories.map((c: { name: string }) => c.name),
     choicesFor: (_t: string, field: string) => ((o.skill ?? plumbing) as any).fields?.find((x: any) => x.name === field)?.choices,
-    ...((): object => { const sk: any = o.skill ?? plumbing; const fc = sk.fields?.find((x: any) => x.role === 'first_clean'); return fc ? { firstClean: { field: fc.name, required: (_t: string, cat: string) => sk.categories.find((c: any) => c.name === cat)?.requires?.includes(fc.name) === true } } : {}; })(), previewBudgetMs: o.previewBudgetMs ?? 3000, ...(o.replyRetryMs === undefined ? {} : { replyRetryMs: o.replyRetryMs }), ...(o.replyFirstWordMs === undefined ? {} : { replyFirstWordMs: o.replyFirstWordMs }), ...(o.replyGapMs === undefined ? {} : { replyGapMs: o.replyGapMs }), ...(o.replyTotalMs === undefined ? {} : { replyTotalMs: o.replyTotalMs }), intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
+    ...((): object => { const sk: any = o.skill ?? plumbing; const fc = sk.fields?.find((x: any) => x.role === 'first_clean'); return fc ? { firstClean: { field: fc.name, required: (_t: string, cat: string) => sk.categories.find((c: any) => c.name === cat)?.requires?.includes(fc.name) === true, ...(o.firstCleanQuestion === undefined ? {} : { question: o.firstCleanQuestion }) } } : {}; })(), ...(o.policeOptional === true ? { requiredFields: (_t: string, cat: string) => requiredFieldsOf((o.skill ?? plumbing) as never, cat) } : {}), previewBudgetMs: o.previewBudgetMs ?? 3000, ...(o.replyRetryMs === undefined ? {} : { replyRetryMs: o.replyRetryMs }), ...(o.replyFirstWordMs === undefined ? {} : { replyFirstWordMs: o.replyFirstWordMs }), ...(o.replyGapMs === undefined ? {} : { replyGapMs: o.replyGapMs }), ...(o.replyTotalMs === undefined ? {} : { replyTotalMs: o.replyTotalMs }), intake: o.wrapIntake ? o.wrapIntake(intake) : intake,
     async intakeContext(tenant, ref) {
       const r = await mintExecutionContext({ credential: 'test', agent: 'intake' }, { verify: () => ({ kind: 'system', id: 'founder-call-test' }), selectTenant: () => tenant, grants: () => ['intake:run'], newCorrelationId: () => `corr-founder-${ref}` });
       if (!r.ok) throw new Error('context');
@@ -2813,8 +2816,7 @@ test('CLEANING STATE extraction omitting an earlier answer does not un-complete 
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.fields.find((f) => f.name === 'Pets')?.value, rec.fields.find((f) => f.name === 'Property type')?.found, rec.missing_fields], ['no pets', true, []]);
-  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false], 'a record whose fields were put back is held for a person, never handed off');
-  assert.ok(rec.reasons.includes('not_confirmed'));
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.reasons], ['confirmed', 'needs-human', false, ['human_review']], 'the caller confirmed what was read back; because the server put an answer back, the record is held for a person and never handed off');
 });
 
 test('CLEANING STATE an explicit correction replaces the accepted answer everywhere; an older reading of the conversation does not bring the stale value back', async () => {
@@ -3007,10 +3009,129 @@ test('BOUNDED PLAYBACK WAIT a carrier that never reports playback does not hold 
   assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
 });
 
-// Known gaps, recorded as todo so they are reported and do not pass silently (see the roadmap, section 5a-10).
-test('FIRST-CLEANING POLARITY the question is worded by the text model, so a differently phrased question ("have you used us before?") reverses what a plain yes or no means', { todo: 'the first-cleaning question has no fixed wording; needs a founder-approved fixed line' }, () => {
-  assert.fail('not implemented');
+// ---------------------------------------------------------------- 2026-10-28: the fixed first-cleaning question, and optional fields kept only with the caller's own evidence
+const FQ = 'Is this your first cleaning with Drew Cleaning?';
+const BY_CODE: Record<string, string> = { PETS: 'no pets', CLEANING_FREQUENCY: 'just one time', EXTRAS: 'no extras', PREFERRED_DATE: 'tomorrow', TIME_WINDOW: 'morning', CUSTOMER_NAME: 'priya raman', CALLBACK_PHONE_NUMBER: 'two one two five five five zero one four two', SERVICE_ADDRESS: '742 Evergreen Terrace' };
+/** Answers whatever the newest ASK log names (the fixed first-cleaning question has no model directive), until the read-back or the incomplete ending. `says[CODE]` are answers in order, the last repeating. */
+async function driveByAsk(r: Rig, sim: Sim, opening: string, says: Record<string, string[]> = {}, max = 30) {
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, opening); await reply(r, sim);
+  const used: Record<string, number> = {};
+  for (let i = 0; i < max && !r.logs.some((l) => l.code === 'READBACK' || l.code === 'INCOMPLETE'); i++) {
+    const code = String(diag(r, 'ASK').at(-1)?.detail?.field ?? '');
+    const list = says[code];
+    const ans = list !== undefined ? list[Math.min(used[code] = (used[code] ?? 0) + 1, list.length) - 1] : BY_CODE[code] ?? 'ok';
+    say(sim, ans); await reply(r, sim);
+    if (sim.messages.some((m: any) => m.type === 'end')) break;
+  }
+}
+const textTokens = (sim: Sim) => sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token as string);
+const OPEN_C = 'I need a regular cleaning for my house, two bedrooms and two bathrooms';
+const frRec = (r: Rig) => r.store.list(T)[0].fields.find((f) => f.name === 'First cleaning with us');
+
+test('FIRST CLEANING the question is the approved exact words, and the voice service builds it from the business name', () => {
+  assert.equal(firstCleanQuestion('Drew Cleaning'), FQ);
 });
-test('UNSUPPORTED OPTIONAL FIELDS a field the category does not require and nobody asked about (last professional clean, home empty) can be filled by Intake from other words and is then read back and saved', { todo: 'needs a decision: read back and save only required, asked or volunteered fields' }, () => {
-  assert.fail('not implemented');
+
+test('FIRST CLEANING yes means first cleaning: the exact fixed question is spoken, the answer is read back and saved as a first cleaning', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { FIRST_CLEANING_WITH_US: ['yes'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(diag(r, 'ASK').map((l) => l.detail?.field)));
+  assert.equal(textTokens(sim).filter((x) => x === FQ).length, 1, 'the question was spoken once, in exactly these words');
+  assert.ok(textTokens(sim).join(' ').match(/First cleaning with us: yes/), 'read back as said');
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  assert.equal(parseFirstClean(String(frRec(r)?.value)), true, `saved as ${frRec(r)?.value}`);
+  assert.ok(!r.claude.sent.some((p) => p.stream && /first cleaning/i.test(String(p.system).split('\n').pop())), 'the text model was not asked to word the first-cleaning question');
+});
+
+test('FIRST CLEANING no means returning customer: saved as not a first cleaning, with the same exact question', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { FIRST_CLEANING_WITH_US: ['no'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.equal(textTokens(sim).filter((x) => x === FQ).length, 1);
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  assert.equal(parseFirstClean(String(frRec(r)?.value)), false, `saved as ${frRec(r)?.value}`);
+});
+
+test('FIRST CLEANING corrections: a later explicit correction replaces the first answer (both directions), including one made at the read-back', async () => {
+  // yes, then "actually I am a returning customer" before the read-back
+  const a = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const s1 = await a.connect();
+  await driveByAsk(a, s1, OPEN_C, { FIRST_CLEANING_WITH_US: ['yes'], PREFERRED_DATE: ['actually, a returning customer', 'tomorrow'] });
+  assert.ok(a.logs.some((l) => l.code === 'READBACK'), JSON.stringify(diag(a, 'ASK').map((l) => l.detail?.field)));
+  say(s1, 'yes'); await reply(a, s1); say(s1, 'yes'); await ended(s1, a);
+  assert.equal(parseFirstClean(String(frRec(a)?.value)), false, `corrected to a returning customer: ${frRec(a)?.value}`);
+  // no, then at the read-back "no, it is my first cleaning"
+  const b = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const s2 = await b.connect();
+  await driveByAsk(b, s2, OPEN_C, { FIRST_CLEANING_WITH_US: ['no'] });
+  assert.ok(b.logs.some((l) => l.code === 'READBACK'));
+  say(s2, 'no that is wrong'); await reply(b, s2);
+  say(s2, 'it is my first cleaning'); await reply(b, s2);
+  assert.ok(b.logs.filter((l) => l.code === 'READBACK').length >= 2, 'the corrected details were read back again');
+  say(s2, 'yes'); await reply(b, s2); say(s2, 'yes'); await ended(s2, b);
+  assert.equal(parseFirstClean(String(frRec(b)?.value)), true, `corrected to a first cleaning: ${frRec(b)?.value}`);
+});
+
+test('FIRST CLEANING a question the caller talked over is asked again in the SAME words, and a plain yes after being talked over is not taken as its answer', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, OPEN_C); await reply(r, sim);
+  for (let i = 0; i < 10 && String(diag(r, 'ASK').at(-1)?.detail?.field) !== 'FIRST_CLEANING_WITH_US'; i++) { const c = String(diag(r, 'ASK').at(-1)?.detail?.field); say(sim, BY_CODE[c] ?? 'ok'); await reply(r, sim); }
+  assert.equal(String(diag(r, 'ASK').at(-1)?.detail?.field), 'FIRST_CLEANING_WITH_US');
+  assert.equal(textTokens(sim).filter((x) => x === FQ).length, 1);
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'Is this', durationUntilInterruptMs: 200 });
+  await new Promise((res) => setTimeout(res, 40));
+  say(sim, 'yes'); await reply(r, sim);
+  assert.equal(textTokens(sim).filter((x) => x === FQ).length, 2, 'asked again, word for word');
+  assert.ok(!/First cleaning with us: yes/.test(callerLines(r).join('\n')) || textTokens(sim).filter((x) => x === FQ).length === 2, 'the yes said over the question was not an answer');
+  say(sim, 'no'); await reply(r, sim);
+  assert.ok(callerLines(r).some((l) => /^First cleaning with us: no/.test(l)), 'the answer to the second asking counts: ' + JSON.stringify(callerLines(r)));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('OPTIONAL FIELDS answers to other questions cannot populate home empty or last professional clean: Intake filling them from "yes" and "once a month" is dropped from the read-back and the record', async () => {
+  const claude = fakeClaude({ services: true, run: () => ({ force: { 'Home empty': 'yes', 'Last professional clean': 'a month' } }) });
+  const r = await servicesRig({ claude, contacts: true, firstCleanQuestion: FQ, policeOptional: true });
+  const sim = await r.connect();
+  // The words Intake is made to over-read are in the conversation (it may only return what the text holds), but in lines about something else.
+  await driveByAsk(r, sim, OPEN_C + ', yes please, and we would like it about once a month', { FIRST_CLEANING_WITH_US: ['yes'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(diag(r, 'ASK').map((l) => l.detail?.field)));
+  assert.ok(diag(r, 'FIELD_UNSUPPORTED').length + diag(r, 'FIELDS_RESTORED').filter((l) => Number(l.detail?.dropped) > 0).length >= 1, 'the unsupported fields were noticed');
+  const spokenAll = textTokens(sim).join(' ');
+  assert.ok(!/Home empty|Last professional clean/.test(spokenAll), 'neither is read back: ' + spokenAll.slice(spokenAll.indexOf('Let me check'), spokenAll.indexOf('Let me check') + 400));
+  assert.ok(/Cleaning frequency: /.test(spokenAll), 'the frequency the caller actually gave is still read back');
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual(['Home empty', 'Last professional clean'].map((n) => rec.fields.find((f) => f.name === n)?.found), [false, false]);
+  assert.deepEqual(rec.missing_fields, [], 'optional fields taken out are not reported as missing');
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.reasons], ['confirmed', 'needs-human', false, ['human_review']], 'confirmed by the caller, held for a person because the server edited the item');
+  assert.ok(rec.fields.find((f) => f.name === 'Pets')?.found && rec.fields.find((f) => f.name === 'Time window')?.found, 'required details are untouched');
+});
+
+test('OPTIONAL FIELDS volunteered in the caller\'s own words are kept: "the house is empty" and "my last professional clean was six months ago"', async () => {
+  const claude = fakeClaude({ services: true, run: () => ({ force: { 'Home empty': 'the house is empty', 'Last professional clean': 'six months ago' } }) });
+  const r = await servicesRig({ claude, contacts: true, firstCleanQuestion: FQ, policeOptional: true });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C + ', the house is empty, and my last professional clean was six months ago', { FIRST_CLEANING_WITH_US: ['yes'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.equal(diag(r, 'FIELD_UNSUPPORTED').length, 0);
+  const spokenAll = textTokens(sim).join(' ');
+  assert.match(spokenAll, /Home empty: the house is empty/); assert.match(spokenAll, /Last professional clean: six months ago/);
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual(['Home empty', 'Last professional clean'].map((n) => rec.fields.find((f) => f.name === n)?.value), ['the house is empty', 'six months ago']);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off], ['confirmed', 'ready', false].map((x, i) => (i === 2 ? rec.handed_off : x)), 'nothing was edited, so Intake\'s own status stands');
+});
+
+test('REQUIRED FIELDS are never policed: under a deep clean the last professional clean and priority areas are required, asked and kept', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, policeOptional: true });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, 'I need a deep clean for my house, two bedrooms and two bathrooms', { FIRST_CLEANING_WITH_US: ['yes'], LAST_PROFESSIONAL_CLEAN: ['a year ago'], PRIORITY_AREAS: ['the kitchen'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(diag(r, 'ASK').map((l) => l.detail?.field)));
+  assert.equal(diag(r, 'FIELD_UNSUPPORTED').length, 0);
+  const spokenAll = textTokens(sim).join(' ');
+  assert.match(spokenAll, /Last professional clean: a year ago/); assert.match(spokenAll, /Priority areas: the kitchen/);
 });

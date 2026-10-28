@@ -27,6 +27,7 @@ import type { CallStatus, DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
 import { CONTACT_FIELDS, spokenDigits } from './contact-capture.ts';
 import { createCleaningState, codeOf } from './cleaning-state.ts';
+import type { EvidenceContext } from './cleaning-state.ts';
 import { MAX_CLARIFICATIONS } from './call-state.ts';
 import type { ContactField } from './call-state.ts';
 import { isBareAnswer, parseFirstClean } from './first-clean.ts';
@@ -37,7 +38,7 @@ import type { CloseInfo, RelayConnection } from './ws-server.ts';
 import { createConversationRelayTransport } from './call-transport.ts';
 import type { CallTransport, TransportEvent } from './call-transport.ts';
 import { isRecord } from './contracts.ts';
-import type { HandoffEnvelopeV1, WorkItemV1 } from './contracts.ts';
+import type { HandoffEnvelopeV1, ReasonCode, WorkItemV1 } from './contracts.ts';
 import { piiProblems } from './pii-screen.ts';
 
 const CALL_SID = /^[A-Za-z0-9]{10,40}$/;
@@ -131,7 +132,12 @@ export interface RelayDeps {
    * ONLY when it follows that very question being asked; explicit wording ("my first cleaning", "not my first") counts wherever it was said, and the newest such answer wins.
    * Optional: without it nothing changes.
    */
-  firstClean?: { field: string; required(tenant: string, category: string): boolean };
+  firstClean?: { field: string; required(tenant: string, category: string): boolean;
+    /**
+     * The question in EXACTLY these words, spoken as a fixed line instead of being worded by the text model (founder-approved 2026-10-28: "Is this your first cleaning with Drew Cleaning?").
+     * Yes means first cleaning; no means returning customer. A model-worded question could be phrased the other way round ("have you used us before?"), which reverses what a plain no means.
+     */
+    question?: string };
   intake: IntakeEntry;
   /** A minted Intake context for this call (the composition root mints it; this file never does). */
   intakeContext(tenant: string, callRef: string): Promise<unknown>;
@@ -157,6 +163,8 @@ export interface RelayDeps {
   speechMs(text: string): number;
   /** How long to wait for the caller's yes or no after a read-back before ending the call unconfirmed. It runs from the END of the read-back's playback when the carrier verifies playback, otherwise from the estimated end of its speech. */
   confirmWaitMs: number;
+  /** The fields the category requires (every field marked required plus the category's own list). With it, an OPTIONAL field with a known topic is kept only when the caller's own words support it (cleaning-state.ts); without it nothing is policed. */
+  requiredFields?(tenant: string, category: string): readonly string[];
   /** The longest to wait for the carrier to report that a read-back finished playing (a bounded failure timeout). Default 90 seconds. */
   playbackMaxMs?: number;
   /** The longest to wait for the Intake run of a turn. A result that misses it chooses nothing; the assistant just listens. */
@@ -204,7 +212,7 @@ export interface RelayHandler {
 interface Attempt { said: string; chars: number; parts: number; failed: number; threw: boolean; timedOut: boolean; stalled: boolean; aborted: boolean; began: number; firstTokenAt: number | undefined }
 
 /** One Intake result. `handoff` is the original sealed envelope object (in memory only: never logged, stored, copied or sent anywhere). */
-interface Preview { item: WorkItemV1; handedOff: boolean; handoff: HandoffEnvelopeV1 | null }
+interface Preview { item: WorkItemV1; handedOff: boolean; handoff: HandoffEnvelopeV1 | null; /** The server edited the item (put an answer back, took a contradicted or unsupported one out): its sealed handoff no longer describes it, so it is held for a person even when the caller confirms it. */ edited?: boolean }
 
 /** The read-back, in fixed words: the non-address fields only. A placeholder is never spoken, and a value that still looks personal is left out. */
 export function readBackText(item: WorkItemV1, phone?: string, name?: string): string {
@@ -287,6 +295,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     // The cleaning answers accepted so far (cleaning-state.ts): shared by the question choice and the saved record, so a detail once given is never asked for again, a correction replaces it, and a
     // contradiction is asked about instead of the stale value being kept.
     const cleaning = createCleaningState({ exclude: deps.firstClean === undefined ? [] : [deps.firstClean.field] });
+    /** The evidence the call holds for an optional field: the category's required fields and the caller's masked lines. Undefined (nothing policed) when the dependency is not given or the category is unknown. */
+    const evidenceFor = (category: string, maskedText: string): EvidenceContext | undefined => (deps.requiredFields === undefined || category === 'unknown' ? undefined : { required: new Set(deps.requiredFields(tenant, category)), lines: maskedText.split('\n').map((l) => l.replace(/^Caller: /, '')) });
     let lastCategory = '';
     let incompleteSnap: { item: WorkItemV1; covers: number } | undefined;   // the very pass whose missing list ended the call: the saved record is that pass, so the two agree
     let phase: 'collect' | 'confirm' | 'address' | 'addressfix' = 'collect';
@@ -388,6 +398,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const s = session;
       if (s === undefined) return;
       const text = intakeText(s); const pii = s.piiSummary(); const turns = s.turns();
+      const callerText = s.maskedText();   // read before the state is cleared: the evidence the optional-field rule needs
       const fallback = lastValid; lastValid = undefined;
       const confirmedContact = readBackContact; readBackContact = undefined;
       const parts = s.revealContactParts();   // RAW: used only to build the stored contact below
@@ -405,15 +416,19 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (!save || turns === 0) { deps.log('CALL_ENDED', { turns, saved: 0 }); return; }
       let w: WorkItemV1; let handedOff: boolean;
       const sealed = confirmed?.handoff ?? null;   // the original object of the confirmed read-back; used only for the confirmedHandoff seam below
-      if (confirmed !== undefined) { w = confirmed.item; handedOff = confirmed.handedOff; }
+      if (confirmed !== undefined) {
+        w = confirmed.item; handedOff = confirmed.handedOff;
+        // The caller confirmed exactly what was read back, but the server had edited the item (its sealed handoff no longer describes it): it is a CONFIRMED request held for a person, never handed off.
+        if (confirmed.edited === true) w = { ...w, status: 'needs-human', reasons: [...new Set([...w.reasons, 'human_review' as ReasonCode])] };
+      }
       else if (incompleteSnap !== undefined && incompleteSnap.covers === turns) { w = incompleteSnap.item; handedOff = false; deps.log('FINAL_FROM_LAST_PASS'); }
       else {
         const r = await runCallIntake(deps.intake, ctx, { tenant, callId, tag: 'final', maskedText: text, pii });
         if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) {
           const g = guardFirstClean(r.item, r.handoff, r.handedOff);
           // The same accepted answers that steered the call: one an extraction pass omitted is put back, a contradicted one is taken out, and the record is then held for a person (never handed off).
-          const ov = cleaning.overlay(g.item);
-          if (ov.changed) { deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length }); w = ov.item; handedOff = false; } else { w = g.item; handedOff = g.handedOff; }
+          const ov = cleaning.overlay(g.item, evidenceFor(g.item.category, callerText));
+          if (ov.changed) { deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length, dropped: ov.dropped.length }); w = ov.item; handedOff = false; } else { w = g.item; handedOff = g.handedOff; }
         }
         else if (fallback !== undefined) {
           // The final run failed or was not validated (`model_failed`). An earlier validated run is still better than a guess or losing the request; it is saved unconfirmed like any other.
@@ -830,15 +845,17 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       let got = await freshPreview(covers);
       if (done) return;
       if (got !== undefined) {
-        const m = cleaning.merge(got.preview.item, heard.line);
+        const evidence = evidenceFor(got.preview.item.category, s.maskedText());
+        const m = cleaning.merge(got.preview.item, heard.line, evidence);
+        if (m.unsupported.length > 0) deps.log('FIELD_UNSUPPORTED', { n: m.unsupported.length, f1: codeOf(m.unsupported[0]) });
         if (m.corrected.length > 0) deps.log('FIELD_CORRECTED', { n: m.corrected.length, f1: codeOf(m.corrected[0]) });
         if (m.conflicts.length > 0) deps.log('FIELD_CONFLICT', { n: m.conflicts.length, f1: codeOf(m.conflicts[0]) });
         const cat = got.preview.item.category;
         if (cat !== lastCategory) { deps.log('CATEGORY', { to: codeOf(cat), from: codeOf(lastCategory) }); lastCategory = cat; }
-        const ov = cleaning.overlay(got.preview.item);
+        const ov = cleaning.overlay(got.preview.item, evidence);
         if (ov.changed) {
-          deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length });
-          const patched: Preview = { item: ov.item, handedOff: false, handoff: null };
+          deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length, dropped: ov.dropped.length, ...(ov.dropped[0] !== undefined ? { f1: codeOf(ov.dropped[0]) } : {}) });
+          const patched: Preview = { item: ov.item, handedOff: false, handoff: null, edited: true };
           const nf = freshFrom(ov.item, covers);
           if (nf !== undefined) { got = { fresh: nf, preview: patched }; if (covers >= lastValidCovers) { lastValid = patched; lastValidCovers = covers; } }
         }
@@ -873,7 +890,13 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const choices = deps.choicesFor?.(tenant, next.field);
         // After one part of the service address was heard (a house number without a street name, or the reverse) only the missing part is asked for.
         const part = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'address' ? s.addressPart() : undefined;
-        const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}) }, statusOf(s, got));
+        const fixed = deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined;
+        let delivered: boolean;
+        if (fixed !== undefined) {
+          // The first-cleaning question is never reworded: the same words on every ask (a repeat does not become a different question), spoken as written, kept in the dialogue history as said.
+          delivered = say(fixed);
+          if (delivered) { s.said(fixed); lastReply = fixed; deps.log('FIRST_CLEAN_ASKED'); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
+        } else delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}) }, statusOf(s, got));
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
         if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
         else { if (prevAt === undefined) lastAskedAt.delete(next.field); else lastAskedAt.set(next.field, prevAt); }

@@ -18,6 +18,7 @@ import type { OpenAITextClient } from './openai-dialogue-model.ts';
 import { createRelayHandler } from './relay-handler.ts';
 import type { RelayHandler } from './relay-handler.ts';
 import { consentNoticeFor } from './opening.ts';
+import { requiredFieldsOf } from './cleaning-state.ts';
 import { createPersona } from './persona.ts';
 import { startRealtimeCall } from './realtime-bridge.ts';
 import { CONTACT_TOOL_DEFINITIONS } from './call-state.ts';
@@ -73,10 +74,13 @@ export function residentialRouting(categories: readonly { name: string; route?: 
   };
 }
 
+/** The first-cleaning question, in the exact approved words (2026-10-28). Yes means first cleaning; no means returning customer. */
+export const firstCleanQuestion = (business: string): string => `Is this your first cleaning with ${business}?`;
+
 export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService {
   const { config, voice } = deps;
   const tenant = config.tenant;
-  const skill = config.skill_config as { categories: { name: string; requires?: string[]; route?: string; keywords?: string[] }[]; fields: { name: string; choices?: string[]; role?: string }[] };
+  const skill = config.skill_config as { categories: { name: string; requires?: string[]; route?: string; keywords?: string[] }[]; fields: { name: string; choices?: string[]; role?: string; required?: boolean }[] };
   const firstCleanField = skill.fields.find((f) => f.role === 'first_clean')?.name;
   const persona = createPersona(voice.persona);
   const settings = effectiveVoiceSettings(voice);
@@ -95,7 +99,8 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     categoryNames: () => skill.categories.filter((c) => c.route !== 'human').map((c) => c.name),
     ...(residential === undefined ? {} : { residential }),
     choicesFor: (_t, field) => skill.fields.find((f) => f.name === field)?.choices,
-    ...(firstCleanField === undefined ? {} : { firstClean: { field: firstCleanField, required: (_t: string, category: string) => skill.categories.find((c) => c.name === category)?.requires?.includes(firstCleanField) === true } }),
+    ...(firstCleanField === undefined ? {} : { firstClean: { field: firstCleanField, required: (_t: string, category: string) => skill.categories.find((c) => c.name === category)?.requires?.includes(firstCleanField) === true, question: firstCleanQuestion(voice.persona.business_name) } }),
+    requiredFields: (_t: string, category: string) => requiredFieldsOf(skill, category),
     intake,
     intakeContext: deps.intakeContext,
     dialogue, store: deps.store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,
