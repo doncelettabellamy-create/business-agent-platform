@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drew Call-to-Booking Specification</title>
+<style>
+:root { --bg:#fbfaf7; --fg:#1d2330; --mut:#586174; --line:#d9d6cc; --card:#fff; --built:#1f7a4d; --missing:#b3261e; --undec:#9a6700; --sim:#5b3fb5; --acc:#24509c; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#14171d; --fg:#e8eaf0; --mut:#a2a9b8; --line:#333a48; --card:#1c2029; --built:#59c78f; --missing:#ff8a80; --undec:#f2c04d; --sim:#b9a4ff; --acc:#8db4ff; } }
+:root[data-theme="dark"] { --bg:#14171d; --fg:#e8eaf0; --mut:#a2a9b8; --line:#333a48; --card:#1c2029; --built:#59c78f; --missing:#ff8a80; --undec:#f2c04d; --sim:#b9a4ff; --acc:#8db4ff; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width:1040px; margin:0 auto; padding:24px 16px 64px; }
+h1 { font-size:1.9rem; margin:.2em 0; } h2 { font-size:1.3rem; margin:2.2em 0 .5em; border-bottom:1px solid var(--line); padding-bottom:.25em; } h3 { font-size:1.05rem; margin:1.4em 0 .4em; }
+p, li { max-width:75ch; } .mut { color:var(--mut); }
+.box { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 16px; margin:12px 0; }
+table { border-collapse:collapse; width:100%; background:var(--card); font-size:.92rem; } th, td { border:1px solid var(--line); padding:6px 9px; vertical-align:top; text-align:left; } th { background:color-mix(in srgb, var(--line) 45%, var(--card)); }
+.wrap { overflow-x:auto; }
+.tag { display:inline-block; font-size:.75rem; font-weight:700; padding:1px 7px; border-radius:10px; border:1px solid currentColor; white-space:nowrap; }
+.built { color:var(--built); } .missing { color:var(--missing); } .undec { color:var(--undec); } .sim { color:var(--sim); }
+code, .say { font-family:ui-monospace, Consolas, monospace; font-size:.88em; } .say { display:block; background:color-mix(in srgb, var(--acc) 8%, var(--card)); border-left:3px solid var(--acc); padding:8px 12px; margin:8px 0; white-space:pre-wrap; font-family:inherit; font-size:.97rem; }
+svg { width:100%; height:auto; max-width:1000px; } svg text { fill:var(--fg); font:13px system-ui, sans-serif; } svg .n { fill:var(--card); stroke:var(--line); stroke-width:1.5; } svg .l { stroke:var(--mut); stroke-width:1.6; fill:none; }
+.legend span { margin-right:14px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Drew Cleaning: residential call-to-booking specification</h1>
+<p class="mut">DRAFT FOR FOUNDER APPROVAL. Written 2026-10-27. Documentation only: it changes no code, live configuration, Twilio setting or running server, and uses no key. Nothing in it is approved until the founder says so; approving it does not start any build (roadmap section 1b: one task at a time, each separately approved). Linked from <code>docs/DEVELOPMENT_ROADMAP.md</code>.</p>
+
+<div class="box legend"><strong>Status key.</strong>
+<span><span class="tag built">BUILT</span> exists in code and tests</span>
+<span><span class="tag missing">MISSING</span> does not exist yet</span>
+<span><span class="tag undec">UNDECIDED</span> needs a business or founder decision (no value is invented here)</span>
+<span><span class="tag sim">SIMULATION</span> test data only, never a real commitment</span></div>
+
+<h2>1. Scope and ground rules</h2>
+<ul>
+<li>One business (Drew Cleaning), residential cleaning only, in <strong>SIMULATION</strong> mode (roadmap section 3a). Going LIVE is a separate founder decision that needs the business's approved rates, real calendar availability and written approval.</li>
+<li>Chain: <strong>verified contact &rarr; service &rarr; simulated quote &rarr; customer approval &rarr; availability &rarr; booking &rarr; QC &rarr; the preserved dashboard.</strong></li>
+<li>The preserved prototype dashboard (<code>prototype/intake-work-items/</code>, routes <code>/</code>, <code>/data.js</code>, <code>/api/owner</code>, owner-view allow-list) is <strong>not replaced, rebuilt or redesigned</strong>. Every dashboard change here is an incremental addition only.</li>
+<li>No business rule is invented in this document. Where a rule is not already recorded as decided, it is marked UNDECIDED with the question to answer.</li>
+<li>Test calls use invented details only. Real customers need a separate data-terms and wording decision.</li>
+</ul>
+
+<h2>2. The call at a glance</h2>
+<div class="wrap">
+<svg viewBox="0 0 1000 250" role="img" aria-label="Call flow from greeting to verified booking">
+<defs><marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L8 4L0 8z" fill="#7a8396"/></marker></defs>
+<g>
+<rect class="n" x="6" y="20" width="110" height="52" rx="8"/><text x="61" y="42" text-anchor="middle">Greeting</text><text x="61" y="60" text-anchor="middle">+ consent</text>
+<rect class="n" x="150" y="20" width="110" height="52" rx="8"/><text x="205" y="42" text-anchor="middle">Questions</text><text x="205" y="60" text-anchor="middle">+ contact</text>
+<rect class="n" x="294" y="20" width="110" height="52" rx="8"/><text x="349" y="42" text-anchor="middle">Read-back</text><text x="349" y="60" text-anchor="middle">+ confirm</text>
+<rect class="n" x="438" y="20" width="110" height="52" rx="8"/><text x="493" y="42" text-anchor="middle">Simulated</text><text x="493" y="60" text-anchor="middle">quote</text>
+<rect class="n" x="582" y="20" width="110" height="52" rx="8"/><text x="637" y="42" text-anchor="middle">Customer</text><text x="637" y="60" text-anchor="middle">approval</text>
+<rect class="n" x="726" y="20" width="110" height="52" rx="8"/><text x="781" y="42" text-anchor="middle">Calendar</text><text x="781" y="60" text-anchor="middle">slots</text>
+<rect class="n" x="870" y="20" width="124" height="52" rx="8"/><text x="932" y="42" text-anchor="middle">Booking, read</text><text x="932" y="60" text-anchor="middle">back &amp; verified</text>
+</g>
+<g class="l" marker-end="url(#a)"><path d="M116 46H148" marker-end="url(#a)"/><path d="M260 46H292" marker-end="url(#a)"/><path d="M404 46H436" marker-end="url(#a)"/><path d="M548 46H580" marker-end="url(#a)"/><path d="M692 46H724" marker-end="url(#a)"/><path d="M836 46H868" marker-end="url(#a)"/></g>
+<text x="8" y="112">Server side behind the call (agents on the sealed hand-offs):</text>
+<rect class="n" x="40" y="128" width="200" height="56" rx="8"/><text x="140" y="152" text-anchor="middle">Intake</text><text x="140" y="170" text-anchor="middle">facts + contact (built)</text>
+<rect class="n" x="290" y="128" width="200" height="56" rx="8"/><text x="390" y="152" text-anchor="middle">Processing</text><text x="390" y="170" text-anchor="middle">quote, hold, write (mock tools)</text>
+<rect class="n" x="540" y="128" width="200" height="56" rx="8"/><text x="640" y="152" text-anchor="middle">QC</text><text x="640" y="170" text-anchor="middle">independent evidence</text>
+<rect class="n" x="790" y="128" width="200" height="56" rx="8"/><text x="890" y="152" text-anchor="middle">Reporting</text><text x="890" y="170" text-anchor="middle">sealed chains, ledger</text>
+<g class="l"><path d="M240 156H288" marker-end="url(#a)"/><path d="M490 156H538" marker-end="url(#a)"/><path d="M740 156H788" marker-end="url(#a)"/></g>
+<rect class="n" x="290" y="205" width="420" height="34" rx="8"/><text x="500" y="227" text-anchor="middle">Preserved owner dashboard (additions only)</text>
+<path class="l" d="M890 184V222H712" marker-end="url(#a)"/>
+</svg>
+</div>
+
+<h2>3. The greeting (draft for approval)</h2>
+<p>Requirements applied: no "test line" and no "made-up details" wording; keep Drew's introduction, the AI/privacy disclosure naming OpenAI, and the consent question; keep the existing approved special exactly as already approved. The consent step is unchanged: the caller says yes to continue, or hangs up.</p>
+<span class="say">Thanks for calling Drew Cleaning. This is Drew, an automated A I assistant. Right now we have a special: $25 off a qualifying first standard cleaning. We do not record this call, but our A I speech provider, OpenAI, hears and transcribes what you say, and may keep it for up to thirty days for safety checks. We save the details you give us so we can handle your request. Please say yes to continue, or hang up now.</span>
+<ul>
+<li><strong>Special wording:</strong> "$25 off a qualifying first standard cleaning" is the existing founder-approved text, unchanged. What "qualifying" means is <span class="tag undec">UNDECIDED</span> (the simulation fixture's first-clean rule is test data and does not define it). The greeting states no price and no terms.</li>
+<li><strong>Disclosure:</strong> keeps the true statement that OpenAI hears and transcribes the call. The retention sentence (up to thirty days) matches OpenAI's documented safety-check period at the time of writing and must be re-verified. The last sentence ("we save the details you give us so we can handle your request") replaces "for testing". <span class="tag undec">UNDECIDED</span> The disclosure needs the business's legal check before real customers; real-customer data terms with OpenAI are a separate decision.</li>
+<li><strong>Not a test line:</strong> because the greeting no longer says it is a test, simulation is made clear later, at the moment a quote or appointment is offered (section 7), never hidden.</li>
+<li><strong>Known gap kept visible:</strong> with the voice as built, the caller's first words (including a "no") are heard by OpenAI before consent is checked (consent-before-audio, roadmap section 6 item 11). <span class="tag missing">MISSING</span> fix: accept consent collected on Twilio first.</li>
+</ul>
+
+<h2>4. Exact questions, in order</h2>
+<p>Which field is asked next is chosen by code (<span class="tag built">BUILT</span> <code>next-field.ts</code>): ask the missing item asked least recently, never-asked first, ties in the order below. The voice never chooses. Wording is the model's own short question unless marked fixed; the exact spoken wording of past calls is not recorded (<em>unavailable</em>). Fixed wording below is quoted from the code.</p>
+<div class="wrap"><table>
+<tr><th>#</th><th>Item (field)</th><th>Asked when</th><th>Choices offered</th><th>Skip rule</th><th>Retry rule</th></tr>
+<tr><td>1</td><td>What the caller needs (service category)</td><td>First, after consent. Recognised from the caller's own words.</td><td>Category names only if not recognised: Standard cleaning, Deep cleaning, Move-in or move-out cleaning, Commercial cleaning</td><td>Skipped when the opening statement already names the service.</td><td>Clarify each turn until recognised (first with names, then open). Commercial routes to a person.</td></tr>
+<tr><td>2</td><td>Property type</td><td>All residential categories</td><td>house, apartment, condo, townhouse (or the caller's own words)</td><td>Skipped when already given.</td><td>See section 5.</td></tr>
+<tr><td>3</td><td>Number of bedrooms</td><td>All</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>4</td><td>Number of bathrooms</td><td>All</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>5</td><td>Pets</td><td>All</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>6a</td><td>Cleaning frequency</td><td>Standard only</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>6b</td><td>Last professional clean; priority areas</td><td>Deep only</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>6c</td><td>Home empty</td><td>Move-in/move-out only</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>7</td><td>Extras</td><td>All</td><td>none (the model must not suggest extras itself)</td><td>Skipped when given; "none" is an answer.</td><td>Section 5.</td></tr>
+<tr><td>8</td><td>First cleaning with us</td><td>All. A bare yes/no counts only straight after this question; explicit wording counts anywhere.</td><td>yes, no</td><td>Skipped when stated.</td><td>Section 5.</td></tr>
+<tr><td>9</td><td>Preferred date</td><td>All</td><td>none</td><td>Skipped when given with a clear year.</td><td>Date and year rules, section 5.</td></tr>
+<tr><td>10</td><td>Time window</td><td>All</td><td>none today. <span class="tag undec">UNDECIDED</span> which windows the business offers.</td><td>Skipped when given.</td><td>Section 5.</td></tr>
+<tr><td>11</td><td>Customer name</td><td>All, added by code when contact capture is on</td><td>none</td><td>Skipped when given.</td><td>Section 5. Not read back today.</td></tr>
+<tr><td>12</td><td>Callback phone number</td><td>All (10 to 15 digits once spoken digits are converted)</td><td>none. <span class="tag undec">UNDECIDED</span> whether caller ID may be suggested for the caller to confirm.</td><td>Not skippable.</td><td>Read back as soon as captured (proposed).</td></tr>
+<tr><td>13</td><td>Service address</td><td>All</td><td>none</td><td>Not skippable. A caller who declines it ends the call as a recorded request without an address.</td><td>Read-back confirmation up to three tries (built).</td></tr>
+</table></div>
+<p class="mut">Status: items 1 to 13 and their rotation <span class="tag built">BUILT</span>. Per-item retry caps, date/year clarification, and early read-back of name and number are <span class="tag missing">MISSING</span> (section 5).</p>
+
+<h2>5. Remembered answers, skip and retry rules</h2>
+<h3>5.1 What the call remembers</h3>
+<ul>
+<li>One Intake pass runs over <em>all</em> the caller's words after every turn, so an answer given early, or out of order, fills its field and that question is never asked <span class="tag built">BUILT</span>.</li>
+<li>Names, numbers and addresses are masked before any text model reads them; the raw values live in the call's memory and then in the encrypted contact vault (30-day pilot retention) <span class="tag built">BUILT</span>.</li>
+<li>The caller's correction ("actually three bedrooms") replaces the earlier answer because the pass reads the whole conversation <span class="tag built">BUILT</span>.</li>
+</ul>
+<h3>5.2 Skip and retry rules</h3>
+<div class="wrap"><table>
+<tr><th>Situation</th><th>Rule</th><th>Status</th></tr>
+<tr><td>Field already answered</td><td>Never asked.</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Field still missing</td><td>Asked again in rotation (asked-least-recently first), a different way. No counter today, so it can loop (seen in call 1: contact items asked repeatedly).</td><td><span class="tag built">BUILT</span> (flaw)</td></tr>
+<tr><td>Per-item retry cap</td><td>Proposed: ask an item at most 2 times, then stop asking it and mark it "not obtained"; a request missing a required item goes to a person with the reason recorded (never a quote or booking). The cap value is an engineering proposal for the founder.</td><td><span class="tag missing">MISSING</span></td></tr>
+<tr><td>Question talked over</td><td>A question that was cut off is not counted as asked.</td><td><span class="tag built">BUILT</span> for the answer rule; <span class="tag missing">MISSING</span> for the rotation count</td></tr>
+<tr><td>Date or time without a year</td><td>Proposed: if the date has no year, or resolves to a past date, ask one fixed clarification ("Which date do you mean, including the year?") using today's date from the server clock, then read the resolved full date back for a yes.</td><td><span class="tag missing">MISSING</span></td></tr>
+<tr><td>Model fails or says nothing</td><td>Empty reply: one retry, then fixed fallback question. Proposed: a thrown error also retries once and then asks the fixed fallback, instead of ending the call with the apology.</td><td>Empty reply <span class="tag built">BUILT</span>; thrown error <span class="tag missing">MISSING</span></td></tr>
+<tr><td>Caller silent</td><td>"I did not hear a reply. Goodbye." after the confirm wait.</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Emergency or danger described</td><td>The model is told to say hang up and dial emergency services; a model refusal ends the call with the fixed emergency line.</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Limits</td><td>Turn and minute caps end the call with a fixed goodbye.</td><td><span class="tag built">BUILT</span></td></tr>
+</table></div>
+
+<h2>6. Read-backs and confirmations (fixed server wording)</h2>
+<div class="wrap"><table>
+<tr><th>Read-back</th><th>Wording</th><th>Limit</th><th>Status</th></tr>
+<tr><td>Job and callback number</td><td class="say" style="display:table-cell">Let me check what I have. &lt;field&gt;: &lt;value&gt;. &hellip; Your callback number: &lt;digits&gt;. Is that correct? Please say yes or no.</td><td>2 read-backs; a second unclear answer ends the call unconfirmed</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Correction</td><td>Sorry about that. What should I change?</td><td>Within the 2 read-backs</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Unclear yes/no</td><td>Sorry, I did not catch that. Please say yes or no.</td><td>1</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Service address</td><td>I have your service address as &lt;address&gt;. Is that correct? Please say yes or no.</td><td>3 tries; confirmed means the caller said yes, never a postal check</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Customer name</td><td>Not read back today. Proposed: read back with the number.</td><td>n/a</td><td><span class="tag missing">MISSING</span></td></tr>
+<tr><td>Resolved date and time window</td><td>Proposed: the full date including the year, and the window, read back for a yes.</td><td>n/a</td><td><span class="tag missing">MISSING</span></td></tr>
+<tr><td>Quote, appointment and booking confirmations</td><td>Section 7 and 9.</td><td>n/a</td><td><span class="tag missing">MISSING</span> on the phone</td></tr>
+</table></div>
+
+<h2>7. Approved pricing (SIMULATION only)</h2>
+<div class="box"><span class="tag sim">SIMULATION</span> There are <strong>no business-approved rates</strong>. The only pricing in existence is a test fixture (<code>pricing-fixture.ts</code>, <span class="tag built">BUILT</span>, not connected to the phone or to Processing). It is test data and says so on every result.</div>
+<ul>
+<li><strong>The fixture's single rule:</strong> a <em>standard</em> cleaning of a <em>house or apartment</em> with at most 2 bedrooms and 2 bathrooms is $199.99, less a $25.00 first-clean discount, giving $174.99. It is a test rule, not a rate card, and not the business's.</li>
+<li><strong>A price is given only when everything is known and eligible:</strong> details confirmed, the first-clean answer is yes, service and property type are the ones the rule names, bedrooms and bathrooms are within limits, no extras, not commercial. Anything else is "a person will price this", with a reason code and no number. Nothing is guessed, rounded or estimated.</li>
+<li><strong>Quote versus estimate</strong> (firm price vs range vs person always prices) per service: <span class="tag undec">UNDECIDED</span>. With no policy set the only allowed words are "a person will price this".</li>
+<li><strong>The special and the fixture:</strong> the greeting's "$25 off a qualifying first standard cleaning" and the fixture's $25 first-clean discount are separate things today. Whether they are the same offer is <span class="tag undec">UNDECIDED</span>.</li>
+<li><strong>Who approves real rates, and when LIVE begins:</strong> <span class="tag undec">UNDECIDED</span> (roadmap section 6 item 2).</li>
+</ul>
+<p>When a simulated price is spoken, the server supplies the exact words, including that it is simulated:</p>
+<span class="say">This is a simulated quote for testing, not a real price. For a standard cleaning the simulated price is one hundred seventy-four dollars and ninety-nine cents, including a twenty-five dollar first-cleaning discount. Would you like to hear simulated appointment times?</span>
+<p class="mut">Wording is a proposal. If no price applies: "A person will need to price this, so I can't give a price on this call." A promise that anyone will call back is not made unless the business has a callback process and a stored number (roadmap section 3a).</p>
+
+<h2>8. Calendar rules</h2>
+<div class="box"><span class="tag sim">SIMULATION</span> <span class="tag missing">MISSING</span> No calendar tool exists. The first version uses a mock calendar of invented slots and crews. Every offered slot is read from it; none is invented by the voice.</div>
+<div class="wrap"><table>
+<tr><th>Rule</th><th>Decision</th><th>Status</th></tr>
+<tr><td>Offer only slots the calendar shows as free</td><td>Yes, recorded in the roadmap.</td><td>Decided; <span class="tag missing">MISSING</span> in code</td></tr>
+<tr><td>A slot is written once; double booking impossible by construction</td><td>Yes, recorded in the roadmap.</td><td>Decided; <span class="tag missing">MISSING</span> in code</td></tr>
+<tr><td>Hold on an offered slot while the customer decides</td><td>Whether to hold, and for how long</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+<tr><td>Business hours, days closed, holidays</td><td>The business's own</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+<tr><td>Appointment length by job size; crews; travel time between jobs</td><td>The business's own</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+<tr><td>Earliest lead time; latest advance booking</td><td>The business's own</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+<tr><td>How many slots are offered at a time</td><td>Engineering proposal: at most 3, spoken with the day, date and window</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+<tr><td>Cancellation and rescheduling by phone</td><td>Out of scope for this specification</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+<tr><td>Real calendar (LIVE)</td><td>Real availability from the business's calendar, connected and checked before any first LIVE call</td><td><span class="tag undec">UNDECIDED</span></td></tr>
+</table></div>
+<p>Simulated appointment wording (server-supplied, proposal):</p>
+<span class="say">These are simulated appointment times for testing, not real bookings. I have Tuesday the twelfth of March at nine in the morning, or Wednesday the thirteenth at one in the afternoon. Which would you like?</span>
+
+<h2>9. Customer approval and verified booking</h2>
+<ol>
+<li><strong>Customer approval.</strong> A price or a booking is final only after the customer has heard it in fixed words and said an explicit yes. A vague, unclear or missing answer is not approval. <span class="tag built">BUILT</span> for the read-back confirmation; <span class="tag missing">MISSING</span> for quote and appointment approval.</li>
+<li><strong>Business approval.</strong> Where the business wants a named human to approve anything with money or a commitment, Processing pauses for that approver <span class="tag built">BUILT</span> (mock tools). Which items need a human is <span class="tag undec">UNDECIDED</span>.</li>
+<li><strong>Write once.</strong> After approval, one booking write with a single idempotent key. A repeat or retry returns the first result and makes no second write. <span class="tag built">BUILT</span> as a Processing mechanism (step ids); <span class="tag missing">MISSING</span> for a booking tool.</li>
+<li><strong>Verify by an independent read.</strong> QC reads the calendar entry, the quote and the contact on file with its own readers, not from the Processing result, and compares. A match is a verified booking; anything else is reported as not booked and escalated to a person. <span class="tag built">BUILT</span> against mock evidence readers; <span class="tag missing">MISSING</span> against a calendar.</li>
+<li><strong>Only then the customer is told it is booked.</strong> Server-supplied wording, marked simulated while in SIMULATION:</li>
+</ol>
+<span class="say">Your simulated appointment is confirmed for Tuesday the twelfth of March at nine in the morning. This is a test booking, not a real appointment. Goodbye.</span>
+<p>If any step fails, the assistant says nothing it cannot back, stops quoting and booking, hands the request to a person as unconfirmed with the reason recorded, and does not promise a callback unless a callback process exists.</p>
+
+<h2>10. Native Realtime conversation with controlled server tools (design)</h2>
+<p>Today the OpenAI voice only speaks exact words the server gives it, and a separate text model plus Intake decide what to ask (<span class="tag built">BUILT</span>, "Option A"). The proposal is to let the Realtime voice hold the conversation natively (listen, understand, answer small side questions, sound natural) while the server keeps every decision that matters behind a small set of tools. The model can only <em>request</em> a tool; the server runs it, validates the arguments, and returns a result the model must voice.</p>
+<h3>10.1 Controlled tool set (proposed)</h3>
+<div class="wrap"><table>
+<tr><th>Tool (server-run)</th><th>Purpose</th><th>Rules</th></tr>
+<tr><td>record_answer</td><td>Store the caller's answer for one named field</td><td>Field must be in the skill; value is masked; server decides what to ask next</td></tr>
+<tr><td>next_question</td><td>Ask the server which item to ask now</td><td>Returns a field and choices from <code>next-field.ts</code>; the model asks only that</td></tr>
+<tr><td>read_back</td><td>Get the fixed read-back words</td><td>Model must say them exactly; yes/no is checked by the server</td></tr>
+<tr><td>get_quote</td><td>Simulated quote from the fixture (later the approved table)</td><td>Server returns exact words and a quote id; model may not state any other figure</td></tr>
+<tr><td>offer_slots</td><td>Slots from the calendar</td><td>Server returns exact words and slot ids; no slot the calendar does not show</td></tr>
+<tr><td>request_booking</td><td>Ask Processing to write after the customer's explicit yes</td><td>Needs a quote id and slot id the server issued; idempotent</td></tr>
+<tr><td>hand_to_person</td><td>Stop and escalate with a fixed reason code</td><td>Always available; ends quoting and booking</td></tr>
+<tr><td>end_call</td><td>Server-run goodbye</td><td>Only the server ends the call</td></tr>
+</table></div>
+<h3>10.2 What stays outside the model</h3>
+<ul>
+<li>Prices, slots, dates and confirmations are spoken only from tool results; the model has no figure of its own and no tool for a price the table does not give.</li>
+<li>Consent, limits, emergency line, kill switch, masking, contact vault, record saving, and the dashboard allow-list stay in server code.</li>
+<li>Tool arguments are checked against the skill's field list and the issued ids; a call the model invents is refused and logged as a fixed code.</li>
+<li>Tool results carry no customer text beyond what must be said; logs hold fixed codes and numbers only.</li>
+</ul>
+<h3>10.3 Not decided, and the risks to settle first</h3>
+<ul>
+<li><span class="tag undec">UNDECIDED</span> Whether to move from Option A (server picks every question, voice only speaks) to native tool calling at all. Native is more natural but gives the model more room to drift; the tools above constrain it but need testing for repeats, interruptions and spoken-number accuracy.</li>
+<li><span class="tag undec">UNDECIDED</span> Whether the voice model or the text model extracts answers (today: Intake on the text model). Using Realtime function calls would send the caller's raw words to OpenAI's voice model, which already hears the audio; masking before a text model would no longer apply to that path.</li>
+<li><span class="tag missing">MISSING</span> Consent-before-audio, the interrupted-read-back gap and the two masker gaps remain open (roadmap section 6 item 11).</li>
+<li>Model, voice and reasoning settings are already chosen for the founder test (<code>founder-voice.config.json</code>) and are not changed here.</li>
+</ul>
+
+<h2>11. Connecting Intake &rarr; Processing &rarr; QC &rarr; Reporting on the preserved dashboard</h2>
+<div class="wrap"><table>
+<tr><th>Link</th><th>What it carries</th><th>Status</th></tr>
+<tr><td>Phone call &rarr; Intake record (facts, contact, confirmation)</td><td>Saved confirmed or unconfirmed record, encrypted contact</td><td><span class="tag built">BUILT</span></td></tr>
+<tr><td>Intake &rarr; Processing hand-off</td><td>Sealed envelope, offered only for a confirmed, ready, handed-off item with no unverified address (<code>eligibleForProcessing</code>)</td><td>Seam built, <span class="tag missing">MISSING</span> wiring: the server does not pass it on</td></tr>
+<tr><td>Processing tools</td><td>Quote, approval pause, availability, booking write</td><td>Pause and idempotency <span class="tag built">BUILT</span> (mock); quote tool, calendar and booking tool <span class="tag missing">MISSING</span></td></tr>
+<tr><td>Processing &rarr; QC</td><td>Sealed candidate; QC re-checks with its own readers</td><td><span class="tag built">BUILT</span> (mock readers); real calendar reader <span class="tag missing">MISSING</span></td></tr>
+<tr><td>QC &rarr; Reporting</td><td>Sealed verdict, chain re-derived, append-only ledger</td><td><span class="tag built">BUILT</span> (in memory; database-backed ledger is separate work)</td></tr>
+<tr><td>Reporting &rarr; preserved dashboard</td><td>Per call: what was asked, decided, needs a human, quoted, booked, with SIMULATION clearly marked</td><td><span class="tag missing">MISSING</span> as additions; the existing dashboard and its owner-view allow-list <span class="tag built">BUILT</span> and untouched</td></tr>
+<tr><td>Two-minute owner view</td><td>Founder requirement, roadmap section 3b</td><td>Proposed, not designed in detail</td></tr>
+</table></div>
+<p>Dashboard rules: additions only, through the existing allow-list; no customer name, number or address on the unauthenticated view; "nothing implies a booking" stays until a verified booking exists; every simulated quote or appointment is labelled SIMULATION.</p>
+
+<h2>12. Built, missing and undecided: summary</h2>
+<div class="wrap"><table>
+<tr><th>Area</th><th class="built">Built</th><th class="missing">Missing</th><th class="undec">Undecided</th></tr>
+<tr><td>Greeting and consent</td><td>Fixed opening with special, disclosure, consent; voice route</td><td>New wording wired in; consent-before-audio</td><td>Legal check; real-customer data terms; what "qualifying" means</td></tr>
+<tr><td>Questions</td><td>Category, 13 items, rotation, choices, first-clean rule</td><td>Retry caps; date/year clarification; early read-back of name and number</td><td>Time windows; caller-ID suggestion</td></tr>
+<tr><td>Read-backs</td><td>Job and number (2), address (3)</td><td>Name, date, quote, appointment read-backs</td><td>Whether the number is read in full</td></tr>
+<tr><td>Pricing</td><td>Simulation fixture and quote function (unconnected)</td><td>Quote tool in Processing; phone wording</td><td>Real rates; quote vs estimate policy; approver; relation of special to discount</td></tr>
+<tr><td>Calendar</td><td>Nothing</td><td>Mock calendar, availability reader, hold</td><td>Hours, lengths, crews, travel, lead times, holds, real calendar</td></tr>
+<tr><td>Approval and booking</td><td>Read-back confirmation; approval pause and idempotency (mock)</td><td>Customer approval of quote and slot; booking tool; verified read-back</td><td>Which items need a human approver</td></tr>
+<tr><td>Realtime and tools</td><td>Voice that speaks exact words; connection check passed</td><td>Tool layer, validation, fixed-wording results</td><td>Whether to adopt native tool calling; who extracts answers</td></tr>
+<tr><td>Agents and dashboard</td><td>Processing, QC, Reporting (mock); preserved dashboard</td><td>Hand-off wiring; dashboard additions</td><td>Owner view details (roadmap 3b)</td></tr>
+</table></div>
+
+<h2>13. Proposed build order (each its own approved task)</h2>
+<ol>
+<li>Diagnostics for the repeated-question and apology findings (log the asked field and the model error status), then the retry cap and the thrown-error retry.</li>
+<li>Date and year clarification and early read-backs.</li>
+<li>Pricing tool in Processing (simulation) and fixed quote wording.</li>
+<li>Mock calendar, availability reader, booking tool with verified read-back and customer approval.</li>
+<li>Intake &rarr; Processing hand-off wiring; QC and Reporting on real tool evidence.</li>
+<li>Dashboard additions (labelled SIMULATION).</li>
+<li>Decision point: native Realtime tool calling (section 10) before any LIVE work.</li>
+</ol>
+<p class="mut">Approving this document does not authorise any of these. Each is proposed to the founder separately (roadmap section 1b).</p>
+</main>
+</body>
+</html>
