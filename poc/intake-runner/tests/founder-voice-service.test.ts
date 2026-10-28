@@ -138,7 +138,8 @@ async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; 
 type Rig = Awaited<ReturnType<typeof rig>>;
 const spokenCount = (r: Rig) => r.voices[0]?.spoken.length ?? 0;
 const where = (r: Rig, sim: Sim): string => JSON.stringify({ logs: r.logs.map((l) => l.code), spoken: spokenCount(r), voiceTypes: (r.voices[0]?.received ?? []).map((m: { type: string }) => m.type), phoneEvents: sim.messages.map((m: { event: string }) => m.event), appended: r.voices[0]?.appended() });
-async function say(r: Rig, text: string, n: number) { r.voices[0].hear(text); await until(() => spokenCount(r) >= n); await r.handler.idle(); }
+// A wait that times out says where the call had got to (log codes and counts only), so a failure on another machine explains itself.
+async function say(r: Rig, text: string, n: number) { r.voices[0].hear(text); await until(() => spokenCount(r) >= n, 20_000, () => JSON.stringify({ waitingFor: n, logs: r.logs.map((l) => l.code), spoken: spokenCount(r), voiceTypes: (r.voices[0]?.received ?? []).map((m: { type: string }) => m.type), diag: r.diagLines.map((d) => d.code).slice(-40) })); await r.handler.idle(); }
 const SECRETS = ['Sam Example', 'sam example', 'Elm Street', '42 Elm', '555 010 0199', '0199'];
 
 test('full call: the notice, a yes, the cleaning questions, the fixed read-back and a saved confirmed record, all over the stream, with the Drew persona on every spoken line', async () => {
