@@ -196,7 +196,7 @@ test('static guard: the persona file imports only the name rule, holds no creden
   for (const banned of [/\bfetch\s*\(/, /process\./, /node:/, /console\./, /api[_-]?key/i, /authorization/i, /https?:\/\//, /\beval\s*\(/, /new Function/]) assert.ok(!banned.test(src), `banned pattern: ${banned}`);
   for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'persona.ts')) {
     const uses = usesPersona(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'));
-    assert.equal(uses, ['dialogue-model.ts', 'realtime-transport.ts', 'openai-dialogue-model.ts', 'founder-voice-gate.ts', 'founder-voice-service.ts', 'voice-check.ts'].includes(f), `${f}: only the adapters, the OpenAI dialogue model and the voice gate and service may take a persona`);
+    assert.equal(uses, ['dialogue-model.ts', 'realtime-transport.ts', 'openai-dialogue-model.ts', 'founder-voice-gate.ts', 'founder-voice-service.ts', 'voice-check.ts', 'founder-voice-prepare.ts'].includes(f), `${f}: only the adapters, the OpenAI dialogue model and the voice gate and service may take a persona`);
   }
   const entry = readFileSync(new URL('../src/founder-call-entry.ts', import.meta.url), 'utf8');
   assert.ok(!usesPersona(entry), 'the live entry point does not use a persona, so the live phone path is unchanged');

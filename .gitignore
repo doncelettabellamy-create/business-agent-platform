@@ -24,3 +24,4 @@ founder-call.stop
 
 # Founder voice test: the private voice settings file is never committed.
 founder-voice.config.json
+founder-voice-call.config.json
