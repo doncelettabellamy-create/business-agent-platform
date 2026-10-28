@@ -49,14 +49,17 @@ jobs:
             grep -E '^✖' "$out" | sort -u | head -40
           } >> "$GITHUB_STEP_SUMMARY"
           # One annotation per failing test (up to 8) with the first lines of its own failure message: the runner prints them in its closing "failing tests" section.
-          node -e '
-            const s = require("fs").readFileSync(process.argv[1], "utf8");
-            const i = s.indexOf("✖ failing tests:");
-            if (i < 0) process.exit(0);
-            const blocks = s.slice(i).split("\ntest at ").slice(1, 9);
-            for (const b of blocks) {
-              const lines = b.split("\n").map((l) => l.trimEnd().slice(0, 240)).filter((l) => l.trim() !== "").slice(0, 9);
-              console.log("::error::" + lines.join("%0A"));
-            }
-          ' "$out"
+          # (Only on a failing run, and never for a test marked todo: the two known masker gaps are reported by the runner as todo, not as failures.)
+          if [ "$code" != "0" ]; then
+            node -e '
+              const s = require("fs").readFileSync(process.argv[1], "utf8");
+              const i = s.indexOf("✖ failing tests:");
+              if (i < 0) process.exit(0);
+              const blocks = s.slice(i).split("\ntest at ").slice(1).filter((b) => !/\)\s+# /.test(b.split("\n").slice(0, 3).join(" "))).slice(0, 8);
+              for (const b of blocks) {
+                const lines = b.split("\n").map((l) => l.trimEnd().slice(0, 240)).filter((l) => l.trim() !== "").slice(0, 9);
+                console.log("::error::" + lines.join("%0A"));
+              }
+            ' "$out"
+          fi
           exit $code
