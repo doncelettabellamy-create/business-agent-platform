@@ -146,7 +146,7 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   const sim = await r.connect();
   assert.equal(sim.status, 101);
   r.start(sim);
-  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1);
+  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 20_000, () => where(r, sim));
   sim.send({ event: 'media', media: { payload: b64(160) } });   // sound during the notice
   assert.equal(r.voices[0].appended(), 0, 'no caller audio reaches the voice service before the notice has been played');
   await until(() => r.has('CALL_STARTED'), 20_000, () => where(r, sim));
