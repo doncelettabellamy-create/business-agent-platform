@@ -42,7 +42,8 @@ const dir = mkdtempSync(join(tmpdir(), 'voice-service-'));
 const closers: Array<() => unknown> = [];
 after(async () => { for (const c of closers.reverse()) try { await c(); } catch { /* already closed */ } rmSync(dir, { recursive: true, force: true }); });
 /** Waits for a condition; on timeout the error says where the call had got to (log codes and counts only, never speech), so an intermittent failure explains itself. */
-async function until(fn: () => boolean, ms = 4000, where?: () => string): Promise<void> { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error(`timed out${where === undefined ? '' : ': ' + where()}`); await new Promise<void>((r) => setTimeout(r, 4)); } }
+// The bound only matters when something is wrong; it is generous because the whole suite runs its files in parallel, and a loaded machine (a CI runner, or a computer short of memory) once took just over four seconds here.
+async function until(fn: () => boolean, ms = 20_000, where?: () => string): Promise<void> { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error(`timed out${where === undefined ? '' : ': ' + where()}`); await new Promise<void>((r) => setTimeout(r, 4)); } }
 const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** A mocked OpenAI text API: the Intake extraction (structured output) and the spoken wording (plain text), answering from what it is sent, as the real one would from the masked text. */
@@ -148,7 +149,7 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1);
   sim.send({ event: 'media', media: { payload: b64(160) } });   // sound during the notice
   assert.equal(r.voices[0].appended(), 0, 'no caller audio reaches the voice service before the notice has been played');
-  await until(() => r.has('CALL_STARTED'), 4000, () => where(r, sim));
+  await until(() => r.has('CALL_STARTED'), 20_000, () => where(r, sim));
   assert.equal(r.voices[0].spoken[0], r.notice);
   assert.equal(r.notice, consentNoticeFor(undefined), 'the notice is the one the existing call logic uses');
   sim.send({ event: 'media', media: { payload: b64(160) } });
