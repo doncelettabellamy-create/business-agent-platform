@@ -15,6 +15,7 @@
 
 import { isRecord } from './contracts.ts';
 import type { CloseInfo, RelayConnection } from './ws-server.ts';
+import type { CallStatus, Directive } from './dialogue-model.ts';
 
 export type TransportEvent =
   /** A frame that could not be read as a message with a string `type`. */
@@ -35,7 +36,17 @@ export type TransportEvent =
    * A reply the call logic sent was NOT played as sent: the carrier reports that it failed, produced no sound, or said different words. The carrier in use today
    * (ConversationRelay) never reports this; a carrier that speaks for itself must, because the call logic otherwise takes a spoken question to have been heard.
    */
-  | { kind: 'reply_failed' };
+  | { kind: 'reply_failed' }
+  /**
+   * Native conversation only: the voice asked for one of the server's tools. `args` is whatever the voice sent (parsed JSON, or undefined when it was not JSON): the receiver validates it, runs
+   * nothing it does not know, and answers with `toolResult`. The callId is the voice service's own.
+   */
+  | { kind: 'tool'; callId: string; name: string; args: unknown };
+
+/** What the voice is asked to do in its own words (native conversation): the same server-chosen directive and status the text model used to be given. */
+export interface ConverseRequest { directive: Directive; status?: CallStatus }
+/** How a native reply ended. `said` is the voice's own transcript of what it said (RAW: the receiver keeps none of it); `spoken` is the part heard before the caller talked over it. */
+export interface ConverseResult { said: string; spoken: string; played: boolean; interrupted: boolean; failed: boolean }
 
 export interface CallTransport {
   /** Set by the call logic. Called once per inbound event, in order. */
@@ -47,6 +58,13 @@ export interface CallTransport {
    * cannot talk over it. False when the connection is gone or too slow to take it.
    */
   speak(token: string, last: boolean, options?: { interruptible?: boolean }): boolean;
+  /**
+   * Native conversation only (a carrier whose voice converses for itself): the voice speaks a reply of its OWN words for this directive, calling tools if it needs to. Resolves when the reply has ended
+   * (played, talked over, or failed). A carrier that only speaks the words it is handed does not have this method.
+   */
+  converse?(request: ConverseRequest): Promise<ConverseResult>;
+  /** Native conversation only: answers a `tool` event. False when it could not be sent. */
+  toolResult?(callId: string, output: string): boolean;
   /** Tells the carrier to end the call. False when it could not be sent. */
   endCall(): boolean;
   close(code?: number): void;

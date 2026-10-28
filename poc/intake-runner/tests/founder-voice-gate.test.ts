@@ -56,7 +56,7 @@ const without = (o: Record<string, unknown>, ...keys: string[]) => Object.fromEn
 test('settings: with none given, the documented defaults apply: minimal voice reasoning, no text reasoning, English hints for the transcribers that document them', () => {
   const bare = without(voiceConfig(), 'realtime_reasoning', 'text_reasoning', 'transcription') as unknown as FounderVoiceConfig;
   assert.deepEqual(founderVoiceConfigProblems(bare), []);
-  assert.deepEqual(effectiveVoiceSettings(bare), { realtimeReasoning: 'minimal', textReasoning: 'none', transcription: { languages: ['en'] } });
+  assert.deepEqual(effectiveVoiceSettings(bare), { realtimeReasoning: 'minimal', textReasoning: 'none', transcription: { languages: ['en'] }, conversation: 'scripted' });
   const whisper = { ...bare, transcription_model: 'whisper-1' } as FounderVoiceConfig;
   assert.deepEqual(founderVoiceConfigProblems(whisper), [], 'another transcriber is allowed when no hints are asked for');
   assert.equal(effectiveVoiceSettings(whisper).transcription, undefined, 'and gets no hints');
@@ -65,7 +65,7 @@ test('settings: with none given, the documented defaults apply: minimal voice re
 test('settings: explicit values are used as given, and the example carries the proposed ones in plain sight', () => {
   const v = voiceConfig({ realtime_reasoning: 'low', text_reasoning: 'medium', transcription: { languages: ['en', 'es'], keywords: ['Drew Cleaning', 'deep clean'] } });
   assert.deepEqual(founderVoiceConfigProblems(v), []);
-  assert.deepEqual(effectiveVoiceSettings(v), { realtimeReasoning: 'low', textReasoning: 'medium', transcription: { languages: ['en', 'es'], keywords: ['Drew Cleaning', 'deep clean'] } });
+  assert.deepEqual(effectiveVoiceSettings(v), { realtimeReasoning: 'low', textReasoning: 'medium', transcription: { languages: ['en', 'es'], keywords: ['Drew Cleaning', 'deep clean'] }, conversation: 'scripted' });
   assert.deepEqual([exampleVoice.realtime_reasoning, exampleVoice.text_reasoning, exampleVoice.transcription], ['minimal', 'none', { languages: ['en'], keywords: ['Drew Cleaning'] }]);
   for (const e of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) assert.deepEqual(founderVoiceConfigProblems(voiceConfig({ text_reasoning: e })), [], e);
   for (const e of ['minimal', 'low', 'medium', 'high', 'xhigh']) assert.deepEqual(founderVoiceConfigProblems(voiceConfig({ realtime_reasoning: e })), [], e);
@@ -203,4 +203,13 @@ test('command line: bad arguments, unreadable files and invalid configs stop wit
   assert.ok(!r.stderr.includes(CANARY) && !r.stdout.includes(CANARY));
   const badCall = workdir({ call: { max_minutes: 99 } });
   assert.equal(run(badCall.args).status, 65);
+});
+
+test('voice config: conversation is optional, scripted by default, and only scripted or native are accepted', () => {
+  const bare = without(voiceConfig(), 'conversation') as unknown as FounderVoiceConfig;
+  assert.equal(effectiveVoiceSettings(bare).conversation, 'scripted');
+  for (const v of ['scripted', 'native']) assert.deepEqual(founderVoiceConfigProblems(voiceConfig({ conversation: v })), [], v);
+  for (const v of ['hybrid', 'NATIVE', 3, null, '']) assert.ok(founderVoiceConfigProblems(voiceConfig({ conversation: v })).length > 0, String(v));
+  assert.equal(effectiveVoiceSettings(voiceConfig({ conversation: 'native' }) as unknown as FounderVoiceConfig).conversation, 'native');
+  assert.notEqual(founderVoiceDigest({ a: 1 }, voiceConfig({ conversation: 'native' })), founderVoiceDigest({ a: 1 }, voiceConfig()), 'choosing native changes the digest the founder approves');
 });

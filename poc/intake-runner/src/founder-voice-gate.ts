@@ -42,9 +42,11 @@ export interface FounderVoiceConfig {
   text_reasoning?: OpenAIEffort;
   /** Optional. Hints for the live transcriber: languages (two-letter codes) and keywords. Only for gpt-transcribe and gpt-live-transcribe. Default: English, for those two. */
   transcription?: RealtimeTranscription;
+  /** Optional. 'scripted' (default): the voice only speaks words the server hands it. 'native': the voice converses in its own words and may call the server's validated contact tools; the voice service keeps the call's turns for the call. */
+  conversation?: 'scripted' | 'native';
 }
 const KEYS = 'approval_id,max_openai_calls,openai_model,persona,realtime_model,transcription_model,voice'.split(',');
-const OPTIONAL = ['safety_identifier', 'realtime_reasoning', 'text_reasoning', 'transcription'];
+const OPTIONAL = ['safety_identifier', 'realtime_reasoning', 'text_reasoning', 'transcription', 'conversation'];
 const ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const VOICE = /^[a-z][a-z0-9_-]{0,31}$/;
 const SAFETY = /^[A-Za-z0-9_.-]{1,64}$/;
@@ -66,6 +68,7 @@ export function founderVoiceConfigProblems(cfg: unknown): string[] {
   if (!isRecord(c.persona) || personaProblems(c.persona).length > 0) p.push('persona is not a valid persona configuration');
   if ('realtime_reasoning' in c && !isRealtimeEffort(c.realtime_reasoning)) p.push('realtime_reasoning must be minimal, low, medium, high or xhigh');
   if ('text_reasoning' in c && !(typeof c.text_reasoning === 'string' && (OPENAI_EFFORTS as readonly string[]).includes(c.text_reasoning))) p.push('text_reasoning must be none, minimal, low, medium, high, xhigh or max');
+  if ('conversation' in c && c.conversation !== 'scripted' && c.conversation !== 'native') p.push('conversation must be scripted or native');
   if ('transcription' in c) {
     for (const m of transcriptionHintProblems(c.transcription)) p.push(m);
     if (typeof c.transcription_model === 'string' && !HINT_TRANSCRIBERS.includes(c.transcription_model)) p.push('transcription hints are documented only for gpt-transcribe and gpt-live-transcribe');
@@ -74,8 +77,9 @@ export function founderVoiceConfigProblems(cfg: unknown): string[] {
 }
 
 /** The settings the run will actually use, with the documented defaults filled in (the voice config must be valid). The dry run prints these, so a default is never a surprise. */
-export function effectiveVoiceSettings(voice: FounderVoiceConfig): { realtimeReasoning: RealtimeEffort; textReasoning: OpenAIEffort; transcription: RealtimeTranscription | undefined } {
+export function effectiveVoiceSettings(voice: FounderVoiceConfig): { realtimeReasoning: RealtimeEffort; textReasoning: OpenAIEffort; transcription: RealtimeTranscription | undefined; conversation: 'scripted' | 'native' } {
   return {
+    conversation: voice.conversation ?? 'scripted',
     realtimeReasoning: voice.realtime_reasoning ?? DEFAULT_REALTIME_EFFORT,
     textReasoning: voice.text_reasoning ?? 'none',
     transcription: voice.transcription ?? (HINT_TRANSCRIBERS.includes(voice.transcription_model) ? { languages: ['en'] } : undefined),

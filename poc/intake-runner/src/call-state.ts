@@ -172,8 +172,9 @@ export const CONTACT_TOOL_DEFINITIONS = Object.freeze([
 ] as const);
 
 export type ContactToolResult =
-  | { readonly ok: true; readonly outcome: CollectOutcome | 'status'; readonly captured: readonly string[]; readonly missing: readonly string[]; readonly learn: readonly string[] }
-  | { readonly ok: false; readonly code: 'UNKNOWN_TOOL' | 'BAD_ARGUMENTS' };
+  | { readonly ok: true; readonly outcome: CollectOutcome | 'status'; readonly field?: ContactField; readonly captured: readonly string[]; readonly missing: readonly string[]; readonly learn: readonly string[] }
+  | { readonly ok: false; readonly code: 'UNKNOWN_TOOL' | 'BAD_ARGUMENTS' | 'NOT_ACTIVE' | 'TOO_MANY' };
+const MAX_HEARD_CHARS = 300;
 
 /** Runs one requested tool against the state. The result holds labels and a fixed outcome word only, never the value the caller gave. Unknown tools and bad arguments are refused. */
 export function runContactTool(state: ContactState, name: unknown, args: unknown): ContactToolResult {
@@ -181,15 +182,15 @@ export function runContactTool(state: ContactState, name: unknown, args: unknown
   const a = args !== null && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : undefined;
   if (a === undefined) return { ok: false, code: 'BAD_ARGUMENTS' };
   const keys = Object.keys(a);
-  const done = (r: CollectResult): ContactToolResult => { const s = state.status(); return { ok: true, outcome: r.outcome, captured: s.captured, missing: s.missing, learn: r.learn }; };
+  const done = (r: CollectResult): ContactToolResult => { const s = state.status(); return { ok: true, outcome: r.outcome, field: r.field, captured: s.captured, missing: s.missing, learn: r.learn }; };
   if (name === 'call_status') {
     if (keys.length > 0) return { ok: false, code: 'BAD_ARGUMENTS' };
     const s = state.status(); return { ok: true, outcome: 'status', captured: s.captured, missing: s.missing, learn: [] };
   }
   if (name === 'correct_contact') {
-    if (keys.length !== 2 || typeof a.heard !== 'string' || (a.field !== 'name' && a.field !== 'phone' && a.field !== 'address')) return { ok: false, code: 'BAD_ARGUMENTS' };
+    if (keys.length !== 2 || typeof a.heard !== 'string' || a.heard.length > MAX_HEARD_CHARS || (a.field !== 'name' && a.field !== 'phone' && a.field !== 'address')) return { ok: false, code: 'BAD_ARGUMENTS' };
     return done(state.collect(a.field, a.heard, true));
   }
-  if (keys.length !== 1 || typeof a.heard !== 'string') return { ok: false, code: 'BAD_ARGUMENTS' };
+  if (keys.length !== 1 || typeof a.heard !== 'string' || a.heard.length > MAX_HEARD_CHARS) return { ok: false, code: 'BAD_ARGUMENTS' };
   return done(state.collect(name === 'collect_name' ? 'name' : name === 'collect_phone' ? 'phone' : 'address', a.heard));
 }

@@ -375,3 +375,20 @@ test('failure: a voice service that drops mid-call ends the call and closes the 
   await r.handler.idle();
   assert.equal(r.handler.active(), 0);
 });
+
+test('native conversation (voice config conversation: "native"): the voice is offered the five contact tools and nothing else, the notice is still spoken word for word, and the default stays scripted', async () => {
+  const s = await rig();
+  const c0 = await s.connect(); s.start(c0);
+  await until(() => s.has('CALL_STARTED'));
+  assert.ok(s.voices[0].received.filter((m) => m.type === 'session.update').every((m) => m.session.tools === undefined), 'scripted by default: no tools');
+  c0.end(); await pause(20);
+  const n = await rig({ voice: { conversation: 'native' } });
+  const c1 = await n.connect(); n.start(c1);
+  await until(() => n.has('CALL_STARTED'));
+  const updates = n.voices[0].received.filter((m) => m.type === 'session.update');
+  assert.ok(updates.length >= 1 && updates.every((m) => m.session.tool_choice === 'auto' && m.session.tools.map((t: any) => t.name).join() === 'collect_name,collect_phone,collect_address,correct_contact,call_status'));
+  assert.ok(!updates.some((m) => m.session.tools.some((t: any) => /price|quote|book|slot|calendar|process|handoff/i.test(t.name))));
+  assert.equal(n.voices[0].spoken[0], n.notice, 'the consent notice is exact');
+  assert.deepEqual(n.voices[0].refused, []);
+  c1.end(); await pause(20);
+});

@@ -13,8 +13,8 @@ import { createMasker } from './pii-screen.ts';
 import type { PiiCount } from './pii-screen.ts';
 import { contactMissing, extractContact } from './contact-capture.ts';
 import type { Contact } from './contact-capture.ts';
-import { createContactState } from './call-state.ts';
-import type { CollectOutcome, ContactField, ContactStatus } from './call-state.ts';
+import { createContactState, runContactTool } from './call-state.ts';
+import type { CollectOutcome, ContactField, ContactStatus, ContactToolResult } from './call-state.ts';
 import type { PiiType } from './pii-screen.ts';
 
 export interface SessionLimits { maxTurns: number; maxMinutes: number; maxChars: number }
@@ -45,6 +45,13 @@ export interface CallSession {
   answer(line: unknown): 'yes' | 'no' | 'unclear';
   /** Records what the assistant said in full. */
   said(text: string): void;
+  /**
+   * Records what the VOICE said in its own words (native conversation). The words may repeat something the caller said, so they are masked first; words that cannot be masked cleanly
+   * are replaced by a fixed marker. The raw words are not kept.
+   */
+  saidMasked(text: string): void;
+  /** Runs one contact tool the voice asked for (call-state.ts), validated by the server. Refused unless the call is active. Never returns the value the caller gave. */
+  tool(name: unknown, args: unknown): ContactToolResult;
   /** The caller talked over the assistant: only the part actually spoken counts. */
   interrupted(spoken: string): void;
   /** The masked caller lines, one per utterance, in order. This is the Intake agent's input. */
@@ -89,6 +96,7 @@ export function createCallSession(config: SessionConfig): CallSession {
   const masker = createMasker({ names: config.names });
   const contact = createContactState();
   let seenPhone: string | undefined;
+  let lastWasVoice = false;   // the newest assistant entry in the dialogue came from the voice's own words (native conversation)
   const TYPE: Record<ContactField, PiiType> = { name: 'Person', phone: 'Contact detail', address: 'Address' };
   /** The server-captured items, with the masker's detections filling only what the server has not captured (a caller who volunteered details unasked). */
   const parts = (): { name?: string; phone?: string; address?: string } => {
@@ -140,15 +148,30 @@ export function createCallSession(config: SessionConfig): CallSession {
     },
     said(text: string): void {
       if (state !== 'active' || typeof text !== 'string' || text.length === 0) return;
+      lastWasVoice = false;
       talk.push({ role: 'assistant', text: text.slice(0, MAX_ASSISTANT_CHARS) });
       if (talk.length > MAX_DIALOGUE) talk = talk.slice(-MAX_DIALOGUE);
+    },
+    saidMasked(text: string): void {
+      if (state !== 'active' || typeof text !== 'string' || text.length === 0) return;
+      // The voice's own words may repeat what the caller said, and running them through the masker would mint placeholders for the assistant's own capitals (its name, a business name). Nothing reads
+      // this history in native conversation (the voice has its own context), so only a fixed marker is kept; the words themselves are never stored.
+      talk.push({ role: 'assistant', text: '[the assistant spoke]' });
+      lastWasVoice = true;
+      if (talk.length > MAX_DIALOGUE) talk = talk.slice(-MAX_DIALOGUE);
+    },
+    tool(name: unknown, args: unknown): ContactToolResult {
+      if (state !== 'active') return { ok: false, code: 'NOT_ACTIVE' };
+      const r = runContactTool(contact, name, args);
+      if (r.ok && r.field !== undefined) for (const l of r.learn) masker.learn(TYPE[r.field], l);   // what the voice captured is masked from now on, wherever it is said
+      return r;
     },
     interrupted(spoken: string): void {
       if (state !== 'active') return;
       const last = talk[talk.length - 1];
       if (last === undefined || last.role !== 'assistant') return;
       const part = typeof spoken === 'string' ? spoken.slice(0, MAX_ASSISTANT_CHARS) : '';
-      if (part.length === 0) talk.pop(); else last.text = part;
+      if (part.length === 0) talk.pop(); else if (!lastWasVoice) last.text = part;   // a voice's own interrupted words are never kept
     },
     maskedText(): string { return lines.join('\n'); },
     turns(): number { return lines.length; },

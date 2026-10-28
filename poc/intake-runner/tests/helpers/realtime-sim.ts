@@ -5,7 +5,7 @@
 // IMPORTANT: this is a model of the service built from documentation read on 2026-10-27. It has not been checked against the real service, so a passing test shows how the adapter
 // and the call logic behave against THIS model, not against OpenAI. The event names, the transcript events and the `x_played_ms` field (how much of a reply the phone layer says was
 // played) are assumptions.
-import { wordsOf } from '../../src/realtime-transport.ts';
+import { wordsOf, SAY_PREFIX } from '../../src/realtime-transport.ts';
 import { refusalFor } from './realtime-schema-rules.ts';
 import type { RealtimeLink } from '../../src/realtime-transport.ts';
 import type { CloseInfo } from '../../src/ws-server.ts';
@@ -24,6 +24,11 @@ export interface RealtimeSimOptions {
   ignoreCancel?: boolean;
   /** Whether the hang-up works. */
   hangupWorks?: () => boolean;
+  /**
+   * NATIVE conversation: what the voice does for a request that is NOT a "say exactly" line. `say` is what it says; `calls` are tools it asks for first (each is answered by the adapter with a
+   * function_call_output item; the voice then answers again, with `round` counting from 0). `outputs` are the tool results it has been given so far for this reply.
+   */
+  native?: (ctx: { instructions: string; n: number; round: number; outputs: string[]; sessionTools: string[] }) => { say?: string; calls?: Array<{ name: string; args?: unknown; rawArgs?: string }> };
 }
 
 export interface RealtimeSim {
@@ -38,6 +43,8 @@ export interface RealtimeSim {
   events: string[];
   readonly hungUp: boolean;
   readonly closeCodes: Array<number | undefined>;
+  /** The function_call_output items the adapter sent, in order (native conversation). */
+  toolOutputs: Array<{ call_id: string; output: string }>;
   /** Whether a reply is playing right now. */
   playing(): boolean;
   /** The phone layer starts the call. */
@@ -61,7 +68,8 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
   const refused: string[] = []; const items = new Set<string>();
   let hungUp = false; let interruptible = true; let n = 0; let item = 0;
   let chain: Promise<void> = Promise.resolve();
-  interface Play { rid: string; mid: string; text: string; behaviour: Behaviour; startedAt: number; timer: ReturnType<typeof setTimeout> }
+  interface Play { rid: string; mid: string; text: string; behaviour: Behaviour; startedAt: number; timer: ReturnType<typeof setTimeout>; nativeReply?: boolean }
+  const toolOutputs: Array<{ call_id: string; output: string }> = []; let sessionTools: string[] = []; let round = 0; let nativeMid = '';
   let play: Play | undefined;
 
   const deliver = (m: unknown): void => { chain = chain.then(() => new Promise<void>((r) => setTimeout(r, 0))).then(() => { link.onMessage(m); }); };
@@ -94,23 +102,34 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
       const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return; }
       const td = m.session?.audio?.input?.turn_detection;
       if (td && typeof td.interrupt_response === 'boolean') interruptible = td.interrupt_response;
+      if (Array.isArray(m.session?.tools)) sessionTools = m.session.tools.map((t: any) => String(t.name));
     } else if (m?.type === 'response.create') {
       const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return; }
       const instructions = String(m.response?.instructions ?? '');
-      const text = wordsOf(instructions);
+      const isNative = o.native !== undefined && !instructions.includes(SAY_PREFIX);
+      const mid0 = String(m.response?.metadata?.id);
+      if (isNative && mid0 !== nativeMid) { nativeMid = mid0; round = 0; } else if (isNative) round++;
+      const plan = isNative ? o.native!({ instructions, n: n + 1, round, outputs: toolOutputs.map((x) => x.output), sessionTools }) : undefined;
+      const text = isNative ? (plan?.say ?? '') : wordsOf(instructions);
       n++;
       const rid = `resp_${n}`;
-      const behaviour = o.behave?.(text, n) ?? 'exact';
+      const behaviour = isNative ? 'exact' : (o.behave?.(text, n) ?? 'exact');
       const p: Play = { rid, mid: String(m.response?.metadata?.id), text, behaviour, startedAt: Date.now(), timer: setTimeout(() => { /* replaced below */ }, 0) };
       clearTimeout(p.timer);
       p.timer = setTimeout(() => { if (behaviour !== 'hang') finish(p); }, Math.max(1, text.length * msPerChar)); p.timer.unref?.();   // a long reply must not keep the test process alive
       play = p;
+      if (isNative) p.nativeReply = true;
       deliver({ type: 'response.created', response: { id: rid, metadata: { id: p.mid } } });
+      if (isNative && text.length > 0) deliver({ type: 'response.output_audio_transcript.delta', response_id: rid, delta: text.slice(0, Math.ceil(text.length / 2)) });
+      if (isNative) (plan?.calls ?? []).forEach((c, i) => deliver({ type: 'response.function_call_arguments.done', response_id: rid, call_id: `call_${n}_${i}`, name: c.name, arguments: c.rawArgs ?? JSON.stringify(c.args ?? {}) }));
     } else if (m?.type === 'response.cancel') {
       // A reply requested out of band is not in the default conversation: only a cancel that names it reaches it.
       if (typeof m.response_id !== 'string') { refused.push('response.cancel without response_id'); return; }
       if (play === undefined || play.rid !== m.response_id) { refuse(m, 'response.cancel of a reply that is not playing', 'response_cancel_not_active'); return; }
       cancel();
+    } else if (m?.type === 'conversation.item.create') {
+      const why = refusalFor(m); if (why !== undefined) { refuse(m, why, 'invalid_request_error'); return; }
+      if (m.item?.type === 'function_call_output') toolOutputs.push({ call_id: m.item.call_id, output: m.item.output });
     } else if (m?.type === 'conversation.item.delete') {
       if (typeof m.item_id !== 'string' || !items.has(m.item_id)) { refuse(m, 'conversation.item.delete of an item that does not exist', 'item_not_found'); return; }
       items.delete(m.item_id);
@@ -131,7 +150,7 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
     onClose: () => {},
   };
   const sim: RealtimeSim = {
-    link, sent, refused, spoken, events, closeCodes,
+    link, sent, refused, spoken, events, closeCodes, toolOutputs,
     get hungUp() { return hungUp; },
     playing: () => play !== undefined,
     start(c) { deliver({ type: 'carrier.start', to: c.to, callSid: c.callSid }); },

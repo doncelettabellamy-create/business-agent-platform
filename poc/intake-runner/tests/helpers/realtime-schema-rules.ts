@@ -19,6 +19,16 @@ export function refusalFor(m: any): string | undefined {
       if ('keywords' in t && !(Array.isArray(t.keywords) && t.keywords.length > 0 && t.keywords.every((k: unknown) => typeof k === 'string' && k.length > 0 && !/[<>\r\n]/.test(k)))) return 'transcription.keywords must be single-line hints without angle brackets';
     }
   }
+  if (m?.type === 'session.update' && m.session?.tools !== undefined) {
+    const tl = m.session.tools;
+    if (!Array.isArray(tl) || tl.length < 1 || !tl.every((t: any) => t?.type === 'function' && typeof t.name === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(t.name) && typeof t.description === 'string' && typeof t.parameters === 'object' && t.parameters !== null)) return 'session.tools must be function tools with a name, a description and parameters';
+    if (m.session.tool_choice !== undefined && !['auto', 'none', 'required'].includes(m.session.tool_choice)) return 'session.tool_choice is not one of the documented values';
+  }
+  if (m?.type === 'response.create' && m.response?.tool_choice !== undefined && !['auto', 'none', 'required'].includes(m.response.tool_choice)) return 'response.tool_choice is not one of the documented values';
+  if (m?.type === 'conversation.item.create') {
+    const it = m.item;
+    if (it?.type === 'function_call_output' && (typeof it.call_id !== 'string' || it.call_id.length === 0 || typeof it.output !== 'string')) return 'a function_call_output needs a call_id and a string output';
+  }
   if (m?.type === 'response.create' && m.response?.reasoning !== undefined && !EFFORTS.includes(m.response.reasoning?.effort)) return 'response.reasoning.effort is not one of the documented values';
   return undefined;
 }

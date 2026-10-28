@@ -59,6 +59,9 @@ export const INCOMPLETE = 'incomplete_call';
 const CONTACT_OF_LABEL: Readonly<Record<string, ContactField>> = Object.freeze({ [CONTACT_FIELDS.name]: 'name', [CONTACT_FIELDS.phone]: 'phone', [CONTACT_FIELDS.address]: 'address' });
 /** Consecutive caller turns on which the dialogue model failed outright (after one retry each) before the call is ended with the apology. */
 const MAX_MODEL_FAILURES = 3;
+/** Native conversation: the most tool calls one call may make, and the number of refused calls (unknown tool, bad arguments) after which the call ends with the apology. */
+const MAX_TOOL_CALLS = 60;
+const MAX_TOOL_REFUSALS = 5;
 
 export const SAY = Object.freeze({
   declined: 'No problem. This test line will not continue. Goodbye.',
@@ -228,6 +231,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let lastAsk: { field: string; prevAt: number | undefined; counted: boolean } | undefined;
     const askCount = new Map<string, number>();
     let modelFailures = 0;
+    let toolCalls = 0; let toolRefused = 0;   // native conversation: tool calls the voice made, and how many were refused
     let partialCredits = 0;
     let correcting = false;
     let incompleteCall = false;
@@ -409,6 +413,24 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     }
 
     /** One try at a reply: streams the model's words to the phone as they come. Returns what happened, in counts. `limitMs` bounds the wait for the FIRST word only. */
+    /**
+     * One native reply: the voice says it in its own words and may call tools meanwhile (each call is answered by onTool). The result is shaped like an ordinary try so the rest of speak() (retry once, the
+     * server's fixed words if the voice says nothing, an interruption) is the same. The voice's words are held here only long enough to count them: they are never logged, and only a fixed marker is kept.
+     */
+    async function attemptNative(directive: Directive, status?: CallStatus): Promise<Attempt> {
+      const controller = new AbortController();
+      streaming = controller;   // a caller who talks over the reply is handled by the same interrupt path as a streamed one
+      const a: Attempt = { said: '', chars: 0, parts: 0, failed: 0, threw: false, timedOut: false, stalled: false, aborted: false, began: deps.now(), firstTokenAt: undefined };
+      try {
+        const r = await (carrier.converse as NonNullable<CallTransport['converse']>)({ directive, ...(status === undefined ? {} : { status }) });
+        a.said = r.said; a.chars = r.said.length; a.parts = r.said.length > 0 ? 1 : 0; a.firstTokenAt = deps.now();
+        if (r.interrupted) { a.aborted = true; interruptedText = r.spoken; }
+        else if (r.failed || !r.played) { if (a.chars === 0) a.timedOut = true; else a.stalled = true; }
+      } catch { a.threw = true; }
+      finally { streaming = undefined; lastReplyEndAt = deps.now(); }
+      if (controller.signal.aborted) a.aborted = true;
+      return a;
+    }
     async function attemptReply(directive: Directive, limitMs?: number, status?: CallStatus): Promise<Attempt> {
       const s = session as CallSession;
       const controller = new AbortController();
@@ -455,6 +477,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
      */
     async function speak(directive: Directive, status?: CallStatus): Promise<boolean> {
       const s = session as CallSession;
+      // Native conversation: the carrier's voice converses in its own words for this directive (it has `converse`); otherwise the text model words it and the carrier speaks those words.
+      const nativeMode = carrier.converse !== undefined;
+      const run = (limitMs: number): Promise<Attempt> => (nativeMode ? attemptNative(directive, status) : attemptReply(directive, limitMs, status));
       const began = deps.now();
       // What happened to a try, in numbers: how much was produced, how soon, whether any write was refused. Plus, for an empty try, how the model's stream ended (fixed word and numbers).
       const detailOf = (a: Attempt, extra: Record<string, number | string> = {}): Record<string, number | string> => {
@@ -470,7 +495,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         return l === undefined || l === null ? {} : { stop: /^[A-Z_]{1,20}$/.test(String(l.stop)) ? String(l.stop) : 'OTHER', output_tokens: typeof l.output_tokens === 'number' ? l.output_tokens : -1, other_blocks: Number.isInteger(l.other_blocks) ? l.other_blocks : 0 };
       };
       // A refusal is the model's own stop reason on a stream with no words (never inferred from text): retrying the same request is pointless, so it goes straight to the fixed wording.
-      const refused = (x: Attempt): boolean => !x.threw && !x.timedOut && !x.stalled && !x.aborted && modelEnd().stop === 'REFUSAL';
+      const refused = (x: Attempt): boolean => !nativeMode && !x.threw && !x.timedOut && !x.stalled && !x.aborted && modelEnd().stop === 'REFUSAL';
       // The model's own error, as fixed words and a status number (never its message).
       const failure = (a: Attempt): Record<string, number | string> => {
         const errs = deps.dialogue.stats?.errors;
@@ -478,18 +503,18 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const name = l === undefined || l === null ? '' : String(l.name ?? '').replace(/[^A-Za-z]+/g, '_').toUpperCase().slice(0, 30);
         return { chars: a.chars, parts: a.parts, failed_sends: a.failed, ...(/^[A-Z_]+$/.test(name) ? { error: name } : {}), ...(l !== undefined && l !== null && typeof l.status === 'number' ? { status: l.status } : {}) };
       };
-      let a = await attemptReply(directive, replyFirstWordMs, status);
+      let a = await run(replyFirstWordMs);
       let tries = 1;
       if (a.threw && a.chars === 0 && !a.aborted && !done) {
         // A transient model error: nothing was said, so one more try is safe.
         deps.log('DIALOGUE_FAILED', failure(a));
         deps.log('REPLY_RETRY');
-        a = await attemptReply(directive, replyRetryMs, status);
+        a = await run(replyRetryMs);
         tries = 2;
       } else if (!a.threw && (!a.aborted || a.timedOut) && !done && a.chars === 0 && !refused(a)) {
         deps.log('REPLY_EMPTY', detailOf(a, { attempt: 1, timed_out: a.timedOut ? 1 : 0, ...modelEnd() }));
         deps.log('REPLY_RETRY');
-        a = await attemptReply(directive, replyRetryMs, status);
+        a = await run(replyRetryMs);
         tries = 2;
       }
       replies++;
@@ -534,7 +559,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         s.said(text); lastReply = text;
         return true;
       }
-      s.said(a.said);
+      if (nativeMode) s.saidMasked(a.said); else s.said(a.said);
       if (a.aborted) { s.interrupted(interruptedText); interruptedText = ''; return false; }
       lastReply = a.said;
       return a.chars > 0 && a.failed === 0;
@@ -724,6 +749,25 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       return speak({ kind: 'listen' }, statusOf(s, got));
     }
 
+    /**
+     * A tool the voice asked for (native conversation). EVERY call is validated by the session (call-state.ts): an unknown tool, bad arguments, a call before consent or after the end, or too many calls
+     * is refused with a fixed code. The answer to the voice holds labels and an outcome word only, never what the caller gave. A run of refused calls ends the call (safe recovery); the count is bounded.
+     */
+    function onTool(ev: { callId: string; name: string; args: unknown }): void {
+      toolCalls++;
+      const s = session;
+      const r: ReturnType<CallSession['tool']> = s === undefined || done ? { ok: false, code: 'NOT_ACTIVE' } : toolCalls > MAX_TOOL_CALLS ? { ok: false, code: 'TOO_MANY' } : s.tool(ev.name, ev.args);
+      if (!r.ok) toolRefused++;
+      deps.log('TOOL', { ok: r.ok ? 1 : 0, calls: toolCalls, refused: toolRefused });
+      const out = r.ok ? { ok: true, outcome: r.outcome, captured: r.captured, missing: r.missing } : { ok: false, code: r.code };
+      if (carrier.toolResult?.(ev.callId, JSON.stringify(out)) !== true) deps.log('TOOL_ANSWER_NOT_SENT');
+      if (toolRefused >= MAX_TOOL_REFUSALS && !done) {
+        deps.log('TOOLS_REFUSED_TOO_OFTEN', { refused: toolRefused });
+        chain = chain.then(async () => { if (!done) await farewell(SAY.trouble, true); }).catch(() => deps.log('HANDLER_ERROR'));
+        void track(chain);
+      }
+    }
+
     /** What the server holds and still needs, as field names only (never a value), for the voice: captured contact items and found Intake fields, and what is still missing. */
     function statusOf(s: CallSession, got: { fresh: Fresh; preview: Preview } | undefined): CallStatus | undefined {
       const contact = deps.contacts === undefined ? { captured: [] as string[], missing: [] as string[] } : s.contactStatus();
@@ -778,6 +822,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       }
       if (ev.kind === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup({ to: ev.to, callSid: ev.callSid })).catch(() => deps.log('HANDLER_ERROR')); } return; }
       if (!setupSeen) { if (++bad > 5) carrier.close(1008); return; }
+      if (ev.kind === 'tool') { onTool(ev); return; }
       if (ev.kind === 'reply_failed') {
         // A question the caller did not hear is not delivered: nothing may treat their next plain yes or no as its answer.
         failedSends++; deps.log('REPLY_NOT_PLAYED');

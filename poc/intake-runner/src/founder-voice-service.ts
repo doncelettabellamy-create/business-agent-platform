@@ -20,6 +20,7 @@ import type { RelayHandler } from './relay-handler.ts';
 import { consentNoticeFor } from './opening.ts';
 import { createPersona } from './persona.ts';
 import { startRealtimeCall } from './realtime-bridge.ts';
+import { CONTACT_TOOL_DEFINITIONS } from './call-state.ts';
 import type { VoiceSocket } from './realtime-bridge.ts';
 import type { FounderCallConfig } from './founder-call-gate.ts';
 import { effectiveVoiceSettings } from './founder-voice-gate.ts';
@@ -97,6 +98,8 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
       startRealtimeCall(conn, deps.openVoice(d as never), (t) => handler.serve(t), {
         notice, transcriptionModel: voice.transcription_model, voice: voice.voice, persona, reasoningEffort: settings.realtimeReasoning, diag: d,
         ...(settings.transcription === undefined ? {} : { transcription: settings.transcription }),
+        // Native conversation (voice config `conversation: "native"`): the voice converses in its own words and may call the server's contact tools, and only those.
+        ...(settings.conversation === 'native' ? { native: { tools: CONTACT_TOOL_DEFINITIONS.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters as Record<string, unknown> })) } } : {}),
       }, { maxCallMs: config.max_minutes * 60_000 + 30_000, diag: d });
     },
   };
