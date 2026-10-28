@@ -354,6 +354,22 @@ test('command line: a spend is refused without a limit, with a limit below the c
   }
 });
 
+test('command line: the free diagnosis is offered in plan mode, needs an interactive terminal and the key, cannot be combined with a spend, and never prints a key', () => {
+  const f = files();
+  const plan = run(['--voice-config', f.vp]);
+  assert.ok(plan.stdout.includes('--diagnose') && plan.stdout.includes('no speech and no text request'));
+  const env = { OPENAI_API_KEY: FAKE_KEY };
+  const piped = run(['--voice-config', f.vp, '--diagnose'], env);
+  assert.equal(piped.status, 78);
+  assert.ok(/diagnose refused: this needs an interactive terminal/.test(piped.stderr));
+  const fromEnv = run(['--voice-config', f.vp, '--diagnose', '--key-from-env'], env);
+  assert.equal(fromEnv.status, 78, 'even with the key in the environment a terminal is required');
+  for (const r of [plan, piped, fromEnv]) assert.ok(!r.stdout.includes(FAKE_KEY) && !r.stderr.includes(FAKE_KEY));
+  const both = run(['--voice-config', f.vp, '--spend', '--diagnose', '--max-usd', '0.20'], env);
+  assert.equal(both.status, 64);
+  assert.ok(/not both/.test(both.stderr));
+});
+
 test('command line: bad arguments, unreadable files, invalid configs and models with no price stop with their own codes and echo nothing', () => {
   const f = files();
   assert.equal(run(['--voice-config', f.vp, '--bogus']).status, 64);

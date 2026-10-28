@@ -27,6 +27,7 @@ import type { Opening } from './opening.ts';
 import { createPersona } from './persona.ts';
 import type { TransportEvent } from './call-transport.ts';
 import type { RelayConnection } from './ws-server.ts';
+import type { Diagnosis } from './realtime-probe.ts';
 
 export const CHECK_PRICES_AS_OF = '2026-10-27';
 /** USD per million tokens, from OpenAI's pricing page on the date above. Verify before relying on it. */
@@ -93,6 +94,8 @@ export interface CheckReport {
   ceilingUsd: number;
   withinCeiling: boolean;
   counts: { speechRequests: number; textRequests: number; blockedSends: number; audioFrames: number; audioMs: number };
+  /** Present only when the Realtime connection or notice failed and a diagnosis was available: HTTP statuses and fixed codes only (realtime-probe.ts). */
+  diagnosis?: Diagnosis;
 }
 export interface CheckDeps {
   plan: CheckPlan;
@@ -103,6 +106,8 @@ export interface CheckDeps {
   now(): number;
   /** Test hook: a shorter wall-clock limit than the plan's. */
   maxMs?: number;
+  /** Asked only when the Realtime part fails, to say why (free requests; see realtime-probe.ts). Its answer holds statuses and fixed codes only. */
+  diagnose?: () => Promise<Diagnosis>;
 }
 
 const clean = (s: unknown, re: RegExp): string => (typeof s === 'string' && re.test(s) ? s : 'other');
@@ -256,8 +261,11 @@ export async function runCheck(d: CheckDeps): Promise<CheckReport> {
   let realtimeUsd = 0;
   for (const r of obs.done.values()) realtimeUsd += (r.input * rtPrice.textIn + r.audio * rtPrice.audioOut + r.text * rtPrice.textOut) / 1e6;
   const estimatedUsd = Math.round((realtimeUsd + textUsd) * 1e6) / 1e6;
+  let diagnosis: Diagnosis | undefined;
+  if (!noticeOk && d.diagnose !== undefined) { try { diagnosis = await d.diagnose(); } catch { diagnosis = undefined; } }
   return {
     checks, allPassed: checks.every((c) => c.ok), elapsedMs: d.now() - started, estimatedUsd, ceilingUsd: d.plan.ceilingUsd, withinCeiling: estimatedUsd <= d.plan.ceilingUsd,
     counts: { speechRequests, textRequests, blockedSends: blocked, audioFrames: media.frames, audioMs },
+    ...(diagnosis === undefined ? {} : { diagnosis }),
   };
 }
