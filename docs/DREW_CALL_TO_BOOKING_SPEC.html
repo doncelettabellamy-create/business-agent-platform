@@ -86,7 +86,7 @@ svg { width:100%; height:auto; max-width:1000px; } svg text { fill:var(--fg); fo
 <p>Which field is asked next is chosen by code (<span class="tag built">BUILT</span> <code>next-field.ts</code>): ask the missing item asked least recently, never-asked first, ties in the order below. The voice never chooses. Wording is the model's own short question unless marked fixed; the exact spoken wording of past calls is not recorded (<em>unavailable</em>). Fixed wording below is quoted from the code.</p>
 <div class="wrap"><table>
 <tr><th>#</th><th>Item (field)</th><th>Asked when</th><th>Choices offered</th><th>Skip rule</th><th>Retry rule</th></tr>
-<tr><td>1</td><td>What the caller needs (service category)</td><td>First, after consent. Recognised from the caller's own words.</td><td>Category names only if not recognised: Standard cleaning, Deep cleaning, Move-in or move-out cleaning</td><td>Skipped when the opening statement already names the service.</td><td>Clarify each turn until recognised (first with names, then open). <em>The configuration still carries a Commercial category, which the call logic now treats as <strong>declined</strong> (<span class="tag built">BUILT</span>, roadmap section 5a-4): it is never offered, a request that lands in it is asked "Drew Cleaning cleans houses, apartments, condos and townhouses. We don’t offer commercial cleaning. Is your request for a residential property?", a residential answer carries on, and a commercial or unresolved answer ends the call unconfirmed, never read back, priced, booked or handed on.</em></td></tr>
+<tr><td>1</td><td>What the caller needs (service category)</td><td>First, after consent. Recognised from the caller's own words.</td><td>Category names only if not recognised: Standard cleaning, Deep cleaning, Move-in or move-out cleaning</td><td>Skipped when the opening statement already names the service.</td><td>Clarify each turn until recognised (first with names, then open). <em>The configuration still carries a Commercial category, which the call logic now treats as <strong>declined</strong> (<span class="tag built">BUILT</span>, roadmap section 5a-4; the decline wording is <strong>approved by the founder, 2026-10-27</strong>): it is never offered, a request that lands in it is asked "Drew Cleaning cleans houses, apartments, condos and townhouses. We don’t offer commercial cleaning. Is your request for a residential property?", a residential answer carries on, and a commercial or unresolved answer ends the call unconfirmed, never read back, priced, booked or handed on.</em></td></tr>
 <tr><td>2</td><td>Property type</td><td>All residential categories</td><td>house, apartment, condo, townhouse (or the caller's own words)</td><td>Skipped when already given.</td><td>See section 5.</td></tr>
 <tr><td>3</td><td>Number of bedrooms</td><td>All</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
 <tr><td>4</td><td>Number of bathrooms</td><td>All</td><td>none</td><td>Skipped when given.</td><td>Section 5.</td></tr>
@@ -305,6 +305,66 @@ svg { width:100%; height:auto; max-width:1000px; } svg text { fill:var(--fg); fo
 <li>Native Realtime conversation with controlled tools (section 10, decided direction), designed with the step 1 fixes built in, before any LIVE work.</li>
 </ol>
 <p class="mut">Approving this document does not authorise any of these. Each is proposed to the founder separately (roadmap section 1b).</p>
+<h2>14. GPT-Live voice connection: comparison and smallest step (documentation only, 2026-10-27)</h2>
+<div class="box"><strong>Founder decision recorded:</strong> the residential decline wording is approved as written: <span class="say">Thank you. Drew Cleaning only cleans residential properties, so I can't help with this request. Goodbye.</span></div>
+<p>Compared: our current connection (Twilio Media Streams &rarr; our bridge &rarr; OpenAI <em>Realtime</em> API, <code>gpt-realtime-2.1</code>) and OpenAI's <em>GPT-Live</em> (<code>gpt-live-1</code>) as Twilio documents it (a Media Streams tutorial, and Twilio Agent Connect's <code>GPTLiveProvider</code>). Read from the vendors' pages on 2026-10-27; <strong>nothing was tried</strong>, and the pages leave gaps (marked below).</p>
+<h3>14.1 What differs</h3>
+<div class="wrap"><table>
+<tr><th>Topic</th><th>Our connection now (Realtime)</th><th>GPT-Live</th></tr>
+<tr><td>Listening and speaking</td><td>Turn-based: server VAD marks the end of a caller turn, <em>our server</em> sends each <code>response.create</code>; automatic replies are off.</td><td>Full duplex: it listens and speaks at the same time; no turn detector in the audio path. Nothing equals "create a reply now".</td></tr>
+<tr><td>Endpoint and start</td><td><code>wss://api.openai.com/v1/realtime?model=…</code>, then <code>session.update</code>.</td><td><code>wss://api.openai.com/v1/live/sessions</code>, then one strict <code>session.start</code> (<code>model</code>, <code>instructions</code>, <code>audio.format</code>, <code>audio.output.voice</code>, <code>delegation</code>, optional <code>input</code>, <code>store</code>); unknown fields are rejected. Wait for <code>session.started</code>.</td></tr>
+<tr><td>Audio</td><td><code>input_audio_buffer.append</code>; <code>response.output_audio.delta</code>; mu-law 8 kHz.</td><td><code>session.input_audio.append</code>; <code>session.output_audio.delta</code>; the tutorial uses <code>{ type: 'audio/pcmu', rate: 8000 }</code> both ways. No timing fields and no "audio done" event.</td></tr>
+<tr><td>Transcripts</td><td>One <code>transcription.completed</code> per caller turn; one transcript per reply.</td><td>Only deltas: <code>session.input_transcript.delta</code> and <code>session.output_transcript.delta</code> (<code>delta</code>, <code>start_ms</code>, <code>end_ms</code>). Turn and reply boundaries are not announced.</td></tr>
+<tr><td>Interruption</td><td><code>speech_started</code> + our cancel + the bridge's Twilio <code>clear</code>, with played-time from Twilio marks.</td><td>Handled inside the model. The app must still clear locally queued audio (OpenAI's server-controls guide); no barge-in event is documented. The tutorial shows no <code>clear</code>.</td></tr>
+<tr><td>Exact words</td><td>"Say exactly …" per reply, checked against the transcript; a mismatch is a failed reply (fail closed).</td><td><code>session.instructions.append</code> steers speech (can interrupt speech in progress); <code>session.commentary.append</code> is paraphrased. <strong>Verbatim speech is not guaranteed</strong>; OpenAI suggests buffering audio and checking the transcript before release.</td></tr>
+<tr><td>Tools</td><td>Function tools on the session; <code>function_call_arguments.done</code>; <code>function_call_output</code>.</td><td>Only through <em>delegation</em>: <code>responses</code> (a backend model such as <code>gpt-6-luna</code> calls tools declared in <code>delegation.responses.tools</code>; the call arrives wrapped in <code>response.event</code>; answer with <code>response.item.create</code> <code>function_call_output</code>, then <code>response.create</code>) or <code>client</code> (our app does the work and feeds back with append events).</td></tr>
+<tr><td>Steering text</td><td>Per-reply brief with the NEXT and STATUS lines.</td><td>Session instructions up to 16,384 tokens; each append up to 500 tokens (so NEXT and STATUS fit).</td></tr>
+<tr><td>Ending</td><td>Our hang-up closes the Twilio stream.</td><td><code>session.close</code> then wait for <code>session.closed</code>; the app ends the phone call itself.</td></tr>
+<tr><td>Moderation, retention</td><td>As before.</td><td>No built-in moderation (the app checks transcripts). <code>store</code> defaults to false; recordings are kept 30 days when stored.</td></tr>
+<tr><td>Compatibility</td><td>&mdash;</td><td>OpenAI: an existing Realtime integration "is not automatically compatible" with GPT-Live.</td></tr>
+</table></div>
+<h3>14.2 What can be reused, and what must change</h3>
+<div class="wrap"><table>
+<tr><th>Reuse unchanged</th><th>Must change</th></tr>
+<tr><td>
+<ul>
+<li><strong>Twilio side:</strong> TwiML <code>&lt;Connect&gt;&lt;Stream&gt;</code>, the secret path and signature check, Media Streams parsing, mu-law 8 kHz pass-through, the bridge's frame limits, marks and played-time tracking.</li>
+<li><strong>Everything above the transport:</strong> consent handling, masker, Intake, the current-call state and its validators, the five contact tools, residential routing, limits, records, the encrypted vault, the dashboard and its allow-list, the hand-off seam, fixed-code diagnostics. Intake &rarr; Processing &rarr; QC &rarr; Reporting is untouched.</li>
+<li><strong>Persona and rules text</strong> as session instructions; the NEXT and STATUS lines as appends.</li>
+<li><strong>The contact tool definitions</strong> as delegation tools (schema form differs slightly); the same server-side <code>session.tool()</code> validation answers them.</li>
+<li><strong>OpenAI auth</strong> (bearer key via the existing voice socket) and the text model already approved (<code>gpt-6-luna</code>) as the delegation model.</li>
+</ul></td><td>
+<ul>
+<li><strong>Wire dialect:</strong> endpoint, handshake, <code>session.start</code>, every event name in both directions, the strict schema.</li>
+<li><strong>Turn model:</strong> the server can no longer start each reply or see each turn end. Turn ends must be <em>inferred</em> (silence after the last input-transcript delta) and reply ends inferred (output pauses plus the phone's played marks). One-Intake-run-per-turn survives only through this inference.</li>
+<li><strong>Who decides when to speak:</strong> steering by appended instructions, not by a per-reply request; the voice may speak before an append lands.</li>
+<li><strong>Verbatim lines:</strong> the consent notice, read-backs, the address question and goodbyes cannot rely on exact speech (decision D1).</li>
+<li><strong>Consent:</strong> the notice must be word for word; collecting it on Twilio before the stream closes the consent-before-audio gap too (decision D1).</li>
+<li><strong>Tools:</strong> declared and answered through delegation, with an extra model hop and tool rounds.</li>
+<li><strong>Close and moderation:</strong> <code>session.close</code> handshake; app-side transcript checks.</li>
+</ul></td></tr>
+</table></div>
+<h3>14.3 Not recommended: adopting Twilio Agent Connect as the platform</h3>
+<p>Agent Connect's <code>GPTLiveProvider</code> takes over audio streaming, turn-taking and interruption handling. That is what we would have to keep control of (consent, masking, the vault, the four-agent boundaries), it needs package installs (not approved), and its source was not read. It is useful as a reference implementation only.</p>
+<h3>14.4 The smallest implementation step (offline; no key, no live change, no Twilio change)</h3>
+<ol>
+<li><strong>A GPT-Live dialect adapter at the existing link seam</strong> (one new file, pure translation): it speaks GPT-Live to the voice socket and the <em>existing</em> link vocabulary to <code>realtime-transport.ts</code>, so the transport, call logic, current-call state, tools, vault and dashboard do not change. It sends one strict <code>session.start</code>; turns caller transcript deltas into one utterance after a silence threshold; turns output audio and transcript into reply start and end; maps tool calls from delegation to the existing validated tool path and answers with <code>function_call_output</code> then <code>response.create</code>; maps barge-in to the existing clear; closes with <code>session.close</code>.</li>
+<li><strong>An offline GPT-Live stand-in and tests</strong> (like the Realtime one): strict-schema refusals, endpointing, interruption, verbatim-check fail closed, tool round trip with invalid tools, close handshake, privacy (raw values nowhere), and the same current-call-memory scenarios (repeated address, correction, split number, bounded clarification).</li>
+<li><strong>A voice-config setting</strong> <code>engine</code> (<code>realtime</code> by default, <code>gpt-live</code>), validated by the gate; unset changes nothing, and setting it changes the voice digest.</li>
+</ol>
+<p>Not in that step: any live trial, any Twilio or TwiML change, any change to the call logic, the vault or the dashboard.</p>
+<h3>14.5 Decisions needed before that step</h3>
+<ul>
+<li><strong>D1 Verbatim lines and consent.</strong> Recommended: collect the consent notice and yes/no on Twilio (<code>&lt;Say&gt;</code> and <code>&lt;Gather&gt;</code>) before the stream opens, and speak read-backs through Twilio the same way (reconnecting GPT-Live with the masked history seeded in <code>input</code>), so exact words stay exact. Alternative: let GPT-Live speak them and fail closed on any mismatch (calls may fail often).</li>
+<li><strong>D2 Who controls turns.</strong> Recommended: the server steers by appended NEXT and STATUS lines and the voice converses between them; accepted risk: it may speak before an append lands.</li>
+<li><strong>D3 Access and cost.</strong> Whether the key has access to <code>gpt-live-1</code> and the delegation model, and the price per minute, are unknown (the pages I read give no pricing). A free access check like the existing connection check would answer the first.</li>
+</ul>
+<h3>14.6 Sources and gaps</h3>
+<ul>
+<li>Twilio, <a href="https://www.twilio.com/en-us/blog/developers/tutorials/integrations/voice-ai-assistant-openai-gpt-live-1-node">Build an AI Voice Assistant with Twilio Voice and Media Streams, OpenAI's GPT-Live API, and Node.js</a>; Twilio, <a href="https://www.twilio.com/en-us/blog/developers/twilio-openai-gpt-live-1-api-resources">GPT-Live-1 resources (Twilio Agent Connect)</a>.</li>
+<li>OpenAI, <a href="https://developers.openai.com/api/docs/guides/live-conversations">Managing GPT-Live sessions</a>; <a href="https://developers.openai.com/api/docs/guides/live-delegation">Delegation and tools in GPT-Live</a>; <a href="https://developers.openai.com/api/docs/guides/voice-server-controls">Server-side controls</a>; <a href="https://developers.openai.com/api/docs/guides/live-partner-integrations">GPT-Live partner integrations</a>.</li>
+<li><strong>Gaps:</strong> turn-detection settings, input-transcription settings and session duration limits are not documented on the pages read; no barge-in or clear event is documented; the Twilio package versions, the Agent Connect source, OpenAI's Connections, audio-format and Telephony guides, and pricing were not read. The tutorial's code was summarised by a fetch tool, not run. Treat every event name above as unverified until a free access check and an offline-to-live comparison.</li>
+</ul>
 </main>
 </body>
 </html>
