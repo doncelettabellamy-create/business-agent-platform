@@ -440,4 +440,6 @@ This is a proposed order, not a plan the founder has approved. "S-nn" are sequen
 | S-40 | UI-02, UI-03 (CRUD screens, internal admin console) | S-27 | D-10 |
 | S-41 | FND-11 (API keys for customer integrations) | S-11 | none |
 
+(Change-log note, 2026-10-28, documentation only: the founder's approved requirements beyond Intake are recorded as `DRF-01` to `DRF-05` in `docs/ROADMAP_BACKLOG.md`; they overlap `PRC-04`, `FND-11`, `FND-27`, `FND-28`, `FND-29`, `QC-01`, `QC-02` and `RPT-01` to `RPT-04` and are cross-referenced there, not duplicated here. None is started or authorized.)
+
 Rows not placed in the sequence: INT-11 and UI-05 (REJECT), and FND-27 to FND-30 (added 2026-10-25; their position in the sequence is not yet proposed, and the steps above do not yet include them).
