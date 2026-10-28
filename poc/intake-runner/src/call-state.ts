@@ -23,11 +23,26 @@ export const CONTACT_FIELD_KEYS: readonly ContactField[] = Object.freeze(['name'
 export const MAX_CLARIFICATIONS = 2;
 
 export type CollectOutcome = 'captured' | 'partial' | 'unclear';
+/**
+ * Why a capture turned out as it did: a FIXED code, safe to log (it names a rule, never a value).
+ *   CAPTURED          the item was taken.            PIECE            a phone piece was joined to the digits held so far.
+ *   RESTART           the pieces could not make a phone number (a repeated prefix, a stray digit word): the held digits were dropped and this piece started over.
+ *   CORRECTED_LAST4   "the last four are ...": the final four digits of the number held were replaced.
+ *   NO_DIGITS         the line held no digit words.   TOO_MANY         more than fifteen digits: start over.
+ *   NOT_A_NAME        not a usable name.              NO_STREET_NUMBER an address line without a street number.   NOT_AN_ADDRESS  not a usable address.
+ *   INACTIVE          the call state was already closed.
+ */
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
   /** Raw pieces the masker must also learn (so they are masked in this and later lines). Never logged, never sent to a model. */
   readonly learn: readonly string[];
+  /** A fixed reason code (never a value). */
+  readonly reason?: CollectReason;
+  /** Phone only: how many digits this line held, and how many are held after it (a count, never the digits). */
+  readonly digits?: number;
+  readonly total?: number;
 }
 export interface ContactStatus { readonly captured: readonly string[]; readonly missing: readonly string[] }
 
@@ -96,6 +111,8 @@ export interface ContactState {
   parts(): { name?: string; phone?: string; address?: string };
   /** Pieces of a phone number heard so far, when there are not yet enough digits. */
   pendingPhone(): boolean;
+  /** How many digits of a number heard in pieces are held (a count only; zero once a number is held). */
+  pendingDigits(): number;
   status(): ContactStatus;
   dispose(): void;
 }
@@ -105,40 +122,64 @@ export function createContactState(): ContactState {
   let pending = '';   // digits of a phone number heard in pieces
   let disposed = false;
 
+  /** Digits joined from pieces make a number only at the usual length: ten, or eleven with a leading 1. (A whole line of 10 to 15 digits is still taken as said.) */
+  const PIECED_NUMBER = /^(?:\d{10}|1\d{10})$/;
+  const held = (): number => (values.phone !== undefined ? values.phone.length : pending.length);
+
   function setPhone(raw: string, replace: boolean): CollectResult {
     const learn = digitRuns(raw);
     const whole = phoneDigits(raw);
-    if (whole !== undefined) { values.phone = whole; pending = ''; return { field: 'phone', outcome: 'captured', learn }; }
+    if (whole !== undefined) { values.phone = whole; pending = ''; return { field: 'phone', outcome: 'captured', learn, reason: 'CAPTURED', digits: whole.length, total: whole.length }; }
     const piece = digitsOf(raw);
-    if (piece === undefined || piece.length === 0) return { field: 'phone', outcome: 'unclear', learn: [] };
-    const joined = (replace ? '' : pending) + piece;
-    if (/^\d{10,15}$/.test(joined)) { values.phone = joined; pending = ''; return { field: 'phone', outcome: 'captured', learn }; }
-    if (joined.length > 15) { pending = ''; return { field: 'phone', outcome: 'unclear', learn }; }
+    if (piece === undefined || piece.length === 0) return { field: 'phone', outcome: 'unclear', learn: [], reason: 'NO_DIGITS', digits: 0, total: held() };
+    const before = replace ? '' : pending;
+    const joined = before + piece;
+    if (PIECED_NUMBER.test(joined)) { values.phone = joined; pending = ''; return { field: 'phone', outcome: 'captured', learn, reason: 'CAPTURED', digits: piece.length, total: joined.length }; }
+    if (joined.length > 15) { pending = ''; return { field: 'phone', outcome: 'unclear', learn, reason: 'TOO_MANY', digits: piece.length, total: 0 }; }
+    if (before.length > 0 && joined.length >= 11) {
+      // REPRODUCED DEFECT (the repeated prefix): "two one two five five five" then "five five five zero one four two" joined to thirteen digits and was taken as the number. Pieces that run past a
+      // real number's length are not a number: the held digits are dropped and this piece starts over, so the caller is asked again instead of being read a wrong number.
+      pending = piece;
+      return { field: 'phone', outcome: 'partial', learn, reason: 'RESTART', digits: piece.length, total: piece.length };
+    }
     pending = joined;
-    return { field: 'phone', outcome: 'partial', learn };
+    return { field: 'phone', outcome: 'partial', learn, reason: 'PIECE', digits: piece.length, total: joined.length };
+  }
+  /** "the last four are nine nine nine nine": replaces the last four digits of the number already held. Undefined when no number is held or the line does not say exactly four digits. */
+  const LAST_FOUR = /\b(?:the\s+)?(?:last|final)\s+(?:four|4)(?:\s+digits?)?\s+(?:are|is|should\s+be|were)\s+([^!?;]{3,40})/i;
+  function correctLastFour(raw: string): CollectResult | undefined {
+    if (values.phone === undefined) return undefined;
+    const m = LAST_FOUR.exec(raw);
+    if (m === null) return undefined;
+    const d = digitsOf(m[1]);
+    if (d === undefined || d.length !== 4) return undefined;
+    values.phone = values.phone.slice(0, -4) + d; pending = '';
+    return { field: 'phone', outcome: 'captured', learn: digitRuns(m[1]), reason: 'CORRECTED_LAST4', digits: 4, total: values.phone.length };
   }
 
   return {
     collect(field, raw, replace = false) {
-      if (disposed || typeof raw !== 'string') return { field, outcome: 'unclear', learn: [] };
+      if (disposed || typeof raw !== 'string') return { field, outcome: 'unclear', learn: [], reason: 'INACTIVE' };
       if (field === 'name') {
         const n = nameFrom(raw);
-        if (n === undefined) return { field, outcome: 'unclear', learn: [] };
-        values.name = n; return { field, outcome: 'captured', learn: [n] };
+        if (n === undefined) return { field, outcome: 'unclear', learn: [], reason: 'NOT_A_NAME' };
+        values.name = n; return { field, outcome: 'captured', learn: [n], reason: 'CAPTURED' };
       }
       if (field === 'address') {
         const a = addressFrom(raw);
-        if (a === undefined) return { field, outcome: 'unclear', learn: [] };
-        values.address = a; return { field, outcome: 'captured', learn: [a] };
+        if (a === undefined) return { field, outcome: 'unclear', learn: [], reason: ADDRESS_NUMBER.test(raw) ? 'NOT_AN_ADDRESS' : 'NO_STREET_NUMBER' };
+        values.address = a; return { field, outcome: 'captured', learn: [a], reason: 'CAPTURED' };
       }
       return setPhone(raw, replace);
     },
     volunteered(raw) {
       const out: CollectResult[] = [];
       if (disposed || typeof raw !== 'string' || raw.length > 1000) return out;
+      const l4 = correctLastFour(raw);
+      if (l4 !== undefined) out.push(l4);
       const nm = CUE_NAME.exec(raw);
       if (nm !== null) { const r = this.collect('name', nm[1], true); if (r.outcome !== 'unclear') out.push(r); }
-      const ph = CUE_PHONE.exec(raw);
+      const ph = l4 === undefined ? CUE_PHONE.exec(raw) : null;
       if (ph !== null) { const r = this.collect('phone', ph[1], true); if (r.outcome !== 'unclear') out.push(r); }
       const ad = CUE_ADDRESS.exec(raw);
       if (ad !== null) { const r = this.collect('address', ad[1], true); if (r.outcome !== 'unclear') out.push(r); }
@@ -150,6 +191,7 @@ export function createContactState(): ContactState {
     value(field) { return disposed ? undefined : values[field]; },
     parts() { return disposed ? {} : { ...values }; },
     pendingPhone() { return !disposed && pending.length > 0 && values.phone === undefined; },
+    pendingDigits() { return disposed || values.phone !== undefined ? 0 : pending.length; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);

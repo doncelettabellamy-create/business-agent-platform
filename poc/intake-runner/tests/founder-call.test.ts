@@ -2580,3 +2580,47 @@ test('residential-only: residentialAnswer reads plain, mixed and contradictory a
   for (const [line, want] of cases) assert.equal(residentialAnswer(line, kw), want, line);
   assert.equal(residentialAnswer('x'.repeat(401), kw), 'unclear');
 });
+
+// ---------------------------------------------------------------- privacy-safe contact diagnostics, repeated prefixes and the last-four correction (2026-10-28 retest)
+test('DIAGNOSTICS contact answers log the item label, a fixed reason and digit counts only; a repeated prefix restarts instead of being read back as a wrong number; no value or transcript is logged', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  const phone = ['two one two five five five', 'five five five zero one four two', 'two one two five five five zero one four two'];
+  let p = 0;
+  for (let i = 0; i < 14 && !r.logs.some((l) => l.code === 'READBACK'); i++) {
+    const last = asks(r).at(-1);
+    const answer = last === 'Customer name' ? 'priya raman' : last === 'Callback phone number' ? phone[Math.min(p++, phone.length - 1)] : last === 'Service address' ? 'twelve Oak Lane' : last === 'Address' ? '42 Elm Street' : 'the pipe is burst';
+    say(sim, answer); await reply(r, sim);
+  }
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), 'the read-back was reached');
+  const answers = diag(r, 'CONTACT_ANSWER').map((l) => l.detail);
+  const phoneAnswers = answers.filter((d) => d?.field === 'PHONE');
+  assert.deepEqual(phoneAnswers.map((d) => [d?.reason, d?.digits, d?.held]), [['PIECE', 6, 6], ['RESTART', 7, 7], ['CAPTURED', 10, 10]]);
+  assert.ok(answers.some((d) => d?.field === 'NAME' && d?.reason === 'CAPTURED'), JSON.stringify(answers));
+  assert.ok(diag(r, 'ASK').every((l) => ['NAME', 'PHONE', 'ADDRESS', 'CONTENT'].includes(String(l.detail?.item)) && typeof l.detail?.n === 'number'));
+  const logs = JSON.stringify(r.logs);
+  assert.ok(!/priya|raman|oak|\d{7,}/i.test(logs), 'no name, address, phone digits or transcript in any log line');
+  const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
+  assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./, 'the number read back is the one restated whole, not the joined repeated prefix');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('DIAGNOSTICS the incomplete ending names the item that ran out of asks and which contact items were held, as flags and a digit count', async () => {
+  const r = await rig({ contacts: true });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  for (let i = 0; i < 20 && !diag(r, 'INCOMPLETE').length; i++) {
+    const last = asks(r).at(-1);
+    say(sim, last === 'Customer name' ? 'maybe later' : last === 'Callback phone number' ? 'five five five' : last === 'Service address' ? '42 Elm Street' : last === 'Address' ? '42 Elm Street' : 'the pipe is burst');
+    await reply(r, sim);
+    if (sim.messages.some((m: any) => m.type === 'end')) break;
+  }
+  const inc = diag(r, 'INCOMPLETE');
+  assert.equal(inc.length, 1, JSON.stringify(asks(r)));
+  assert.equal(inc[0].detail?.item, 'NAME');
+  assert.equal(inc[0].detail?.name, 0);
+  assert.equal(typeof inc[0].detail?.phoneDigits, 'number');
+  assert.ok(diag(r, 'CONTACT_ANSWER').some((l) => l.detail?.field === 'NAME' && l.detail?.reason === 'NOT_A_NAME'));
+  assert.ok(!/\d{7,}|maybe|elm/i.test(JSON.stringify(r.logs)));
+});

@@ -58,6 +58,8 @@ export const COMMERCIAL_DECLINED = 'commercial_declined';
 /** Reason on a request saved after an item was asked for and still not obtained (the safe incomplete outcome): it is held for a person, never handed off. */
 export const INCOMPLETE = 'incomplete_call';
 /** The contact items by the fixed label the assistant is told to ask for. */
+/** Flags and a digit count only: which contact items are held, and how many digits of a phone number heard in pieces. Never a value. */
+const contactFlags = (s: CallSession): { name: number; phone: number; address: number; phoneDigits: number } => { const d = s.contactDiag(); return { name: d.name ? 1 : 0, phone: d.phone ? 1 : 0, address: d.address ? 1 : 0, phoneDigits: d.phoneDigits }; };
 const CONTACT_OF_LABEL: Readonly<Record<string, ContactField>> = Object.freeze({ [CONTACT_FIELDS.name]: 'name', [CONTACT_FIELDS.phone]: 'phone', [CONTACT_FIELDS.address]: 'address' });
 /** Consecutive caller turns on which the dialogue model failed outright (after one retry each) before the call is ended with the apology. */
 const MAX_MODEL_FAILURES = 3;
@@ -748,7 +750,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         // A number said in pieces is progress, not a failed attempt: that question is not counted against the item.
         // At most three pieces per call get this credit, so noise can never keep one question alive for ever.
         if (took?.outcome === 'partial' && lastAsk?.counted && partialCredits++ < 3) askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1));
-        deps.log('CONTACT_ANSWER', { outcome: took === undefined ? 0 : took.outcome === 'captured' ? 1 : took.outcome === 'partial' ? 2 : 3, heard: contactAsk.heard ? 1 : 0 });
+        // Privacy-safe: the item's label, a fixed reason code and digit COUNTS (this line, and held after it). Never a value, a word of the caller's or a transcript.
+        deps.log('CONTACT_ANSWER', { field: contactAsk.field.toUpperCase(), outcome: took === undefined ? 0 : took.outcome === 'captured' ? 1 : took.outcome === 'partial' ? 2 : 3, reason: took?.reason ?? 'NOT_HEARD', heard: contactAsk.heard ? 1 : 0, ...(contactAsk.field === 'phone' ? { digits: took?.digits ?? 0, held: took?.total ?? s.contactDiag().phoneDigits } : {}), n: askCount.get(CONTACT_FIELDS[contactAsk.field]) ?? 0 });
         contactAsk = undefined;
       }
       correcting = false; lastAsk = undefined;
@@ -789,14 +792,14 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (next.kind === 'ask') {
         // An item asked and heard the first time plus MAX_CLARIFICATIONS more times and still not obtained: the call ends as a safe incomplete outcome, saved unconfirmed, never handed off.
         if ((askCount.get(next.field) ?? 0) >= 1 + MAX_CLARIFICATIONS) {
-          deps.log('INCOMPLETE', { clarifications: MAX_CLARIFICATIONS, lines: covers });
+          deps.log('INCOMPLETE', { clarifications: MAX_CLARIFICATIONS, lines: covers, item: (CONTACT_OF_LABEL[next.field] ?? 'content').toUpperCase(), ...contactFlags(s) });
           incompleteCall = true;
           await farewell(SAY.incomplete, true);
           return;
         }
         const prevAt = lastAskedAt.get(next.field);
         lastAskedAt.set(next.field, covers);
-        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers });
+        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers, item: ((deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field]) ?? 'content').toUpperCase(), n: (askCount.get(next.field) ?? 0) + 1 });
         const choices = deps.choicesFor?.(tenant, next.field);
         const delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}) }, statusOf(s, got));
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.

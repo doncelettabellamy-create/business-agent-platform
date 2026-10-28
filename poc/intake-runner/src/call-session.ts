@@ -14,7 +14,7 @@ import type { PiiCount } from './pii-screen.ts';
 import { contactMissing, extractContact } from './contact-capture.ts';
 import type { Contact } from './contact-capture.ts';
 import { createContactState, runContactTool } from './call-state.ts';
-import type { CollectOutcome, ContactField, ContactStatus, ContactToolResult } from './call-state.ts';
+import type { CollectOutcome, CollectReason, ContactField, ContactStatus, ContactToolResult } from './call-state.ts';
 import type { PiiType } from './pii-screen.ts';
 
 export interface SessionLimits { maxTurns: number; maxMinutes: number; maxChars: number }
@@ -29,7 +29,7 @@ export interface SessionConfig {
 }
 export type LimitReason = 'TURNS' | 'TIME' | 'CHARS' | 'KILLED';
 /** What the server captured from this line for a contact item (the one just asked for, or one the caller volunteered with an explicit cue). Fixed words only: never the value. */
-export interface HeardContact { field: ContactField; outcome: CollectOutcome }
+export interface HeardContact { field: ContactField; outcome: CollectOutcome; reason?: CollectReason; digits?: number; total?: number }
 export type Hear = { ok: true; line: string; contact?: HeardContact[] } | { ok: false; code: 'TOO_LONG' | 'ODD_TEXT' | 'RESIDUAL' | 'ENDED' };
 export interface DialogueTurn { role: 'user' | 'assistant'; text: string }
 export interface CallSession {
@@ -64,6 +64,8 @@ export interface CallSession {
   contactStatus(): ContactStatus;
   /** A phone number heard in pieces, not yet complete. */
   phonePending(): boolean;
+  /** Diagnostics only, counts and flags (never a value): which contact items are held, and how many digits of a number heard in pieces. */
+  contactDiag(): { name: boolean; phone: boolean; address: boolean; phoneDigits: number };
   /**
    * The caller's name, callback number and service address, only when all three are usable. RAW personal data: for the spoken read-back of the number
    * and the encrypted contact vault, nowhere else.
@@ -125,7 +127,7 @@ export function createCallSession(config: SessionConfig): CallSession {
       if (typeof raw === 'string' && raw.length <= 1000) {
         const results = contact.volunteered(raw);
         if (expecting !== undefined && !results.some((r) => r.field === expecting)) results.push(contact.collect(expecting, raw, correcting));
-        for (const r of results) { heardContact.push({ field: r.field, outcome: r.outcome }); for (const l of r.learn) masker.learn(TYPE[r.field], l); }
+        for (const r of results) { heardContact.push({ field: r.field, outcome: r.outcome, ...(r.reason !== undefined ? { reason: r.reason } : {}), ...(r.digits !== undefined ? { digits: r.digits } : {}), ...(r.total !== undefined ? { total: r.total } : {}) }); for (const l of r.learn) masker.learn(TYPE[r.field], l); }
       }
       let m = masker.mask(raw);
       // A contact answer the masker's own fail-closed rules would refuse (a number said in an odd way) is not lost and does not end the call: the server already holds it, and the
@@ -179,6 +181,7 @@ export function createCallSession(config: SessionConfig): CallSession {
     contactMissing(): string[] { return contactMissing(parts()); },
     contactStatus(): ContactStatus { parts(); return contact.status(); },
     phonePending(): boolean { return contact.pendingPhone(); },
+    contactDiag() { parts(); return { name: contact.value('name') !== undefined, phone: contact.value('phone') !== undefined, address: contact.value('address') !== undefined, phoneDigits: contact.pendingDigits() }; },
     revealContactParts(): { name?: string; phone?: string; address?: string } { return parts(); },
     forgetAddress(): void { masker.supersede('Address'); contact.clear('address'); },
     revealContact(): Contact | undefined {
