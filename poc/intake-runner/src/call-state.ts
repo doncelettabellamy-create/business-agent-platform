@@ -26,7 +26,9 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
 /**
  * Why a capture turned out as it did: a FIXED code, safe to log (it names a rule, never a value).
  *   CAPTURED          the item was taken.            PIECE            a phone piece was joined to the digits held so far.
- *   RESTART           the pieces could not make a phone number (a repeated prefix, a stray digit word): the held digits were dropped and this piece started over.
+ *   MERGED            the new piece repeated the end of the digits held and exactly ONE reading makes a whole number: the repeated digits are said once.   SAME   the piece restated the digits already held: nothing changes.
+ *   AMBIGUOUS         the pieces cannot be fitted together (too many digits, or more than one reading): the held digits are forgotten and the caller is asked for the whole number again. No number is guessed.
+ *   RESTART           (no longer produced; kept for old logs) the pieces could not make a phone number (a repeated prefix, a stray digit word): the held digits were dropped and this piece started over.
  *   CORRECTED_LAST4   "the last four are ...": the final four digits of the number held were replaced.
  *   NOT_DIGITS        the line carries a date, a time, a duration or another quantity ("October 22", "six months", "9:30"): its digits are not phone digits and are not taken.
  *   NO_DIGITS         the line held no digit words.   TOO_MANY         more than fifteen digits: start over.
@@ -34,7 +36,7 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   NEED_STREET       a house number was heard without a street name: it is held and only the street name is asked.   NEED_NUMBER   a street name without a house number.   JOINED   the held part and the new part made the address.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'JOINED' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'JOINED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -69,15 +71,17 @@ const DIGIT_TOKEN = '(?:(?:double|triple|treble)[\\s-]+)?(?:zero|oh|one|two|thre
 /** The stretches of a line that are digits said or written ("five five five 0 1 double 0"), so only those are taught to the masker, not the words around them. */
 const DIGIT_RUNS = new RegExp(`\\b${DIGIT_TOKEN}(?:[\\s,.-]+${DIGIT_TOKEN})*\\b`, 'gi');
 export function digitRuns(raw: string): string[] { return [...raw.matchAll(DIGIT_RUNS)].map((m) => m[0]).filter((s) => s.length > 0); }
+const CLOCK_TIME = /\b(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|oh|fifteen|thirty|forty[- ]five)\s*(?:a\.?\s?m\.?|p\.?\s?m\.?)(?![a-z])/i;
 /** The digit runs of five or more digits (never a day of the month, a count or a year). */
 function longDigitRuns(raw: string): string[] { return digitRuns(raw).filter((r) => (digitsOf(r) ?? '').length >= 5); }
 const NOT_PHONE_WORDS = new Set(['january', 'february', 'april', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
   'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'today', 'tomorrow', 'tonight', 'morning', 'afternoon', 'evening', 'noon', 'midnight', 'week', 'weeks', 'month', 'months', 'year', 'years', 'day', 'days',
-  'hour', 'hours', 'minute', 'minutes', 'am', 'pm', "o'clock", 'bedroom', 'bedrooms', 'bathroom', 'bathrooms', 'room', 'rooms', 'dollars', 'dollar', 'percent', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
+  'hour', 'hours', 'minute', 'minutes', "o'clock", 'bedroom', 'bedrooms', 'bathroom', 'bathrooms', 'room', 'rooms', 'dollars', 'dollar', 'percent', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety',
   'hundred', 'thousand', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen']);
 /** Whether the line is a date, a time, a duration or another quantity rather than phone digits. A phone number is spoken digit by digit, so ordinals, tens words, clock times and calendar words rule a line out. */
 function looksLikeDateOrQuantity(raw: string): boolean {
-  if (/\b\d{1,2}:\d{2}\b/.test(raw) || /\b\d{1,2}\s?(?:a\.?m\.?|p\.?m\.?)(?![a-z])/i.test(raw)) return true;
+  // A clock time is a number WITH am or pm ("10 am", "ten pm", "nine thirty a.m.", "9:30"); the word "am" in "I am" is only conversation.
+  if (/\b\d{1,2}:\d{2}\b/.test(raw) || CLOCK_TIME.test(raw)) return true;
   return raw.toLowerCase().split(/[^a-z0-9']+/).some((t) => NOT_PHONE_WORDS.has(t) || /^\d+(?:st|nd|rd|th)$/.test(t));
 }
 
@@ -157,6 +161,10 @@ export interface ContactState {
   pendingPhone(): boolean;
   /** How many digits of a number heard in pieces are held (a count only; zero once a number is held). */
   pendingDigits(): number;
+  /** What the next phone question should ask for, as COUNTS only (never a digit): how many digits are still needed after some were heard, or 'restate' when the pieces could not be fitted together. */
+  phoneNeed(): number | 'restate' | undefined;
+  /** The caller declined to go on: forgets the pieces held for one item (a phone number, or one part of an address). */
+  abandon(field: ContactField): void;
   /** Which part of the service address is still needed after one part was heard (never the part itself): the street name, the house number, or none. */
   addressPart(): 'street name' | 'house number' | undefined;
   status(): ContactStatus;
@@ -166,6 +174,7 @@ export interface ContactState {
 export function createContactState(): ContactState {
   let values: { name?: string; phone?: string; address?: string } = {};
   let pending = '';   // digits of a phone number heard in pieces
+  let phoneAmbiguous = false;   // the pieces heard could not be fitted together and were forgotten: the caller is asked for the whole number again
   let pendNumber = ''; let pendStreet = '';   // one part of a service address heard on its own, held until the other arrives
   let disposed = false;
 
@@ -183,17 +192,25 @@ export function createContactState(): ContactState {
     const piece = digitsOf(raw);
     if (piece === undefined || piece.length === 0) return { field: 'phone', outcome: 'unclear', learn: [], reason: 'NO_DIGITS', digits: 0, total: held() };
     const before = replace ? '' : pending;
+    const captured = (digits: string, reason: CollectReason): CollectResult => { values.phone = digits; pending = ''; phoneAmbiguous = false; return { field: 'phone', outcome: 'captured', learn, reason, digits: piece.length, total: digits.length }; };
+    const forget = (reason: CollectReason): CollectResult => { pending = ''; phoneAmbiguous = true; return { field: 'phone', outcome: 'unclear', learn, reason, digits: piece.length, total: 0 }; };
+    if (piece.length > 15) return forget('TOO_MANY');
+    if (before.length === 0) { pending = piece; phoneAmbiguous = false; return { field: 'phone', outcome: 'partial', learn, reason: 'PIECE', digits: piece.length, total: piece.length }; }
+    // Digits held from earlier pieces, and a new piece. Only what the caller actually said is ever used; nothing is guessed:
+    //   1. appended, they make a whole number (ten digits, or eleven with a leading 1): taken. (Legitimate repeated digits, "five five five" then "five five five zero one four two", land here.)
+    //   2. the new piece starts by repeating the END of what is held (at least three digits) and exactly ONE way of saying the repeated digits once makes a whole number: merged. Two different readings: ambiguous.
+    //   3. the new piece is the digits already held (six or more, so it cannot be a legitimate continuation): a restatement, nothing changes.
+    //   4. appended it is still short of a whole number (at most ten digits): another piece.
+    //   5. otherwise the pieces do not fit together: the held digits are forgotten and the caller is asked for the whole number again.
     const joined = before + piece;
-    if (PIECED_NUMBER.test(joined)) { values.phone = joined; pending = ''; return { field: 'phone', outcome: 'captured', learn, reason: 'CAPTURED', digits: piece.length, total: joined.length }; }
-    if (joined.length > 15) { pending = ''; return { field: 'phone', outcome: 'unclear', learn, reason: 'TOO_MANY', digits: piece.length, total: 0 }; }
-    if (before.length > 0 && joined.length >= 11) {
-      // REPRODUCED DEFECT (the repeated prefix): "two one two five five five" then "five five five zero one four two" joined to thirteen digits and was taken as the number. Pieces that run past a
-      // real number's length are not a number: the held digits are dropped and this piece starts over, so the caller is asked again instead of being read a wrong number.
-      pending = piece;
-      return { field: 'phone', outcome: 'partial', learn, reason: 'RESTART', digits: piece.length, total: piece.length };
-    }
-    pending = joined;
-    return { field: 'phone', outcome: 'partial', learn, reason: 'PIECE', digits: piece.length, total: joined.length };
+    if (PIECED_NUMBER.test(joined)) return captured(joined, 'CAPTURED');
+    const merges = new Set<string>();
+    for (let k = Math.min(before.length, piece.length - 1); k >= 3; k--) { if (before.endsWith(piece.slice(0, k))) { const m = before + piece.slice(k); if (PIECED_NUMBER.test(m)) merges.add(m); } }
+    if (merges.size === 1) return captured([...merges][0], 'MERGED');
+    if (merges.size > 1) return forget('AMBIGUOUS');
+    if (piece === before && before.length >= 6) return { field: 'phone', outcome: 'partial', learn, reason: 'SAME', digits: piece.length, total: before.length };
+    if (joined.length <= 10) { pending = joined; phoneAmbiguous = false; return { field: 'phone', outcome: 'partial', learn, reason: 'PIECE', digits: piece.length, total: joined.length }; }
+    return forget('AMBIGUOUS');
   }
   /** "the last four are nine nine nine nine": replaces the last four digits of the number already held. Undefined when no number is held or the line does not say exactly four digits. */
   const LAST_FOUR = /\b(?:the\s+)?(?:last|final)\s+(?:four|4)(?:\s+digits?)?\s+(?:are|is|should\s+be|were)\s+([^!?;]{3,40})/i;
@@ -247,20 +264,22 @@ export function createContactState(): ContactState {
       if (ad !== null) { const r = this.collect('address', ad[1], true); if (r.outcome !== 'unclear') out.push(r); }
       return out;
     },
-    clear(field) { delete values[field]; if (field === 'phone') pending = ''; if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
+    clear(field) { delete values[field]; if (field === 'phone') { pending = ''; phoneAmbiguous = false; } if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
     set(field, value) { if (disposed) return; values[field] = value; if (field === 'phone') pending = ''; if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
     fallback(field, value) { if (!disposed && values[field] === undefined && typeof value === 'string' && value.length > 0) values[field] = value; },
     value(field) { return disposed ? undefined : values[field]; },
     parts() { return disposed ? {} : { ...values }; },
     pendingPhone() { return !disposed && pending.length > 0 && values.phone === undefined; },
     pendingDigits() { return disposed || values.phone !== undefined ? 0 : pending.length; },
+    phoneNeed() { if (disposed || values.phone !== undefined) return undefined; if (pending.length >= 1 && pending.length <= 9) return 10 - pending.length; return phoneAmbiguous ? 'restate' : undefined; },
+    abandon(field) { if (field === 'phone') { pending = ''; phoneAmbiguous = false; } else if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
     addressPart() { return disposed || values.address !== undefined ? undefined : pendNumber !== '' ? 'street name' : pendStreet !== '' ? 'house number' : undefined; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);
       return { captured, missing };
     },
-    dispose() { disposed = true; values = {}; pending = ''; pendNumber = ''; pendStreet = ''; },
+    dispose() { disposed = true; values = {}; pending = ''; phoneAmbiguous = false; pendNumber = ''; pendStreet = ''; },
   };
 }
 

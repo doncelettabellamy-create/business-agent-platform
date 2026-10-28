@@ -992,7 +992,7 @@ test('contacts: nothing is ready until a name, a usable number and an address ar
   say(sim, 'I have a burst pipe in the kitchen and the address is 42 Elm Street'); await reply(r, sim);   // Intake is ready, the contact is not
   say(sim, 'My name is Priya Raman'); await reply(r, sim);
   say(sim, 'My phone number is 555 0100'); await reply(r, sim);                                              // seven digits: not a callback number
-  assert.deepEqual(directives(r), ['NEXT OPEN', 'NEXT ASK Customer name', 'NEXT ASK Callback phone number', 'NEXT ASK Callback phone number (asked before: ask it a different way)']);
+  assert.deepEqual(directives(r), ['NEXT OPEN', 'NEXT ASK Customer name', 'NEXT ASK Callback phone number', 'NEXT ASK Callback phone number (asked before: ask it a different way) (part of the number is already heard: ask only for the remaining 3 digits)']);
   assert.ok(!r.logs.some((l) => l.code === 'READBACK'));
   noPriya('what the model was sent', JSON.stringify(r.claude.sent));
   sim.end(); await sim.closed; await waitFor(() => r.store.list(T).length === 1); await r.handler.idle();
@@ -2596,7 +2596,7 @@ test('residential-only: residentialAnswer reads plain, mixed and contradictory a
 });
 
 // ---------------------------------------------------------------- privacy-safe contact diagnostics, repeated prefixes and the last-four correction (2026-10-28 retest)
-test('DIAGNOSTICS contact answers log the item label, a fixed reason and digit counts only; a repeated prefix restarts instead of being read back as a wrong number; no value or transcript is logged', async () => {
+test('DIAGNOSTICS contact answers log the item label, a fixed reason and digit counts only; a repeated prefix is merged once instead of being read back as a wrong number; no value or transcript is logged', async () => {
   const r = await rig({ contacts: true });
   const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
   say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
@@ -2610,7 +2610,7 @@ test('DIAGNOSTICS contact answers log the item label, a fixed reason and digit c
   assert.ok(r.logs.some((l) => l.code === 'READBACK'), 'the read-back was reached');
   const answers = diag(r, 'CONTACT_ANSWER').map((l) => l.detail);
   const phoneAnswers = answers.filter((d) => d?.field === 'PHONE');
-  assert.deepEqual(phoneAnswers.map((d) => [d?.reason, d?.digits, d?.held]), [['PIECE', 6, 6], ['RESTART', 7, 7], ['CAPTURED', 10, 10]]);
+  assert.deepEqual(phoneAnswers.map((d) => [d?.reason, d?.digits, d?.held]), [['PIECE', 6, 6], ['MERGED', 7, 10]]);
   assert.ok(answers.some((d) => d?.field === 'NAME' && d?.reason === 'CAPTURED'), JSON.stringify(answers));
   assert.ok(diag(r, 'ASK').every((l) => ['NAME', 'PHONE', 'ADDRESS', 'CONTENT'].includes(String(l.detail?.item)) && typeof l.detail?.n === 'number'));
   const logs = JSON.stringify(r.logs);
@@ -2632,7 +2632,7 @@ test('DIAGNOSTICS the incomplete ending names the item that ran out of asks and 
   }
   const inc = diag(r, 'INCOMPLETE');
   assert.equal(inc.length, 1, JSON.stringify(asks(r)));
-  assert.equal(inc[0].detail?.item, 'NAME');
+  assert.equal(inc[0].detail?.item, 'PHONE', 'the phone being completed is kept until its limit ends the call');
   assert.equal(inc[0].detail?.name, 0);
   assert.equal(typeof inc[0].detail?.phoneDigits, 'number');
   assert.ok(diag(r, 'CONTACT_ANSWER').some((l) => l.detail?.field === 'NAME' && l.detail?.reason === 'NOT_A_NAME'));
@@ -3011,7 +3011,7 @@ test('BOUNDED PLAYBACK WAIT a carrier that never reports playback does not hold 
 
 // ---------------------------------------------------------------- 2026-10-28: the fixed first-cleaning question, and optional fields kept only with the caller's own evidence
 const FQ = 'Is this your first cleaning with Drew Cleaning?';
-const BY_CODE: Record<string, string> = { PETS: 'no pets', CLEANING_FREQUENCY: 'just one time', EXTRAS: 'no extras', PREFERRED_DATE: 'tomorrow', TIME_WINDOW: 'morning', CUSTOMER_NAME: 'priya raman', CALLBACK_PHONE_NUMBER: 'two one two five five five zero one four two', SERVICE_ADDRESS: '742 Evergreen Terrace' };
+const BY_CODE: Record<string, string> = { FIRST_CLEANING_WITH_US: 'yes', PETS: 'no pets', CLEANING_FREQUENCY: 'just one time', EXTRAS: 'no extras', PREFERRED_DATE: 'tomorrow', TIME_WINDOW: 'morning', CUSTOMER_NAME: 'priya raman', CALLBACK_PHONE_NUMBER: 'two one two five five five zero one four two', SERVICE_ADDRESS: '742 Evergreen Terrace' };
 /** Answers whatever the newest ASK log names (the fixed first-cleaning question has no model directive), until the read-back or the incomplete ending. `says[CODE]` are answers in order, the last repeating. */
 async function driveByAsk(r: Rig, sim: Sim, opening: string, says: Record<string, string[]> = {}, max = 30) {
   setup(sim); say(sim, 'yes'); await reply(r, sim);
@@ -3134,4 +3134,92 @@ test('REQUIRED FIELDS are never policed: under a deep clean the last professiona
   assert.equal(diag(r, 'FIELD_UNSUPPORTED').length, 0);
   const spokenAll = textTokens(sim).join(' ');
   assert.match(spokenAll, /Last professional clean: a year ago/); assert.match(spokenAll, /Priority areas: the kitchen/);
+});
+
+// ---------------------------------------------------------------- 2026-10-28 4:02 PM call: phone pieces merged once, the item being completed kept, the digits still needed asked for, no incomplete address accepted
+const phoneLines = (r: Rig) => directives(r).filter((d) => d.startsWith('NEXT ASK Callback phone number'));
+const askFields = (r: Rig) => diag(r, 'ASK').map((l) => String(l.detail?.field));
+const noDigitsLeak = (r: Rig) => assert.ok(!/\d{3,}/.test(JSON.stringify(r.logs.map((l) => l.detail)).replace(/"(?:call|ms|lines|total_ms|since_prompt_ms|first_token_ms|chars|parts|preview_ms|waitMs|unplayedMs)":\d+/g, '')), 'no digit string in any log');
+
+test('LIVE SEQUENCE (4:02 PM) a number said in pieces with a restated prefix finishes; Drew stays on the phone, asks for the digits still NEEDED (counts only), then the address in two parts; both are read back and confirmed', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { CALLBACK_PHONE_NUMBER: ['two one two', 'five five five', 'um I am not sure', 'five five five zero one four two'], SERVICE_ADDRESS: ['seven four two', 'Evergreen Terrace'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(askFields(r)));
+  assert.deepEqual(diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'PHONE').map((l) => `${l.detail?.reason}${l.detail?.digits !== undefined ? '(' + l.detail.digits + '=' + l.detail.held + ')' : ''}`), ['PIECE(3=3)', 'PIECE(3=6)', 'NO_DIGITS(0=6)', 'MERGED(7=10)'], 'the repeated exchange was said once; "I am" did not refuse the line');
+  const contactAsks = askFields(r).filter((f) => /^(CUSTOMER_NAME|CALLBACK_PHONE_NUMBER|SERVICE_ADDRESS)$/.test(f));
+  assert.deepEqual(contactAsks, ['CUSTOMER_NAME', 'CALLBACK_PHONE_NUMBER', 'CALLBACK_PHONE_NUMBER', 'CALLBACK_PHONE_NUMBER', 'CALLBACK_PHONE_NUMBER', 'SERVICE_ADDRESS', 'SERVICE_ADDRESS'], 'the phone is kept until it is whole, THEN the address (and its street name is asked, not the whole address again)');
+  assert.deepEqual(phoneLines(r).map((d) => /\(part of the number is already heard: ask only for the remaining (\d+) digits\)/.exec(d)?.[1] ?? 'none'), ['none', '7', '4', '4'], 'the digits still needed, as counts');
+  assert.ok(directives(r).some((d) => d.includes('(the house number is already heard: ask only for the street name)')));
+  assert.ok(directives(r).every((d) => !/\d{3,}/.test(d)), 'no digit string in any model instruction');
+  noDigitsLeak(r);
+  const rb = textTokens(sim).join(' ');
+  assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./, 'the whole number is read back, once');
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.equal(q.token, 'I have your service address as seven four two Evergreen Terrace. Is that correct? Please say yes or no.', 'the whole address is read back for a yes');
+  say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.address_status, rec.missing_fields], ['confirmed', 'caller_confirmed', []]);
+  assert.equal(r.vault?.get(T, rec.call_ref)?.phone, '2125550142');
+  assert.ok(r.logs.some((l) => l.code === 'ADDRESS_CONFIRMED'));
+});
+
+test('PHONE legitimate repeated digits are not a restatement: "five five five" twice, then the rest, is 555 555 0142', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { CALLBACK_PHONE_NUMBER: ['five five five', 'five five five', 'zero one four two'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.deepEqual(diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'PHONE').map((l) => l.detail?.reason), ['PIECE', 'PIECE', 'CAPTURED']);
+  assert.match(textTokens(sim).join(' '), /Your callback number: 5 5 5 5 5 5 0 1 4 2\./);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('PHONE pieces that do not fit together are forgotten and the whole number is asked for again; the whole number said then corrects everything; no digit is guessed', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { CALLBACK_PHONE_NUMBER: ['two one two', 'five five five', 'zero one four two nine nine', 'two one two five five five zero one four two'] });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(askFields(r)));
+  assert.deepEqual(diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'PHONE').map((l) => l.detail?.reason), ['PIECE', 'PIECE', 'AMBIGUOUS', 'CAPTURED']);
+  assert.ok(phoneLines(r).some((d) => d.includes('(the pieces heard did not fit together: ask for the whole number again, from the start, digit by digit)')), 'the clarification asks for the whole number again');
+  assert.ok(directives(r).every((d) => !/\d{3,}/.test(d)));
+  assert.match(textTokens(sim).join(' '), /Your callback number: 2 1 2 5 5 5 0 1 4 2\./);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('PARTIAL FIELD KEPT until it is whole, declined or its existing limit ends the call: a caller who declines moves on; one who never finishes ends incomplete on that field', async () => {
+  const d = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const s1 = await d.connect();
+  await driveByAsk(d, s1, OPEN_C, { CALLBACK_PHONE_NUMBER: ['two one two', "I would rather not give my number", 'two one two five five five zero one four two'] });
+  assert.ok(diag(d, 'CONTACT_DECLINED').length >= 1, 'the refusal ended the completion');
+  assert.ok(d.logs.some((l) => l.code === 'READBACK'), JSON.stringify(askFields(d)));
+  s1.end(); await s1.closed; await d.handler.idle();
+  const n = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const s2 = await n.connect();
+  await driveByAsk(n, s2, OPEN_C, { CALLBACK_PHONE_NUMBER: ['five', 'five', 'five', 'five', 'five'] }, 40);
+  if (!s2.messages.some((m: any) => m.type === 'end')) await ended(s2, n);
+  assert.equal(diag(n, 'INCOMPLETE').length, 1);
+  assert.equal(diag(n, 'INCOMPLETE')[0].detail?.item, 'PHONE', 'the limit ended it on the field being completed');
+  const [rec] = n.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
+  assert.equal(n.vault?.list(T).length, 0, 'no incomplete number was stored');
+});
+
+test('PHONE "I am" is conversation, not a time: a number said after it is taken; real clock times are still refused', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { CALLBACK_PHONE_NUMBER: ['ten am', 'I am at two one two five five five zero one four two'] });
+  assert.deepEqual(diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'PHONE').map((l) => l.detail?.reason), ['NOT_DIGITS', 'CAPTURED']);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('ADDRESS a street name said to another question is not an address: the masker\'s own guess is not accepted without a street number, and the address is still asked for', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { CUSTOMER_NAME: ['we are on Evergreen Terrace', 'priya raman'], SERVICE_ADDRESS: ['742 Evergreen Terrace'] });
+  assert.ok(diag(r, 'CONTACT_ANSWER').some((l) => l.detail?.field === 'NAME' && l.detail?.reason === 'NOT_A_NAME'));
+  assert.ok(askFields(r).includes('SERVICE_ADDRESS'), 'the address was still asked for: ' + askFields(r).join(','));
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  say(sim, 'yes'); const q = await reply(r, sim);
+  assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Is that correct? Please say yes or no.');
+  sim.end(); await sim.closed; await r.handler.idle();
 });

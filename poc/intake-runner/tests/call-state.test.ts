@@ -6,6 +6,7 @@ import { createCallSession } from '../src/call-session.ts';
 import { CONTACT_FIELDS } from '../src/contact-capture.ts';
 import { renderStatus, renderDirective, fallbackText, DIALOGUE_INSTRUCTION } from '../src/dialogue-model.ts';
 import { createMasker } from '../src/pii-screen.ts';
+import { selectNext } from '../src/next-field.ts';
 
 const session = () => { const s = createCallSession({ limits: { maxTurns: 30, maxMinutes: 8, maxChars: 4000 }, names: [], now: () => 0, killed: () => false }); assert.equal(s.consent('yes'), 'granted'); return s; };
 
@@ -121,21 +122,20 @@ test('dispose clears the captured values', () => {
 });
 
 // ---------------------------------------------------------------- 2026-10-28 retest: pieces, repeated prefixes, stray digit words and the last-four correction
-test('REPRODUCED a repeated prefix is not joined into a wrong number: the held digits are dropped and the piece starts over; a stray "oh" cannot make a number either', () => {
+test('a repeated prefix is merged ONCE when exactly one reading makes a whole number; anything that does not fit is forgotten and the whole number is asked for again: no digit is guessed', () => {
   const t = createContactState();
   assert.equal(t.collect('phone', 'two one two five five five').reason, 'PIECE');
   const r = t.collect('phone', 'five five five zero one four two');
-  assert.deepEqual([r.outcome, r.reason, r.digits, r.total], ['partial', 'RESTART', 7, 7]);
-  assert.equal(t.value('phone'), undefined, 'thirteen joined digits were not taken as the number');
-  const w = t.collect('phone', 'two one two five five five zero one four two');
-  assert.deepEqual([w.outcome, w.reason, t.value('phone')], ['captured', 'CAPTURED', '2125550142']);
-  const u = createContactState();
+  assert.deepEqual([r.outcome, r.reason, r.digits, r.total, t.value('phone')], ['captured', 'MERGED', 7, 10, '2125550142'], 'the repeated exchange is said once, never thirteen digits');
+  const u = createContactState();   // a stray "oh" between pieces and a piece that fits nothing
   u.collect('phone', 'two one two'); u.collect('phone', 'oh sorry');
-  assert.equal(u.collect('phone', 'five five five zero one four two').outcome, 'partial');
-  assert.equal(u.value('phone'), undefined, 'a stray "oh" did not produce an eleven digit number');
+  const bad = u.collect('phone', 'five five five zero one four two');
+  assert.deepEqual([bad.outcome, bad.reason, u.value('phone'), u.phoneNeed()], ['unclear', 'AMBIGUOUS', undefined, 'restate']);
   const v = createContactState();
   v.collect('phone', 'two one two five five five');
-  assert.equal(v.collect('phone', 'zero one four two nine nine').outcome, 'partial', 'twelve joined digits are not a number');
+  const twelve = v.collect('phone', 'zero one four two nine nine');
+  assert.deepEqual([twelve.outcome, twelve.reason, v.pendingDigits(), v.phoneNeed()], ['unclear', 'AMBIGUOUS', 0, 'restate'], 'twelve digits are not a number and none is kept');
+  assert.equal(v.collect('phone', 'two one two five five five zero one four two').reason, 'CAPTURED', 'a whole number said again corrects everything');
 });
 
 test('split numbers still join at the usual lengths (ten, or eleven with a leading one) and a whole line of ten to fifteen digits is taken as said', () => {
@@ -297,4 +297,69 @@ test('masking: an ordinary date stays intact when no phone piece was accepted, a
   assert.ok(c.ok && !/five/.test(c.line), 'the piece is masked again later: ' + JSON.stringify(c));
   assert.ok(/October 22/.test(s.maskedText()), 'the date is still in what a model reads');
   assert.ok(!/five five five zero/.test(s.maskedText()));
+});
+
+// ---------------------------------------------------------------- 2026-10-28: overlaps, restatements, repeated digits, "I am", guidance counts, fallback
+test('phone merge: only an UNAMBIGUOUS overlap is merged; a restatement changes nothing; legitimate repeated digits append; two readings are ambiguous and nothing is kept', () => {
+  const a = createContactState();
+  a.collect('phone', 'two one two five five five');
+  const same = a.collect('phone', 'two one two five five five');
+  assert.deepEqual([same.outcome, same.reason, a.pendingDigits()], ['partial', 'SAME', 6], 'six digits said again are a restatement: not twelve');
+  assert.equal(a.collect('phone', 'zero one four two').reason, 'CAPTURED'); assert.equal(a.value('phone'), '2125550142');
+  const b = createContactState();
+  b.collect('phone', 'five five five'); assert.equal(b.collect('phone', 'five five five').reason, 'PIECE');
+  assert.deepEqual([b.collect('phone', 'zero one four two').reason, b.value('phone')], ['CAPTURED', '5555550142']);
+  const c = createContactState();   // two different ways of saying the repeated digits once make a whole number (ten digits and eleven starting with 1)
+  c.collect('phone', 'one five five five five five five');
+  const amb = c.collect('phone', 'five five five five zero one two');
+  assert.deepEqual([amb.outcome, amb.reason, c.value('phone'), c.pendingDigits(), c.phoneNeed()], ['unclear', 'AMBIGUOUS', undefined, 0, 'restate']);
+  const d = createContactState();   // an overlap of fewer than three digits is not an overlap
+  d.collect('phone', 'two one two five five five');
+  assert.deepEqual([d.collect('phone', 'five zero one four two nine').reason, d.value('phone')], ['AMBIGUOUS', undefined]);
+});
+
+test('phone: a whole number said at any time replaces what was held (a correction), and the digits still needed are reported as counts only', () => {
+  const s = createContactState();
+  assert.equal(s.phoneNeed(), undefined);
+  s.collect('phone', 'two one two'); assert.equal(s.phoneNeed(), 7);
+  s.collect('phone', 'five five five'); assert.equal(s.phoneNeed(), 4);
+  s.collect('phone', 'zero one four two nine nine'); assert.equal(s.phoneNeed(), 'restate');
+  const w = s.collect('phone', 'actually it is nine nine nine eight eight eight zero zero zero one', true);
+  assert.deepEqual([w.outcome, s.value('phone'), s.phoneNeed()], ['captured', '9998880001', undefined]);
+  const t = createContactState(); t.collect('phone', 'two one two five five five'); t.abandon('phone');
+  assert.deepEqual([t.pendingDigits(), t.phoneNeed()], [0, undefined], 'a declined number is forgotten');
+});
+
+test('"I am" is conversation; only a number with am or pm (or a clock) is a time', () => {
+  for (const ok of ['I am at two one two five five five zero one four two', 'yes I am, it is 2125550142', 'I am calling from 212 555 0142']) assert.equal(createContactState().collect('phone', ok).reason, 'CAPTURED', ok);
+  assert.equal(createContactState().collect('phone', 'yes I am').reason, 'NO_DIGITS');
+  for (const bad of ['10 am', 'ten pm', 'nine thirty a.m.', '9:30', 'at 9 p.m.', 'twelve am']) assert.equal(createContactState().collect('phone', bad).reason, 'NOT_DIGITS', bad);
+});
+
+test('guidance for the voice is counts only: no digit is ever in the instruction, and the fixed fallback asks the same', () => {
+  assert.equal(renderDirective({ kind: 'ask', field: 'Callback phone number', phone: 7 }), 'NEXT ASK Callback phone number (part of the number is already heard: ask only for the remaining 7 digits)');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Callback phone number', phone: 'restate', again: true }), 'NEXT ASK Callback phone number (asked before: ask it a different way) (the pieces heard did not fit together: ask for the whole number again, from the start, digit by digit)');
+  assert.equal(renderDirective({ kind: 'ask', field: 'Callback phone number', phone: 12 as never }), 'NEXT ASK Callback phone number');
+  assert.equal(fallbackText({ kind: 'ask', field: 'Callback phone number', phone: 4 }), 'Sorry about the pause. What are the remaining 4 digits?');
+  assert.equal(fallbackText({ kind: 'ask', field: 'Callback phone number', phone: 'restate' }), 'Sorry about the pause. Could you say the whole number again, from the start?');
+});
+
+test('address fallback: the masker\'s own detection fills an address only when it is complete (a street number and a street name)', () => {
+  const s = session();
+  s.hear('seven four two', 'address');
+  s.hear('Evergreen Terrace', 'phone');
+  assert.equal(s.contactDiag().address, false, 'a street alone, said to another question, is not an address');
+  assert.equal(s.addressPart(), 'street name', 'the house number held is still held');
+  assert.ok(s.contactMissing().includes(CONTACT_FIELDS.address));
+  const t = session();
+  t.hear('Evergreen Terrace', 'phone'); assert.equal(t.contactDiag().address, false);
+});
+
+test('selection keeps the field being completed: it is asked before any other missing field, and an ordinary rotation resumes without it', () => {
+  const missing = ['Cleaning frequency', 'Callback phone number', 'Service address'];
+  const fresh = { covers: 3, category: 'Standard cleaning', missing, ready: false };
+  const history = { lastAskedAt: new Map([['Callback phone number', 2]]), clarified: false };
+  assert.equal((selectNext(fresh, 3, history) as { field: string }).field, 'Cleaning frequency', 'rotation: never-asked fields first');
+  assert.deepEqual(selectNext(fresh, 3, { ...history, keep: 'Callback phone number' }), { kind: 'ask', field: 'Callback phone number', again: true });
+  assert.equal((selectNext(fresh, 3, { ...history, keep: 'Name' }) as { field: string }).field, 'Cleaning frequency', 'a kept field that is no longer missing changes nothing');
 });

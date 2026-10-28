@@ -63,6 +63,8 @@ export const INCOMPLETE = 'incomplete_call';
 /** The contact items by the fixed label the assistant is told to ask for. */
 /** Flags and a digit count only: which contact items are held, and how many digits of a phone number heard in pieces. Never a value. */
 const contactFlags = (s: CallSession): { name: number; phone: number; address: number; phoneDigits: number } => { const d = s.contactDiag(); return { name: d.name ? 1 : 0, phone: d.phone ? 1 : 0, address: d.address ? 1 : 0, phoneDigits: d.phoneDigits }; };
+/** The caller declining to give an item (not an unclear answer): its pieces are forgotten and it is not pressed in the same way. */
+const CONTACT_REFUSAL = /\b(?:rather not|prefer not|do not want|don'?t want|dont want|not comfortable|not giving|won'?t (?:give|say|tell)|no thanks)\b/i;
 const CONTACT_OF_LABEL: Readonly<Record<string, ContactField>> = Object.freeze({ [CONTACT_FIELDS.name]: 'name', [CONTACT_FIELDS.phone]: 'phone', [CONTACT_FIELDS.address]: 'address' });
 /** Consecutive caller turns on which the dialogue model failed outright (after one retry each) before the call is ended with the apology. */
 const MAX_MODEL_FAILURES = 3;
@@ -283,6 +285,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     // Current-call state beyond the rotation (call-state.ts holds the contact values themselves). The contact item just asked for, and whether the question was HEARD: the caller's next line is taken as its
     // answer and validated by the server. How many times each item has been asked AND heard (a question talked over does not count), the model-failure run, and whether this is a correction turn.
     let contactAsk: { field: ContactField; heard: boolean } | undefined;
+    let partialLabel: string | undefined;   // the contact item being completed (some pieces heard): asked next, before any other item, until it is whole, declined, or its existing limit ends the call
     let lastAsk: { field: string; prevAt: number | undefined; counted: boolean } | undefined;
     const askCount = new Map<string, number>();
     let modelFailures = 0;
@@ -816,8 +819,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (took?.outcome === 'partial' && lastAsk?.counted && partialCredits++ < 3) askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1));
         // Privacy-safe: the item's label, a fixed reason code and digit COUNTS (this line, and held after it). Never a value, a word of the caller's or a transcript.
         deps.log('CONTACT_ANSWER', { field: contactAsk.field.toUpperCase(), outcome: took === undefined ? 0 : took.outcome === 'captured' ? 1 : took.outcome === 'partial' ? 2 : 3, reason: took?.reason ?? 'NOT_HEARD', heard: contactAsk.heard ? 1 : 0, ...(contactAsk.field === 'phone' ? { digits: took?.digits ?? 0, held: took?.total ?? s.contactDiag().phoneDigits } : {}), n: askCount.get(CONTACT_FIELDS[contactAsk.field]) ?? 0 });
+        // A caller who declines to go on with that item ("I'd rather not give my number") ends its completion: the pieces held are forgotten, and the item goes back to the ordinary rotation and its limit.
+        if (CONTACT_REFUSAL.test(heard.line)) { s.abandonPartial(contactAsk.field); deps.log('CONTACT_DECLINED', { field: contactAsk.field.toUpperCase() }); }
         contactAsk = undefined;
       }
+      partialLabel = s.phoneNeed() !== undefined && s.contactDiag().phoneDigits > 0 ? CONTACT_FIELDS.phone : s.addressPart() !== undefined ? CONTACT_FIELDS.address : s.phoneNeed() === 'restate' ? CONTACT_FIELDS.phone : undefined;
       correcting = false; lastAsk = undefined;
       // Residential-only routing: the answer to the residential question is read before anything else happens on this turn.
       if (deps.residential !== undefined && residential === 'asked') {
@@ -872,7 +878,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (residential === 'residential') return await declineCommercial('COMMERCIAL_REMAINS');
         if (residential === 'none') { residential = 'asked'; deps.log('RESIDENTIAL_ASK'); askResidential(); return; }
       }
-      const next = selectNext(fresh, covers, { lastAskedAt, clarified });
+      const next = selectNext(fresh, covers, { lastAskedAt, clarified, ...(partialLabel === undefined ? {} : { keep: partialLabel }) });
       if (next.kind === 'ready' && got !== undefined) return startReadback(got.preview);
       if (next.kind === 'ask') {
         // An item asked and heard the first time plus MAX_CLARIFICATIONS more times and still not obtained: the call ends as a safe incomplete outcome, saved unconfirmed, never handed off.
@@ -886,17 +892,19 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         }
         const prevAt = lastAskedAt.get(next.field);
         lastAskedAt.set(next.field, covers);
-        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers, item: ((deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field]) ?? 'content').toUpperCase(), n: (askCount.get(next.field) ?? 0) + 1, field: codeOf(next.field), cat: codeOf(fresh?.category) });
+        deps.log('ASK', { again: next.again ? 1 : 0, lines: covers, item: ((deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field]) ?? 'content').toUpperCase(), n: (askCount.get(next.field) ?? 0) + 1, field: codeOf(next.field), cat: codeOf(fresh?.category), ...(deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'phone' && s.phoneNeed() !== undefined ? { need: s.phoneNeed() === 'restate' ? 0 : Number(s.phoneNeed()) } : {}) });
         const choices = deps.choicesFor?.(tenant, next.field);
         // After one part of the service address was heard (a house number without a street name, or the reverse) only the missing part is asked for.
         const part = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'address' ? s.addressPart() : undefined;
+        // Part of a phone number was heard: the question asks for the digits still needed (a COUNT, never a digit), or for the whole number again when the pieces did not fit together.
+        const phoneNeed = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'phone' ? s.phoneNeed() : undefined;
         const fixed = deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined;
         let delivered: boolean;
         if (fixed !== undefined) {
           // The first-cleaning question is never reworded: the same words on every ask (a repeat does not become a different question), spoken as written, kept in the dialogue history as said.
           delivered = say(fixed);
           if (delivered) { s.said(fixed); lastReply = fixed; deps.log('FIRST_CLEAN_ASKED'); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
-        } else delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}) }, statusOf(s, got));
+        } else delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}) }, statusOf(s, got));
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
         if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
         else { if (prevAt === undefined) lastAskedAt.delete(next.field); else lastAskedAt.set(next.field, prevAt); }

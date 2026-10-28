@@ -13,7 +13,7 @@ import { createMasker } from './pii-screen.ts';
 import type { PiiCount } from './pii-screen.ts';
 import { contactMissing, extractContact } from './contact-capture.ts';
 import type { Contact } from './contact-capture.ts';
-import { createContactState, runContactTool } from './call-state.ts';
+import { createContactState, runContactTool, addressFrom } from './call-state.ts';
 import type { CollectOutcome, CollectReason, ContactField, ContactStatus, ContactToolResult } from './call-state.ts';
 import type { PiiType } from './pii-screen.ts';
 
@@ -64,6 +64,10 @@ export interface CallSession {
   contactStatus(): ContactStatus;
   /** A phone number heard in pieces, not yet complete. */
   phonePending(): boolean;
+  /** What the next phone question should ask for (counts only, never a digit): the digits still needed, or 'restate' to ask for the whole number again. */
+  phoneNeed(): number | 'restate' | undefined;
+  /** The caller declined to go on with one contact item: its held pieces are forgotten. */
+  abandonPartial(field: ContactField): void;
   /** Diagnostics only, counts and flags (never a value): which contact items are held, and how many digits of a number heard in pieces. */
   contactDiag(): { name: boolean; phone: boolean; address: boolean; phoneDigits: number };
   /** Which part of the service address is still needed after one part was heard (a fixed word, never the part): the street name, the house number, or none. */
@@ -105,7 +109,8 @@ export function createCallSession(config: SessionConfig): CallSession {
   /** The server-captured items, with the masker's detections filling only what the server has not captured (a caller who volunteered details unasked). */
   const parts = (): { name?: string; phone?: string; address?: string } => {
     const seen = extractContact(masker.reveal());
-    for (const k of ['name', 'phone', 'address'] as const) contact.fallback(k, seen[k]);
+    // The masker's own guess fills an item only when it is a COMPLETE one: an address needs a street number and a street name (a street said to another question is not an address), like every other capture path.
+    for (const k of ['name', 'phone', 'address'] as const) contact.fallback(k, k === 'address' && (seen.address === undefined || addressFrom(seen.address) === undefined) ? undefined : seen[k]);
     return contact.parts();
   };
   let state: 'consent' | 'active' | 'ended' = 'consent';
@@ -183,6 +188,8 @@ export function createCallSession(config: SessionConfig): CallSession {
     contactMissing(): string[] { return contactMissing(parts()); },
     contactStatus(): ContactStatus { parts(); return contact.status(); },
     phonePending(): boolean { return contact.pendingPhone(); },
+    phoneNeed() { return contact.phoneNeed(); },
+    abandonPartial(field: ContactField): void { contact.abandon(field); },
     addressPart() { return contact.addressPart(); },
     contactDiag() { parts(); return { name: contact.value('name') !== undefined, phone: contact.value('phone') !== undefined, address: contact.value('address') !== undefined, phoneDigits: contact.pendingDigits() }; },
     revealContactParts(): { name?: string; phone?: string; address?: string } { return parts(); },

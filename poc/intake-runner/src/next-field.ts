@@ -25,6 +25,8 @@ export interface Fresh {
   readonly ready: boolean;
 }
 export interface AskHistory {
+  /** A field being completed (some of its pieces were heard): while it is still missing it is asked next, before any other. The existing limits still end it. */
+  readonly keep?: string;
   /** For each field already asked: the caller-line count when it was asked. */
   readonly lastAskedAt: ReadonlyMap<string, number>;
   /** Whether the category names have already been offered. */
@@ -65,6 +67,7 @@ export function selectNext(fresh: Fresh | undefined, lines: number, history: Ask
   if (fresh.ready) return { kind: 'ready' };
   if (fresh.category === 'unknown') return { kind: 'clarify', first: !history.clarified };
   if (fresh.missing.length === 0) return { kind: 'listen' };
+  if (history.keep !== undefined && fresh.missing.includes(history.keep)) return { kind: 'ask', field: history.keep, again: (history.lastAskedAt.get(history.keep) ?? -1) >= 0 };
   let best = fresh.missing[0];
   let bestAt = history.lastAskedAt.get(best) ?? -1;
   for (const field of fresh.missing) {

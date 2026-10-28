@@ -32,7 +32,7 @@ export interface DialogueClient {
 export type AddressPart = 'street name' | 'house number';
 export type Directive =
   | { kind: 'open' }
-  | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[]; part?: AddressPart }
+  | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[]; part?: AddressPart; phone?: number | 'restate' }
   | { kind: 'clarify'; categories?: readonly string[] }
   | { kind: 'listen' };
 /** Which items the server already holds and which it still needs, as field names only (never a value). Given to the voice so it does not ask for what the caller has already said. */
@@ -95,7 +95,8 @@ export function renderDirective(d: Directive): string {
       const again = d.again === true ? ' (asked before: ask it a different way)' : '';
       const choices = d.choices === undefined || d.choices.length === 0 ? '' : ` CHOICES: ${d.choices.slice(0, 10).map(name).join('; ')}`;
       const part = d.part === 'street name' || d.part === 'house number' ? ` (the ${d.part === 'street name' ? 'house number' : 'street name'} is already heard: ask only for the ${d.part})` : '';
-      return `NEXT ASK ${name(d.field)}${again}${part}${choices}`;
+      const phone = typeof d.phone === 'number' && Number.isInteger(d.phone) && d.phone >= 1 && d.phone <= 9 ? ` (part of the number is already heard: ask only for the remaining ${d.phone} digits)` : d.phone === 'restate' ? ' (the pieces heard did not fit together: ask for the whole number again, from the start, digit by digit)' : '';
+      return `NEXT ASK ${name(d.field)}${again}${part}${phone}${choices}`;
     }
     case 'clarify': return d.categories === undefined || d.categories.length === 0 ? 'NEXT CLARIFY' : `NEXT CLARIFY: ${d.categories.slice(0, 10).map(name).join('; ')}`;
     case 'listen': return 'NEXT LISTEN';
@@ -131,6 +132,8 @@ export function fallbackText(d: Directive): string {
       const choices = (d.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
       const offer = choices.length > 0 ? ` You can say ${orList(choices)}, or tell me in your own words.` : '';
       if (d.part === 'street name' || d.part === 'house number') return `Sorry about the pause. What is the ${d.part}?`;
+      if (typeof d.phone === 'number' && Number.isInteger(d.phone) && d.phone >= 1 && d.phone <= 9) return `Sorry about the pause. What are the remaining ${d.phone} digits?`;
+      if (d.phone === 'restate') return 'Sorry about the pause. Could you say the whole number again, from the start?';
       return good(d.field) ? `Sorry about the pause. Can you tell me about ${d.field.trim().toLowerCase()}?${offer}` : 'Sorry about the pause. Could you say that again?';
     }
     case 'clarify': {
