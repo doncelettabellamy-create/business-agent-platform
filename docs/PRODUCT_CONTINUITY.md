@@ -49,6 +49,8 @@ The product is four cooperating agents, each judged by evidence the previous one
 | **3 Quality Control** | Judge the result by reading back evidence Processing did not write: pass, rework or escalate. | Built against the mock evidence reader only. |
 | **4 Reporting** | Verify the chain, keep an append-only history, produce per-tenant reports. | Built (memory and SQLite ledger); reports are not yet shown on the dashboard. |
 
+**How the offers sit on these four agents (founder, 2026-10-29).** The product is offered as AI Receptionist & Booking, Estimate Follow-up, Customer Reactivation, Membership Renewal where applicable, and Owner Dashboard & Alerts. They are packaging over these four agents, which stay underneath; the audit is in `docs/ROADMAP_BACKLOG.md` section 3b and the phased plan in `docs/DEVELOPMENT_ROADMAP.md` section 5e. No price or package is set, nothing is authorized, and an offer may be described only as far as it is verified live.
+
 **Not connected yet:** the phone path keeps only a yes/no hand-off flag; nothing passes its sealed hand-off to Processing. `eligibleForProcessing` (confirmed, ready, handed off, and either no address or one the caller confirmed, checked against the encrypted contact) is the single test a future bridge must use. Until the bridge exists, the dashboard shows Intake results only. The dashboard is the owner's window onto all four agents over time, which is why its privacy contract and its evolution matter.
 
 ## 4. Path from test dashboard to production dashboard (proposed; none of it is decided)
