@@ -3469,3 +3469,80 @@ test('CONFIRM (carrier that cannot verify playback): a read-back the provider re
   say(sim, 'yes that is right'); await ended(sim, r);
   assert.equal(r.store.list(T)[0].confirmation, 'confirmed');
 });
+
+// ---------------------------------------------------------------- 2026-10-29 12:05 PM call: a mask placeholder returned by Intake for a job field is never an answer
+/** A fake extraction model that, once the masked text holds the address's placeholder, answers `field` with that placeholder (as the live model did for Pets); before that it answers as the stand-in normally does, optionally with a fixed value. */
+function placeholderClaude(o: { before?: string; until?: string } = {}) {
+  const claude = fakeClaude({ services: true });
+  const orig = claude.client.messages.create.bind(claude.client.messages);
+  (claude.client.messages as any).create = async (p: any) => {
+    const res: any = await orig(p);
+    if (p.stream === true) return res;
+    const req = JSON.parse(p.messages[0].content);
+    if (req.task !== 'extract_fields') return res;
+    const text = String(req.data.masked_text);
+    const out = JSON.parse(res.content[0].text);
+    for (const f of out.fields) if (f.name === 'Pets') {
+      if (text.includes('[ADDRESS_') && !(o.until !== undefined && new RegExp(o.until, 'i').test(text))) { f.value = '[ADDRESS_1]'; f.confidence = 0.9; }
+      else if (o.before !== undefined && new RegExp(o.before, 'i').test(text) && !(o.until !== undefined && new RegExp(o.until, 'i').test(text))) { f.value = o.before; f.confidence = 0.6; }
+    }
+    res.content[0].text = JSON.stringify(out);
+    return res;
+  };
+  return claude;
+}
+const savedPlaceholders = (rec: { fields: Array<{ name: string; value: unknown }> }) => rec.fields.filter((f) => typeof f.value === 'string' && /\[[A-Z]+_\d{1,3}\]/.test(f.value) && !/address|location/i.test(f.name)).map((f) => f.name);
+const spokenLines = (sim: Sim) => sim.messages.filter((m: any) => m.type === 'text' && m.last === true).map((m: any) => m.token as string);
+
+test('PLACEHOLDER the exact 12:05 PM failure: the first pets answer is never accepted, a placeholder then comes back for Pets: it is held, Pets is asked again, the real answer is saved, and no read-back says "a detail you gave"', async () => {
+  const r = await servicesRig({ claude: placeholderClaude({ before: 'not sure', until: 'no pets' }), contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { PETS: ['not sure', 'no pets'] }, 40);
+  assert.deepEqual(diag(r, 'ASK').filter((l) => l.detail?.field === 'PETS').map((l) => `n${l.detail?.n}`), ['n1', 'n2'], 'Pets was asked again after the placeholder was held');
+  assert.ok(diag(r, 'FIELDS_RESTORED').some((l) => Number(l.detail?.withheld) >= 1), 'the hold is logged (fixed codes and counts)');
+  const rb = spokenLines(sim).find((s) => /^Let me check/.test(s)) ?? '';
+  assert.match(rb, /Pets: no pets\./);
+  assert.ok(!/a detail you gave/.test(rb), 'no placeholder wording was spoken');
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.fields.find((f) => f.name === 'Pets')?.value, rec.confirmation, rec.status, rec.address_status], ['no pets', 'confirmed', 'ready', 'caller_confirmed']);
+  assert.deepEqual(savedPlaceholders(rec), []);
+  assert.ok(!/\[[A-Z]+_\d/.test(JSON.stringify(r.logs.map((l) => l.detail))), 'no placeholder or value in any log');
+});
+
+test('PLACEHOLDER an unresolved placeholder-only required field can never reach a confirmed ready record: the model keeps returning it, the call cannot read back, and what is saved is held for a person with Pets missing', async () => {
+  const r = await servicesRig({ claude: placeholderClaude({ before: 'not sure' }), contacts: true, firstCleanQuestion: FQ });
+  // From the first placeholder on, every pass returns it; the accepted-answer restore cannot help because no pets answer was ever accepted by Intake.
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, { PETS: ['not sure', 'no pets', 'no pets', 'no pets', 'no pets'] }, 60);
+  if (!sim.messages.some((m: any) => m.type === 'end')) { try { sim.end(); } catch { /* closed */ } }
+  await sim.closed; await r.handler.idle();
+  const recs = r.store.list(T);
+  for (const rec of recs) {
+    assert.deepEqual(savedPlaceholders(rec), [], 'no job field holds a placeholder in any saved record');
+    assert.ok(!(rec.confirmation === 'confirmed' && rec.status === 'ready' && rec.missing_fields.length > 0));
+  }
+  assert.ok(!spokenLines(sim).some((s) => /a detail you gave/.test(s)), 'a placeholder was never read back');
+});
+
+test('PLACEHOLDER legitimate pet answers are not disturbed: a plain no, a descriptive answer, and a later correction each reach the read-back and the record', async () => {
+  for (const [answer, expect] of [['no pets', /Pets: no pets\./], ['we have a cat', /Pets: a cat\./]] as const) {
+    const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+    const sim = await r.connect();
+    await driveByAsk(r, sim, OPEN_C, { PETS: [answer] }, 40);
+    assert.equal(diag(r, 'ASK').filter((l) => l.detail?.field === 'PETS').length, 1, answer + ': asked once');
+    assert.match(spokenLines(sim).find((s) => /^Let me check/.test(s)) ?? '', expect);
+    say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+    assert.equal(r.store.list(T)[0].fields.find((f) => f.name === 'Pets')?.found, true, answer);
+  }
+});
+
+test('PLACEHOLDER the address keeps its placeholder and masking is unchanged: the address and the caller\'s words are still masked, and the confirmed record still carries the address as confirmed', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, {}, 40);
+  say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r);
+  const [rec] = r.store.list(T);
+  assert.equal(rec.address_status, 'caller_confirmed');
+  assert.ok(!/742|evergreen/i.test(JSON.stringify(rec)), 'the address value is in the vault only');
+});

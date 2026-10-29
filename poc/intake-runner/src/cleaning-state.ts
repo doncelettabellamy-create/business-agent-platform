@@ -27,6 +27,18 @@ import type { FieldEntry, ItemStatus, ReasonCode, WorkItemV1 } from './contracts
 export type FieldKind = 'count' | 'polarity' | 'frequency' | 'date' | 'time' | 'free';
 export type BindResult = 'bound' | 'ambiguous' | 'unchecked';
 export interface MergeOutcome { readonly accepted: readonly string[]; readonly corrected: readonly string[]; readonly conflicts: readonly string[]; readonly unsupported: readonly string[] }
+/**
+ * A value that is ONLY mask placeholders (and punctuation), such as "[ADDRESS_1]", is never an answer to a question about the job: it is what the masker put where the caller's words were, and an
+ * extraction pass can return it because it is "copied from the masked text". For a field that is not an address or a location it is not found. A value that mixes a placeholder with other words is NOT covered
+ * by this rule (a separate, unverified hazard, reported and left alone).
+ */
+const PLACEHOLDER_TOKEN = /\[[A-Z]+_\d{1,3}\]/g;
+export function isPlaceholderOnly(value: unknown): boolean {
+  if (typeof value !== 'string' || !PLACEHOLDER_TOKEN.test(value)) { PLACEHOLDER_TOKEN.lastIndex = 0; return false; }
+  PLACEHOLDER_TOKEN.lastIndex = 0;
+  return value.replace(PLACEHOLDER_TOKEN, '').replace(/[\s.,;:!?'"()\-]/g, '') === '';
+}
+const ADDRESS_LIKE = /address|location/i;
 export interface OverlayResult { readonly item: WorkItemV1; readonly changed: boolean; readonly restored: readonly string[]; readonly withheld: readonly string[]; readonly dropped: readonly string[] }
 /** What the evidence rule needs: the fields the item's category requires (undefined: do not police) and the caller's masked lines. */
 export interface EvidenceContext { readonly required?: ReadonlySet<string>; readonly lines: readonly string[] }
@@ -172,6 +184,8 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
         if (!f.found || typeof f.value !== 'string' || !usable(f.name)) continue;
         const v = clean(f.value).slice(0, MAX_VALUE);
         const kind = kindOf(f.name);
+        // A mask placeholder returned as the answer to a question about the job is not an answer and is never accepted (the overlay below holds the field and the question is asked again; an accepted answer stands).
+        if (isPlaceholderOnly(v) && !ADDRESS_LIKE.test(f.name)) continue;
         if (!plausible(f.name, kind, v)) continue;
         if (!supported(f.name, v, ctx)) { out.unsupported.push(f.name); continue; }
         const had = accepted.get(f.name);
@@ -194,6 +208,8 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
       const fields = item.fields.map((f) => {
         if (conflicted.has(f.name)) { if (f.found || f.value !== null || !missing.includes(f.name)) withheld.push(f.name); return { ...f, value: null, confidence: null, found: false }; }
         const a = accepted.get(f.name);
+        // Placeholder-only value, nothing accepted: held (not found, asked first), on every path including the final pass; an accepted answer is restored by the rule below.
+        if (a === undefined && f.found && isPlaceholderOnly(f.value) && !ADDRESS_LIKE.test(f.name)) { withheld.push(f.name); return { ...f, value: null, confidence: null, found: false }; }
         // An optional field the caller's words do not support (Intake filled it from other wording) is taken out: not found, not missing, nothing invented, no required field touched.
         if (a === undefined && f.found && typeof f.value === 'string' && !supported(f.name, clean(f.value), ctx)) { dropped.push(f.name); return { ...f, value: null, confidence: null, found: false }; }
         if (a !== undefined && (!f.found || f.value === null)) { restored.push(f.name); return { ...f, value: a, confidence: 0.8, found: true }; }

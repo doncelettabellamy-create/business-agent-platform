@@ -166,3 +166,65 @@ test('requiredFieldsOf: fields marked required plus the category list', () => {
   assert.deepEqual(requiredFieldsOf(skill, 'Standard cleaning'), ['Job description', 'Pets', 'Extras']);
   assert.deepEqual(requiredFieldsOf(skill, 'Unknown'), ['Job description']);
 });
+
+// ---------------------------------------------------------------- 2026-10-29: a mask placeholder is never an answer to a question about the job (the Pets value of the 12:05 PM call)
+import { isPlaceholderOnly } from '../src/cleaning-state.ts';
+
+test('placeholder-only values: only mask placeholders and punctuation count; a placeholder with other words is NOT covered by this rule', () => {
+  for (const v of ['[ADDRESS_1]', ' [ADDRESS_12]. ', '[PERSON_1], [ADDRESS_2]', '"[CONTACT_3]"', '[ID_1]!']) assert.equal(isPlaceholderOnly(v), true, v);
+  for (const v of ['No', 'no pets', 'two dogs and a cat', 'no [PERSON_1]', 'at [ADDRESS_1]', '', '[address_1]', '[ADDRESS_]', '[]', 42, null, undefined]) assert.equal(isPlaceholderOnly(v as never), false, String(v));
+  assert.equal(isPlaceholderOnly('[ADDRESS_1]'), true, 'repeated calls give the same answer (no stale regex state)');
+});
+
+test('overlay: a placeholder-only value for a job field with nothing accepted is held: not found, missing and asked first, with the ambiguous-field reason; the record cannot be ready', () => {
+  const s = createCleaningState();
+  const out = s.overlay(item([fe('Pets', '[ADDRESS_1]'), fe('Extras', 'No extras')]));
+  assert.equal(out.changed, true); assert.deepEqual([...out.withheld], ['Pets']);
+  const pets = out.item.fields.find((f) => f.name === 'Pets') as FieldEntry;
+  assert.deepEqual([pets.found, pets.value], [false, null]);
+  assert.deepEqual(out.item.missing_fields, ['Pets']);
+  assert.ok(out.item.reasons.includes('missing_fields') && out.item.reasons.includes('ambiguous_field'));
+  assert.notEqual(out.item.status, 'ready');
+  assert.equal(out.item.fields.find((f) => f.name === 'Extras')?.value, 'No extras', 'other fields are untouched');
+});
+
+test('merge ignores a placeholder-only value (never accepted), and the next real answer is accepted and restored over later placeholders', () => {
+  const s = createCleaningState();
+  const m = s.merge(item([fe('Pets', '[ADDRESS_1]')]), 'whatever', undefined);
+  assert.deepEqual(m.accepted, []); assert.equal(s.has('Pets'), false);
+  s.merge(item([fe('Pets', 'no pets')]), 'no pets', undefined);
+  assert.equal(s.has('Pets'), true);
+  const out = s.overlay(item([fe('Pets', '[ADDRESS_1]')]));
+  assert.equal(out.item.fields.find((f) => f.name === 'Pets')?.value, 'no pets', 'the accepted answer stands over a later placeholder');
+  assert.equal(out.item.fields.find((f) => f.name === 'Pets')?.found, true);
+  assert.deepEqual([...out.withheld], []);
+});
+
+test('an address or location field keeps its placeholder: that is what the masker is meant to put there', () => {
+  const s = createCleaningState();
+  for (const name of ['Address', 'Service address', 'Job location']) {
+    const out = s.overlay(item([fe(name, '[ADDRESS_1]')]));
+    assert.equal(out.changed, false, name);
+    assert.equal(out.item.fields[0].value, '[ADDRESS_1]');
+  }
+});
+
+test('legitimate answers are untouched: yes and no answers, a descriptive answer, and a correction', () => {
+  const s = createCleaningState();
+  for (const [v, w] of [['No', 'No'], ['no pets', 'no pets'], ['two dogs and a cat', 'two dogs and a cat']] as const) {
+    const t = createCleaningState();
+    const m = t.merge(item([fe('Pets', v)]), v, undefined);
+    assert.deepEqual(m.accepted, ['Pets'], v);
+    assert.equal(t.overlay(item([fe('Pets', v)])).changed, false);
+    assert.equal(t.has('Pets'), true); void w;
+  }
+  s.merge(item([fe('Pets', 'no pets')]), 'no pets', undefined);
+  const c = s.merge(item([fe('Pets', 'a dog')]), 'actually we do have a dog', undefined);
+  assert.deepEqual(c.corrected, ['Pets'], 'a correction still replaces an accepted answer');
+});
+
+test('KNOWN HAZARD, OUTSIDE THIS FIX: a value that mixes a placeholder with other words is not held and no safety claim is made for it', () => {
+  const s = createCleaningState();
+  const out = s.overlay(item([fe('Pets', 'no [PERSON_1]')]));
+  assert.equal(out.changed, false, 'unchanged by design here; widening the rule needs its own evidence and approval');
+});
