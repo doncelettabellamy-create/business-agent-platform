@@ -26,6 +26,7 @@ import { createRelayHandler, readBackText, redactSensitive, residentialAnswer, S
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
 import { requiredFieldsOf, codeOf } from '../src/cleaning-state.ts';
+import { classifyPropertyAnswer } from '../src/property-choice.ts';
 import { scriptedQuestion, scriptedClarify, JOB_QUESTIONS } from '../src/scripted-questions.ts';
 import { firstCleanQuestion, FIXED_QUESTIONS, residentialRouting, VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS } from '../src/founder-voice-service.ts';
 import { parseFirstClean } from '../src/first-clean.ts';
@@ -3565,6 +3566,7 @@ const SQ_SENTENCES: Map<string, string> = (() => {
     else if (fixed.has(f.name)) m.set(FIXED_QUESTIONS[f.name], `FIXED_${codeOf(f.name)}`);
     else { const q = scriptedQuestion({ field: f.name, ...(f.choices ? { choices: f.choices } : {}) }); m.set(q.text, q.id); }
   }
+  { const q = scriptedQuestion({ field: 'Property type', choices: ((servicesSkill as any).fields.find((x: any) => x.name === 'Property type').choices as string[]), clarify: true }); m.set(q.text, q.id); }
   for (const field of ['Customer name', 'Callback phone number', 'Service address']) {
     for (const rejected of [false, true]) { const q = scriptedQuestion({ field, rejected }); m.set(q.text, q.id); }
   }
@@ -3576,7 +3578,7 @@ const SQ_SENTENCES: Map<string, string> = (() => {
 })();
 /** What a plain caller says to each question they hear. */
 const SQ_PLAIN: Record<string, string> = {
-  JOB_PROPERTY_TYPE: 'it is a house', JOB_NUMBER_OF_BEDROOMS: 'two bedrooms', JOB_NUMBER_OF_BATHROOMS: 'two bathrooms', JOB_PETS: 'no pets', JOB_CLEANING_FREQUENCY: 'just one time', JOB_EXTRAS: 'no extras',
+  JOB_PROPERTY_TYPE: 'it is a house', JOB_PROPERTY_TYPE_CLARIFY: 'house', JOB_NUMBER_OF_BEDROOMS: 'two bedrooms', JOB_NUMBER_OF_BATHROOMS: 'two bathrooms', JOB_PETS: 'no pets', JOB_CLEANING_FREQUENCY: 'just one time', JOB_EXTRAS: 'no extras',
   JOB_LAST_PROFESSIONAL_CLEAN: 'a year ago', JOB_PRIORITY_AREAS: 'the kitchen', JOB_HOME_EMPTY: 'yes it is empty', FIRST_CLEAN: 'yes', FIXED_PREFERRED_DATE: 'tomorrow', FIXED_TIME_WINDOW: 'morning',
   NAME: 'priya raman', NAME_RETRY: 'priya raman', PHONE: 'two one two five five five zero one four two', PHONE_RETRY: 'two one two five five five zero one four two', ADDRESS: '742 Evergreen Terrace', ADDRESS_RETRY: '742 Evergreen Terrace',
   CATEGORY: 'a regular cleaning', CATEGORY_OPEN: 'a regular cleaning',
@@ -3588,7 +3590,7 @@ const sqExpected = (code: string): (id: string) => boolean => {
   if (code === 'SERVICE_ADDRESS') return (id) => /^ADDRESS/.test(id);
   if (code === 'FIRST_CLEANING_WITH_US') return (id) => id === 'FIRST_CLEAN';
   if (code === 'PREFERRED_DATE' || code === 'TIME_WINDOW') return (id) => id === `FIXED_${code}`;
-  return (id) => id === `JOB_${code}`;
+  return (id) => id === `JOB_${code}` || id === `JOB_${code}_CLARIFY`;
 };
 interface SqStep { heard: string; id: string | undefined; said: string }
 /**
@@ -4168,4 +4170,139 @@ test('SCRIPTED ADDRESS bounded retries: a caller who only ever repeats the house
   const rec = sqRec(r);
   assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.address_status], ['unconfirmed', 'needs-human', false, 'none']);
   adPrivate(r);
+});
+
+// ---------------------------------------------------------------- 2026-10-29: PROPERTY TYPE (founder-approved): an answer that is not one of the configured choices is asked about ONCE, in fixed words listing the choices; an
+// unambiguous supported answer is accepted; anything else is kept as the caller's own masked words and the record is saved for a person (confirmed, needs-human, never ready or handed off). Nothing is guessed, replaced or normalised,
+// and a negated choice is not accepted. The extractor stand-in returns the caller's own word for Property type when the base pattern finds none (what the live model did with "Health" and "residential"), and, like a model, may return just
+// "house" for "not a house".
+const PR_OPEN = 'I need a regular cleaning, two bedrooms and two bathrooms';
+const PR_CLARIFY = scriptedQuestion({ field: 'Property type', choices: ((servicesSkill as any).fields.find((x: any) => x.name === 'Property type').choices as string[]), clarify: true });
+const propClaude = (said: string[], force?: string) => sqClaude({ tweak: (out, _p, text) => {
+  const lines = text.split('\n').filter((l) => l.startsWith('Caller: ')).map((l) => l.slice(8));
+  const mine = lines.filter((l) => said.includes(l));
+  // Like a competent model: the newest line that affirms a configured choice wins; with none, the base pattern's reading (which can be just "house" from "not a house") stands.
+  const choices = ((servicesSkill as any).fields.find((x: any) => x.name === 'Property type').choices as string[]);
+  const newest = [...lines].reverse().find((l) => classifyPropertyAnswer(l, choices) === 'choice');
+  for (const f of out.fields) if (f.name === 'Property type') {
+    if (force !== undefined && mine.length > 0) { f.value = force; f.confidence = 0.9; }
+    else if (newest !== undefined) { f.value = /house|apartment|condo|townhouse/i.exec(newest)![0].toLowerCase(); f.confidence = 0.9; }
+    else if (mine.length > 0 && f.value === null) { f.value = mine.at(-1)!.replace(/[.]+$/, ''); f.confidence = 0.9; }
+  }
+} });
+const prAsks = (steps: SqStep[]) => steps.filter((s) => /^JOB_PROPERTY_TYPE/.test(s.id ?? '')).map((s) => s.id);
+const prRb = (sim: Sim, nth = -1) => /Property type: ([^.]*)\./.exec(textTokens(sim).filter((x) => /^Let me check/.test(x)).at(nth) ?? '')?.[1];
+const prRun = async (said: string[], answers: Record<string, string[]>, o: { open?: string; force?: string } = {}) => {
+  const r = await servicesRig({ ...SQ_RIG, claude: propClaude(said, o.force) });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { open: o.open ?? PR_OPEN, answers, max: 40 });
+  return { r, sim, steps };
+};
+const prNoWords = (r: Rig, ...words: string[]) => { const j = JSON.stringify(r.logs).toLowerCase(); for (const w of words) assert.ok(!j.includes(w.toLowerCase()), `no caller word in a log: ${w}`); };
+
+for (const [wrong, label] of [['Health.', 'Health'], ['residential', 'residential']] as const) {
+  test(`SCRIPTED PROPERTY "${label}" is not a configured choice: it is asked about once, in fixed words listing the choices, and the caller's "house" is accepted: read back as house, saved ready and handed off, "${label}" never saved`, async () => {
+    const { r, sim, steps } = await prRun([wrong], { JOB_PROPERTY_TYPE: [wrong], JOB_PROPERTY_TYPE_CLARIFY: ['house'] });
+    assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY'], 'asked, then clarified once');
+    assert.equal(PR_CLARIFY.text, 'Just to be sure, is it a house, apartment, condo, or townhouse?');
+    assert.equal(diag(r, 'PROPERTY_CLARIFY').length, 1);
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => s.id)));
+    assert.equal(prRb(sim), 'house');
+    await sqFinish(r, sim);
+    assert.equal(sqVal(r, 'Property type'), 'house');
+    assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off, sqRec(r).missing_fields, sqRec(r).reasons], ['confirmed', 'ready', true, [], []]);
+    prNoWords(r, label);
+  });
+}
+
+test('SCRIPTED PROPERTY unresolved: "Health" and then "Health" again is kept as said (never turned into a choice), asked about only once, read back as said, and saved confirmed but needs-human, never ready, never handed off', async () => {
+  const { r, sim, steps } = await prRun(['Health.'], { JOB_PROPERTY_TYPE: ['Health.'], JOB_PROPERTY_TYPE_CLARIFY: ['Health.'] });
+  assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY'], 'one clarification only, never a third question');
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.equal(prRb(sim), 'Health');
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Property type'), 'Health');
+  const rec = sqRec(r);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.missing_fields], ['confirmed', 'needs-human', false, []]);
+  assert.ok(rec.reasons.includes('human_review'));
+  assert.equal(diag(r, 'PROPERTY_UNRESOLVED').length, 1);
+  prNoWords(r, 'Health');
+});
+
+test('SCRIPTED PROPERTY a genuine off-list description is preserved as the caller said it (the newest one), never replaced, and the record is held for a person', async () => {
+  const said = ['bungalow', 'a bungalow with a basement'];
+  const { r, sim, steps } = await prRun(said, { JOB_PROPERTY_TYPE: ['bungalow'], JOB_PROPERTY_TYPE_CLARIFY: ['a bungalow with a basement'] });
+  assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY']);
+  assert.equal(prRb(sim), 'a bungalow with a basement');
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Property type'), 'a bungalow with a basement');
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'needs-human', false]);
+  assert.ok(sqRec(r).reasons.includes('human_review'));
+  prNoWords(r, 'bungalow', 'basement');
+});
+
+test('SCRIPTED PROPERTY a negated choice is not accepted, even when the extraction returns just "house": "not a house" is asked about, and an unambiguous answer after it is accepted', async () => {
+  const { r, sim, steps } = await prRun(['not a house'], { JOB_PROPERTY_TYPE: ['not a house'], JOB_PROPERTY_TYPE_CLARIFY: ['it is an apartment'] });
+  assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY'], 'the extraction said "house" and it was still asked about');
+  assert.equal(diag(r, 'PROPERTY_CLARIFY').length, 1);
+  await sqFinish(r, sim);
+  assert.match(sqVal(r, 'Property type') ?? '', /apartment/i);
+  assert.ok(!/not a house/i.test(sqVal(r, 'Property type') ?? ''));
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'ready', true]);
+});
+
+test('SCRIPTED PROPERTY a negated answer that stays negated is kept as said ("no house", never "house") and held for a person; two choices at once ("house or apartment") are asked about too', async () => {
+  const neg = await prRun(['not a house', 'no house'], { JOB_PROPERTY_TYPE: ['not a house'], JOB_PROPERTY_TYPE_CLARIFY: ['no house'] });
+  assert.equal(prRb(neg.sim), 'no house');
+  await sqFinish(neg.r, neg.sim);
+  assert.equal(sqVal(neg.r, 'Property type'), 'no house');
+  assert.deepEqual([sqRec(neg.r).confirmation, sqRec(neg.r).status, sqRec(neg.r).handed_off], ['confirmed', 'needs-human', false]);
+  const multi = await prRun(['house or apartment'], { JOB_PROPERTY_TYPE: ['house or apartment'], JOB_PROPERTY_TYPE_CLARIFY: ['apartment'] });
+  assert.deepEqual(prAsks(multi.steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY']);
+  await sqFinish(multi.r, multi.sim);
+  assert.equal(sqVal(multi.r, 'Property type'), 'apartment');
+  assert.equal(sqRec(multi.r).status, 'ready');
+});
+
+test('SCRIPTED PROPERTY volunteered and supported answers are untouched: a house said in the request is never asked about; "House." and "a nice house" to the question are accepted at once; no clarification, ready and handed off', async () => {
+  const vol = await prRun([], {}, { open: 'I need a regular cleaning for my house, two bedrooms and two bathrooms' });
+  assert.deepEqual(prAsks(vol.steps), []);
+  assert.equal(diag(vol.r, 'PROPERTY_CLARIFY').length, 0);
+  await sqFinish(vol.r, vol.sim);
+  assert.deepEqual([sqVal(vol.r, 'Property type'), sqRec(vol.r).status, sqRec(vol.r).handed_off], ['house', 'ready', true]);
+  for (const reply of ['House.', 'a nice house']) {
+    const x = await prRun([reply], { JOB_PROPERTY_TYPE: [reply] });
+    assert.deepEqual(prAsks(x.steps), ['JOB_PROPERTY_TYPE'], reply);
+    assert.equal(diag(x.r, 'PROPERTY_CLARIFY').length, 0, reply);
+    await sqFinish(x.r, x.sim);
+    assert.deepEqual([sqRec(x.r).status, sqRec(x.r).handed_off], ['ready', true], reply);
+  }
+});
+
+test('SCRIPTED PROPERTY corrections: a supported answer corrected at the read-back to another choice is read back and saved as the correction; an unresolved description corrected to a choice is replaced by it', async () => {
+  const a = await prRun([], {}, { open: 'I need a regular cleaning for my house, two bedrooms and two bathrooms' });
+  say(a.sim, 'no that is not right'); assert.equal((await reply(a.r, a.sim)).token, SAY.correct);
+  say(a.sim, 'actually it is an apartment'); await reply(a.r, a.sim);
+  assert.match(prRb(a.sim) ?? '', /apartment/i);
+  await sqFinish(a.r, a.sim);
+  assert.match(sqVal(a.r, 'Property type') ?? '', /apartment/i);
+  assert.equal(sqRec(a.r).confirmation, 'confirmed');
+  const b = await prRun(['Health.'], { JOB_PROPERTY_TYPE: ['Health.'], JOB_PROPERTY_TYPE_CLARIFY: ['Health.'] });
+  assert.equal(prRb(b.sim), 'Health');
+  say(b.sim, 'no that is not right'); assert.equal((await reply(b.r, b.sim)).token, SAY.correct);
+  say(b.sim, 'actually it is a house'); await reply(b.r, b.sim);
+  assert.match(prRb(b.sim) ?? '', /house/i);
+  await sqFinish(b.r, b.sim);
+  assert.match(sqVal(b.r, 'Property type') ?? '', /house/i);
+  assert.ok(!/health/i.test(sqVal(b.r, 'Property type') ?? ''));
+  assert.equal(sqRec(b.r).confirmation, 'confirmed');
+});
+
+test('SCRIPTED PROPERTY if the extraction keeps returning the unsupported word after the caller answered the clarification with a choice, the caller\'s own answer is used, and because the server set it the record is held for a person (never handed off)', async () => {
+  const { r, sim } = await prRun(['Health.'], { JOB_PROPERTY_TYPE: ['Health.'], JOB_PROPERTY_TYPE_CLARIFY: ['house'] }, { force: 'Health' });
+  assert.equal(prRb(sim), 'house');
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Property type'), 'house');
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'needs-human', false]);
+  assert.equal(diag(r, 'PROPERTY_RESOLVED').length, 1);
 });

@@ -32,6 +32,7 @@ import type { EvidenceContext } from './cleaning-state.ts';
 import { MAX_CLARIFICATIONS } from './call-state.ts';
 import type { ContactField } from './call-state.ts';
 import { isBareAnswer, parseFirstClean } from './first-clean.ts';
+import { classifyPropertyAnswer } from './property-choice.ts';
 import type { Contact } from './contact-capture.ts';
 import type { AddressState, ContactVault, StoredContact } from './contact-vault.ts';
 import type { Fresh } from './next-field.ts';
@@ -324,6 +325,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     let correcting = false;
     let incompleteCall = false;
     let lastReply = '';   // the full text of the assistant's most recent reply, to compare with what the phone provider says was spoken before an interruption
+    // PROPERTY TYPE (founder-approved 2026-10-29; this field only). An answer that is not one of the configured choices is asked about ONCE, in fixed words listing the choices; an unambiguous supported answer is accepted;
+    // anything else is kept as the caller's own masked words and the record is saved for a person (confirmed, needs-human, never ready or handed off). Nothing is guessed, replaced or normalised, and a negated choice is not accepted.
+    const PROPERTY_FIELD = /^property type$/i;
+    const property: { field: string | undefined; pending: boolean; asked: boolean; first: string | undefined; reply: string | undefined; noted: boolean } = { field: undefined, pending: false, asked: false, first: undefined, reply: undefined, noted: false };
     let capture: { yes: boolean; text: string } | undefined;   // the caller's newest attributable first-cleaning answer (their own masked words)
     // The cleaning answers accepted so far (cleaning-state.ts): shared by the question choice and the saved record, so a detail once given is never asked for again, a correction replaces it, and a
     // contradiction is asked about instead of the stale value being kept.
@@ -373,7 +378,40 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     const trigger = deps.residential === undefined || deps.residential.keywords.length === 0 ? undefined
       : new RegExp(`(?<![A-Za-z0-9])(?:${[...deps.residential.keywords].sort((a, b) => b.length - a.length).map((k) => k.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')).join('|')})(?![A-Za-z0-9])`, 'gi');
     const neutral = (text: string): string => (residential === 'residential' && trigger !== undefined ? text.replace(trigger, 'property') : text);
-    const intakeText = (s: CallSession): string => { const held = cleaning.lines(); return neutral(s.maskedText() + (held.length > 0 ? `\n${held.join('\n')}` : '')) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : ''); };
+    const intakeText = (s: CallSession): string => { const held = cleaning.lines(); return neutral(s.maskedText() + (held.length > 0 ? `\n${held.join('\n')}` : '')) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '') + (property.reply !== undefined && property.field !== undefined && classifyPropertyAnswer(property.reply, deps.choicesFor?.(tenant, property.field)) === 'choice' ? `\n${property.field}: ${property.reply}` : ''); };
+    /**
+     * The property-type guard (see the state above). Applied beside the first-cleaning guard to every Intake result. `canAsk` is false for the final run, which cannot ask anything. A supported answer from Intake is untouched. Otherwise: before the
+     * clarification was asked (and when it can be) the field is held so it is asked about once; after it, the caller's answer to it (a supported choice) is used if Intake did not return it, and anything unresolved is kept as said and marked for a person.
+     * Any change here means the sealed handoff no longer describes the item, so it is never handed off.
+     */
+    function guardProperty<T extends { item: WorkItemV1; handoff: HandoffEnvelopeV1 | null; handedOff: boolean; edited?: true }>(g: T, canAsk: boolean): T {
+      const field = g.item.fields.find((x) => PROPERTY_FIELD.test(x.name));
+      const choices = field === undefined ? undefined : deps.choicesFor?.(tenant, field.name);
+      if (field === undefined || choices === undefined || choices.length === 0) return g;
+      property.field = field.name;
+      const held = field.found && typeof field.value === 'string' ? field.value : undefined;
+      // Intake can return just "house" for "not a house": the caller's own answer line to the property question (or to the clarification) is checked too, and a negated or two-choice answer is never accepted.
+      const answerLine = property.asked ? property.reply : property.first;
+      const lineKind = answerLine === undefined ? undefined : classifyPropertyAnswer(answerLine, choices);
+      const heldKind = held === undefined ? undefined : classifyPropertyAnswer(held, choices);
+      if (heldKind === 'choice' && lineKind !== 'negated' && lineKind !== 'multi') return g;
+      if (held === undefined && property.reply === undefined) return g;   // nothing has been said about it yet
+      if (!property.asked && canAsk && held !== undefined && deps.scripted !== undefined && carrier.converse === undefined) {
+        if (!property.pending) deps.log('PROPERTY_CLARIFY');
+        property.pending = true;
+        const missing = [field.name, ...g.item.missing_fields.filter((m) => m !== field.name)];
+        const reasons = [...new Set([...g.item.reasons, 'missing_fields' as const, 'ambiguous_field' as const])];
+        return { ...g, item: { ...g.item, fields: g.item.fields.map((x) => (x === field ? { ...x, value: null, confidence: null, found: false } : x)), missing_fields: missing, reasons, status: 'needs-human' as const }, handoff: null, handedOff: false, edited: true };
+      }
+      const reply = property.reply;
+      const supported = reply !== undefined && classifyPropertyAnswer(reply, choices) === 'choice';
+      const value = supported ? (reply as string) : (heldKind === 'choice' || held === undefined ? (answerLine ?? held ?? (reply as string)) : held);   // never the choice Intake extracted from a negated answer
+      const missing = g.item.missing_fields.filter((m) => m !== field.name);
+      let reasons = g.item.reasons.filter((r) => !(r === 'missing_fields' && missing.length === 0));
+      if (!supported && !reasons.includes('human_review')) reasons = [...reasons, 'human_review' as const];
+      if (!property.noted) { property.noted = true; deps.log(supported ? 'PROPERTY_RESOLVED' : 'PROPERTY_UNRESOLVED'); }
+      return { ...g, item: { ...g.item, fields: g.item.fields.map((x) => (x === field ? { ...x, value, confidence: x.confidence ?? 0.8, found: true } : x)), missing_fields: missing, reasons, status: reasons.length === 0 ? ('ready' as const) : ('needs-human' as const) }, handoff: null, handedOff: false, edited: true };
+    }
     /**
      * The first-cleaning guard. It is also DURABLE: when the caller's own newest attributable answer exists, a pass that omits it or reads something else does not overrule it (see below). A value for the first-cleaning field survives only if it is the caller's newest attributable answer, or explicit wording said with no newer
      * attributable answer. A plain yes or no that no first-cleaning question was asked for, and anything that disagrees with the newest attributable answer, is dropped:
@@ -475,7 +513,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       else {
         const r = await runCallIntake(deps.intake, ctx, { tenant, callId, tag: 'final', maskedText: text, pii });
         if (r.ok && (fallback === undefined || freshFrom(r.item, 1) !== undefined)) {
-          const g = guardFirstClean(r.item, r.handoff, r.handedOff);
+          const g = guardProperty(guardFirstClean(r.item, r.handoff, r.handedOff), false);
           // The same accepted answers that steered the call: one an extraction pass omitted is put back, a contradicted one is taken out, and the record is then held for a person (never handed off).
           const ov = cleaning.overlay(g.item, evidenceFor(g.item.category, callerText));
           if (ov.changed) { deps.log('FIELDS_RESTORED', { restored: ov.restored.length, withheld: ov.withheld.length, dropped: ov.dropped.length }); w = ov.item; handedOff = false; } else { w = g.item; handedOff = g.handedOff; }
@@ -537,7 +575,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const run = track(runCallIntake(deps.intake, ctx, { tenant, callId, tag, maskedText: text, pii }).then((r) => {
         if (done) return undefined;
         if (!r.ok) { deps.log('PREVIEW_FAILED', { code: r.code }); return undefined; }
-        const g = guardFirstClean(r.item, r.handoff, r.handedOff);
+        const g = guardProperty(guardFirstClean(r.item, r.handoff, r.handedOff), true);
         const fresh = freshFrom(g.item, covers);
         if (fresh === undefined) { deps.log('PREVIEW_UNUSABLE'); return undefined; }
         const preview: Preview = { item: g.item, handedOff: g.handedOff, handoff: g.handoff, ...(g.edited === true ? { edited: true } : {}) };
@@ -962,6 +1000,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (answer !== null && (activeAsk === deps.firstClean.field || !isBareAnswer(heard.line))) capture = { yes: answer, text: heard.line.trim().slice(0, 80) };
       }
       // The caller's line is the answer to the cleaning question that was just asked and cleanly delivered, when it plausibly is one (a vague or off-topic reply is not stored and the question is asked again).
+      if (activeAsk !== undefined && PROPERTY_FIELD.test(activeAsk)) {   // the caller's own masked words, the first thing said after the property question, and after the clarification
+        if (!property.asked) { if (property.first === undefined) property.first = heard.line.trim().slice(0, 80); }
+        else if (property.reply === undefined) property.reply = heard.line.trim().slice(0, 80);
+      }
       if (activeAsk !== undefined && CONTACT_OF_LABEL[activeAsk] === undefined && activeAsk !== deps.firstClean?.field) {
         const b = cleaning.bind(activeAsk, heard.line);
         // Fixed codes and two counts only: the selected field, the verdict, the branch that gave it (why), the kind of field and the size of the MASKED reply the classifier was given (characters, words). The counts describe
@@ -1001,7 +1043,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (residential === 'residential') return await declineCommercial('COMMERCIAL_REMAINS');
         if (residential === 'none') { residential = 'asked'; deps.log('RESIDENTIAL_ASK'); askResidential(); return; }
       }
-      const next = selectNext(fresh, covers, { lastAskedAt, clarified, ...(partialLabel === undefined ? {} : { keep: partialLabel }) });
+      const next = selectNext(fresh, covers, { lastAskedAt, clarified, ...(partialLabel !== undefined ? { keep: partialLabel } : property.pending && !property.asked && property.field !== undefined ? { keep: property.field } : {}) });
       // The preview above takes seconds. Immediately before anything is spoken, look again: a later utterance already waiting (or, while a number or address is still being given, speech that resumed
       // after the quiet window) makes this question stale. It is not said; the waiting line is handled next, as a continuation of the same item. Bounded like the first wait.
       if (next.kind !== 'ready' && !done) {
@@ -1033,7 +1075,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const contactField0 = deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field];
         const own = deps.fixedQuestions?.[next.field] ?? (deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined);
         const tpl: ScriptedQuestion | undefined = own === undefined && deps.scripted !== undefined && carrier.converse === undefined
-          ? deps.scripted.ask({ field: next.field, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}), rejected: contactField0 !== undefined && contactRejected.get(contactField0) === true })
+          ? deps.scripted.ask({ field: next.field, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}), ...(property.pending && !property.asked && PROPERTY_FIELD.test(next.field) ? { clarify: true } : {}), rejected: contactField0 !== undefined && contactRejected.get(contactField0) === true })
           : undefined;
         const fixed = own ?? tpl?.text;
         let delivered: boolean;
@@ -1046,6 +1088,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
         if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
         else { if (prevAt === undefined) lastAskedAt.delete(next.field); else lastAskedAt.set(next.field, prevAt); }
+        if (delivered && tpl?.id === 'JOB_PROPERTY_TYPE_CLARIFY') { property.asked = true; property.pending = false; }   // asked once, and only once it was actually delivered
         const contactField = deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field];
         if (contactField !== undefined) contactAsk = { field: contactField, heard: delivered };
         activeAsk = delivered ? next.field : undefined;

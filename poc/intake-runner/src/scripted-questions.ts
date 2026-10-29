@@ -17,6 +17,8 @@ export interface ScriptedAsk {
   part?: AddressPart;
   phone?: number | 'restate';
   rejected?: boolean;
+  /** The property-type clarification (asked once, when the first answer is not one of the configured choices): the fixed sentence lists the configured choices once. */
+  clarify?: boolean;
 }
 /** `id` is a fixed code (logged); `text` is spoken exactly as written. */
 export interface ScriptedQuestion { id: string; text: string }
@@ -62,6 +64,7 @@ export function scriptedQuestion(a: ScriptedAsk): ScriptedQuestion {
   }
   const choices = (a.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
   const offer = choices.length > 0 ? ` You can say ${orList(choices)}.` : '';
+  if (a.clarify === true && f === 'property type' && choices.length > 0) return { id: 'JOB_PROPERTY_TYPE_CLARIFY', text: `Just to be sure, is it a ${orList(choices)}?` };
   const own = JOB_QUESTIONS[f];
   if (own !== undefined) return { id: `JOB_${idOf(a.field)}`, text: `${own}${offer}` };
   return { id: 'GENERIC', text: good(a.field) ? `Can you tell me about ${a.field.trim().toLowerCase()}?${offer}` : 'Could you tell me a little more about that?' };
