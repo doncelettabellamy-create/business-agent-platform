@@ -1,7 +1,7 @@
 // cleaning-state.ts: the validated current-call cleaning answers shared by the question choice and the saved record. Invented words only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createCleaningState, kindOf, countOf, polarityOf, codeOf, requiredFieldsOf } from '../src/cleaning-state.ts';
+import { createCleaningState, kindOf, countOf, polarityOf, codeOf, requiredFieldsOf, answerMeaning, isRefusalOrUnsure } from '../src/cleaning-state.ts';
 import type { WorkItemV1, FieldEntry } from '../src/contracts.ts';
 
 const fe = (name: string, value: string | null): FieldEntry => ({ name, value, confidence: value === null ? null : 0.9, found: value !== null });
@@ -227,4 +227,64 @@ test('KNOWN HAZARD, OUTSIDE THIS FIX: a value that mixes a placeholder with othe
   const s = createCleaningState();
   const out = s.overlay(item([fe('Pets', 'no [PERSON_1]')]));
   assert.equal(out.changed, false, 'unchanged by design here; widening the rule needs its own evidence and approval');
+});
+
+// ---- 2026-10-29: refusal / uncertainty protection for non-address job fields, and the field-specific meanings for the two Deep-cleaning free-text fields
+test('answerMeaning: Priority areas takes no / none / no preference; Last professional clean takes never, and asks again for no / none / no preference; a longer answer is ordinary', () => {
+  const m = (f: string, v: string) => answerMeaning(f, v);
+  for (const v of ['no', 'None', 'No preference.', 'no preferences', 'nothing', 'Um, none']) assert.equal(m('Priority areas', v), 'valid', v);
+  for (const v of ['never', 'Never.', 'not ever', 'we have never had one', 'I have never had a professional clean']) assert.equal(m('Last professional clean', v), 'valid', v);
+  for (const v of ['no', 'none', 'no preference', 'Nope.', 'nothing']) assert.equal(m('Last professional clean', v), 'unclear', v);
+  for (const v of ['the kitchen', 'no preference for the kitchen but the bathrooms', 'a year ago', 'never, but we cleaned it ourselves last week']) assert.equal(m(v.startsWith('a year') || v.startsWith('never,') ? 'Last professional clean' : 'Priority areas', v), undefined, v);
+  assert.equal(m('Priority areas', 'never'), undefined, 'never says nothing about areas: an ordinary reply');
+  assert.equal(m('Pets', 'none'), undefined, 'no rule for other fields');
+});
+
+test('isRefusalOrUnsure: only the COMPLETE reply counts, so legitimate negative answers and phrases that contain those words are untouched', () => {
+  for (const v of ["I'd rather not answer", 'I would rather not say', 'rather not', 'I prefer not to say', "I don't know", 'Not sure.', "I'm not sure", 'no comment', 'not telling', 'pass', 'maybe', 'I do not want to answer that', 'Um, I don’t know']) assert.equal(isRefusalOrUnsure(v), true, v);
+  for (const v of ['no', 'none', 'no pets', 'nothing', 'never', "we don't want any extras", "I don't know the old cleaner but it was in March", 'not sure about the oven but yes the fridge', 'no preference for the kitchen', 'two dogs', 'it was a long time ago and I do not remember who', 'the kitchen', '', 'pass the kitchen first']) assert.equal(isRefusalOrUnsure(v), false, v);
+  assert.equal(isRefusalOrUnsure(42 as never), false);
+});
+
+test('bind: a valid Deep-field reply is bound in the caller\'s words, a reply that is not an answer to THAT question or a refusal is ambiguous and stored nowhere, anything else is unchecked as before', () => {
+  const s = createCleaningState();
+  assert.equal(s.bind('Priority areas', 'No preference.'), 'bound');
+  assert.deepEqual(s.lines(), ['Priority areas: No preference']);
+  assert.equal(s.bind('Last professional clean', 'none'), 'ambiguous');
+  assert.equal(s.bind('Last professional clean', "I'd rather not answer"), 'ambiguous');
+  assert.equal(s.bind('Last professional clean', 'a year ago'), 'unchecked');
+  assert.equal(s.bind('Last professional clean', 'never'), 'bound');
+  assert.deepEqual(s.lines(), ['Priority areas: No preference', 'Last professional clean: never']);
+  assert.equal(s.bind('Job description', 'not sure'), 'ambiguous', 'a refusal or an I-do-not-know is never an answer, for any free-text field');
+  assert.equal(s.bind('Job description', 'a burst pipe'), 'unchecked');
+});
+
+test('merge and overlay: a refusal, an uncertain reply or (for the field) a reply that is not an answer is held when nothing is accepted: not found, missing, asked again, never ready', () => {
+  for (const [field, v] of [['Priority areas', "I'd rather not answer"], ['Priority areas', 'not sure'], ['Last professional clean', 'no'], ['Last professional clean', 'none'], ['Pets', 'maybe'], ['Number of bedrooms', "I don't know"]] as const) {
+    const s = createCleaningState();
+    const it = item([fe(field, v)]);
+    const m = s.merge(it, v, undefined);
+    assert.deepEqual(m.accepted, [], `${field}: ${v} is not accepted`);
+    const out = s.overlay(it);
+    assert.equal(out.changed, true, `${field}: ${v}`);
+    assert.deepEqual([out.item.fields[0].found, out.item.fields[0].value, out.item.missing_fields[0], out.item.status], [false, null, field, 'needs-human']);
+    assert.ok(out.item.reasons.includes('ambiguous_field') && out.item.reasons.includes('missing_fields'));
+  }
+});
+
+test('merge and overlay: valid answers and answers that contain those words are kept; an accepted answer is never overruled by a later refusal; a correction still replaces it', () => {
+  for (const [field, v] of [['Priority areas', 'no'], ['Priority areas', 'none'], ['Last professional clean', 'never'], ['Pets', 'no pets'], ['Last professional clean', "I don't know who it was but it was in March"], ['Extras', "we don't want the oven cleaned"]] as const) {
+    const s = createCleaningState();
+    const it = item([fe(field, v)]);
+    s.merge(it, v, undefined);
+    assert.equal(s.overlay(it).item.fields[0].found, true, `${field}: ${v} stays found`);
+  }
+  const s = createCleaningState();
+  s.merge(item([fe('Priority areas', 'none')]), 'none', undefined);
+  const later = s.overlay(item([fe('Priority areas', "I'd rather not answer")]));
+  assert.deepEqual([later.item.fields[0].found, later.item.fields[0].value], [true, 'none'], 'the accepted answer stands over a later refusal');
+  const omitted = s.overlay(item([fe('Priority areas', null)], ['Priority areas'], ['missing_fields'], 'needs-human'));
+  assert.deepEqual([omitted.item.fields[0].value, omitted.restored], ['none', ['Priority areas']]);
+  const c = s.merge(item([fe('Priority areas', 'the kitchen')]), 'actually the kitchen', undefined);
+  assert.deepEqual(c.corrected, ['Priority areas'], 'an explicit correction replaces it');
 });

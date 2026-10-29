@@ -3762,25 +3762,124 @@ test('SCRIPTED NO / NONE the plain refusals "no", "none" and "nothing" are compl
   assert.deepEqual([sqVal(r, 'Pets'), sqVal(r, 'Extras')], ['none', 'nothing']);
 });
 
-// REPORTED, NOT WIDENED (2026-10-29): the call state binds an answer to its question only for count, yes/no, frequency, date and time fields. A free-text field (Priority areas, Last professional clean) is 'UNCHECKED': a bare "none",
-// "no preference", "never" or "no" reaches Intake as an unlabelled caller line (Intake never sees the question), so whether it is read as the answer depends on the extraction model, and when it is not the question is asked again.
-const GAP = 'VALIDATION GAP (reported, not widened): a bare none / no preference / never / no is not bound to a free-text field, so the question is asked again';
-for (const [label, field, id, said, todo] of [
-  ['"none" to the priority-areas question', 'Priority areas', 'JOB_PRIORITY_AREAS', 'none', GAP],
-  ['"no preference" to the priority-areas question', 'Priority areas', 'JOB_PRIORITY_AREAS', 'no preference', GAP],
-  ['"never" to the last-professional-clean question', 'Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'never', GAP],
-  ['a plain "no" to the priority-areas question ("are there any areas you would like us to focus on?")', 'Priority areas', 'JOB_PRIORITY_AREAS', 'no', GAP],
-] as const) {
-  test(`SCRIPTED CONTEXTUAL NONE (deep cleaning) ${label} is a completed answer: asked once, saved, read back`, { ...(todo === undefined ? {} : { todo }) }, async () => {
+// DEEP CLEANING FREE-TEXT FIELDS (founder-approved 2026-10-29): what a complete short reply means for Priority areas and Last professional clean.
+//   Priority areas:           no / none / no preference is an answer (stored in the caller's words).
+//   Last professional clean:  never is an answer; no / none / no preference does not say when, so it is asked again.
+//   Everywhere (non-address): a refusal or an "I don't know" that is the COMPLETE reply is never an answer: held, asked again within the usual limit, ending as an incomplete, unconfirmed request for a person.
+// Each case runs with an extractor that maps the caller's bare line to the field ("mapped", the best case) and one that does not ("unmapped"), because the answer must not depend on that.
+type DeepOutcome = 'valid' | 'held';
+const DEEP_CASES: ReadonlyArray<readonly [string, string, string, DeepOutcome]> = [
+  ['Priority areas', 'JOB_PRIORITY_AREAS', 'none', 'valid'],
+  ['Priority areas', 'JOB_PRIORITY_AREAS', 'No preference.', 'valid'],
+  ['Priority areas', 'JOB_PRIORITY_AREAS', 'no', 'valid'],
+  ['Priority areas', 'JOB_PRIORITY_AREAS', "I'd rather not answer", 'held'],
+  ['Priority areas', 'JOB_PRIORITY_AREAS', "I don't know", 'held'],
+  ['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'never', 'valid'],
+  ['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'none', 'held'],
+  ['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'no', 'held'],
+  ['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'no preference', 'held'],
+  ['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', "I'd rather not answer", 'held'],
+  ['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'not sure', 'held'],
+];
+const DEEP_OPEN = 'I need a deep clean for my house, two bedrooms and two bathrooms';
+/** An extractor that copies the caller's bare line into the field when it can (the best case for acceptance). */
+const sqMapped = (field: string, said: string) => sqClaude({ tweak: (out, _p, text) => { const lines = text.split('\n').filter((l) => l.startsWith('Caller: ')).map((l) => l.slice(8)); for (const f of out.fields) if (f.name === field && f.value === null && lines.includes(said)) { f.value = said; f.confidence = 0.9; } } });
+for (const mode of ['unmapped', 'mapped'] as const) {
+  for (const [field, id, said, outcome] of DEEP_CASES) {
+    test(`SCRIPTED DEEP FIELDS (${mode} extraction) ${field}: ${JSON.stringify(said)} is ${outcome === 'valid' ? 'a complete answer, saved in the caller\'s words' : 'not an answer: held, asked again within the limit, never saved or read back'}`, async () => {
+      const r = await servicesRig({ ...SQ_RIG, claude: mode === 'mapped' ? sqMapped(field, said) : sqClaude() });
+      const sim = await r.connect();
+      const steps = await sqConverse(r, sim, { open: DEEP_OPEN, answers: { [id]: [said] }, max: 30 });
+      const asked = steps.filter((s) => s.id === id).length;
+      if (outcome === 'valid') {
+        assert.equal(asked, 1, `${field} was asked ${asked} times`);
+        assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+        sqAgree(r, sim);
+        await sqFinish(r, sim);
+        const kept = said.replace(/[.!?,;\s]+$/, '');
+        assert.equal(sqVal(r, field)?.toLowerCase(), kept.toLowerCase(), 'the caller\'s own words, nothing inferred');
+        assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off, sqRec(r).missing_fields], ['confirmed', 'ready', true, []]);
+      } else {
+        assert.ok(asked >= 2 && asked <= 3, `${field}: the question was asked ${asked} times (bounded, and asked again)`);
+        assert.equal(diag(r, 'INCOMPLETE').length, 1, 'the bounded clarification ended the call as incomplete');
+        assert.ok(!r.logs.some((l) => l.code === 'READBACK'), 'a request with a held required field is never read back');
+        await ended(sim, r).catch(() => {});
+        const rec = sqRec(r);
+        assert.deepEqual([rec.confirmation, rec.status, rec.handed_off], ['unconfirmed', 'needs-human', false]);
+        assert.ok(rec.missing_fields.includes(field), 'the field is listed as missing for a person');
+        assert.equal(sqVal(r, field), undefined, 'the held reply was not saved as an answer');
+        assert.ok(!JSON.stringify(r.logs).toLowerCase().includes('rather not'), 'no caller word in a log');
+      }
+    });
+  }
+}
+
+test('SCRIPTED DEEP FIELDS a clarification resolves: a held reply is asked again with the same sentence and a real answer then completes the field, in two asks', async () => {
+  for (const [field, id, first, second] of [['Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'none', 'never'], ['Priority areas', 'JOB_PRIORITY_AREAS', "I'd rather not answer", 'no preference']] as const) {
     const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
     const sim = await r.connect();
-    const steps = await sqConverse(r, sim, { open: 'I need a deep clean for my house, two bedrooms and two bathrooms', answers: { [id]: [said] } });
-    assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => [s.id, s.said])));
-    assert.equal(steps.filter((s) => s.id === id).length, 1, `${field} was asked ${steps.filter((s) => s.id === id).length} times`);
+    const steps = await sqConverse(r, sim, { open: DEEP_OPEN, answers: { [id]: [first, second] } });
+    assert.equal(steps.filter((s) => s.id === id).length, 2, field);
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'));
     await sqFinish(r, sim);
-    assert.equal(sqVal(r, field)?.toLowerCase(), said);
-  });
-}
+    assert.equal(sqVal(r, field), second);
+    assert.deepEqual([sqRec(r).confirmation, sqRec(r).status], ['confirmed', 'ready']);
+  }
+});
+
+test('SCRIPTED DEEP FIELDS a valid answer survives a pass that omits it: it is put back, and because the server restored it the confirmed request is held for a person (never handed on)', async () => {
+  // The first pass that sees the labelled answer finds it (that is what accepts a bound answer); every later pass omits it.
+  let found = false;
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude({ tweak: (out, _p, text) => { if (/^Priority areas: /m.test(text)) { if (!found) { found = true; return; } for (const f of out.fields) if (f.name === 'Priority areas') { f.value = null; f.confidence = null; } } } }) });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { open: DEEP_OPEN, answers: { JOB_PRIORITY_AREAS: ['no preference'] } });
+  assert.equal(steps.filter((s) => s.id === 'JOB_PRIORITY_AREAS').length, 1);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.ok(diag(r, 'FIELDS_RESTORED').length > 0);
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Priority areas'), 'no preference');
+  assert.equal(sqRec(r).confirmation, 'confirmed');
+  assert.ok(sqRec(r).reasons.includes('human_review') && !sqRec(r).handed_off, 'restored by the server: held for a person');
+});
+
+test('SCRIPTED DEEP FIELDS a valid answer is replaced only by the caller explicit correction at the read-back (the accepted-over-refusal rule is a unit test: the extraction text of a real call can only hold words the caller said)', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { open: DEEP_OPEN, answers: { JOB_PRIORITY_AREAS: ['none'] } });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.match(textTokens(sim).filter((t) => /^Let me check/.test(t)).at(-1) ?? '', /Priority areas: none./);
+  say(sim, 'no that is not right'); assert.equal((await reply(r, sim)).token, SAY.correct);
+  say(sim, 'actually the kitchen'); await reply(r, sim);
+  assert.match(textTokens(sim).filter((t) => /^Let me check/.test(t)).at(-1) ?? '', /Priority areas: the kitchen./);
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Priority areas'), 'the kitchen');
+});
+
+test('SCRIPTED DEEP FIELDS privacy: the labelled line Intake reads is the masked caller wording only, and no log carries a caller word', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { open: DEEP_OPEN, answers: { JOB_PRIORITY_AREAS: ['no preference'], JOB_LAST_PROFESSIONAL_CLEAN: ['never'] } });
+  const texts = r.claude.sent.filter((p) => !p.stream).map((p) => JSON.parse(p.messages[0].content)).filter((m) => m.task === 'extract_fields').map((m) => String(m.data.masked_text));
+  const last = texts.at(-1) ?? '';
+  assert.match(last, /^Priority areas: no preference$/m);
+  assert.match(last, /^Last professional clean: never$/m);
+  assert.ok(!/priya|evergreen|742|212555/i.test(last), 'no raw contact detail reaches the extraction text');
+  assert.ok(!/no preference|never/i.test(JSON.stringify(r.logs)), 'no caller word in a log');
+  sim.end(); await sim.closed.catch(() => {}); await r.handler.idle();
+});
+
+test('SCRIPTED DEEP FIELDS a refusal that a pass returns for ANY non-address job field is held (never an answer), while a longer answer that merely contains those words is kept', async () => {
+  // Pets: the complete reply "not sure" is uncertainty (held, asked again); "no pets, but I don't know about the garden cat" is an ordinary answer.
+  for (const [said, kept] of [['not sure', false], ["I'd rather not say", false], ["no pets but I don't know about a cat next door", true]] as const) {
+    const claude = sqClaude({ tweak: (out, _p, text) => { const lines = text.split('\n').filter((l) => l.startsWith('Caller: ')).map((l) => l.slice(8)); for (const f of out.fields) if (f.name === 'Pets' && lines.includes(said)) { f.value = said; f.confidence = 0.9; } } });
+    const r = await servicesRig({ ...SQ_RIG, claude });
+    const sim = await r.connect();
+    const steps = await sqConverse(r, sim, { answers: { JOB_PETS: [said] }, max: 30 });
+    const asked = steps.filter((s) => s.id === 'JOB_PETS').length;
+    if (kept) { assert.equal(asked, 1, said); await sqFinish(r, sim); assert.equal(sqVal(r, 'Pets'), said); }
+    else { assert.ok(asked >= 2, `${said}: asked again (${asked})`); await ended(sim, r).catch(() => {}); assert.equal(sqVal(r, 'Pets'), undefined); assert.equal(sqRec(r).confirmation, 'unconfirmed'); }
+  }
+});
 
 for (const [what, said, field, expect] of [
   ['the bedrooms', 'actually it is three bedrooms', 'Number of bedrooms', 'three bedrooms'],

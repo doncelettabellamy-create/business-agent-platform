@@ -9,7 +9,8 @@
 //             needs frequency words, a date needs date words, a time needs a time of day, a yes or no needs a yes or no (or a description). A short vague reply ("maybe", "um", "I don't know"),
 //             or one that is clearly about another field ("just this one time" to an extras question), is AMBIGUOUS: nothing is stored and the question is asked again within the usual limits.
 //             A bound answer is only CONTEXT for Intake (a "Field: answer" line); it counts as accepted, and is never put back into a record, until an Intake pass has itself found it.
-//             Free-text fields (no checkable shape) are not bound at all: Intake reads them from the conversation exactly as before.
+//             Free-text fields (no checkable shape) are not bound, EXCEPT for a complete short reply that means something (2026-10-29): for Priority areas no / none / no preference is an answer, for Last professional clean
+//             never is, and no / none / no preference there is asked again; a refusal or an "I don't know" that is the whole reply is never an answer for any field. Everything else Intake reads as before.
 //   merge     what an Intake pass found is kept once accepted. A later pass that omits it does not un-complete it. A later pass that reads a DIFFERENT value out of the newest caller line is
 //             either an explicit correction (the caller said "actually", "sorry", "I meant", "make that" ...) and replaces the old value, or a genuine contradiction and is held as a CONFLICT:
 //             the field is asked again and the stale value is never kept silently. A different reading of older lines is ignored (the accepted value stands).
@@ -58,6 +59,36 @@ const POS = /\b(?:yes|yeah|yep|yup|definitely|absolutely|of course|correct|we do
 const CORRECTION = /\b(?:actually|sorry|correction|i meant|i mean|make that|change (?:that|it)|instead|no,? (?:it'?s|it is|that'?s|make)|rather)\b|\bnot\b[^.!?]{0,40}\bbut\b/i;
 const UNITS: ReadonlyArray<readonly [string, RegExp]> = [['bedroom', /\bbed ?rooms?\b/i], ['bathroom', /\bbath ?rooms?\b/i], ['room', /\b(?:rooms?)\b/i]];
 
+/** The words of an answer for whole-answer tests: lower case, plain apostrophes, no punctuation, leading fillers ("um", "well", "oh") removed. */
+function wholeAnswer(v: string): string {
+  let t = String(v).toLowerCase().replace(/[‘’]/g, "'").replace(/[.,!?;:"()]+/g, ' ').replace(/\s+/g, ' ').trim();
+  for (let i = 0; i < 3 && /^(?:um+|uh+|hmm+|well|oh|so|er+) /.test(t); i++) t = t.replace(/^(?:um+|uh+|hmm+|well|oh|so|er+) /, '');
+  return t;
+}
+/** A caller who declines to answer, or says they do not know: the COMPLETE answer must be that and nothing else, so "we don't know the old cleaner but it was in March" and "no pets" are ordinary answers. */
+const REFUSAL_OR_UNSURE = /^(?:(?:i(?:'d| would)? )?(?:rather|prefer) not(?: to)?(?: (?:answer|say|tell|share|give|talk about)(?: that| it| this)?)?|i (?:do not|don't|dont|won't|wont|will not|can't|cant|cannot) (?:want to )?(?:answer|say|tell|share|give|know)(?: that| it| this)?|(?:i )?(?:do not|don't|dont) know|(?:i'?m )?(?:really )?(?:not sure|unsure)|no (?:idea|comment)|not telling|pass|skip(?: it| that| this)?|i guess|maybe|perhaps)$/;
+export function isRefusalOrUnsure(value: unknown): boolean {
+  return typeof value === 'string' && value.length <= 120 && REFUSAL_OR_UNSURE.test(wholeAnswer(value));
+}
+// Field-specific meanings of a COMPLETE short answer (founder-approved 2026-10-29), for the two Deep-cleaning fields whose answers have no checkable shape. The caller's own words are kept; nothing is inferred, no date or history is invented.
+const NONE_ANSWER = /^(?:no|none|nope|nothing|no preferences?)$/;
+const NEVER_ANSWER = /^(?:(?:we|i) )?(?:have )?never(?: (?:had|been|done|used|hired)(?: [a-z' ]{0,30})?)?$|^not ever$/;
+const FIELD_MEANINGS: ReadonlyArray<readonly [RegExp, RegExp, RegExp | undefined]> = [
+  [/^priority areas?/i, NONE_ANSWER, undefined],       // "any areas you would like us to focus on?": no / none / no preference is an answer
+  [/^last professional clean/i, NEVER_ANSWER, NONE_ANSWER],   // "when was the last time ...?": never is an answer; no / none / no preference does not say when, so it is asked again
+];
+/** 'valid': a complete answer that means something for this field; 'unclear': a complete reply that is not an answer to it (asked again); undefined: an ordinary answer (or no rule for the field). */
+export function answerMeaning(field: string, value: unknown): 'valid' | 'unclear' | undefined {
+  if (typeof value !== 'string' || value.length > 120) return undefined;
+  const m = FIELD_MEANINGS.find(([name]) => name.test(String(field)));
+  if (m === undefined) return undefined;
+  const t = wholeAnswer(value);
+  if (m[1].test(t)) return 'valid';
+  return m[2] !== undefined && m[2].test(t) ? 'unclear' : undefined;
+}
+/** Whether the complete value is a refusal, an expression of not knowing, or (for the field) a reply that is not an answer: such a value is never accepted for a field. */
+const heldAnswer = (field: string, value: unknown): boolean => isRefusalOrUnsure(value) || answerMeaning(field, value) === 'unclear';
+
 /** What kind of answer a field takes, by its configured name. */
 export function kindOf(field: string): FieldKind {
   const f = String(field).toLowerCase();
@@ -88,7 +119,7 @@ const unitOf = (field: string): string | undefined => { const m = /^number of ([
 
 /** Whether the words could plausibly be the answer to a field of this kind (and to this very field). */
 function plausible(field: string, kind: FieldKind, v: string): boolean {
-  if (v.length === 0 || AMBIGUOUS.test(v)) return false;
+  if (v.length === 0 || AMBIGUOUS.test(v) || isRefusalOrUnsure(v)) return false;
   switch (kind) {
     case 'count': {
       const n = countOf(v);
@@ -104,7 +135,7 @@ function plausible(field: string, kind: FieldKind, v: string): boolean {
     case 'frequency': return FREQUENCY.test(v) && !DEFLECT.test(v);
     case 'date': return DATE.test(v) && !DEFLECT.test(v);
     case 'time': return TIME.test(v) && !DEFLECT.test(v);
-    default: return content(v).length >= 1 && !DEFLECT.test(v);
+    default: { const m = answerMeaning(field, v); if (m !== undefined) return m === 'valid'; return content(v).length >= 1 && !DEFLECT.test(v); }
   }
 }
 /** Whether two answers say the same thing for this kind of field. */
@@ -169,9 +200,14 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
     bind(field, line) {
       if (disposed || !usable(field) || typeof line !== 'string') return 'ambiguous';
       const kind = kindOf(field);
-      if (kind === 'free') return 'unchecked';
-      const v = clean(line).slice(0, MAX_VALUE);
-      if (!plausible(field, kind, v)) return 'ambiguous';
+      let v = clean(line).slice(0, MAX_VALUE);
+      if (kind === 'free') {
+        // A free-text field has no checkable shape, except for the complete short replies that mean something: a valid one is bound (a labelled line for Intake, in the caller's own words); a refusal, an "I don't know" or a reply that is not an answer to THIS question is held and the question is asked again.
+        v = v.replace(/[.!?,;\s]+$/, '');
+        const m = answerMeaning(field, v);
+        if (m === undefined) return isRefusalOrUnsure(v) ? 'ambiguous' : 'unchecked';
+        if (m === 'unclear') return 'ambiguous';
+      } else if (!plausible(field, kind, v)) return 'ambiguous';
       if (conflicted.has(field)) { accepted.set(field, v); candidates.delete(field); conflicted.delete(field); answered.add(field); return 'bound'; }   // the caller answered the very question the contradiction raised: the new answer replaces the stale value
       candidates.set(field, v); answered.add(field);
       return 'bound';
@@ -210,6 +246,8 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
         const a = accepted.get(f.name);
         // Placeholder-only value, nothing accepted: held (not found, asked first), on every path including the final pass; an accepted answer is restored by the rule below.
         if (a === undefined && f.found && isPlaceholderOnly(f.value) && !ADDRESS_LIKE.test(f.name)) { withheld.push(f.name); return { ...f, value: null, confidence: null, found: false }; }
+        // A refusal, an "I don't know" or (for the field) a reply that is not an answer, returned by a pass for a field with nothing accepted, is not an answer: held, asked again, never saved or read back. An accepted answer is untouched (the rule below), and a value that merely CONTAINS such words is an ordinary answer.
+        if (a === undefined && f.found && heldAnswer(f.name, f.value) && !ADDRESS_LIKE.test(f.name)) { withheld.push(f.name); return { ...f, value: null, confidence: null, found: false }; }
         // An optional field the caller's words do not support (Intake filled it from other wording) is taken out: not found, not missing, nothing invented, no required field touched.
         if (a === undefined && f.found && typeof f.value === 'string' && !supported(f.name, clean(f.value), ctx)) { dropped.push(f.name); return { ...f, value: null, confidence: null, found: false }; }
         if (a !== undefined && (!f.found || f.value === null)) { restored.push(f.name); return { ...f, value: a, confidence: 0.8, found: true }; }
