@@ -114,6 +114,8 @@ Each stage is shown to the founder before the next, and each keeps the dashboard
 
 ## 7. Rules for any future session
 
+**New session: start at the "Resume here" section at the top of `docs/PROJECT_CONTINUITY_HANDOFF.md`**, which gives the reading order, the active milestone, the evidence, the next proposed step and the open items.
+
 1. Read this file before touching `prototype/intake-work-items/`, `dashboard-server.ts` or `owner-view.ts`.
 2. Do not delete, replace or rebuild the dashboard without the founder's explicit written authorization naming that action.
 3. Change it in small steps with tests; run the full suite; keep the privacy contract and its tests green.
