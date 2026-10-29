@@ -3339,6 +3339,80 @@ test('ADDRESS PARTS in two bursts: the house number and the street name that fol
   sim.end(); await sim.closed; await r.handler.idle();
 });
 
+// The live 7:5x PM call: the quiet window had passed, then the Intake preview took about three seconds, and the caller's next fragments arrived DURING it; the stale question was spoken over them.
+function slowPreviewRig(ms: number) {
+  const gate = { on: false };
+  const claude = fakeClaude({ services: true, run: () => (gate.on ? { delayMs: ms } : {}) });
+  return { gate, make: (o: RigOptions = {}) => rig({ skill: servicesSkill, claude, contacts: true, firstCleanQuestion: FQ, ...o }) };
+}
+
+test('DELAYED PREVIEW fragments that arrive while the preview is running cancel the stale question: nothing is spoken until the caller stops, and the one question asks only for what is still needed', async () => {
+  const { gate, make } = slowPreviewRig(700);
+  const r = await make({ contactSettleMs: 250, contactCollectMaxMs: 3000 });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim);
+  gate.on = true;
+  say(sim, 'two one two');            // 3 digits: the quiet window passes (250 ms), then the preview starts and runs for 700 ms
+  await sleep(450);                   // the caller resumes in the middle of the preview, after the quiet window
+  say(sim, 'five five five');         // 3 more
+  await sleep(150);
+  say(sim, 'zero one');               // and 2 more, still before the first turn's preview has finished
+  await sleep(2600);
+  assert.equal(asksSpoken(sim) - before, 1, 'exactly one question after the whole burst, none of them stale (' + phoneAsks(r).join(' ') + ')');
+  assert.deepEqual(phoneAsks(r).slice(-1), ['n1/need2'], 'asks only for the two digits still needed');
+  assert.ok(diag(r, 'CONTACT_SETTLE').some((l) => l.detail?.stage === 'AFTER_PREVIEW' && l.detail?.outcome === 'MORE'), 'the stale question was cancelled after the preview');
+  assert.equal(diag(r, 'INCOMPLETE').length, 0);
+  const logged = JSON.stringify(r.logs.map((l) => l.detail)).replace(/"\w+_ms":\d+/g, '');   // timings are numbers of milliseconds, not digits the caller said
+  assert.ok(!/\d{4,}/.test(logged), 'no digit string in any log');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('DELAYED PREVIEW speech that resumes (interim results) past the end of the preview holds the question until the caller is quiet again', async () => {
+  const { gate, make } = slowPreviewRig(600);
+  const r = await make({ contactSettleMs: 300, contactCollectMaxMs: 3000 });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim);
+  gate.on = true;
+  say(sim, 'two one two five five five');
+  await sleep(300);                   // the quiet window is over; the preview is now running
+  // Interim results resume and continue past the end of the preview (every 80 ms for 1.2 s). No question may be spoken while they keep arriving.
+  let lastPartialAt = Date.now(); let spokenWhileTalking = false;
+  for (let i = 0; i < 15; i++) { partial(sim, 'zero'); lastPartialAt = Date.now(); await sleep(80); if (asksSpoken(sim) > before) spokenWhileTalking = true; }
+  assert.ok(!spokenWhileTalking, 'no question was spoken over the resumed speech');
+  let askAt = 0; for (let i = 0; i < 300 && askAt === 0; i++) { if (asksSpoken(sim) > before) askAt = Date.now(); else await sleep(10); }
+  assert.ok(askAt > 0 && askAt - lastPartialAt >= 250, 'the question came only after the caller was quiet (' + (askAt - lastPartialAt) + ' ms)');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('DELAYED PREVIEW the wait after the preview is bounded: speech that never stops cannot hold the question back for ever', async () => {
+  const { gate, make } = slowPreviewRig(400);
+  const r = await make({ contactSettleMs: 300, contactCollectMaxMs: 900 });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim);
+  gate.on = true;
+  const t0 = Date.now(); say(sim, 'two one two five five five');
+  let askAt = 0; for (let i = 0; i < 80 && askAt === 0; i++) { partial(sim, 'um'); if (asksSpoken(sim) > before) askAt = Date.now(); else await sleep(100); }
+  assert.ok(askAt > 0 && askAt - t0 < 5000, 'a question came, bounded (' + (askAt - t0) + ' ms)');
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('DELAYED PREVIEW an ordinary question made stale by a line that arrived meanwhile is not spoken: the waiting line is handled first', async () => {
+  const { gate, make } = slowPreviewRig(600);
+  const r = await make({ contactSettleMs: 250, contactCollectMaxMs: 3000 });
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  const before = asksSpoken(sim);
+  gate.on = true;
+  say(sim, 'I need a standard cleaning for a house'); await sleep(200);
+  say(sim, 'it has two bedrooms and two bathrooms');
+  await sleep(2500);
+  assert.equal(asksSpoken(sim) - before, 1, 'one question, after both lines');
+  assert.ok(diag(r, 'CONTACT_SETTLE').some((l) => l.detail?.stage === 'AFTER_PREVIEW'));
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
 test('FIXED QUESTIONS the date and the time of day are asked in exactly the approved words, never worded by the model, with no weekday, availability or confirmation', async () => {
   const D = 'What date would you prefer for the cleaning?'; const TM = 'What time of day would you prefer?';
   const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, fixedQuestions: { 'Preferred date': D, 'Time window': TM } });

@@ -818,11 +818,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
      * Waits until the caller has been quiet for `contactSettleMs` after the newest sign of speech, for at most `contactCollectMaxMs`. Returns 'MORE' at once when a later utterance is already waiting or
      * arrives meanwhile (that turn is handled next and nothing is asked now), 'QUIET' when the caller stopped, 'MAX' when the bound was reached while speech kept coming.
      */
-    async function settleForMoreSpeech(idx: number): Promise<'MORE' | 'QUIET' | 'MAX'> {
+    async function settleForMoreSpeech(idx: number, since?: number): Promise<'MORE' | 'QUIET' | 'MAX'> {
       const settle = deps.contactSettleMs ?? 0;
-      if (settle <= 0) return 'QUIET';
+      if (settle <= 0) return utteranceSeq !== idx ? 'MORE' : 'QUIET';
       const max = deps.contactCollectMaxMs ?? DEFAULT_COLLECT_MAX_MS;
-      const began = deps.now();
+      const began = since ?? deps.now();
       for (;;) {
         if (done) return 'QUIET';
         if (utteranceSeq !== idx) return 'MORE';
@@ -838,6 +838,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const s = session;
       if (s === undefined || done) return;
       clearConfirmTimer();
+      const turnStart = deps.now();
       if (s.state === 'consent') {
         if (s.consent(raw) === 'declined') { await farewell(SAY.declined, false); return; }
         deps.log('CONSENT_GRANTED');
@@ -898,6 +899,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const b = cleaning.bind(activeAsk, heard.line);
         deps.log('FIELD_ANSWER', { field: codeOf(activeAsk), result: b === 'bound' ? 'BOUND' : b === 'ambiguous' ? 'AMBIGUOUS' : 'UNCHECKED' });
       }
+      const activeBefore = activeAsk;
       activeAsk = undefined;
       const covers = s.turns();
       let got = await freshPreview(covers);
@@ -931,6 +933,14 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (residential === 'none') { residential = 'asked'; deps.log('RESIDENTIAL_ASK'); askResidential(); return; }
       }
       const next = selectNext(fresh, covers, { lastAskedAt, clarified, ...(partialLabel === undefined ? {} : { keep: partialLabel }) });
+      // The preview above takes seconds. Immediately before anything is spoken, look again: a later utterance already waiting (or, while a number or address is still being given, speech that resumed
+      // after the quiet window) makes this question stale. It is not said; the waiting line is handled next, as a continuation of the same item. Bounded like the first wait.
+      if (next.kind !== 'ready' && !done) {
+        const again = madeProgress && partialLabel !== undefined && (deps.contactSettleMs ?? 0) > 0 ? await settleForMoreSpeech(idx, turnStart) : utteranceSeq !== idx ? 'MORE' : 'QUIET';
+        if (done) return;
+        if (again === 'MORE' && settleSkips < MAX_SETTLE_SKIPS) { settleSkips++; contactAsk = askedBefore; activeAsk = activeBefore; deps.log('CONTACT_SETTLE', { outcome: 'MORE', stage: 'AFTER_PREVIEW', skips: settleSkips }); return; }
+        if (again === 'MAX') deps.log('CONTACT_SETTLE', { outcome: 'MAX', stage: 'AFTER_PREVIEW', skips: settleSkips });
+      }
       if (next.kind === 'ready' && got !== undefined) return startReadback(got.preview);
       if (next.kind === 'ask') {
         // An item asked and heard the first time plus MAX_CLARIFICATIONS more times and still not obtained: the call ends as a safe incomplete outcome, saved unconfirmed, never handed off.
