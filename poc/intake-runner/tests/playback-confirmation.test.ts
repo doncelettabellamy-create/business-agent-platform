@@ -12,7 +12,7 @@ import { createTenantRegistry } from '../src/tenant-boundary.ts';
 import { mintExecutionContext } from '../src/execution-context.ts';
 import { createIntakeRecordStore } from '../src/intake-record-store.ts';
 import { createContactVault } from '../src/contact-vault.ts';
-import { createRelayHandler } from '../src/relay-handler.ts';
+import { createRelayHandler, SAY } from '../src/relay-handler.ts';
 import { consentNoticeFor } from '../src/opening.ts';
 import type { DialogueModel } from '../src/dialogue-model.ts';
 import type { ModelProvider, ModelRequest } from '../src/model-gateway.ts';
@@ -153,4 +153,151 @@ test('bounded failure: a read-back whose playback is never reported complete doe
   assert.ok(['TIMEOUT', 'CUT'].includes(String(settled?.detail?.outcome)), 'a playback that never completed is TIMEOUT (or CUT if the transport gave up first): ' + JSON.stringify(settled?.detail));
   const done = (at(r, 'CONFIRM_TIMEOUT') ?? at(r, 'UNCONFIRMED') ?? Date.now()) - readbackAt;
   assert.ok(done < 5000, `the call did not stay open: ${done} ms`);
+});
+
+// ================================================================ 2026-10-29: ONE confirmation flow for the job read-back and the address question, decided by MEASURED playback (not by estimated characters).
+// A yes counts only when the unit it answers (the details and the question, the last words being the question) was played to the line in full. An earlier yes confirms nothing and never becomes valid later.
+const sleepMs = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+const readbacksHeard = (r: Rig) => r.sim.spoken.filter((s) => s.startsWith('Let me check')).length;
+const heldList = (r: Rig) => r.logs.filter((l) => l.code === 'CONFIRM_HELD').map((l) => `${l.detail?.kind}/${l.detail?.why}`);
+const settled = (r: Rig) => r.logs.filter((l) => l.code === 'PLAYBACK_SETTLED').length;
+/** Waits until the newest speech has been played in full and the call logic has the verdict. */
+async function heardInFull(r: Rig, n = settled(r) + 1) { await r.sim.waitFor(() => settled(r) >= n, 30_000); await r.sim.idle(); await r.handler.idle(); await sleepMs(20); }
+const ADDR_SPOKEN = (r: Rig) => r.sim.spoken.filter((s) => s.startsWith('I have your service address as'));
+
+test('CONFIRM live replay (job): the details and question were heard in full, an unclear line followed, and the caller\'s yes came over the repeated question: it is held, only the question is asked again, and a fresh yes after it was heard goes on', async () => {
+  const r = await rig({ mpc: 20, confirmWaitMs: 8000 });
+  await toReadback(r);
+  await heardInFull(r);                                        // the whole read-back reached the line (the live call: 32,700 of 32,700 ms)
+  assert.equal(readbacksHeard(r), 1);
+  r.sim.say('hmm what was that');                               // an unclear line: the short question is spoken
+  await r.sim.waitFor(() => r.sim.playing(), 5000);
+  r.sim.say('yes');                                            // the live call's yes: it cut the short question at 0 acknowledged
+  await r.sim.waitFor(() => heldList(r).length > 0, 10_000);
+  await r.sim.idle(); await r.handler.idle();
+  assert.deepEqual(heldList(r), ['QUESTION/CUT']);
+  assert.equal(has(r, 'ADDRESS_READBACK'), false, 'the early yes confirmed nothing');
+  await r.sim.waitFor(() => r.sim.spoken.includes(SAY.question), 15_000);     // only the question, not the whole read-back
+  assert.equal(r.sim.spoken.filter((s) => s === SAY.question).length, 1, 'the question was cut once and then played once in full');
+  await r.sim.idle(); await r.handler.idle(); await sleepMs(20);
+  assert.equal(readbacksHeard(r), 1, 'the details were not read again');
+  assert.equal(has(r, 'ADDRESS_READBACK'), false, 'the old yes did not become valid when the question finished playing');
+  r.sim.say('yes');                                            // a fresh yes, after the question was heard
+  await r.sim.waitFor(() => has(r, 'ADDRESS_READBACK'), 10_000);
+  assert.deepEqual(heldList(r), ['QUESTION/CUT']);
+});
+
+test('CONFIRM live replay (address): the question cut with 6,000 of 7,450 ms acknowledged is not heard; the yes is held, the question is asked in full again, and only a fresh yes after it confirms', async () => {
+  const r = await rig({ mpc: 25, confirmWaitMs: 8000 });
+  await toReadback(r);
+  await heardInFull(r);
+  r.sim.say('yes');
+  await r.sim.waitFor(() => has(r, 'ADDRESS_READBACK'), 15_000);
+  await r.sim.waitFor(() => r.sim.playing(), 5000);
+  r.sim.say('correct');                                        // over the address question
+  await r.sim.waitFor(() => has(r, 'ADDRESS_ANSWER_IGNORED'), 10_000);
+  assert.deepEqual(heldList(r), ['ADDRESS/CUT']);
+  assert.equal(has(r, 'ADDRESS_CONFIRMED'), false);
+  await r.sim.waitFor(() => ADDR_SPOKEN(r).length >= 1, 20_000);               // the repeated question played in full
+  await heardInFull(r, settled(r));
+  assert.equal(has(r, 'ADDRESS_CONFIRMED'), false, 'the early yes did not become valid later');
+  assert.ok(r.logs.filter((l) => l.code === 'ADDRESS_READBACK').length >= 2);
+  r.sim.say('correct');
+  await r.sim.waitFor(() => has(r, 'ADDRESS_CONFIRMED'), 10_000);
+  await r.sim.waitFor(() => r.sim.hungUp, 15_000);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.address_status], ['confirmed', 'caller_confirmed']);
+});
+
+test('CONFIRM a yes over the details of the job read-back is held, the read-back is said again, and with no fresh yes the call still ends unconfirmed (the early yes never becomes valid)', async () => {
+  const r = await rig({ mpc: 20, confirmWaitMs: 500 });
+  await toReadback(r);
+  r.sim.say('yes');                                            // the read-back is still playing
+  await r.sim.waitFor(() => heldList(r).length > 0, 10_000);
+  assert.deepEqual(heldList(r), ['JOB/CUT']);
+  await r.sim.waitFor(() => readbacksHeard(r) >= 1, 20_000);                  // said again in full
+  assert.equal(has(r, 'ADDRESS_READBACK'), false);
+  await r.sim.waitFor(() => has(r, 'CONFIRM_TIMEOUT') || r.sim.hungUp, 20_000);
+  assert.equal(has(r, 'ADDRESS_READBACK'), false, 'nothing was confirmed by the early yes');
+  await r.sim.waitFor(() => r.sim.hungUp, 15_000);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
+});
+
+test('CONFIRM differing speech speeds: whatever the pace, a yes after the whole unit was played is accepted and a yes during it is held (nothing depends on characters per second)', async () => {
+  for (const mpc of [2, 45]) {
+    const slow = await rig({ mpc, confirmWaitMs: 8000 });
+    await toReadback(slow);
+    await heardInFull(slow);
+    slow.sim.say('yes');
+    await slow.sim.waitFor(() => has(slow, 'ADDRESS_READBACK'), 15_000);
+    assert.deepEqual(heldList(slow), [], `pace ${mpc}: a yes after the read-back was heard is not held`);
+    const fast = await rig({ mpc, confirmWaitMs: 8000 });
+    await toReadback(fast);
+    fast.sim.say('yes');
+    await fast.sim.waitFor(() => heldList(fast).length > 0 || has(fast, 'ADDRESS_READBACK'), 15_000);
+    if (mpc >= 20) assert.deepEqual(heldList(fast), ['JOB/CUT'], `pace ${mpc}: a yes during the read-back is held`);
+    assert.equal(has(fast, 'ADDRESS_READBACK'), false, `pace ${mpc}: and it confirmed nothing`);
+  }
+});
+
+test('CONFIRM one mark short: a read-back whose last mark the phone never acknowledged was not played to the line, so a yes does not confirm it; the read-back is said again and a yes to that one does', async () => {
+  let n = 0;
+  const r = await rig({ mpc: 3, confirmWaitMs: 8000, behave: (text) => (text.startsWith('Let me check') && n++ === 0 ? 'short' : 'exact') });
+  await toReadback(r);
+  await r.sim.waitFor(() => has(r, 'REPLY_NOT_PLAYED'), 20_000);
+  await r.sim.idle(); await r.handler.idle();
+  r.sim.say('yes');
+  await r.sim.waitFor(() => heldList(r).length > 0, 10_000);
+  assert.deepEqual(heldList(r), ['JOB/LOST']);
+  assert.equal(has(r, 'ADDRESS_READBACK'), false);
+  await r.sim.waitFor(() => readbacksHeard(r) >= 1, 20_000);
+  await heardInFull(r, settled(r));
+  r.sim.say('yes that is right');
+  await r.sim.waitFor(() => has(r, 'ADDRESS_READBACK'), 10_000);
+});
+
+test('CONFIRM a no or a correction is processed normally even when the unit was not heard in full; only a yes needs the whole unit', async () => {
+  const j = await rig({ mpc: 20, confirmWaitMs: 8000 });
+  await toReadback(j);
+  j.sim.say('no that is wrong');                                // over the read-back
+  await j.sim.waitFor(() => j.sim.spoken.includes(SAY.correct), 15_000);
+  assert.deepEqual(heldList(j), [], 'a no is not held');
+  const a = await rig({ mpc: 25, confirmWaitMs: 8000 });
+  await toReadback(a);
+  await heardInFull(a);
+  a.sim.say('yes');
+  await a.sim.waitFor(() => has(a, 'ADDRESS_READBACK'), 15_000);
+  await a.sim.waitFor(() => a.sim.playing(), 5000);
+  a.sim.say('no that is wrong');                                // over the address question
+  await a.sim.waitFor(() => a.sim.spoken.includes(SAY.addressWrong), 15_000);
+  assert.deepEqual(heldList(a), []);
+  assert.equal(has(a, 'ADDRESS_CORRECTION'), true);
+});
+
+test('CONFIRM bounded: repeated early yes answers end the call unconfirmed for human review; they never confirm', async () => {
+  const r = await rig({ mpc: 20, confirmWaitMs: 8000 });
+  await toReadback(r);
+  r.sim.say('yes');                                            // over read-back 1: held, said again
+  await r.sim.waitFor(() => r.logs.filter((l) => l.code === 'READBACK').length >= 2, 10_000);
+  r.sim.say('yes');                                            // over read-back 2: the limit is reached
+  await r.sim.waitFor(() => r.sim.hungUp, 30_000);
+  assert.equal(has(r, 'ADDRESS_READBACK'), false);
+  assert.equal(heldList(r).length, 2);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
+});
+
+test('CONFIRM the log holds fixed codes and millisecond counts only: the measured numbers agree with the verdict (all acknowledged when played, fewer when cut) and no word of the call appears', async () => {
+  const r = await rig({ mpc: 20, confirmWaitMs: 8000 });
+  await toReadback(r);
+  r.sim.say('yes');
+  await r.sim.waitFor(() => heldList(r).length > 0, 10_000);
+  await r.sim.waitFor(() => readbacksHeard(r) >= 1, 20_000); await r.sim.idle(); await r.handler.idle(); await sleepMs(20);
+  const sets = r.logs.filter((l) => l.code === 'CONFIRM_UNIT').map((l) => l.detail as Record<string, unknown>);
+  const cut = r.logs.find((l) => l.code === 'CONFIRM_HELD')?.detail as Record<string, unknown> | undefined; const played = sets.filter((d) => d.outcome === 'PLAYED').at(-1);
+  assert.ok(cut !== undefined && typeof cut.sent_ms === 'number' && typeof cut.acked_ms === 'number' && (cut.acked_ms as number) < (cut.sent_ms as number), JSON.stringify(sets));
+  assert.ok(played !== undefined && played.sent_ms === played.acked_ms && (played.sent_ms as number) > 0, JSON.stringify(sets));
+  const logged = JSON.stringify(r.logs.map((l) => [l.code, l.detail]));
+  assert.ok(!/burst pipe|Evergreen|priya|raman/i.test(logged) && !/\d{5,}/.test(logged.replace(/"[a-z_]*ms":\d+/g, '')), 'no caller word or digit string in any log');
 });

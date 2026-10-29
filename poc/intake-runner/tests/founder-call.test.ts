@@ -155,7 +155,7 @@ test('a natural call becomes a validated record on the dashboard, with no person
   await reply(r, sim);
   say(sim, 'The address is 42 Elm Street, you can reach me on 555 010 0199');
   const readBack = await reply(r, sim);   // Intake is ready: the server reads back the job (never the address) and asks for a yes or no, on the same turn
-  assert.match(readBack.token, /^Let me check what I have\. Job description: burst pipe\. Is that correct\? Please say yes or no\.$/);
+  assert.match(readBack.token, /^Let me check what I have\. Job description: burst pipe\. Please say yes or no\. Is that correct\?$/);
   say(sim, 'yes that is right');
   const closing = await sim.next((m) => m.type === 'text' && m.token === SAY.thanks);
   assert.equal(closing.interruptible, false, 'the closing line cannot be talked over');
@@ -575,7 +575,7 @@ test('read-back: the server reads back the job in fixed words, never the address
   const r = await rig();
   const sim = await r.connect();
   const rb = await toReadback(r, sim);
-  assert.equal(rb.token, 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.');
+  assert.equal(rb.token, 'Let me check what I have. Job description: burst pipe. Please say yes or no. Is that correct?');
   for (const s of ['Elm', '42', 'ADDRESS', '[', ']']) assert.ok(!rb.token.includes(s), `the read-back must not contain "${s}"`);
   assert.equal(rb.interruptible, undefined, 'the caller may answer over a read-back');
   assert.equal(r.store.list(T).length, 0, 'nothing is saved before the answer');
@@ -598,7 +598,7 @@ test('read-back: a no asks what to change, listens, and reads back again; a yes 
   assert.equal(r.store.list(T).length, 0);
   say(sim, 'it is tomorrow morning');
   const second = await reply(r, sim);
-  assert.match(second.token, /Job description: burst pipe\. Preferred date: tomorrow morning\. Is that correct/);
+  assert.match(second.token, /Job description: burst pipe\. Preferred date: tomorrow morning\. Please say yes or no\. Is that correct/);
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.confirmation, rec.handed_off, rec.fields.find((f) => f.name === 'Preferred date')?.value], ['confirmed', true, 'tomorrow morning']);
@@ -765,10 +765,10 @@ test('hang-up: a closing line that is already played out does not delay the end'
 test('read-back text: only found, non-address fields, in fixed words; placeholders and personal-looking values are never spoken', () => {
   const f = (name: string, value: string | null) => ({ name, value, confidence: value === null ? null : 0.9, found: value !== null });
   const item = (fields: ReturnType<typeof f>[]) => ({ fields }) as never;
-  assert.equal(readBackText(item([f('Address', '[ADDRESS_1]'), f('Job description', 'burst pipe'), f('Preferred date', null)])), 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.');
-  assert.equal(readBackText(item([f('Address', '[ADDRESS_1]')])), 'Let me check what I have. I have your request. Is that correct? Please say yes or no.');
-  assert.equal(readBackText(item([f('Job description', 'leak near [ADDRESS_2] again')])), 'Let me check what I have. Job description: leak near a detail you gave again. Is that correct? Please say yes or no.');
-  assert.equal(readBackText(item([f('Job description', 'call 555 010 0199'), f('Home Address line', 'x')])), 'Let me check what I have. I have your request. Is that correct? Please say yes or no.');
+  assert.equal(readBackText(item([f('Address', '[ADDRESS_1]'), f('Job description', 'burst pipe'), f('Preferred date', null)])), 'Let me check what I have. Job description: burst pipe. Please say yes or no. Is that correct?');
+  assert.equal(readBackText(item([f('Address', '[ADDRESS_1]')])), 'Let me check what I have. I have your request. Please say yes or no. Is that correct?');
+  assert.equal(readBackText(item([f('Job description', 'leak near [ADDRESS_2] again')])), 'Let me check what I have. Job description: leak near a detail you gave again. Please say yes or no. Is that correct?');
+  assert.equal(readBackText(item([f('Job description', 'call 555 010 0199'), f('Home Address line', 'x')])), 'Let me check what I have. I have your request. Please say yes or no. Is that correct?');
   assert.ok(readBackText(item([f('Job description', 'x'.repeat(500))])).length < 220, 'a long value is cut');
 });
 
@@ -1005,11 +1005,11 @@ test('contacts: the number is read back to the caller only; a yes stores the con
   const r = await rig({ contacts: true });
   const sim = await r.connect();
   const rb = await toContactReadback(r, sim);
-  assert.match(rb.token, /^Let me check what I have\. Job description: burst pipe\. Your name: Priya Raman\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Is that correct\? Please say yes or no\.$/);
+  assert.match(rb.token, /^Let me check what I have\. Job description: burst pipe\. Your name: Priya Raman\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Please say yes or no\. Is that correct\?$/);
   assert.ok(!/Elm/.test(rb.token), 'the address is not in the job read-back (it has its own question)');
   assert.equal(r.store.list(T).length, 0);
   say(sim, 'yes'); const addressQ = await reply(r, sim);
-  assert.equal(addressQ.token, 'I have your service address as 42 Elm Street. Is that correct? Please say yes or no.');
+  assert.equal(addressQ.token, 'I have your service address as 42 Elm Street. Please say yes or no. Is that correct?');
   assert.equal(r.store.list(T).length, 0, 'nothing is saved until the address question is answered');
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
@@ -1084,7 +1084,7 @@ test('contacts: without the vault nothing about contacts changes: no extra quest
   const r = await rig();
   const sim = await r.connect();
   const rb = await toReadback(r, sim);
-  assert.equal(rb.token, 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.');
+  assert.equal(rb.token, 'Let me check what I have. Job description: burst pipe. Please say yes or no. Is that correct?');
   assert.equal(r.vault, undefined);
   sim.end(); await sim.closed; await r.handler.idle();
 });
@@ -1858,7 +1858,7 @@ test('delivery: a successfully delivered question makes the next plain yes its a
 });
 
 // ---------------------------------------------------------------- the service address is read back, confirmed, corrected or refused (never postal validation)
-const ADDRESS_Q = 'I have your service address as 42 Elm Street. Is that correct? Please say yes or no.';
+const ADDRESS_Q = 'I have your service address as 42 Elm Street. Please say yes or no. Is that correct?';
 const OAK = ['Oak', '77 Oak', 'Oak Lane'];
 const noOak = (what: string, hay: string) => { for (const x of OAK) assert.ok(!hay.includes(x), `${what} must not contain "${x}"`); };
 const addrLogs = (r: Rig) => r.logs.filter((l) => l.code.startsWith('ADDRESS_')).map((l) => l.code);
@@ -1894,7 +1894,7 @@ test('address confirmation: a wrong address is corrected: the old one is not kep
   say(sim, 'no that is wrong'); assert.equal((await reply(r, sim)).token, SAY.addressWrong);
   say(sim, 'the address is 77 Oak Lane');
   const second = await reply(r, sim);
-  assert.match(second.token, /^I have your service address as 77 Oak Lane\. Is that correct\? Please say yes or no\.$/);
+  assert.match(second.token, /^I have your service address as 77 Oak Lane\. Please say yes or no\. Is that correct\?$/);
   assert.ok(!second.token.includes('Elm'), 'the address the caller said was wrong is not repeated');
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
@@ -2667,7 +2667,7 @@ test('ADDRESS PARTS a house number alone is kept, only the street name is asked 
   const rb = sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token).join('');
   assert.ok(/Your name: Priya Raman\. Your callback number: 2 1 2 5 5 5 0 1 4 2\./.test(rb));
   say(sim, 'yes'); const q = await reply(r, sim);
-  assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Is that correct? Please say yes or no.', 'the joined address is read back to the caller only');
+  assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Please say yes or no. Is that correct?', 'the joined address is read back to the caller only');
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   const c = r.vault?.get(T, rec.call_ref);
@@ -2685,7 +2685,7 @@ test('ADDRESS PARTS a street name first, then the house number, joins in either 
   assert.deepEqual(addressAnswers(r), ['NEED_NUMBER', 'JOINED']);
   assert.ok(directives(r).some((d) => d.includes('(the street name is already heard: ask only for the house number)')));
   say(sim, 'yes'); const q = await reply(r, sim);
-  assert.equal(q.token, 'I have your service address as seven forty two Evergreen Terrace. Is that correct? Please say yes or no.');
+  assert.equal(q.token, 'I have your service address as seven forty two Evergreen Terrace. Please say yes or no. Is that correct?');
   say(sim, 'yes'); await ended(sim, r);
 });
 
@@ -2731,7 +2731,7 @@ test('ADDRESS PARTS in the correction step a number alone is kept and only the s
   say(sim, 'seven twenty four'); const ask = await reply(r, sim);
   assert.equal(ask.token, SAY.addressStreet, 'only the street name is asked for');
   say(sim, 'Oak Lane'); const second = await reply(r, sim);
-  assert.equal(second.token, 'I have your service address as seven twenty four Oak Lane. Is that correct? Please say yes or no.');
+  assert.equal(second.token, 'I have your service address as seven twenty four Oak Lane. Please say yes or no. Is that correct?');
   assert.ok(!second.token.includes('Elm'));
   say(sim, 'yes'); await ended(sim, r);
   const c = r.vault?.get(T, r.store.list(T)[0].call_ref);
@@ -3156,7 +3156,7 @@ test('LIVE SEQUENCE (4:02 PM) a number said in pieces with a restated prefix fin
   const rb = textTokens(sim).join(' ');
   assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./, 'the whole number is read back, once');
   say(sim, 'yes'); const q = await reply(r, sim);
-  assert.equal(q.token, 'I have your service address as seven four two Evergreen Terrace. Is that correct? Please say yes or no.', 'the whole address is read back for a yes');
+  assert.equal(q.token, 'I have your service address as seven four two Evergreen Terrace. Please say yes or no. Is that correct?', 'the whole address is read back for a yes');
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   assert.deepEqual([rec.confirmation, rec.address_status, rec.missing_fields], ['confirmed', 'caller_confirmed', []]);
@@ -3221,7 +3221,7 @@ test('ADDRESS a street name said to another question is not an address: the mask
   assert.ok(askFields(r).includes('SERVICE_ADDRESS'), 'the address was still asked for: ' + askFields(r).join(','));
   assert.ok(r.logs.some((l) => l.code === 'READBACK'));
   say(sim, 'yes'); const q = await reply(r, sim);
-  assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Is that correct? Please say yes or no.');
+  assert.equal(q.token, 'I have your service address as 742 Evergreen Terrace. Please say yes or no. Is that correct?');
   sim.end(); await sim.closed; await r.handler.idle();
 });
 
@@ -3276,7 +3276,7 @@ test('SETTLE the live sequence with restatement, pauses and a talk-over: the who
   assert.match(rb, /Your callback number: 2 1 2 5 5 5 0 1 4 2\./);
   const spoken = Object.fromEntries([...rb.slice(rb.indexOf('Let me check')).matchAll(/([A-Z][A-Za-z ]+): ([^.]+)\./g)].map((m) => [m[1], m[2]]));
   say(sim, 'yes'); const q = await reply(r, sim);
-  assert.equal(q.token, 'I have your service address as seven four two Evergreen Terrace. Is that correct? Please say yes or no.');
+  assert.equal(q.token, 'I have your service address as seven four two Evergreen Terrace. Please say yes or no. Is that correct?');
   say(sim, 'yes'); await ended(sim, r);
   const [rec] = r.store.list(T);
   for (const f of rec.fields.filter((x) => x.found && spoken[x.name] !== undefined)) assert.equal(f.value, spoken[f.name], `${f.name}: read back "${spoken[f.name]}", saved "${f.value}"`);
@@ -3451,4 +3451,21 @@ test('VOICE SERVICE settings: the approved fixed questions, a 1.5 second quiet a
   assert.deepEqual({ ...FIXED_QUESTIONS }, { 'Preferred date': 'What date would you prefer for the cleaning?', 'Time window': 'What time of day would you prefer?' });
   assert.deepEqual([VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS], [1500, 8000]);
   assert.ok(VOICE_CONTACT_COLLECT_MAX_MS > VOICE_CONTACT_SETTLE_MS && VOICE_CONTACT_COLLECT_MAX_MS <= 30_000, 'the maximum bounds the wait');
+});
+
+test('CONFIRM (carrier that cannot verify playback): a read-back the provider reports as talked over before it was fully spoken is not confirmed by a yes; it is said again, and only a fresh yes to the full one goes on', async () => {
+  const r = await rig();
+  const sim = await r.connect(); setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'I have a burst pipe in the kitchen'); await reply(r, sim);
+  say(sim, 'The address is 42 Elm Street');
+  const first = await sim.next((m) => m.type === 'text' && /^Let me check/.test(m.token));
+  sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'Let me check what I have', durationUntilInterruptMs: 300 });
+  await new Promise((res) => setTimeout(res, 40));
+  say(sim, 'yes');                                              // over the read-back
+  const again = await reply(r, sim);
+  assert.equal(again.token, first.token, 'the same read-back, said again');
+  assert.ok(r.logs.some((l) => l.code === 'CONFIRM_HELD') && r.logs.some((l) => l.code === 'READBACK_NOT_HEARD'));
+  assert.equal(r.store.list(T).length, 0, 'the early yes confirmed nothing');
+  say(sim, 'yes that is right'); await ended(sim, r);
+  assert.equal(r.store.list(T)[0].confirmation, 'confirmed');
 });

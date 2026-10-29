@@ -63,6 +63,8 @@ export interface CallTransport {
    * (played, talked over, or failed). A carrier that only speaks the words it is handed does not have this method.
    */
   converse?(request: ConverseRequest): Promise<ConverseResult>;
+  /** Optional. The measured playback of the newest reply the carrier finished with, when it can measure: audio milliseconds sent and milliseconds the phone acknowledged. Numbers only; undefined when not measured. */
+  playbackMeasure?(): { sentMs: number; ackedMs: number } | undefined;
   /** Native conversation only: answers a `tool` event. False when it could not be sent. */
   toolResult?(callId: string, output: string): boolean;
   /**

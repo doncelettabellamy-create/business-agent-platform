@@ -45,7 +45,7 @@ test('schema: every settings update names its session type, and nothing the docu
 test('persona: every speech request carries the speak-only rule and the Drew manner itself, and nothing else besides the exact words', async () => {
   const a = adapter();
   await live(a);
-  const lines = ['Could you tell me the address of the job?', 'Is it a standard clean or a deep clean?', 'Let me check what I have. Is that correct? Please say yes or no.'];
+  const lines = ['Could you tell me the address of the job?', 'Is it a standard clean or a deep clean?', 'Let me check what I have. Please say yes or no. Is that correct?'];
   for (const [i, line] of lines.entries()) { a.t.speak(line, true, { interruptible: i !== 2 }); await a.sim.heard(i + 2); }
   const preamble = `${SPEAK_ONLY} ${voiceManner(drew)}`;
   const sent = requests(a).map((m) => String(m.response.instructions));

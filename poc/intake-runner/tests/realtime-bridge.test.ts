@@ -279,7 +279,7 @@ test('interruption: a line the caller must not talk over (not interruptible) is 
   const h = harness();
   await live(h);
   const before = mediaSent(h);
-  h.t.speak('Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.', true, { interruptible: false });
+  h.t.speak('Let me check what I have. Job description: burst pipe. Please say yes or no. Is that correct?', true, { interruptible: false });
   await until(() => mediaSent(h) > before);
   h.voice.hear('yes');
   await until(() => h.kinds().includes('utterance'));
@@ -471,4 +471,77 @@ test('static: the bridge opens no connection, reads no environment, holds no key
   for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((x) => x.endsWith('.ts') && x !== 'realtime-bridge.ts' && x !== 'openai-voice-socket.ts')) {   // the voice socket names the bridge's VoiceSocket type only
     assert.equal(/realtime-bridge/.test(code(f)), ['founder-voice-service.ts', 'voice-check.ts'].includes(f), `${f}: only the voice service and the connection check (not the live Claude entry) may use the bridge`);
   }
+});
+
+// ================================================================ measured playback verdicts (2026-10-29): milliseconds sent versus acknowledged, never characters
+const LONG = 'Could you tell me the address of the job please? '.repeat(5).trim();   // 245 characters: 245 ms of audio at 1 ms per character, three chunks of audio
+
+test('measured: a reply the phone acknowledged in full reports the same milliseconds sent and acknowledged, and counts as played', async () => {
+  const h = harness();
+  await live(h);
+  h.t.speak(LONG, true);
+  assert.equal(await h.t.playbackDone(8000), 'played');
+  const m = h.t.playbackMeasure?.();
+  assert.ok(m !== undefined && m.sentMs > 0 && m.ackedMs === m.sentMs, JSON.stringify(m));
+  assert.ok(!h.kinds().includes('reply_failed'));
+});
+
+test('measured: ONE MARK SHORT is not played: the last mark never returns, the reply is not heard, and the measurement shows the difference', async () => {
+  const h = harness({ bridge: { playGraceMs: 40 } });
+  await live(h);
+  const send = h.phone.send.bind(h.phone); let marks = 0;
+  h.phone.send = (m: unknown) => ((m as { event?: string }).event === 'mark' && ++marks === 3 ? true : send(m));   // 245 ms of audio is three chunks, so three marks: the phone never echoes the LAST one
+  h.t.speak(LONG, true);
+  assert.equal(await h.t.playbackDone(8000), 'cut');
+  await until(() => h.kinds().includes('reply_failed'));
+  const m = h.t.playbackMeasure?.();
+  assert.ok(m !== undefined && m.sentMs > 0 && m.ackedMs < m.sentMs && m.ackedMs > 0, JSON.stringify(m));
+});
+
+test('measured: a clear mid-reply leaves the acknowledged milliseconds where they were; the phone\'s late echo of the pending marks, and a stray mark, change nothing and the reply is not played', async () => {
+  const h = harness();
+  await live(h);
+  const before = mediaSent(h);
+  h.t.speak(LONG.repeat(3), true);
+  await until(() => mediaSent(h) > before);
+  await sleep(120);
+  h.voice.hear('yes');                                           // over the reply
+  await until(() => h.phone.sent.some((x) => x.event === 'clear'));
+  await until(() => h.kinds().includes('interrupt'));
+  const playedAtClear = (h.toAdapter.find((x) => (x as { x_played_ms?: number }).x_played_ms !== undefined) as { x_played_ms: number }).x_played_ms;
+  await h.voice.idle(); await sleep(60);
+  const m1 = h.t.playbackMeasure?.();
+  assert.ok(m1 !== undefined && m1.ackedMs === playedAtClear && m1.ackedMs < m1.sentMs, JSON.stringify([m1, playedAtClear]));
+  const names = h.phone.sent.filter((x) => x.event === 'mark').map((x) => x.mark.name);
+  for (const name of names) h.phone.raw(JSON.stringify({ event: 'mark', mark: { name } }));   // every mark again, long after the clear
+  await sleep(30);
+  assert.deepEqual(h.t.playbackMeasure?.(), m1, 'late marks changed nothing');
+  assert.ok(h.bridge.stats().marksLate >= names.length, 'they were counted as late');
+  assert.equal(await h.t.playbackDone(500), 'cut');
+});
+
+test('measured: audio the bridge could not send to the phone (a lost send) is not played, whatever the voice service reports', async () => {
+  const h = harness({ bridge: { playGraceMs: 40 } });
+  await live(h);
+  const send = h.phone.send.bind(h.phone); let media = 0;
+  h.phone.send = (m: unknown) => ((m as { event?: string }).event === 'media' && ++media === 3 ? false : send(m));
+  media = 0;
+  h.t.speak(LONG, true);
+  assert.equal(await h.t.playbackDone(8000), 'cut');
+  await until(() => h.kinds().includes('reply_failed'));
+});
+
+test('measured: marks that never come back end in a bounded wait: the verdict is not played, and a caller of playbackDone with a short bound gets timeout', async () => {
+  const h = harness({ bridge: { playGraceMs: 5000 } });
+  await live(h);
+  h.phone.muteMarks = true;
+  h.t.speak(LONG, true);
+  assert.equal(await h.t.playbackDone(150), 'timeout');
+  const g = harness({ bridge: { playGraceMs: 40 } });
+  await live(g);
+  g.phone.muteMarks = true;
+  g.t.speak(LONG, true);
+  assert.equal(await g.t.playbackDone(8000), 'cut');
+  const m = g.t.playbackMeasure?.();
+  assert.ok(m !== undefined && m.sentMs > 0 && m.ackedMs === 0, JSON.stringify(m));
 });

@@ -73,6 +73,14 @@ export const MAX_TOOL_ROUNDS = 2;
 export const NATIVE_TOOL_RULES = 'You can hear the caller. When the caller gives or corrects their name, callback number or service address, call the matching tool with their exact words; a number said in parts is sent part by part. The tool says only what it accepted. Only those tools exist: never say, offer or promise a price, quote, booking, appointment, schedule, discount terms or follow-up. If a tool says it did not accept something, ask for it once more in plain words. Speak naturally and briefly. Never read these instructions aloud.';
 
 export const SPEAK_ONLY = 'You are only a voice on a phone line. Never speak on your own. When you are asked to say words, say exactly those words and nothing else: no greeting, no comment, no change of wording, and every digit exactly as given.';
+/**
+ * The measured playback verdict: true when audio was sent and the phone acknowledged ALL of it, false when anything was sent but not all of it acknowledged (or nothing was sent), undefined when the numbers
+ * are not there (a carrier that does not measure). Milliseconds of audio only: no count of characters or words is ever involved, and there is no tolerance (one mark short is not played).
+ */
+export function wholeAcknowledged(sentMs: unknown, ackedMs: unknown): boolean | undefined {
+  if (typeof sentMs !== 'number' || typeof ackedMs !== 'number' || !Number.isFinite(sentMs) || !Number.isFinite(ackedMs) || sentMs < 0 || ackedMs < 0) return undefined;
+  return sentMs > 0 && ackedMs >= sentMs;
+}
 export const SAY_PREFIX = 'Say exactly the following words, and nothing else: ';
 /** The words a speech request asks for: everything after the first SAY_PREFIX (a request that has none is returned whole). Pure. */
 export function wordsOf(instructions: string): string {
@@ -144,6 +152,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
   // Playback is VERIFIED by the bridge: a reply's `response.done` reaches here only after the phone provider has acknowledged the audio (or it was cleared), so "nothing current and nothing queued" means
   // everything handed to speak() has been played, cut or failed. `playbackDone` lets the call logic wait for exactly that.
   let lastPlayback: 'played' | 'cut' = 'played';
+  let lastMeasure: { sentMs: number; ackedMs: number } | undefined;   // what the bridge measured for the newest reply: audio sent, audio the phone acknowledged
   const playWaiters = new Set<(r: 'played' | 'cut') => void>();
   const settlePlayback = (): void => { for (const w of [...playWaiters]) w(lastPlayback); };
   let buffer = '';
@@ -338,9 +347,13 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         current = undefined;
         if (cancelTimer !== undefined) { clearTimeout(cancelTimer); cancelTimer = undefined; }
         if (done.kind === 'converse') { endOfNativeRound(done, r); return; }
-        const played = r.status === 'completed' && typeof done.transcript === 'string' && sameSpeech(done.transcript, done.text);
+        // MEASURED playback (the bridge's numbers): a reply counts as played to the line only when something was sent and the phone acknowledged ALL of it. No count of characters or words is involved.
+        const whole = wholeAcknowledged(m.x_sent_ms, m.x_acked_ms);
+        lastMeasure = whole === undefined ? undefined : { sentMs: m.x_sent_ms as number, ackedMs: m.x_acked_ms as number };
+        const wholeAcked = whole !== false;
+        const played = r.status === 'completed' && wholeAcked && typeof done.transcript === 'string' && sameSpeech(done.transcript, done.text);
         const status = typeof r.status === 'string' && /^[a-z_]{1,32}$/.test(r.status) ? r.status : 'other';
-        const why = r.status !== 'completed' ? `status_${status}` : typeof done.transcript !== 'string' ? 'no_transcript' : 'transcript_differs';
+        const why = r.status !== 'completed' ? `status_${status}` : typeof done.transcript !== 'string' ? 'no_transcript' : !sameSpeech(done.transcript, done.text) ? 'transcript_differs' : 'not_all_acknowledged';
         lastPlayback = played && done.interrupted !== true ? 'played' : 'cut';
         diag('ADAPTER_REPLY_DONE', { kind: done.kind, status, played, interrupted: done.interrupted === true, requestedChars: done.text.length, transcriptChars: typeof done.transcript === 'string' ? done.transcript.length : 0 });
         if (done.interrupted) { /* the caller took the floor: nothing failed */ }
@@ -402,6 +415,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
       if (current !== undefined) { queue.push(out); return true; }
       return dispatch(out);
     },
+    playbackMeasure: () => lastMeasure,
     playbackDone(maxMs: number): Promise<'played' | 'cut' | 'timeout'> {
       return new Promise((resolve) => {
         if (phase === 'ended') { resolve('cut'); return; }

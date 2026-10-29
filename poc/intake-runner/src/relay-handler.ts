@@ -44,6 +44,7 @@ import { piiProblems } from './pii-screen.ts';
 const CALL_SID = /^[A-Za-z0-9]{10,40}$/;
 const E164 = /^\+[1-9][0-9]{6,14}$/;
 const MAX_READBACKS = 2;
+const MAX_HELD_QUESTIONS = 2;   // repeats of the question alone, after a yes that came before it was heard
 /** A caller declining to give the address (not merely correcting it). */
 const ADDRESS_REFUSAL = /\b(?:rather not|prefer not|not comfortable|refuse|decline)\b|\b(?:do not|don't|dont) want to (?:give|share|say|tell)\b|\b(?:won't|will not|am not going to|not going to|not gonna) (?:give|share|say|tell)\b|\bnot (?:giving|sharing)\b/i;
 const MAX_SPEECH_WAIT_MS = 15_000;
@@ -85,9 +86,10 @@ export const SAY = Object.freeze({
   limit: 'Thank you. That is all the time I have for this call. Goodbye.',
   thanks: 'Thank you. Your request is recorded. Goodbye.',
   correct: 'Sorry about that. What should I change?',
-  yesno: 'Sorry, I did not catch that. Please say yes or no.',
+  question: 'Please say yes or no. Is that correct?',
+  yesno: 'Sorry, I did not catch that. Please say yes or no. Is that correct?',
   silence: 'I did not hear a reply. Goodbye.',
-  addressAsk: 'I have your service address. Is that correct? Please say yes or no.',   // what the dialogue history keeps: the address itself is never in it
+  addressAsk: 'I have your service address. Please say yes or no. Is that correct?',   // what the dialogue history keeps: the address itself is never in it
   addressWrong: 'Sorry about that. What is the correct service address?',
   addressMissing: 'I did not catch an address. What is the service address?',
   addressStreet: 'Thank you. What is the street name?',
@@ -242,7 +244,7 @@ export function readBackText(item: WorkItemV1, phone?: string, name?: string): s
   }
   const who = name === undefined ? '' : ` Your name: ${name}.`;
   const callback = phone === undefined ? '' : ` Your callback number: ${spokenDigits(phone)}.`;
-  return `Let me check what I have. ${parts.length > 0 ? parts.join(' ') : 'I have your request.'}${who}${callback} Is that correct? Please say yes or no.`;
+  return `Let me check what I have. ${parts.length > 0 ? parts.join(' ') : 'I have your request.'}${who}${callback} Please say yes or no. Is that correct?`;
 }
 
 export function createRelayHandler(deps: RelayDeps): RelayHandler {
@@ -327,12 +329,19 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     // The service-address confirmation that follows the first yes when contact capture is on.
     let addressState: AddressState | undefined; let addressTries = 0; let addressUnclear = 0;
     let addressParts = 0;   // how many times only the missing part of the address was asked for after the confirmation step (bounded)
-    let addressAsked = false;   // the address question was sent in full and has not since been reported talked over: only then can a yes or no answer it
     let lastAddressText = '';
     let readbacks = 0;
     let unclear = 0;
+    let heldQuestions = 0;
+    let lastSendOk = true;
+    const lastSent = (): boolean => lastSendOk;
     let readBack: Preview | undefined;   // exactly what the caller was asked to confirm
-    let readBackLost = false;   // the carrier reported that the read-back was not played as sent: the next answer cannot be taken as a confirmation of it
+    // ONE confirmation flow for the job read-back and the address question. Whatever confirmation speech was sent last is the UNIT: it counts as heard only when the carrier's own playback verdict says every word of it
+    // was played to the line (for the voice route: every audio mark acknowledged, nothing cleared, nothing lost). No count of characters or words is ever used for that. A yes that arrives before the unit is
+    // heard confirms nothing, and does not become valid later: the unit is spoken again and a fresh yes is required.
+    interface Unit { kind: 'job' | 'address' | 'question'; text: string; heard: boolean | undefined; why: string }
+    let unit: Unit | undefined;
+    let detailsHeard = false;   // the job read-back itself (not a later repeat of its question) was played in full
     let readBackContact: Contact | undefined;   // the contact as it stood when the number was read back: RAW, never logged, never sent to a model, cleared in finish()
     let confirmTimer: ReturnType<typeof setTimeout> | undefined;
     let setupSeen = false;   // a prompt may arrive while setup is still being prepared: it waits behind it
@@ -384,7 +393,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     const tally = (ok: boolean): boolean => { if (!ok) failedSends++; return ok; };
     let lastSay = '';   // the words of the newest fixed line sent (for the speech estimate when the carrier cannot verify playback)
     let confirmGen = 0;   // bumps whenever the confirmation wait is cleared or re-armed, so a late playback report cannot start a stale timer
-    const say = (text: string, final = false): boolean => { lastSay = text; return tally(final ? carrier.speak(text, true, { interruptible: false }) : carrier.speak(text, true)); };
+    const say = (text: string, final = false): boolean => { lastSay = text; lastSendOk = tally(final ? carrier.speak(text, true, { interruptible: false }) : carrier.speak(text, true)); return lastSendOk; };
     const clearConfirmTimer = (): void => { confirmGen++; if (confirmTimer !== undefined) { clearTimeout(confirmTimer); confirmTimer = undefined; } };
     function release(): void {
       clearTimeout(setupTimer);
@@ -708,12 +717,47 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         bounded.then((outcome) => {
           if (guard !== undefined) clearTimeout(guard);
           if (gen !== confirmGen || done) return;
-          deps.log('PLAYBACK_SETTLED', { outcome: outcome === 'played' ? 'PLAYED' : outcome === 'cut' ? 'CUT' : 'TIMEOUT' });
+          const m = carrier.playbackMeasure?.();   // the carrier's measurement of the newest reply, when it has one (numbers only)
+          deps.log('PLAYBACK_SETTLED', { outcome: outcome === 'played' ? 'PLAYED' : outcome === 'cut' ? 'CUT' : 'TIMEOUT', ...(m === undefined ? {} : { sent_ms: m.sentMs, acked_ms: m.ackedMs }) });
           begin(deps.confirmWaitMs);
         }, () => { if (guard !== undefined) clearTimeout(guard); begin(deps.confirmWaitMs); });
         return;
       }
       begin(deps.confirmWaitMs + (lastSay === '' ? 0 : Math.min(MAX_SPEECH_WAIT_MS, Math.max(0, deps.speechMs(lastSay)))));
+    }
+
+    const flatText = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    function markHeard(u: Unit, heard: boolean, why: string): void {
+      if (u.heard !== undefined && !(u.heard === true && !heard)) return;   // a verdict is only ever made worse after the fact (a cut), never better
+      u.heard = heard; u.why = heard ? '' : why;
+      if (u.kind === 'job') detailsHeard = heard;
+    }
+    /**
+     * Opens the confirmation unit for speech just sent. With a carrier that verifies playback the verdict is the carrier's own (played to the line in full, or not); with one that cannot, a sent unit counts
+     * as heard until an interruption report shows otherwise. Never a count of characters.
+     */
+    function openUnit(kind: Unit['kind'], text: string, sent: boolean): void {
+      const u: Unit = { kind, text, heard: undefined, why: '' };
+      unit = u;
+      if (kind === 'job') detailsHeard = false;
+      if (!sent) { markHeard(u, false, 'LOST'); return; }
+      if (typeof carrier.playbackDone !== 'function') { markHeard(u, true, ''); return; }
+      const max = deps.playbackMaxMs ?? PLAYBACK_MAX_MS;
+      let guard: ReturnType<typeof setTimeout> | undefined;
+      const bounded = Promise.race([carrier.playbackDone(max), new Promise<'timeout'>((resolve) => { guard = setTimeout(() => resolve('timeout'), max + 500); guard.unref?.(); })]);
+      const settle = (o: 'played' | 'cut' | 'timeout'): void => {
+        if (guard !== undefined) clearTimeout(guard);
+        if (unit !== u) return;
+        const m = carrier.playbackMeasure?.();   // the carrier's measurement of this unit's speech: audio milliseconds sent and acknowledged (numbers only)
+        deps.log('CONFIRM_UNIT', { kind: u.kind.toUpperCase(), outcome: o === 'played' ? 'PLAYED' : o === 'cut' ? 'CUT' : 'TIMEOUT', ...(m === undefined ? {} : { sent_ms: m.sentMs, acked_ms: m.ackedMs }) });
+        markHeard(u, o === 'played', o === 'cut' ? 'CUT' : 'TIMEOUT');
+      };
+      bounded.then(settle, () => settle('timeout'));
+    }
+    /** A yes that arrived before the unit was heard: it confirms nothing and is not kept. Fixed codes only. */
+    function logHeld(why: string): void {
+      const m = carrier.playbackMeasure?.();   // the newest finished reply's measurement (numbers only), so the log shows how much of the unit reached the line
+      deps.log('CONFIRM_HELD', { kind: (unit?.kind ?? 'job').toUpperCase(), why, ...(m === undefined ? {} : { sent_ms: m.sentMs, acked_ms: m.ackedMs }) });
     }
 
     function startReadback(item: Preview): void {
@@ -723,7 +767,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       // The caller hears the number; the dialogue history (which goes to the model on later turns) gets the same words WITHOUT it.
       // Words that could not be sent were never heard: a yes cannot confirm them, and the history does not claim they were said. The next answer sends them again (up to the same limit).
       const sent = say(readBackText(item.item, readBackContact?.phone, readBackContact?.name));
-      readBackLost = !sent;
+      openUnit('job', readBackText(item.item), sent);
       if (sent) s.said(readBackText(item.item));
       deps.log('READBACK', { n: readbacks });
       if (!sent) deps.log('READBACK_NOT_SENT');
@@ -734,10 +778,10 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     function askAddress(): void {
       const s = session as CallSession;
       const address = s.revealContactParts().address;
-      if (address === undefined) { phase = 'addressfix'; addressAsked = say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer(); return; }
+      if (address === undefined) { phase = 'addressfix'; say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer(); return; }
       phase = 'address';
-      lastAddressText = `I have your service address as ${address}. Is that correct? Please say yes or no.`;
-      addressAsked = say(lastAddressText);   // false when the write was refused: that question cannot be answered
+      lastAddressText = `I have your service address as ${address}. Please say yes or no. Is that correct?`;
+      openUnit('address', lastAddressText, say(lastAddressText));   // a refused write is never heard
       s.said(SAY.addressAsk);
       deps.log('ADDRESS_READBACK', { n: addressTries + 1 });
       armConfirmTimer();
@@ -751,12 +795,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       await finish(true, readBack);
       return await hangUp(line, at);
     }
-    async function onAddressAnswer(line: string): Promise<void> {
+    async function onAddressAnswer(line: string, heardFirst: boolean): Promise<void> {
       const s = session as CallSession;
       if (ADDRESS_REFUSAL.test(line)) return await finishAddress('refused');
       const a = s.answer(line);
-      if (!addressAsked) {   // the question was never sent in full, or was talked over: this answer cannot be taken as an answer to it
-        deps.log('ADDRESS_ANSWER_IGNORED');
+      if (a === 'yes' && !heardFirst) {   // a yes before the whole question was played to the line confirms nothing, now or later: the question is asked again and a fresh yes is needed
+        logHeld(unit?.why || 'EARLY'); deps.log('ADDRESS_ANSWER_IGNORED');
         if (++addressUnclear > 1) return await finishAddress('unconfirmed');
         askAddress();
         return;
@@ -765,7 +809,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (a === 'no') {
         if (++addressTries > 2) { s.forgetAddress(); return await finishAddress('unconfirmed'); }   // the caller said this address is wrong: it is not kept
         deps.log('ADDRESS_CORRECTION', { n: addressTries });
-        s.forgetAddress(); phase = 'addressfix'; addressAsked = false; addressUnclear = 0;
+        s.forgetAddress(); phase = 'addressfix'; unit = undefined; addressUnclear = 0;
         say(SAY.addressWrong); s.said(SAY.addressWrong); armConfirmTimer();
         return;
       }
@@ -783,17 +827,22 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer();
     }
 
-    async function onAnswer(line: string): Promise<void> {
+    async function onAnswer(line: string, heardFirst: boolean): Promise<void> {
       const s = session as CallSession;
-      if (readBackLost && readBack !== undefined) {
-        // Whatever the caller said, it was not an answer to words they did not hear as sent: say the read-back again, up to the same limit.
-        readBackLost = false;
-        deps.log('READBACK_NOT_HEARD');
+      const a = s.answer(line);
+      if (a === 'yes' && !heardFirst && readBack !== undefined) {
+        // A yes before the read-back and its question were played in full (or one that was never sent) confirms nothing, and does not become valid later. If the details themselves were heard and only a repeat of
+        // the question was cut, only the question is asked again; otherwise the read-back is said again, up to the same limits. Either way a fresh yes is needed.
+        logHeld(unit?.why || 'EARLY'); deps.log('READBACK_NOT_HEARD');
+        if (detailsHeard) {
+          if (++heldQuestions > MAX_HELD_QUESTIONS) return await farewell(SAY.unconfirmed, true);
+          say(SAY.question); openUnit('question', SAY.question, lastSent()); s.said(SAY.question); armConfirmTimer();
+          return;
+        }
         if (readbacks >= MAX_READBACKS) return await farewell(SAY.unconfirmed, true);
         startReadback(readBack);
         return;
       }
-      const a = s.answer(line);
       if (a === 'yes' && deps.contacts !== undefined && readBackContact !== undefined) { addressTries = 0; addressUnclear = 0; addressState = undefined; askAddress(); return; }
       if (a === 'yes') {
         const item = readBack;
@@ -810,7 +859,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         return;
       }
       if (++unclear > 1) return await farewell(SAY.unconfirmed, true);
-      say(SAY.yesno); s.said(SAY.yesno);
+      say(SAY.yesno); openUnit('question', SAY.yesno, lastSent()); s.said(SAY.yesno);
       armConfirmTimer();
     }
 
@@ -834,7 +883,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       }
     }
 
-    async function onPrompt(raw: unknown, idx = utteranceSeq): Promise<void> {
+    async function onPrompt(raw: unknown, idx = utteranceSeq, unitOk = false): Promise<void> {
       const s = session;
       if (s === undefined || done) return;
       clearConfirmTimer();
@@ -851,8 +900,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const expecting: ContactField | undefined = phase === 'addressfix' ? 'address' : phase === 'collect' && deps.contacts !== undefined ? contactAsk?.field : undefined;
       const heard = s.hear(raw, expecting, phase === 'collect' && correcting);
       if (!heard.ok) { deps.log('UTTERANCE_REFUSED', { code: heard.code }); await farewell(SAY.trouble, true); return; }
-      if (phase === 'confirm') return onAnswer(heard.line);
-      if (phase === 'address') return onAddressAnswer(heard.line);
+      if (phase === 'confirm') return onAnswer(heard.line, unitOk);
+      if (phase === 'address') return onAddressAnswer(heard.line, unitOk);
       if (phase === 'addressfix') return onAddressFix(heard.line);
       let madeProgress = false;   // this turn ADDED to what is being collected (more digits, or the missing part of an address): it is never a failed attempt
       const askedBefore = contactAsk;
@@ -1064,7 +1113,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
             lastAsk.counted = false;
             if (contactAsk !== undefined) contactAsk.heard = false;
           }
-          if (addressAsked && phase === 'address' && !(flat(lastAddressText).length > 0 && flat(spoken).length >= flat(lastAddressText).length)) addressAsked = false;
+          // A confirmation unit that is not yet heard and is talked over was cut. With a carrier that verifies playback that is the whole story; a carrier that cannot says only what was spoken, and then the
+          // provider's own report must cover the unit's words.
+          if (unit !== undefined && unit.heard !== false) {
+            if (typeof carrier.playbackDone === 'function') { if (unit.heard === undefined) markHeard(unit, false, 'CUT'); }
+            else if (!(flatText(unit.text).length > 0 && flatText(spoken).length >= flatText(unit.text).length)) { unit.heard = undefined; markHeard(unit, false, 'CUT'); }
+          }
           session?.interrupted(spoken);
         }
         return;
@@ -1076,16 +1130,16 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         // A question the caller did not hear is not delivered: nothing may treat their next plain yes or no as its answer.
         failedSends++; deps.log('REPLY_NOT_PLAYED');
         activeAsk = undefined;
-        if (phase === 'address') addressAsked = false;
-        if (phase === 'confirm' && readBack !== undefined) readBackLost = true;
+        if (unit !== undefined && unit.heard !== false) { unit.heard = undefined; markHeard(unit, false, 'LOST'); }
         return;
       }
       if (ev.kind === 'partial') { partialPrompts++; lastSpeechAt = deps.now(); return; }   // a partial result is not acted on, but it is counted, and it shows the caller is still speaking
       if (ev.kind === 'utterance') {
         lastPromptAt = deps.now(); lastSpeechAt = lastPromptAt;
         const heard = ev.text; const idx = ++utteranceSeq;
+        const unitOk = unit?.heard === true;   // judged NOW, when the caller's line arrived: a unit that finishes playing later does not rescue an earlier yes
         clearConfirmTimer();   // an answer is on its way: the silence timer must not win the race against it
-        chain = chain.then(() => onPrompt(heard, idx)).catch(() => deps.log('HANDLER_ERROR'));
+        chain = chain.then(() => onPrompt(heard, idx, unitOk)).catch(() => deps.log('HANDLER_ERROR'));
         void track(chain);
         return;
       }

@@ -164,7 +164,7 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   assert.ok(r.has('CONSENT_GRANTED'));
   await say(r, 'Hi, I have a burst pipe in the kitchen', 3);
   await say(r, 'The address is 42 Elm Street', 4);
-  assert.equal(r.voices[0].spoken[3], 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.', 'the read-back is the server\'s fixed wording');
+  assert.equal(r.voices[0].spoken[3], 'Let me check what I have. Job description: burst pipe. Please say yes or no. Is that correct?', 'the read-back is the server\'s fixed wording');
   await say(r, 'yes that is right', 5);
   await sim.closed;
   assert.equal(sim.closeCode(), 1000, 'the stream is closed after the goodbye, which is what lets the TwiML hang up');

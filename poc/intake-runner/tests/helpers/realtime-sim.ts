@@ -12,7 +12,7 @@ import type { CloseInfo } from '../../src/ws-server.ts';
 
 const WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine'];
 /** How a requested reply is played. `words` says every numeral as a word; `{ say }` says other words than the ones asked for. */
-export type Behaviour = 'exact' | 'words' | 'silent' | 'fail' | 'incomplete' | 'hang' | { say: string };
+export type Behaviour = 'exact' | 'words' | 'silent' | 'fail' | 'incomplete' | 'hang' | 'short' | { say: string };   // 'short': completes with the right words, but the phone acknowledged one mark fewer than was sent
 export interface RealtimeSimOptions {
   /** Milliseconds of playback per character. Default 2 (fast). The adapter is given the same figure. */
   msPerChar?: number;
@@ -87,13 +87,16 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
     else if (typeof b === 'object') transcript = b.say;
     if (transcript !== undefined) deliver({ type: 'response.output_audio_transcript.done', response_id: p.rid, transcript });
     if (status === 'completed' && transcript !== undefined && transcript.trim() !== '') { chain = chain.then(() => { spoken.push(transcript as string); events.push('heard: ' + transcript); }); }
-    deliver({ type: 'response.done', response: { id: p.rid, status, metadata: { id: p.mid } } });
+    // The bridge's measurement (audio milliseconds sent, and acknowledged by the phone): all of it, except for a reply that was cut or that is modelled as one mark short.
+    const sentMs = Math.max(2, Math.round(p.text.length * msPerChar));
+    deliver({ type: 'response.done', x_sent_ms: sentMs, x_acked_ms: b === 'short' ? sentMs - 1 : status === 'completed' ? sentMs : 0, response: { id: p.rid, status, metadata: { id: p.mid } } });
   }
   function cancel(): void {
     const p = play;
     if (p === undefined || o.ignoreCancel === true) return;
     clearTimeout(p.timer); play = undefined;
-    deliver({ type: 'response.done', response: { id: p.rid, status: 'cancelled', metadata: { id: p.mid } } });
+    const sentMs = Math.max(2, Math.round(p.text.length * msPerChar));
+    deliver({ type: 'response.done', x_sent_ms: sentMs, x_acked_ms: Math.min(sentMs - 1, Math.max(0, Date.now() - p.startedAt)), response: { id: p.rid, status: 'cancelled', metadata: { id: p.mid } } });
   }
   /** The service answers a refused request with an error that names the request (`error.event_id`), as the documented server does. */
   const refuse = (m: any, why: string, code: string): void => { refused.push(why); deliver({ type: 'error', error: { type: 'invalid_request_error', code, message: why, event_id: m.event_id ?? null } }); };
@@ -160,8 +163,8 @@ export function createRealtimeSim(o: RealtimeSimOptions = {}): RealtimeSim {
       const playedMs = opts?.playedMs ?? (play ? Date.now() - play.startedAt : 0);
       deliver({ type: 'input_audio_buffer.speech_started', ...(talkingOver ? { x_played_ms: playedMs } : {}) });
       if (talkingOver && interruptible) chain = chain.then(() => { cancel(); });   // the service stops its own reply when the caller talks over it, if interruption is on
-      deliver({ type: 'input_audio_buffer.speech_stopped' });
-      deliver({ type: 'conversation.item.input_audio_transcription.completed', item_id: id, transcript: text });
+      // The cancelled reply's end (with its measurement) is delivered before the caller's words, as through the bridge, which closes the reply the moment the caller starts talking.
+      chain = chain.then(() => { deliver({ type: 'input_audio_buffer.speech_stopped' }); deliver({ type: 'conversation.item.input_audio_transcription.completed', item_id: id, transcript: text }); });
     },
     mumble() { const id = `item_${++item}`; items.add(id); deliver({ type: 'conversation.item.input_audio_transcription.completed', item_id: id, transcript: '  ' }); },
     drop(info) { chain = chain.then(() => { link.onClose(info); }); },

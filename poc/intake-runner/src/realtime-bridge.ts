@@ -130,7 +130,8 @@ export function createRealtimeBridge(phone: RelayConnection, voice: VoiceSocket,
     diag('BRIDGE_RESPONSE_RELEASED', { status: finalStatus, how, sentMs: r.sentMs, ackedMs: r.ackedMs, lost: r.lost === true });
     // The first reply is the consent notice; only one that was fully played opens the caller's microphone to the voice service.
     if (!firstDone) { firstDone = true; const s = isRecord(msg.response) ? msg.response.status : undefined; noticeHeard = s === 'completed'; diag('BRIDGE_NOTICE_HEARD', { ok: noticeHeard, heldBack: stats.audioHeldBack }); }
-    toAdapter(msg);
+    // The MEASURED playback of this reply, for the adapter's verdict: audio milliseconds handed to the phone, and milliseconds of it the phone has acknowledged as played (the newest mark returned). Numbers only.
+    toAdapter({ ...msg, x_sent_ms: Math.floor(r.sentMs), x_acked_ms: Math.floor(r.ackedMs) });
   }
   function onVoice(text: string): void {
     if (ended) return;

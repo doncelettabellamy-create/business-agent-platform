@@ -18,7 +18,7 @@ import { fallbackText } from '../src/dialogue-model.ts';
 import type { DialogueModel, Directive } from '../src/dialogue-model.ts';
 import type { DialogueTurn } from '../src/call-session.ts';
 import type { ModelProvider, ModelRequest } from '../src/model-gateway.ts';
-import { createRealtimeTransport, sameSpeech, SAY_PREFIX, SPEAK_ONLY, wordsOf } from '../src/realtime-transport.ts';
+import { createRealtimeTransport, sameSpeech, SAY_PREFIX, SPEAK_ONLY, wholeAcknowledged, wordsOf } from '../src/realtime-transport.ts';
 import type { TransportEvent } from '../src/call-transport.ts';
 import { createRealtimeSim } from './helpers/realtime-sim.ts';
 import type { Behaviour, RealtimeSim } from './helpers/realtime-sim.ts';
@@ -129,7 +129,7 @@ async function toReadback(r: Rig, sim = r.sim, sid = SID(1)) {
   sim.say('Hi, I have a burst pipe in the kitchen'); await sim.heard(3); await r.handler.idle();
   sim.say('The address is 42 Elm Street'); await sim.heard(4); await r.handler.idle();
 }
-const READBACK = 'Let me check what I have. Job description: burst pipe. Is that correct? Please say yes or no.';
+const READBACK = 'Let me check what I have. Job description: burst pipe. Please say yes or no. Is that correct?';
 const ended = async (r: Rig, sim = r.sim) => { await sim.waitFor(() => sim.hungUp); await sim.idle(); await r.handler.idle(); };
 
 // ================================================================ consent
@@ -244,7 +244,7 @@ test('read-back: the closing line cannot be talked over (interruption is switche
 
 test('read-back: a read-back said in other words is not a read-back; the caller\'s yes is not taken, and it is said again until it is heard right', async () => {
   let drifted = 0;
-  const r = await rig({ behave: (text) => (text === READBACK && drifted++ === 0 ? { say: 'Let me check what I have. Job description: leaking tap. Is that correct? Please say yes or no.' } : 'exact') });
+  const r = await rig({ behave: (text) => (text === READBACK && drifted++ === 0 ? { say: 'Let me check what I have. Job description: leaking tap. Please say yes or no. Is that correct?' } : 'exact') });
   await consent(r);
   r.sim.say('Hi, I have a burst pipe in the kitchen'); await r.sim.heard(3); await r.handler.idle();
   r.sim.say('The address is 42 Elm Street');
@@ -624,7 +624,7 @@ test('adapter: sameSpeech treats "$25" and "twenty-five dollars" as the same wor
 
 test('adapter: sameSpeech ignores case, punctuation and spacing and accepts a digit said as a word, but nothing else', () => {
   assert.ok(sameSpeech('Your callback number: 5 5 5 0 1 0 0 1 9 9.', 'your callback number five five five oh one zero zero one nine nine'));
-  assert.ok(sameSpeech('Is that correct? Please say yes or no.', 'is that correct please say yes or no'));
+  assert.ok(sameSpeech('Please say yes or no. Is that correct?', 'please say yes or no is that correct'));
   assert.ok(!sameSpeech('Your callback number: 5 5 5 0 1 0 0 1 9 9.', 'Your callback number: 5 5 5 0 1 0 0 1 9 8.'));
   assert.ok(!sameSpeech('Job description: burst pipe.', 'Job description: leaking pipe.'));
   assert.ok(!sameSpeech('Is that correct?', ''), 'nothing said is never a match');
@@ -653,4 +653,19 @@ test('boundary: the adapter imports only local files, holds no credential or net
   }
   const handler = code(src('relay-handler'));
   for (const name of ['response.create', 'response.done', 'speech_started', 'session.update', 'conversation.item', 'carrier.start', 'x_played_ms']) assert.ok(!handler.includes(name), `relay-handler.ts must not name ${name}`);
+});
+
+test('wholeAcknowledged: the measured verdict is milliseconds only: the live call\'s numbers, one mark short, nothing sent, and unmeasured', () => {
+  // The 2026-10-28 call: job read-back, address read-back cut, address read-back repeated, the short question cut at the start, the thanks.
+  assert.equal(wholeAcknowledged(32700, 32700), true);
+  assert.equal(wholeAcknowledged(7450, 6000), false);
+  assert.equal(wholeAcknowledged(7550, 7550), true);
+  assert.equal(wholeAcknowledged(800, 0), false);
+  assert.equal(wholeAcknowledged(3900, 3900), true);
+  assert.equal(wholeAcknowledged(7450, 7449), false, 'one millisecond short is not played: there is no tolerance');
+  assert.equal(wholeAcknowledged(7450, 7450.4), true);
+  assert.equal(wholeAcknowledged(0, 0), false, 'nothing was sent, so nothing was heard');
+  for (const bad of [[undefined, 5], [5, undefined], ['5', 5], [NaN, 5], [5, Infinity], [-1, 0], [null, null]]) assert.equal(wholeAcknowledged(bad[0], bad[1]), undefined, JSON.stringify(bad));
+  // The speed of speech is irrelevant: the same milliseconds give the same verdict whatever the text length.
+  for (const chars of [10, 92, 387]) for (const msPerChar of [40, 70, 84, 120]) { const sent = chars * msPerChar; assert.equal(wholeAcknowledged(sent, sent), true); assert.equal(wholeAcknowledged(sent, sent - 1), false); }
 });

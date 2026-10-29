@@ -210,7 +210,7 @@ test('native: a correction replaces what was captured, is read back to the calle
   await r.sim.waitFor(() => fixedLines(r.sim).some((l) => l.startsWith('Let me check what I have')));
   await r.sim.idle(); await r.handler.idle();
   const first = fixedLines(r.sim).find((l) => l.startsWith('Let me check what I have')) as string;
-  assert.match(first, /Your name: Priya Raman\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Is that correct\?/);
+  assert.match(first, /Your name: Priya Raman\. Your callback number: 5 5 5 0 1 0 0 1 2 3\. Please say yes or no\. Is that correct\?/);
   said = 'no'; r.sim.say(said); await r.sim.waitFor(() => fixedLines(r.sim).includes(SAY.correct)); await r.sim.idle(); await r.handler.idle();
   said = 'wait the name is Jon Smith'; r.sim.say(said);
   await r.sim.waitFor(() => fixedLines(r.sim).filter((l) => l.startsWith('Let me check what I have')).length === 2);
