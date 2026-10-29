@@ -288,3 +288,69 @@ test('merge and overlay: valid answers and answers that contain those words are 
   const c = s.merge(item([fe('Priority areas', 'the kitchen')]), 'actually the kitchen', undefined);
   assert.deepEqual(c.corrected, ['Priority areas'], 'an explicit correction replaces it');
 });
+
+// ---- 2026-10-29: the reason code of the newest bind (diagnostics only; no verdict changed)
+test('lastBind: the verdict and the fixed reason code of the branch actually taken, for representative replies (existing verdicts recorded, including ones that are not endorsed)', () => {
+  const GOLDEN: ReadonlyArray<readonly [string, string, string, string]> = [
+    ['Number of bedrooms', 'It has two', 'bound', 'OK'],
+    ['Number of bedrooms', 'two', 'bound', 'OK'],
+    ['Number of bedrooms', 'two bedrooms', 'bound', 'OK'],
+    ['Number of bedrooms', 'a few', 'ambiguous', 'NO_NUMBER'],
+    ['Number of bedrooms', 'um', 'ambiguous', 'VAGUE'],
+    ['Number of bedrooms', 'to', 'ambiguous', 'NO_NUMBER'],
+    ['Number of bedrooms', 'two bathrooms', 'ambiguous', 'OTHER_UNIT'],
+    ['Number of bedrooms', '25', 'ambiguous', 'NUMBER_TOO_LARGE'],
+    ['Number of bedrooms', 'two in the morning', 'ambiguous', 'TIME_WORD'],
+    ['Number of bedrooms', 'October 22', 'ambiguous', 'NUMBER_TOO_LARGE'],
+    ['Number of bedrooms', "I'd rather not answer", 'ambiguous', 'REFUSAL_OR_UNSURE'],
+    ['Number of bedrooms', 'I have two bedrooms, and I am the owner', 'ambiguous', 'TIME_WORD'],   // existing behaviour: the word "am" reads as a time of day. Recorded, NOT endorsed, not changed here.
+    ['Number of bedrooms', '', 'ambiguous', 'EMPTY'],
+    ['Pets', 'no pets', 'bound', 'OK'],
+    ['Pets', 'a dog', 'bound', 'OK'],
+    ['Pets', 'just one time', 'ambiguous', 'FREQUENCY_WORD'],
+    ['Pets', 'tomorrow', 'ambiguous', 'DATE_WORD'],
+    ['Pets', 'maybe', 'ambiguous', 'VAGUE'],
+    ['Extras', 'just this one time', 'ambiguous', 'FREQUENCY_WORD'],
+    ['Extras', 'nothing', 'bound', 'OK'],
+    ['Cleaning frequency', 'every two weeks', 'bound', 'OK'],
+    ['Cleaning frequency', 'tomorrow', 'ambiguous', 'NO_FREQUENCY_WORD'],
+    ['Preferred date', 'next Tuesday', 'bound', 'OK'],
+    ['Preferred date', 'whenever you like', 'ambiguous', 'NO_DATE_WORD'],
+    ['Time window', 'in the morning', 'bound', 'OK'],
+    ['Time window', 'next Tuesday', 'ambiguous', 'NO_TIME_WORD'],
+    ['Priority areas', 'none', 'bound', 'FIELD_MEANING'],
+    ['Priority areas', 'no', 'bound', 'FIELD_MEANING'],
+    ['Priority areas', 'the kitchen', 'unchecked', 'FREE_TEXT'],
+    ['Priority areas', "I'd rather not answer", 'ambiguous', 'REFUSAL_OR_UNSURE'],
+    ['Last professional clean', 'never', 'bound', 'FIELD_MEANING'],
+    ['Last professional clean', 'none', 'ambiguous', 'NOT_AN_ANSWER_FOR_FIELD'],
+    ['Last professional clean', 'a year ago', 'unchecked', 'FREE_TEXT'],
+    ['Job description', 'house', 'unchecked', 'FREE_TEXT'],
+  ];
+  assert.equal(createCleaningState().lastBind(), undefined, 'nothing before the first bind');
+  for (const [field, reply, result, why] of GOLDEN) {
+    const s = createCleaningState();
+    assert.equal(s.bind(field, reply), result, `${field}: ${JSON.stringify(reply)}`);
+    assert.deepEqual(s.lastBind(), { result, why }, `${field}: ${JSON.stringify(reply)}`);
+  }
+  // The code is a fixed token whatever the caller said, and a refused reply stores nothing.
+  const s = createCleaningState();
+  assert.equal(s.bind('Number of bedrooms', 'zebra crossing'), 'ambiguous');
+  assert.ok(/^[A-Z_]+$/.test(s.lastBind()?.why ?? ''));
+  assert.deepEqual(s.lines(), []);
+  // An unusable field or a disposed state is reported as such, not as an answer.
+  const t = createCleaningState();
+  assert.deepEqual([t.bind('', 'two'), t.lastBind()?.why], ['ambiguous', 'UNUSABLE']);
+  t.dispose();
+  assert.deepEqual([t.bind('Pets', 'no pets'), t.lastBind()?.why], ['ambiguous', 'UNUSABLE']);
+});
+
+test('lastBind: a conflict-resolving answer is reported with the branch that accepted it', () => {
+  const s = createCleaningState();
+  s.merge(item([fe('Pets', 'no pets')]), 'no pets', undefined);
+  s.merge(item([fe('Pets', 'a dog')]), 'we have a dog', undefined);
+  assert.deepEqual(s.conflicts(), ['Pets']);
+  assert.equal(s.bind('Pets', 'a dog'), 'bound');
+  assert.deepEqual(s.lastBind(), { result: 'bound', why: 'OK' });
+  assert.deepEqual(s.conflicts(), []);
+});

@@ -27,7 +27,7 @@ import type { ScriptedAsk, ScriptedQuestion } from './scripted-questions.ts';
 import type { CallStatus, DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
 import { CONTACT_FIELDS, spokenDigits } from './contact-capture.ts';
-import { createCleaningState, codeOf } from './cleaning-state.ts';
+import { createCleaningState, codeOf, kindOf } from './cleaning-state.ts';
 import type { EvidenceContext } from './cleaning-state.ts';
 import { MAX_CLARIFICATIONS } from './call-state.ts';
 import type { ContactField } from './call-state.ts';
@@ -964,7 +964,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       // The caller's line is the answer to the cleaning question that was just asked and cleanly delivered, when it plausibly is one (a vague or off-topic reply is not stored and the question is asked again).
       if (activeAsk !== undefined && CONTACT_OF_LABEL[activeAsk] === undefined && activeAsk !== deps.firstClean?.field) {
         const b = cleaning.bind(activeAsk, heard.line);
-        deps.log('FIELD_ANSWER', { field: codeOf(activeAsk), result: b === 'bound' ? 'BOUND' : b === 'ambiguous' ? 'AMBIGUOUS' : 'UNCHECKED' });
+        // Fixed codes and two counts only: the selected field, the verdict, the branch that gave it (why), the kind of field and the size of the MASKED reply the classifier was given (characters, words). The counts describe
+        // that line; they are not proof that it matches what the caller said or what any transcript shows. No caller word, digit or value is ever logged.
+        deps.log('FIELD_ANSWER', { field: codeOf(activeAsk), result: b === 'bound' ? 'BOUND' : b === 'ambiguous' ? 'AMBIGUOUS' : 'UNCHECKED', why: cleaning.lastBind()?.why ?? 'NONE', kind: kindOf(activeAsk).toUpperCase(), chars: heard.line.length, words: heard.line.trim().split(/\s+/).filter((w) => w.length > 0).length });
       }
       const activeBefore = activeAsk;
       activeAsk = undefined;

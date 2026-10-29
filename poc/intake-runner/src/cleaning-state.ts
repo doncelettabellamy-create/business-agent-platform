@@ -118,26 +118,40 @@ export function polarityOf(v: string): 'neg' | 'pos' | undefined {
 const unitOf = (field: string): string | undefined => { const m = /^number of ([a-z]+?)s?$/i.exec(String(field).trim()); return m === null ? undefined : m[1].toLowerCase(); };
 
 /** Whether the words could plausibly be the answer to a field of this kind (and to this very field). */
-function plausible(field: string, kind: FieldKind, v: string): boolean {
-  if (v.length === 0 || AMBIGUOUS.test(v) || isRefusalOrUnsure(v)) return false;
+function rejection(field: string, kind: FieldKind, v: string): string | undefined {
+  if (v.length === 0) return 'EMPTY';
+  if (AMBIGUOUS.test(v)) return 'VAGUE';
+  if (isRefusalOrUnsure(v)) return 'REFUSAL_OR_UNSURE';
   switch (kind) {
     case 'count': {
       const n = countOf(v);
-      if (n === undefined || n > 20 || DATE.test(v) || TIME.test(v)) return false;   // a day of the month or a time of day is not a number of rooms
+      if (n === undefined) return 'NO_NUMBER';
+      if (n > 20) return 'NUMBER_TOO_LARGE';
+      if (DATE.test(v)) return 'DATE_WORD';   // a day of the month or a time of day is not a number of rooms
+      if (TIME.test(v)) return 'TIME_WORD';
       const own = unitOf(field);
       const others = UNITS.filter(([name, re]) => name !== own && re.test(v) && !(own !== undefined && new RegExp(`\\b${own}s?\\b`, 'i').test(v)));
-      return others.length === 0;
+      return others.length === 0 ? undefined : 'OTHER_UNIT';
     }
     case 'polarity':
-      if (polarityOf(v) !== undefined) return true;
-      if (FREQUENCY.test(v) || DATE.test(v) || TIME.test(v) || DEFLECT.test(v)) return false;   // "just this one time", "October 22" or "in the morning" is not an answer about extras or pets
-      return content(v).length >= 2;
-    case 'frequency': return FREQUENCY.test(v) && !DEFLECT.test(v);
-    case 'date': return DATE.test(v) && !DEFLECT.test(v);
-    case 'time': return TIME.test(v) && !DEFLECT.test(v);
-    default: { const m = answerMeaning(field, v); if (m !== undefined) return m === 'valid'; return content(v).length >= 1 && !DEFLECT.test(v); }
+      if (polarityOf(v) !== undefined) return undefined;
+      if (FREQUENCY.test(v)) return 'FREQUENCY_WORD';   // "just this one time", "October 22" or "in the morning" is not an answer about extras or pets
+      if (DATE.test(v)) return 'DATE_WORD';
+      if (TIME.test(v)) return 'TIME_WORD';
+      if (DEFLECT.test(v)) return 'DEFLECT_PHRASE';
+      return content(v).length >= 2 ? undefined : 'TOO_SHORT';
+    case 'frequency': if (!FREQUENCY.test(v)) return 'NO_FREQUENCY_WORD'; return DEFLECT.test(v) ? 'DEFLECT_PHRASE' : undefined;
+    case 'date': if (!DATE.test(v)) return 'NO_DATE_WORD'; return DEFLECT.test(v) ? 'DEFLECT_PHRASE' : undefined;
+    case 'time': if (!TIME.test(v)) return 'NO_TIME_WORD'; return DEFLECT.test(v) ? 'DEFLECT_PHRASE' : undefined;
+    default: {
+      const m = answerMeaning(field, v);
+      if (m !== undefined) return m === 'valid' ? undefined : 'NOT_AN_ANSWER_FOR_FIELD';
+      if (content(v).length < 1) return 'NO_CONTENT';
+      return DEFLECT.test(v) ? 'DEFLECT_PHRASE' : undefined;
+    }
   }
 }
+const plausible = (field: string, kind: FieldKind, v: string): boolean => rejection(field, kind, v) === undefined;
 /** Whether two answers say the same thing for this kind of field. */
 function same(kind: FieldKind, a: string, b: string): boolean {
   if (kind === 'count') { const x = countOf(a); const y = countOf(b); if (x !== undefined && y !== undefined) return x === y; }
@@ -167,6 +181,12 @@ export function requiredFieldsOf(skill: { fields?: ReadonlyArray<{ name: string;
 export interface CleaningState {
   /** The caller's line as the answer to `field` (the question just asked and cleanly delivered). Replaces any earlier answer and clears a conflict on that field. */
   bind(field: string, line: string): BindResult;
+  /**
+   * Why the newest bind() gave its verdict: a FIXED CODE for the branch actually taken (never a caller word, digit or value), or undefined before any bind. For the call's diagnostics only; it does not take part in any decision.
+   * Codes: OK (the words have the shape the field takes), FIELD_MEANING (a complete short reply that means something for the field), FREE_TEXT (no checkable shape: Intake reads it), UNUSABLE, and, for a reply that is not
+   * taken: EMPTY, VAGUE, REFUSAL_OR_UNSURE, NO_NUMBER, NUMBER_TOO_LARGE, DATE_WORD, TIME_WORD, OTHER_UNIT, FREQUENCY_WORD, DEFLECT_PHRASE, TOO_SHORT, NO_FREQUENCY_WORD, NO_DATE_WORD, NO_TIME_WORD, NOT_AN_ANSWER_FOR_FIELD, NO_CONTENT.
+   */
+  lastBind(): { readonly result: BindResult; readonly why: string } | undefined;
   /** Folds one validated Intake pass into the state. `newest` is the caller's newest line. */
   merge(item: Pick<WorkItemV1, 'fields'>, newest: string, ctx?: EvidenceContext): MergeOutcome;
   has(field: string): boolean;
@@ -186,6 +206,7 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
   let conflicted = new Set<string>();
   let answered = new Set<string>();   // fields the caller answered in context (a plausible answer to the question asked): evidence for an optional field
   let disposed = false;
+  let lastVerdict: { result: BindResult; why: string } | undefined;
   /** Whether the caller's own words support this value for this field. Required fields and fields with no known topic are not policed. */
   const supported = (field: string, value: string, ctx: EvidenceContext | undefined): boolean => {
     if (ctx === undefined || ctx.required === undefined || ctx.required.has(field)) return true;
@@ -197,20 +218,27 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
   };
   const usable = (field: string): boolean => typeof field === 'string' && field.length > 0 && field.length <= 60 && !/[\r\n:[\]<>]/.test(field) && !exclude.has(field);
   return {
+    lastBind() { return lastVerdict; },
     bind(field, line) {
-      if (disposed || !usable(field) || typeof line !== 'string') return 'ambiguous';
+      const out = (result: BindResult, why: string): BindResult => { lastVerdict = { result, why }; return result; };
+      if (disposed || !usable(field) || typeof line !== 'string') return out('ambiguous', 'UNUSABLE');
       const kind = kindOf(field);
       let v = clean(line).slice(0, MAX_VALUE);
+      let ok = 'OK';
       if (kind === 'free') {
         // A free-text field has no checkable shape, except for the complete short replies that mean something: a valid one is bound (a labelled line for Intake, in the caller's own words); a refusal, an "I don't know" or a reply that is not an answer to THIS question is held and the question is asked again.
         v = v.replace(/[.!?,;\s]+$/, '');
         const m = answerMeaning(field, v);
-        if (m === undefined) return isRefusalOrUnsure(v) ? 'ambiguous' : 'unchecked';
-        if (m === 'unclear') return 'ambiguous';
-      } else if (!plausible(field, kind, v)) return 'ambiguous';
-      if (conflicted.has(field)) { accepted.set(field, v); candidates.delete(field); conflicted.delete(field); answered.add(field); return 'bound'; }   // the caller answered the very question the contradiction raised: the new answer replaces the stale value
+        if (m === undefined) return isRefusalOrUnsure(v) ? out('ambiguous', 'REFUSAL_OR_UNSURE') : out('unchecked', 'FREE_TEXT');
+        if (m === 'unclear') return out('ambiguous', 'NOT_AN_ANSWER_FOR_FIELD');
+        ok = 'FIELD_MEANING';
+      } else {
+        const why = rejection(field, kind, v);
+        if (why !== undefined) return out('ambiguous', why);
+      }
+      if (conflicted.has(field)) { accepted.set(field, v); candidates.delete(field); conflicted.delete(field); answered.add(field); return out('bound', ok); }   // the caller answered the very question the contradiction raised: the new answer replaces the stale value
       candidates.set(field, v); answered.add(field);
-      return 'bound';
+      return out('bound', ok);
     },
     merge(item, newest, ctx) {
       const out = { accepted: [] as string[], corrected: [] as string[], conflicts: [] as string[], unsupported: [] as string[] };

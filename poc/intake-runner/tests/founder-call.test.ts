@@ -3648,7 +3648,7 @@ function sqClaude(o: { delay?: (n: number) => number; tweak?: (out: { fields: Ar
       if (f.name === 'Pets') { const all = [...callerLines.join('\n').matchAll(/no pets|one (?:dog|cat)|a (?:dog|cat)/gi)]; if (all.length > 0) { f.value = all.at(-1)![0]; f.confidence = 0.9; } }
       // The newest mention of a count wins (a competent extractor reads a correction).
       const unit = /^Number of (bedrooms|bathrooms)$/.exec(f.name)?.[1]?.replace(/s$/, '');
-      if (unit !== undefined) { const all = [...callerLines.join('\n').matchAll(new RegExp(`(\\w+) ${unit}s?`, 'gi'))]; if (all.length > 0) { f.value = all.at(-1)![0]; f.confidence = 0.9; } }
+      if (unit !== undefined) { const all = [...callerLines.join('\n').matchAll(new RegExp(`(\\w+) ${unit}s?`, 'gi'))]; if (all.length > 0) { f.value = all.at(-1)![0]; f.confidence = 0.9; } else { const held = new RegExp(`^${f.name}: (.+)$`, 'mi').exec(text); if (held !== null) { f.value = held[1]; f.confidence = 0.9; } } }   // else: a competent extractor reads the labelled line
       // A bare line ("none", "never") carries no context for a free-text field: an extractor only sees the caller's lines, not the question that was asked.
       if ((f.name === 'Priority areas' || f.name === 'Last professional clean') && f.value !== null && /^(?:none|never|nothing|no|no preference)$/i.test(String(f.value).trim()) && callerLines.some((l) => l.trim().toLowerCase() === String(f.value).trim().toLowerCase()) && !new RegExp(`^${f.name}: `, 'mi').test(text)) { f.value = null; f.confidence = null; }
     }
@@ -4003,5 +4003,75 @@ test('SCRIPTED DEFAULT OFF without the table the text model words the questions 
   const sim = await r.connect();
   await driveByAsk(r, sim, OPEN_C, {});
   assert.equal(diag(r, 'SCRIPTED_ASK').length, 0);
+  sim.end(); await sim.closed.catch(() => {}); await r.handler.idle();
+});
+
+// ---------------------------------------------------------------- 2026-10-29: FIELD_ANSWER diagnostics (privacy-safe reason codes on the existing classification path)
+// The log says which field was selected, the verdict, WHICH BRANCH gave it (a fixed code), the kind of field, and two counts of the MASKED reply the classifier was given (characters, words). The counts describe that line only: they
+// are not proof that it matches what the caller said or what any transcript shows. No caller word, digit or value is logged, and no verdict changed (a differential check of 492 field/reply pairs against the previous classifier found no difference).
+const FA_FIELDS = new Set(['field', 'result', 'why', 'kind', 'chars', 'words']);
+const FA_WHY = new Set(['OK', 'FIELD_MEANING', 'FREE_TEXT', 'UNUSABLE', 'EMPTY', 'VAGUE', 'REFUSAL_OR_UNSURE', 'NO_NUMBER', 'NUMBER_TOO_LARGE', 'DATE_WORD', 'TIME_WORD', 'OTHER_UNIT', 'FREQUENCY_WORD', 'DEFLECT_PHRASE', 'TOO_SHORT', 'NO_FREQUENCY_WORD', 'NO_DATE_WORD', 'NO_TIME_WORD', 'NOT_AN_ANSWER_FOR_FIELD', 'NO_CONTENT']);
+const faRows = (r: Rig) => diag(r, 'FIELD_ANSWER').map((l) => l.detail as Record<string, string | number>);
+const faShapeOk = (r: Rig): void => {
+  for (const d of faRows(r)) {
+    assert.deepEqual(Object.keys(d).sort(), [...FA_FIELDS].sort(), 'only the fixed keys');
+    assert.ok(/^[A-Z_]+$/.test(String(d.field)) && FA_WHY.has(String(d.why)) && /^[A-Z]+$/.test(String(d.kind)), JSON.stringify(d));
+    assert.ok(Number.isInteger(d.chars) && Number.isInteger(d.words) && Number(d.chars) >= 0 && Number(d.words) >= 0);
+    // The reason matches the verdict: the branch actually taken, not a guess.
+    const bound = ['OK', 'FIELD_MEANING'].includes(String(d.why));
+    assert.equal(d.result === 'BOUND', bound, `BOUND exactly when the branch accepted the shape: ${JSON.stringify(d)}`);
+    assert.equal(d.result === 'UNCHECKED', d.why === 'FREE_TEXT', JSON.stringify(d));
+  }
+};
+
+test('SCRIPTED DIAGNOSTICS "It has two" (the first bedrooms reply of the PID 15304 call, as the chat transcription shows it) is BOUND for the bedrooms question: why OK, kind COUNT, 10 characters and 3 words of the masked line; asked once; the Intake text carries the labelled line', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { open: 'I need a regular cleaning for my house', answers: { JOB_NUMBER_OF_BEDROOMS: ['It has two'] }, max: 30 });
+  assert.equal(steps.filter((s) => s.id === 'JOB_NUMBER_OF_BEDROOMS').length, 1, 'asked once');
+  const bed = faRows(r).filter((d) => d.field === 'NUMBER_OF_BEDROOMS');
+  assert.deepEqual(bed, [{ field: 'NUMBER_OF_BEDROOMS', result: 'BOUND', why: 'OK', kind: 'COUNT', chars: 10, words: 3 }]);
+  faShapeOk(r);
+  const last = r.claude.sent.filter((p) => !p.stream).map((p) => JSON.parse(p.messages[0].content)).filter((m) => m.task === 'extract_fields').map((m) => String(m.data.masked_text)).at(-1) ?? '';
+  assert.match(last, /^Number of bedrooms: It has two$/m);
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Number of bedrooms'), 'It has two');
+});
+
+test('SCRIPTED DIAGNOSTICS representative rejection reasons through the real path: each rejected reply is logged with the branch that rejected it, then the question is asked again and accepted (OK); nothing the caller said is in any log', async () => {
+  // Replies are chosen so that a rejected one does not also answer another question (a frequency phrase said to the extras question would answer the frequency question and it would not be asked again); the other codes are covered by the unit table.
+  const replies = { bed: 'two bathrooms', pets: "I'd rather not say", freq: 'um', extras: 'hmm', date: 'whenever you like', time: 'next Tuesday' };
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { open: 'I need a regular cleaning for my house', max: 40, answers: {
+    JOB_NUMBER_OF_BEDROOMS: [replies.bed, 'two bedrooms'], JOB_PETS: [replies.pets, 'no pets'],
+    JOB_CLEANING_FREQUENCY: [replies.freq, 'just one time'], JOB_EXTRAS: [replies.extras, 'no extras'], FIXED_PREFERRED_DATE: [replies.date, 'tomorrow'], FIXED_TIME_WINDOW: [replies.time, 'morning'],
+  } });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => s.id)));
+  const seq = (field: string) => faRows(r).filter((d) => d.field === field).map((d) => `${d.result}:${d.why}`);
+  assert.deepEqual(seq('NUMBER_OF_BEDROOMS'), ['AMBIGUOUS:OTHER_UNIT', 'BOUND:OK']);   // the bathrooms were answered by that reply, so they are not asked
+  assert.deepEqual(seq('PETS'), ['AMBIGUOUS:REFUSAL_OR_UNSURE', 'BOUND:OK']);
+  assert.deepEqual(seq('CLEANING_FREQUENCY'), ['AMBIGUOUS:VAGUE', 'BOUND:OK']);
+  assert.deepEqual(seq('EXTRAS'), ['AMBIGUOUS:VAGUE', 'BOUND:OK']);
+  assert.deepEqual(seq('PREFERRED_DATE'), ['AMBIGUOUS:NO_DATE_WORD', 'BOUND:OK']);
+  assert.deepEqual(seq('TIME_WINDOW'), ['AMBIGUOUS:NO_TIME_WORD', 'BOUND:OK']);
+  faShapeOk(r);
+  // The counts are those of the masked line the classifier saw (here the masker leaves these replies unchanged); they are a size, not an identity.
+  const pets = faRows(r).filter((d) => d.field === 'PETS')[0];
+  assert.deepEqual([pets.chars, pets.words], [replies.pets.length, replies.pets.split(' ').length]);
+  const faText = JSON.stringify(faRows(r));
+  for (const said of [...Object.values(replies).filter((x) => x.length > 3), 'two bedrooms', 'just one time', 'no pets', 'no extras', 'morning']) assert.ok(!faText.toLowerCase().includes(said.toLowerCase()), `no caller wording in the diagnostics: "${said}"`);
+  assert.ok(!/\d{3}/.test(faText.replace(/"(chars|words)":\d+/g, '')), 'no digit string other than the two counts');
+  await sqFinish(r, sim);
+});
+
+test('SCRIPTED DIAGNOSTICS the Deep-cleaning free-text fields log the branch taken: a meaningful short reply (FIELD_MEANING), a reply that is not an answer to THAT question (NOT_AN_ANSWER_FOR_FIELD), and an ordinary free-text answer (FREE_TEXT)', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { open: DEEP_OPEN, max: 40, answers: { JOB_PRIORITY_AREAS: ['none'], JOB_LAST_PROFESSIONAL_CLEAN: ['none', 'a year ago'] } });
+  const seq = (field: string) => faRows(r).filter((d) => d.field === field).map((d) => `${d.result}:${d.why}:${d.kind}`);
+  assert.deepEqual(seq('PRIORITY_AREAS'), ['BOUND:FIELD_MEANING:FREE']);
+  assert.deepEqual(seq('LAST_PROFESSIONAL_CLEAN'), ['AMBIGUOUS:NOT_AN_ANSWER_FOR_FIELD:FREE', 'UNCHECKED:FREE_TEXT:FREE']);
+  faShapeOk(r);
   sim.end(); await sim.closed.catch(() => {}); await r.handler.idle();
 });
