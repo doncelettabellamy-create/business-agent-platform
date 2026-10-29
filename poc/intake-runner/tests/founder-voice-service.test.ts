@@ -21,6 +21,7 @@ import { SPEAK_ONLY } from '../src/realtime-transport.ts';
 import { createPersona, dialogueStyle, voiceManner } from '../src/persona.ts';
 import { createOpenAIHttpClient } from '../src/openai-http-client.ts';
 import { fallbackText } from '../src/dialogue-model.ts';
+import { scriptedQuestion } from '../src/scripted-questions.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import type { Sim } from './helpers/twilio-sim.ts';
 import { b64, createWireVoice } from './helpers/realtime-wire-sim.ts';
@@ -181,7 +182,10 @@ test('full call: the notice, a yes, the cleaning questions, the fixed read-back 
   assert.deepEqual(r.voices[0].refused, [], 'nothing the documented schema would refuse was sent');
   // The spoken wording came from the OpenAI text model with the persona line before the NEXT line, which is last.
   const dialogue = r.text.seen.filter((p) => !p.text);
-  assert.ok(dialogue.length >= 2, 'the opening question and the address question were worded by the text model');
+  // Scripted question table: the text model words the OPENING only. The question for the required Address field is the table's fixed sentence (this test skill has no entry for it, so it is the plain generic one), never model wording.
+  assert.equal(dialogue.length, 1, 'only the opening question was worded by the text model');
+  assert.equal(r.voices[0].spoken[2], scriptedQuestion({ field: 'Address' }).text, "the address question is the table's fixed sentence");
+  assert.ok(dialogue.every((p) => !(String(p.instructions).split('\n').pop() ?? '').startsWith('NEXT ASK')),'no required-item question was handed to the text model');
   for (const p of dialogue) {
     const lines = String(p.instructions).split('\n').filter((l) => !l.startsWith('STATUS '));   // the STATUS line (field names only) sits between the persona line and NEXT
     assert.equal(lines[lines.length - 2], dialogueStyle(persona));
@@ -358,19 +362,22 @@ test('failure: when the OpenAI text model answers with nothing, the caller is no
   sim.end(); await pause(20);
 });
 
-test('failure: when the OpenAI text model keeps erroring, each turn is retried and answered in fixed words, and the third failed turn in a row ends the call with the fixed apology, saved unconfirmed with nothing handed on, and the stream closed', async () => {
+test('failure: when the OpenAI text model keeps erroring, the opening is said in fixed words and every required question is still asked from the scripted table (the model is not needed for it), so the call completes with a confirmed record; the apology after three failed model turns is covered at the call-logic level (founder-call.test.ts), where the model words the questions', async () => {
   const r = await rig({ failDialogue: true });
   const sim = await r.connect(); r.start(sim);
   await until(() => r.has('CALL_STARTED'));
   await say(r, 'yes I agree', 2);
-  assert.equal(r.voices[0].spoken[1], fallbackText({ kind: 'open' }), 'the opening is said in the server\'s own words');
+  assert.equal(r.voices[0].spoken[1], fallbackText({ kind: 'open' }), "the opening is said in the server's own words");
   await say(r, 'I have a burst pipe', 3);
-  r.voices[0].hear('it is flooding');
+  assert.equal(r.voices[0].spoken[2], scriptedQuestion({ field: 'Address' }).text, 'the required question does not depend on the text model');
+  assert.equal(r.logs.filter((l) => l.code === 'DIALOGUE_FAILED').length, 2, 'only the opening used the failing model (tried, then retried)');
+  await say(r, 'The address is 42 Elm Street', 4);
+  await say(r, 'yes that is right', 5);
   await sim.closed;
   await r.handler.idle();
-  assert.equal(r.voices[0].spoken[3], SAY.trouble);
+  assert.equal(r.voices[0].spoken[4], SAY.thanks);
   assert.equal(sim.closeCode(), 1000);
-  assert.ok(r.store.list(T).every((x) => x.handed_off === false));
+  assert.equal(r.store.list(T)[0]?.confirmation, 'confirmed');
 });
 
 test('failure: a voice service that drops mid-call ends the call and closes the stream', async () => {

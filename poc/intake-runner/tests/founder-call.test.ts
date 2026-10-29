@@ -25,8 +25,9 @@ import type { RelayConnection } from '../src/ws-server.ts';
 import { createRelayHandler, readBackText, redactSensitive, residentialAnswer, SAY, speechDelayMs } from '../src/relay-handler.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import { createContactVault } from '../src/contact-vault.ts';
-import { requiredFieldsOf } from '../src/cleaning-state.ts';
-import { firstCleanQuestion, FIXED_QUESTIONS, VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS } from '../src/founder-voice-service.ts';
+import { requiredFieldsOf, codeOf } from '../src/cleaning-state.ts';
+import { scriptedQuestion, scriptedClarify, JOB_QUESTIONS } from '../src/scripted-questions.ts';
+import { firstCleanQuestion, FIXED_QUESTIONS, residentialRouting, VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS } from '../src/founder-voice-service.ts';
 import { parseFirstClean } from '../src/first-clean.ts';
 import { createConversationRelayTransport } from '../src/call-transport.ts';
 import type { CallTransport } from '../src/call-transport.ts';
@@ -91,7 +92,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean } }
+interface RigOptions { contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean }; scripted?: boolean }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -119,6 +120,7 @@ async function rig(o: RigOptions = {}) {
       if (!r.ok) throw new Error('context');
       return r.context;
     },
+    ...(o.scripted === true ? { scripted: { ask: scriptedQuestion, clarify: scriptedClarify } } : {}),
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
     limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
     killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(o.contactSettleMs === undefined ? {} : { contactSettleMs: o.contactSettleMs }), ...(o.contactCollectMaxMs === undefined ? {} : { contactCollectMaxMs: o.contactCollectMaxMs }), ...(o.fixedQuestions === undefined ? {} : { fixedQuestions: o.fixedQuestions }), ...(o.playbackMaxMs === undefined ? {} : { playbackMaxMs: o.playbackMaxMs }), ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
@@ -3545,4 +3547,362 @@ test('PLACEHOLDER the address keeps its placeholder and masking is unchanged: th
   const [rec] = r.store.list(T);
   assert.equal(rec.address_status, 'caller_confirmed');
   assert.ok(!/742|evergreen/i.test(JSON.stringify(rec)), 'the address value is in the vault only');
+});
+
+// ---------------------------------------------------------------- 2026-10-29: SCRIPTED QUESTION TABLE (scripted-questions.ts) through the whole scripted conversation
+// A caller who answers the question they actually HEAR (the spoken sentence is matched against the table; the log of which field was selected is only compared afterwards), an extractor that is not
+// cooperative (delays, omissions, stale values), and checks on the FINAL record and the read-back, not on the parser. Invented data only.
+const SQ_OPEN = 'I need a regular cleaning for my house, two bedrooms and two bathrooms';
+// The same wiring as the voice service: the approved fixed date/time questions, the first-cleaning question, residential-only routing and the contact settle window.
+const SQ_RIG = { scripted: true, contacts: true, firstCleanQuestion: FQ, fixedQuestions: FIXED_QUESTIONS, residential: residentialRouting((servicesSkill as any).categories, 'Drew Cleaning'), contactSettleMs: 250, contactCollectMaxMs: 1500, previewBudgetMs: 8000 } as const;
+const sqCategoryNames = (servicesSkill as any).categories.filter((c: any) => c.route !== 'human').map((c: any) => c.name as string);
+/** Every sentence the scripted path can speak as a question, by id. */
+const SQ_SENTENCES: Map<string, string> = (() => {
+  const m = new Map<string, string>();
+  const fixed = new Set<string>(Object.keys(FIXED_QUESTIONS));
+  for (const f of (servicesSkill as any).fields as Array<{ name: string; choices?: string[]; role?: string }>) {
+    if (f.role === 'first_clean') m.set(FQ, 'FIRST_CLEAN');
+    else if (fixed.has(f.name)) m.set(FIXED_QUESTIONS[f.name], `FIXED_${codeOf(f.name)}`);
+    else { const q = scriptedQuestion({ field: f.name, ...(f.choices ? { choices: f.choices } : {}) }); m.set(q.text, q.id); }
+  }
+  for (const field of ['Customer name', 'Callback phone number', 'Service address']) {
+    for (const rejected of [false, true]) { const q = scriptedQuestion({ field, rejected }); m.set(q.text, q.id); }
+  }
+  for (let n = 1; n <= 9; n++) { const q = scriptedQuestion({ field: 'Callback phone number', phone: n }); m.set(q.text, q.id + '_' + n); }
+  { const q = scriptedQuestion({ field: 'Callback phone number', phone: 'restate' }); m.set(q.text, q.id); }
+  for (const part of ['street name', 'house number'] as const) { const q = scriptedQuestion({ field: 'Service address', part }); m.set(q.text, q.id); }
+  for (const first of [true, false]) { const q = scriptedClarify(sqCategoryNames, first); m.set(q.text, q.id); }
+  return m;
+})();
+/** What a plain caller says to each question they hear. */
+const SQ_PLAIN: Record<string, string> = {
+  JOB_PROPERTY_TYPE: 'it is a house', JOB_NUMBER_OF_BEDROOMS: 'two bedrooms', JOB_NUMBER_OF_BATHROOMS: 'two bathrooms', JOB_PETS: 'no pets', JOB_CLEANING_FREQUENCY: 'just one time', JOB_EXTRAS: 'no extras',
+  JOB_LAST_PROFESSIONAL_CLEAN: 'a year ago', JOB_PRIORITY_AREAS: 'the kitchen', JOB_HOME_EMPTY: 'yes it is empty', FIRST_CLEAN: 'yes', FIXED_PREFERRED_DATE: 'tomorrow', FIXED_TIME_WINDOW: 'morning',
+  NAME: 'priya raman', NAME_RETRY: 'priya raman', PHONE: 'two one two five five five zero one four two', PHONE_RETRY: 'two one two five five five zero one four two', ADDRESS: '742 Evergreen Terrace', ADDRESS_RETRY: '742 Evergreen Terrace',
+  CATEGORY: 'a regular cleaning', CATEGORY_OPEN: 'a regular cleaning',
+};
+/** The field a selected-field code must be asked with: the ids a code may be spoken as. */
+const sqExpected = (code: string): (id: string) => boolean => {
+  if (code === 'CUSTOMER_NAME') return (id) => id === 'NAME' || id === 'NAME_RETRY';
+  if (code === 'CALLBACK_PHONE_NUMBER') return (id) => /^PHONE/.test(id);
+  if (code === 'SERVICE_ADDRESS') return (id) => /^ADDRESS/.test(id);
+  if (code === 'FIRST_CLEANING_WITH_US') return (id) => id === 'FIRST_CLEAN';
+  if (code === 'PREFERRED_DATE' || code === 'TIME_WINDOW') return (id) => id === `FIXED_${code}`;
+  return (id) => id === `JOB_${code}`;
+};
+interface SqStep { heard: string; id: string | undefined; said: string }
+/**
+ * Drives the call: each turn the caller hears the newest spoken line, finds it in the table, and answers THAT question (`answers[id]` in order, the last repeating, else the plain answer). A line that is not a table
+ * sentence (the read-back, a fixed yes/no line) ends the loop. Returns what was heard and said, in order.
+ */
+async function sqConverse(r: Rig, sim: Sim, o: { open?: string; answers?: Record<string, string[]>; max?: number; before?: (sim: Sim, id: string | undefined, n: number) => Promise<void> | void } = {}): Promise<SqStep[]> {
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, o.open ?? SQ_OPEN); await reply(r, sim);
+  const steps: SqStep[] = []; const used: Record<string, number> = {};
+  for (let i = 0; i < (o.max ?? 40) && !r.logs.some((l) => l.code === 'READBACK' || l.code === 'INCOMPLETE') && !sim.messages.some((m: any) => m.type === 'end'); i++) {
+    const heard = textTokens(sim).at(-1) ?? '';
+    const id = SQ_SENTENCES.get(heard);
+    const list = id === undefined ? undefined : o.answers?.[id];
+    const said = list !== undefined ? list[Math.min(used[id as string] = (used[id as string] ?? 0) + 1, list.length) - 1] : id === undefined ? 'ok' : SQ_PLAIN[id.replace(/_\d$/, '')] ?? (/^PHONE_REMAINING_/.test(id) ? 'five five five' : 'ok');
+    steps.push({ heard, id, said });
+    if (o.before) await o.before(sim, id, i);
+    say(sim, said);
+    try { await reply(r, sim); } catch (e) { if (sim.messages.some((m: any) => m.type === 'end')) break; throw e; }   // the call may end on this very turn (a cap): that is an outcome, not a hang
+  }
+  return steps;
+}
+/** Every question the call asked, in order, as ids; and the selected-field codes in order. They must agree one for one, and the table must have an entry for every required field (no GENERIC). */
+function sqAgree(r: Rig, sim: Sim): void {
+  const spoken = textTokens(sim).map((t) => SQ_SENTENCES.get(t)).filter((x): x is string => x !== undefined && !/^CATEGORY/.test(x));
+  const selected = diag(r, 'ASK').map((l) => String(l.detail?.field));
+  assert.equal(spoken.length, selected.length, `one spoken question per selected field: ${JSON.stringify({ spoken, selected })}`);
+  spoken.forEach((id, i) => assert.ok(sqExpected(selected[i])(id), `the spoken question ${id} is not the table sentence for the selected field ${selected[i]}`));
+  assert.ok(!spoken.some((id) => id === 'GENERIC'), 'no required question fell back to the generic sentence');
+  for (const t of textTokens(sim)) assert.ok(!/[\[\]<>]|\d/.test(SQ_SENTENCES.has(t) ? t.replace(/remaining \d digits/, 'remaining N digits') : ''), 'a table sentence holds no bracket and no digit');
+}
+/** The read-back and the saved record say the same thing. */
+function sqReadbackMatchesRecord(r: Rig, sim: Sim, nth = -1): void {
+  const rb = textTokens(sim).filter((t) => /^Let me check/.test(t)).at(nth) ?? '';
+  const [rec] = r.store.list(T);
+  assert.ok(rb.length > 0, 'there was a read-back');
+  for (const f of rec.fields.filter((x) => x.found && x.value !== null && !/address/i.test(x.name))) assert.ok(rb.includes(`${f.name}: ${f.value}.`), `read back "${f.name}" as saved ("${f.value}")`);
+}
+/** Extraction that is not cooperative: realistic delays, and a hook to omit, stale or flip a value on any pass. It also reads a held answer ("Field: value" line in the text) the way a competent extractor does. */
+function sqClaude(o: { delay?: (n: number) => number; tweak?: (out: { fields: Array<{ name: string; value: string | null; confidence: number | null }> }, pass: number, text: string) => void } = {}) {
+  const claude = fakeClaude({ services: true });
+  const orig = (claude.client.messages as any).create.bind(claude.client.messages);
+  let pass = 0;
+  (claude.client.messages as any).create = async (p: any) => {
+    const res: any = await orig(p);
+    if (p.stream === true) return res;
+    const req = JSON.parse(p.messages[0].content);
+    if (req.task !== 'extract_fields') return res;
+    pass++;
+    const text = String(req.data.masked_text);
+    const out = JSON.parse(res.content[0].text);
+    for (const f of out.fields) {
+      if (f.value === null) { const m = new RegExp(`^${f.name}: (.+)$`, 'mi').exec(text); if (m !== null) { f.value = m[1]; f.confidence = 0.9; } }
+    }
+    const callerLines = text.split('\n').filter((l) => l.startsWith('Caller: ')).map((l) => l.slice(8));
+    for (const f of out.fields) {
+      if (f.name === 'Pets') { const all = [...callerLines.join('\n').matchAll(/no pets|one (?:dog|cat)|a (?:dog|cat)/gi)]; if (all.length > 0) { f.value = all.at(-1)![0]; f.confidence = 0.9; } }
+      // The newest mention of a count wins (a competent extractor reads a correction).
+      const unit = /^Number of (bedrooms|bathrooms)$/.exec(f.name)?.[1]?.replace(/s$/, '');
+      if (unit !== undefined) { const all = [...callerLines.join('\n').matchAll(new RegExp(`(\\w+) ${unit}s?`, 'gi'))]; if (all.length > 0) { f.value = all.at(-1)![0]; f.confidence = 0.9; } }
+      // A bare line ("none", "never") carries no context for a free-text field: an extractor only sees the caller's lines, not the question that was asked.
+      if ((f.name === 'Priority areas' || f.name === 'Last professional clean') && f.value !== null && /^(?:none|never|nothing|no|no preference)$/i.test(String(f.value).trim()) && callerLines.some((l) => l.trim().toLowerCase() === String(f.value).trim().toLowerCase()) && !new RegExp(`^${f.name}: `, 'mi').test(text)) { f.value = null; f.confidence = null; }
+    }
+    o.tweak?.(out, pass, text);
+    res.content[0].text = JSON.stringify(out);
+    await new Promise((x) => setTimeout(x, o.delay ? o.delay(pass) : 120 + (pass % 4) * 110));
+    return res;
+  };
+  return claude;
+}
+const sqFinish = async (r: Rig, sim: Sim) => { say(sim, 'yes'); await reply(r, sim); say(sim, 'yes'); await ended(sim, r); sqReadbackMatchesRecord(r, sim); };
+const sqRec = (r: Rig) => r.store.list(T)[0];
+const sqVal = (r: Rig, name: string) => { const f = sqRec(r).fields.find((x) => x.name === name); return f?.found ? String(f.value) : undefined; };
+const sqCodes = (r: Rig, code: string) => diag(r, code).map((l) => String(l.detail?.field));
+
+test('SCRIPTED TABLE every required field of every residential category has its own entry, in plain words: no bracket, no digit, no caller word, no business name, no generic fallback', () => {
+  for (const c of (servicesSkill as any).categories.filter((x: any) => x.route !== 'human') as Array<{ name: string; requires: string[] }>) {
+    for (const field of c.requires) {
+      if (field === 'First cleaning with us' || field === 'Preferred date' || field === 'Time window') continue;   // approved fixed questions (founder-voice-service.ts)
+      const q = scriptedQuestion({ field, choices: (servicesSkill as any).fields.find((f: any) => f.name === field)?.choices });
+      assert.notEqual(q.id, 'GENERIC', `${c.name} / ${field} has its own table entry`);
+      assert.ok(/^[A-Z][^[\]<>\d]*[?.]$/.test(q.text), `${field}: ${q.text}`);
+      assert.ok(!/drew/i.test(q.text));
+    }
+  }
+  assert.deepEqual(Object.keys(JOB_QUESTIONS).sort(), ['cleaning frequency', 'extras', 'home empty', 'last professional clean', 'number of bathrooms', 'number of bedrooms', 'pets', 'priority areas', 'property type']);
+  // The approved sentences, exactly.
+  assert.equal(scriptedQuestion({ field: 'Property type', choices: ['house', 'apartment', 'condo', 'townhouse'] }).text, 'What type of property is it? You can say house, apartment, condo, or townhouse.');
+  assert.equal(scriptedQuestion({ field: 'Extras' }).text, 'Is there anything extra you would like included in the cleaning?');
+  assert.deepEqual([1, 7, 9].map((n) => scriptedQuestion({ field: 'Callback phone number', phone: n }).text), ['Thank you. What are the remaining 1 digits?', 'Thank you. What are the remaining 7 digits?', 'Thank you. What are the remaining 9 digits?']);
+  assert.equal(scriptedQuestion({ field: 'Callback phone number', phone: 'restate' }).text, 'Could you say the whole phone number again, from the start?');
+  assert.equal(scriptedQuestion({ field: 'Service address', part: 'street name' }).text, 'Thank you. What is the street name?');
+  assert.equal(scriptedQuestion({ field: 'Service address', part: 'house number' }).text, 'Thank you. What is the house number?');
+  assert.equal(scriptedQuestion({ field: 'Service address', rejected: true }).text, 'I did not catch an address. What is the service address?');
+  assert.equal(scriptedQuestion({ field: 'Customer name', rejected: true }).text, 'I did not catch your name. May I have your name, please?');
+  assert.equal(scriptedQuestion({ field: 'Callback phone number', rejected: true }).text, 'I did not catch a phone number. What is the best phone number to reach you?');
+  // No generic repeat apology, and a repeat is the same words.
+  for (const text of SQ_SENTENCES.keys()) assert.ok(!/sorry|pause/i.test(text), text);
+  assert.equal(scriptedQuestion({ field: 'Pets' }).text, scriptedQuestion({ field: 'Pets' }).text);
+  // The category question is built from the business's own configured (residential) category names.
+  assert.equal(scriptedClarify(['Standard cleaning', 'Deep cleaning', 'Move-in or move-out cleaning'], true).text, 'Are you calling about Standard cleaning, Deep cleaning, or Move-in or move-out cleaning?');
+  assert.equal(scriptedClarify(['Standard cleaning'], false).text, 'Could you say in a few words what you need?');
+  assert.ok(!/commercial/i.test(scriptedClarify(sqCategoryNames, true).text), 'a declined category is never named');
+  // A name that is not a sentence-safe label is never spoken.
+  assert.equal(scriptedQuestion({ field: 'Pets', choices: ['a [b]', 'ok'] }).text, 'Do you have any pets in the home? You can say ok.');
+});
+
+test('SCRIPTED WRONG-FIELD WORDING a text model that keeps asking for the phone number whatever it is told cannot change any required question: every ask is the table sentence for the selected field, the call completes, and the read-back agrees with the saved record', async () => {
+  const kinds: string[] = [];
+  const dialogue: DialogueModel = { stats: { calls: 0, errors: [] }, async *reply(input) { kinds.push(String((input.directive as any).kind)); await new Promise((x) => setTimeout(x, 300)); yield 'Could you repeat your phone number, please?'; } };
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude(), dialogue });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => s.id)));
+  sqAgree(r, sim);
+  assert.ok(!kinds.includes('ask'), 'the text model was never handed a request for a required item: ' + kinds.join());
+  assert.ok(steps.every((s) => s.id !== undefined), 'every line the caller answered was a table sentence: ' + JSON.stringify(steps.filter((s) => s.id === undefined).map((s) => s.heard)));
+  await sqFinish(r, sim);
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).missing_fields], ['confirmed', 'ready', []]);
+  assert.equal(sqVal(r, 'Number of bedrooms'), 'two bedrooms');
+});
+
+test('SCRIPTED NON-COOPERATIVE EXTRACTION late passes omit the counts and the pets answer, and one returns stale values, with delays: completed fields stay complete, no question repeats beyond the existing bound, the read-back agrees with the record', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude({
+    delay: (n) => 400 + (n % 3) * 500,
+    tweak: (out, pass) => { if (pass >= 5) for (const f of out.fields) if (/bedrooms|bathrooms|Pets/.test(f.name)) { if (pass % 4 !== 0) { f.value = null; f.confidence = null; } } },
+  }) });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { open: 'I need a regular cleaning for my house', answers: { JOB_NUMBER_OF_BEDROOMS: ['two bedrooms'], JOB_NUMBER_OF_BATHROOMS: ['two bathrooms'], JOB_PETS: ['no pets'] } });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(diag(r, 'ASK').map((l) => l.detail?.field)));
+  sqAgree(r, sim);
+  const counts = new Map<string, number>(); for (const f of sqCodes(r, 'ASK')) counts.set(f, (counts.get(f) ?? 0) + 1);
+  assert.ok([...counts.values()].every((n) => n <= 1), 'an answered question is not asked again: ' + JSON.stringify([...counts]));
+  assert.ok(diag(r, 'FIELDS_RESTORED').length > 0, 'the omitted answers were put back from the call state');
+  await sqFinish(r, sim);
+  assert.deepEqual([sqVal(r, 'Number of bedrooms'), sqVal(r, 'Number of bathrooms'), sqVal(r, 'Pets')], ['two bedrooms', 'two bathrooms', 'no pets']);
+});
+
+test('SCRIPTED EQUIVALENT ANSWERS "House" and "house", "2" and "two" are the same answer: asked once, never a conflict, saved once', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { open: 'I need a regular cleaning, 2 bedrooms', answers: { JOB_PROPERTY_TYPE: ['House'], JOB_NUMBER_OF_BATHROOMS: ['two bathrooms'], JOB_PETS: ['no pets, it is a house'] } });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.equal(steps.filter((s) => s.id === 'JOB_PROPERTY_TYPE').length, 1);
+  assert.equal(steps.filter((s) => s.id === 'JOB_NUMBER_OF_BEDROOMS').length, 0, 'the bedrooms were given as "2" and are not asked');
+  assert.equal(diag(r, 'FIELD_CONFLICT').length, 0, 'no equivalent value became a conflict');
+  sqAgree(r, sim);
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Property type')?.toLowerCase(), 'house');
+});
+
+test('SCRIPTED COMPOUND COUNTS "two bedrooms and two bathrooms" answers the bedroom question once: the bathrooms are not asked, and both are saved', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { open: 'I need a regular cleaning for my house', answers: { JOB_NUMBER_OF_BEDROOMS: ['two bedrooms and two bathrooms'] } });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.deepEqual([steps.filter((s) => s.id === 'JOB_NUMBER_OF_BEDROOMS').length, steps.filter((s) => s.id === 'JOB_NUMBER_OF_BATHROOMS').length], [1, 0]);
+  await sqFinish(r, sim);
+  assert.deepEqual([sqVal(r, 'Number of bedrooms'), sqVal(r, 'Number of bathrooms')], ['two bedrooms', 'two bathrooms']);
+});
+
+test('SCRIPTED NO / NONE the plain refusals "no", "none" and "nothing" are completed answers to the yes-or-no style questions, each asked once and saved', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { answers: { JOB_PETS: ['none'], JOB_EXTRAS: ['nothing'], JOB_CLEANING_FREQUENCY: ['just one time'] } });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => [s.id, s.said])));
+  assert.equal(steps.filter((s) => s.id === 'JOB_PETS').length, 1, 'none is an answer to the pets question');
+  assert.equal(steps.filter((s) => s.id === 'JOB_EXTRAS').length, 1, 'nothing is an answer to the extras question');
+  sqAgree(r, sim);
+  await sqFinish(r, sim);
+  assert.deepEqual([sqVal(r, 'Pets'), sqVal(r, 'Extras')], ['none', 'nothing']);
+});
+
+// REPORTED, NOT WIDENED (2026-10-29): the call state binds an answer to its question only for count, yes/no, frequency, date and time fields. A free-text field (Priority areas, Last professional clean) is 'UNCHECKED': a bare "none",
+// "no preference", "never" or "no" reaches Intake as an unlabelled caller line (Intake never sees the question), so whether it is read as the answer depends on the extraction model, and when it is not the question is asked again.
+const GAP = 'VALIDATION GAP (reported, not widened): a bare none / no preference / never / no is not bound to a free-text field, so the question is asked again';
+for (const [label, field, id, said, todo] of [
+  ['"none" to the priority-areas question', 'Priority areas', 'JOB_PRIORITY_AREAS', 'none', GAP],
+  ['"no preference" to the priority-areas question', 'Priority areas', 'JOB_PRIORITY_AREAS', 'no preference', GAP],
+  ['"never" to the last-professional-clean question', 'Last professional clean', 'JOB_LAST_PROFESSIONAL_CLEAN', 'never', GAP],
+  ['a plain "no" to the priority-areas question ("are there any areas you would like us to focus on?")', 'Priority areas', 'JOB_PRIORITY_AREAS', 'no', GAP],
+] as const) {
+  test(`SCRIPTED CONTEXTUAL NONE (deep cleaning) ${label} is a completed answer: asked once, saved, read back`, { ...(todo === undefined ? {} : { todo }) }, async () => {
+    const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+    const sim = await r.connect();
+    const steps = await sqConverse(r, sim, { open: 'I need a deep clean for my house, two bedrooms and two bathrooms', answers: { [id]: [said] } });
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => [s.id, s.said])));
+    assert.equal(steps.filter((s) => s.id === id).length, 1, `${field} was asked ${steps.filter((s) => s.id === id).length} times`);
+    await sqFinish(r, sim);
+    assert.equal(sqVal(r, field)?.toLowerCase(), said);
+  });
+}
+
+for (const [what, said, field, expect] of [
+  ['the bedrooms', 'actually it is three bedrooms', 'Number of bedrooms', 'three bedrooms'],
+  ['the pets answer', 'actually we have a cat', 'Pets', 'a cat'],
+  ['the first-cleaning answer', 'it is not my first cleaning', 'First cleaning with us', 'not my first cleaning'],
+] as const) {
+  test(`SCRIPTED CORRECTIONS a caller who corrects ${what} after the read-back: the corrected read-back, the final record and the dashboard-facing fields carry the corrected value, and nothing else changed`, async () => {
+    const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+    const sim = await r.connect();
+    await sqConverse(r, sim, { answers: { FIRST_CLEAN: ['yes'] } });
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+    const before = r.logs.length;
+    say(sim, 'no that is not right'); assert.equal((await reply(r, sim)).token, SAY.correct);
+    say(sim, said); await reply(r, sim);
+    const rbs = textTokens(sim).filter((t) => /^Let me check/.test(t));
+    assert.equal(rbs.length, 2, 'the corrected request was read back again');
+    const got = new RegExp(`${field}: ([^.]*)\\.`).exec(rbs[1])?.[1];
+    if (field === 'First cleaning with us') assert.equal(parseFirstClean(got), false); else assert.equal(got, expect);
+    for (const other of ['Number of bedrooms', 'Number of bathrooms', 'Pets', 'Cleaning frequency', 'Extras'].filter((x) => x !== field)) assert.equal(new RegExp(`${other}: [^.]*\\.`).exec(rbs[1])?.[0], new RegExp(`${other}: [^.]*\\.`).exec(rbs[0])?.[0], `${other} is unchanged`);
+    assert.ok(r.logs.length > before);
+    await sqFinish(r, sim);
+    assert.equal(sqRec(r).confirmation, 'confirmed');
+    if (field === 'First cleaning with us') assert.equal(parseFirstClean(sqVal(r, field)), false); else assert.equal(sqVal(r, field), expect);
+  });
+}
+
+test('SCRIPTED FIRST CLEANING IS DURABLE a later extraction pass that omits, flips or reads the first-cleaning answer as unclear does not undo it: asked once, saved as the caller said it, read back the same', async () => {
+  for (const mode of ['omit', 'flip', 'unclear'] as const) {
+    const r = await servicesRig({ ...SQ_RIG, claude: sqClaude({ tweak: (out, _pass, text) => { if (/^First cleaning with us: /m.test(text)) for (const f of out.fields) if (f.name === 'First cleaning with us') { if (mode === 'omit') { f.value = null; f.confidence = null; } else if (mode === 'flip') { f.value = 'no'; f.confidence = 0.9; } else { f.value = 'house'; f.confidence = 0.5; } } } }) });   // both are words of the call (grounded), so Intake accepts them: only the guard stands between them and the record
+    const sim = await r.connect();
+    const steps = await sqConverse(r, sim, { answers: { FIRST_CLEAN: ['yes'] } });
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'), `${mode}: ` + JSON.stringify(steps.map((s) => s.id)));
+    assert.equal(steps.filter((s) => s.id === 'FIRST_CLEAN').length, 1, `${mode}: the first-cleaning question was asked once`);
+    assert.ok(diag(r, 'FIRST_CLEAN_RESTORED').length > 0, `${mode}: the caller's answer was put back`);
+    await sqFinish(r, sim);
+    assert.equal(parseFirstClean(sqVal(r, 'First cleaning with us')), true, `${mode}: saved as the caller said it`);
+    assert.equal(sqRec(r).confirmation, 'confirmed');
+    assert.ok(sqRec(r).reasons.includes('human_review'), `${mode}: the server edited the item, so it is held for a person`);
+  }
+});
+
+test('SCRIPTED SPLIT CONTACTS a phone number said in pieces and an address said in parts are asked for with the situation-specific sentences, in order, and the contact stored after the yes is what was said', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { answers: {
+    NAME: ['one two three'], NAME_RETRY: ['priya raman'],
+    PHONE: ['uh not sure'], PHONE_RETRY: ['two one two'], PHONE_REMAINING_7: ['nothing much', 'five five five zero one four two'],
+    ADDRESS: ['around the corner'], ADDRESS_RETRY: ['seven four two'], ADDRESS_STREET: ['no idea', 'Evergreen Terrace'],
+  } });
+  const ids = steps.map((s) => s.id).filter((x): x is string => x !== undefined);
+  for (const want of ['NAME', 'NAME_RETRY', 'PHONE', 'PHONE_RETRY', 'PHONE_REMAINING_7', 'ADDRESS', 'ADDRESS_RETRY', 'ADDRESS_STREET']) assert.ok(ids.includes(want), `${want} was asked: ${JSON.stringify(ids)}`);
+  sqAgree(r, sim);
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => [s.id, s.said])));
+  // Nothing in a log or an ask carries what was said.
+  assert.ok(!/priya|evergreen|742|2125550142/i.test(JSON.stringify(r.logs)));
+  await sqFinish(r, sim);
+  const c = r.vault?.get(T, sqRec(r).call_ref);
+  assert.equal(c?.phone, '2125550142');
+  assert.equal(sqRec(r).confirmation, 'confirmed');
+  sqReadbackMatchesRecord(r, sim);
+});
+
+test('SCRIPTED PRIVACY the scripted logs are fixed codes only (field code, template id): no caller word, no digit of a number, no sentence', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim);
+  const logs = diag(r, 'SCRIPTED_ASK');
+  assert.ok(logs.length >= 6);
+  for (const l of logs) assert.ok(/^[A-Z_0-9]+$/.test(String(l.detail?.field)) && /^[A-Z_0-9]+$/.test(String(l.detail?.tpl)) && Object.keys(l.detail ?? {}).sort().join() === 'field,tpl', JSON.stringify(l));
+  assert.ok(!/priya|evergreen|742|[0-9]{7}/i.test(JSON.stringify(r.logs)));
+});
+
+test('SCRIPTED INTERRUPTED ASKS a caller who talks over every question and says nothing useful cannot keep the call going: it ends at the existing turn cap, saved unconfirmed and never handed on, and the number of questions stays within the cap', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude(), limits: { maxTurns: 14 } });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { max: 40, answers: Object.fromEntries([...new Set(SQ_SENTENCES.values())].map((id) => [id, ['uh']])), before: (s) => { s.send({ type: 'interrupt', utteranceUntilInterrupt: 'Do you', durationUntilInterruptMs: 150 }); } });
+  await ended(sim, r).catch(() => {});
+  const [rec] = r.store.list(T);
+  assert.ok(rec !== undefined, 'the call was saved');
+  assert.deepEqual([rec.confirmation, rec.handed_off], ['unconfirmed', false]);
+  // The call ends at the existing turn cap (the consent line and the opening are turns too), with the fixed limit goodbye, and every question is a table sentence.
+  assert.ok(steps.length <= 16, `the turn cap bounded the call: ${steps.length} questions answered`);
+  assert.ok(textTokens(sim).includes(SAY.limit), 'the call ended with the fixed limit goodbye');
+  assert.equal(diag(r, 'INCOMPLETE').length, 0, 'interrupted asks are not counted as asked (by design), so the per-field limit is never reached: only the turn cap ends this call (REPORTED, not changed)');
+  assert.ok(steps.filter((s) => s.heard !== SAY.limit).every((s) => s.id !== undefined), 'every line heard was a table sentence (but the goodbye)');
+});
+
+test('SCRIPTED CATEGORY PATHS each residential category asks exactly its own required fields, and an answer given up front is not asked', async () => {
+  for (const [open, cat, extra, notAsked] of [
+    ['I need a regular cleaning for my house, two bedrooms and two bathrooms', 'Standard cleaning', ['JOB_CLEANING_FREQUENCY'], ['JOB_LAST_PROFESSIONAL_CLEAN', 'JOB_PRIORITY_AREAS', 'JOB_HOME_EMPTY']],
+    ['I need a deep clean for my house, two bedrooms and two bathrooms', 'Deep cleaning', ['JOB_LAST_PROFESSIONAL_CLEAN', 'JOB_PRIORITY_AREAS'], ['JOB_CLEANING_FREQUENCY', 'JOB_HOME_EMPTY']],
+    ['I am moving out and need a cleaning for my house, two bedrooms and two bathrooms', 'Move-in or move-out cleaning', ['JOB_HOME_EMPTY'], ['JOB_CLEANING_FREQUENCY', 'JOB_LAST_PROFESSIONAL_CLEAN', 'JOB_PRIORITY_AREAS']],
+  ] as const) {
+    const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+    const sim = await r.connect();
+    const steps = await sqConverse(r, sim, { open });
+    const ids = steps.map((s) => s.id);
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'), cat + ' ' + JSON.stringify(ids));
+    for (const id of extra) assert.ok(ids.includes(id), `${cat} asks ${id}`);
+    for (const id of notAsked) assert.ok(!ids.includes(id), `${cat} does not ask ${id}`);
+    for (const id of ['JOB_NUMBER_OF_BEDROOMS', 'JOB_NUMBER_OF_BATHROOMS', 'JOB_PROPERTY_TYPE']) assert.ok(id === 'JOB_PROPERTY_TYPE' || !ids.includes(id), `${cat}: ${id} was volunteered and is not asked`);
+    sqAgree(r, sim);
+  }
+});
+
+test('SCRIPTED UNKNOWN CATEGORY the category question is built from the configured residential names and never names the declined one; the second try is the open question', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  setup(sim); say(sim, 'yes'); await reply(r, sim);
+  say(sim, 'hello there'); await reply(r, sim);
+  const first = textTokens(sim).at(-1);
+  assert.equal(first, scriptedClarify(sqCategoryNames, true).text);
+  say(sim, 'something else entirely'); await reply(r, sim);
+  assert.equal(textTokens(sim).at(-1), scriptedClarify(sqCategoryNames, false).text);
+  assert.deepEqual(diag(r, 'SCRIPTED_ASK').map((l) => l.detail?.tpl), ['CATEGORY', 'CATEGORY_OPEN']);
+  sim.end(); await sim.closed.catch(() => {}); await r.handler.idle();
+});
+
+test('SCRIPTED DEFAULT OFF without the table the text model words the questions exactly as before (the tests of that path are unchanged) and no scripted question is logged', async () => {
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ });
+  const sim = await r.connect();
+  await driveByAsk(r, sim, OPEN_C, {});
+  assert.equal(diag(r, 'SCRIPTED_ASK').length, 0);
+  sim.end(); await sim.closed.catch(() => {}); await r.handler.idle();
 });

@@ -23,6 +23,7 @@ import type { CallSession, SessionLimits } from './call-session.ts';
 import { runCallIntake } from './call-intake.ts';
 import type { IntakeEntry } from './intake-entry.ts';
 import { fallbackText } from './dialogue-model.ts';
+import type { ScriptedAsk, ScriptedQuestion } from './scripted-questions.ts';
 import type { CallStatus, DialogueModel, Directive } from './dialogue-model.ts';
 import { freshFrom, selectNext } from './next-field.ts';
 import { CONTACT_FIELDS, spokenDigits } from './contact-capture.ts';
@@ -186,6 +187,11 @@ export interface RelayDeps {
   contactCollectMaxMs?: number;
   /** Questions spoken in EXACTLY these words (never worded by the text model), by field name; the first-cleaning question is `firstClean.question`. */
   fixedQuestions?: Readonly<Record<string, string>>;
+  /**
+   * SCRIPTED QUESTIONS (scripted-questions.ts). With it, and while the carrier does not converse natively, EVERY question for a required item (and the category question) is one of the table's fixed sentences,
+   * chosen by the field the code selected; the text model never words a request for a required item. Without it nothing changes. The `ASK`/`SCRIPTED_ASK` logs carry the template id (a fixed code), never the words.
+   */
+  scripted?: { ask(a: ScriptedAsk): ScriptedQuestion; clarify(categories: readonly string[], first: boolean): ScriptedQuestion };
   /** The longest to wait for the Intake run of a turn. A result that misses it chooses nothing; the assistant just listens. */
   previewBudgetMs: number;
   /** The longest the one retry of an EMPTY model reply waits for its first word, in milliseconds (default 4000). After that the server asks in fixed words. */
@@ -305,6 +311,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     // Current-call state beyond the rotation (call-state.ts holds the contact values themselves). The contact item just asked for, and whether the question was HEARD: the caller's next line is taken as its
     // answer and validated by the server. How many times each item has been asked AND heard (a question talked over does not count), the model-failure run, and whether this is a correction turn.
     let contactAsk: { field: ContactField; heard: boolean } | undefined;
+    const contactRejected = new Map<ContactField, boolean>();   // whether the caller's last answer to a contact item was not usable (selects the situation-specific retry question)
     let partialLabel: string | undefined;   // the contact item being completed (some pieces heard): asked next, before any other item, until it is whole, declined, or its existing limit ends the call
     let lastAsk: { field: string; prevAt: number | undefined; counted: boolean } | undefined;
     const askCount = new Map<string, number>();
@@ -368,16 +375,26 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     const neutral = (text: string): string => (residential === 'residential' && trigger !== undefined ? text.replace(trigger, 'property') : text);
     const intakeText = (s: CallSession): string => { const held = cleaning.lines(); return neutral(s.maskedText() + (held.length > 0 ? `\n${held.join('\n')}` : '')) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : ''); };
     /**
-     * The first-cleaning guard. A value for the first-cleaning field survives only if it is the caller's newest attributable answer, or explicit wording said with no newer
+     * The first-cleaning guard. It is also DURABLE: when the caller's own newest attributable answer exists, a pass that omits it or reads something else does not overrule it (see below). A value for the first-cleaning field survives only if it is the caller's newest attributable answer, or explicit wording said with no newer
      * attributable answer. A plain yes or no that no first-cleaning question was asked for, and anything that disagrees with the newest attributable answer, is dropped:
      * the field is not found, the item is held (reason ambiguous_field, and missing_fields when the category requires it) and its handoff is discarded. An unclear answer
      * is kept as said (it is not a yes, and the pricing fixture reads it as unknown).
      */
-    function guardFirstClean(item: WorkItemV1, handoff: HandoffEnvelopeV1 | null, handedOff: boolean): { item: WorkItemV1; handoff: HandoffEnvelopeV1 | null; handedOff: boolean } {
+    function guardFirstClean(item: WorkItemV1, handoff: HandoffEnvelopeV1 | null, handedOff: boolean): { item: WorkItemV1; handoff: HandoffEnvelopeV1 | null; handedOff: boolean; edited?: true } {
       const fc = deps.firstClean;
       if (fc === undefined) return { item, handoff, handedOff };
       const f = item.fields.find((x) => x.name === fc.field);
-      if (f === undefined || !f.found || typeof f.value !== 'string') return { item, handoff, handedOff };
+      if (f === undefined) return { item, handoff, handedOff };
+      // DURABLE: the caller's own newest attributable answer is what the call was steered by. A pass that omitted it, returned something unclear, or read a different value does not overrule it (only the caller's
+      // own newer answer replaces it, in onPrompt). It is put back as the caller said it, and the item is marked edited: its sealed handoff no longer describes it, so it is held for a person if confirmed.
+      if (capture !== undefined && (!f.found || typeof f.value !== 'string' || parseFirstClean(f.value) !== capture.yes)) {
+        deps.log('FIRST_CLEAN_RESTORED');
+        const missing = item.missing_fields.filter((m) => m !== fc.field);
+        const reasons = item.reasons.filter((r) => !(r === 'missing_fields' && missing.length === 0));
+        const restored: WorkItemV1 = { ...item, fields: item.fields.map((x) => (x.name === fc.field ? { ...x, value: capture!.text, confidence: x.confidence ?? 0.8, found: true } : x)), missing_fields: missing, reasons, status: reasons.length === 0 ? 'ready' : 'needs-human' };
+        return { item: restored, handoff: null, handedOff: false, edited: true };
+      }
+      if (!f.found || typeof f.value !== 'string') return { item, handoff, handedOff };
       const v = parseFirstClean(f.value);
       const keep = capture !== undefined ? v !== null && v === capture.yes : !isBareAnswer(f.value);
       if (keep) return { item, handoff, handedOff };
@@ -523,7 +540,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const g = guardFirstClean(r.item, r.handoff, r.handedOff);
         const fresh = freshFrom(g.item, covers);
         if (fresh === undefined) { deps.log('PREVIEW_UNUSABLE'); return undefined; }
-        const preview: Preview = { item: g.item, handedOff: g.handedOff, handoff: g.handoff };
+        const preview: Preview = { item: g.item, handedOff: g.handedOff, handoff: g.handoff, ...(g.edited === true ? { edited: true } : {}) };
         if (covers >= lastValidCovers) { lastValid = preview; lastValidCovers = covers; }
         return { fresh, preview };
       }, () => { deps.log('PREVIEW_FAILED', { code: 0 }); return undefined; }));
@@ -912,6 +929,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (madeProgress && lastAsk?.counted && progressCredits < MAX_PROGRESS_CREDITS) { progressCredits++; askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1)); lastAsk.counted = false; }
         // Privacy-safe: the item's label, a fixed reason code and digit COUNTS (this line, and held after it). Never a value, a word of the caller's or a transcript.
         deps.log('CONTACT_ANSWER', { field: contactAsk.field.toUpperCase(), outcome: took === undefined ? 0 : took.outcome === 'captured' ? 1 : took.outcome === 'partial' ? 2 : 3, reason: took?.reason ?? 'NOT_HEARD', heard: contactAsk.heard ? 1 : 0, ...(contactAsk.field === 'phone' ? { digits: took?.digits ?? 0, held: took?.total ?? s.contactDiag().phoneDigits } : {}), n: askCount.get(CONTACT_FIELDS[contactAsk.field]) ?? 0 });
+        contactRejected.set(contactAsk.field, took === undefined || took.outcome === 'unclear');
         // A caller who declines to go on with that item ("I'd rather not give my number") ends its completion: the pieces held are forgotten, and the item goes back to the ordinary rotation and its limit.
         if (CONTACT_REFUSAL.test(heard.line)) { s.abandonPartial(contactAsk.field); deps.log('CONTACT_DECLINED', { field: contactAsk.field.toUpperCase() }); }
         contactAsk = undefined;
@@ -1009,13 +1027,19 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const part = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'address' ? s.addressPart() : undefined;
         // Part of a phone number was heard: the question asks for the digits still needed (a COUNT, never a digit), or for the whole number again when the pieces did not fit together.
         const phoneNeed = deps.contacts !== undefined && CONTACT_OF_LABEL[next.field] === 'phone' ? s.phoneNeed() : undefined;
-        const fixed = deps.fixedQuestions?.[next.field] ?? (deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined);
+        // Scripted turn control: a question for a required item is a fixed sentence chosen by the selected field (scripted-questions.ts), never the text model's wording. Native conversation keeps its own voice.
+        const contactField0 = deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field];
+        const own = deps.fixedQuestions?.[next.field] ?? (deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined);
+        const tpl: ScriptedQuestion | undefined = own === undefined && deps.scripted !== undefined && carrier.converse === undefined
+          ? deps.scripted.ask({ field: next.field, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}), rejected: contactField0 !== undefined && contactRejected.get(contactField0) === true })
+          : undefined;
+        const fixed = own ?? tpl?.text;
         let delivered: boolean;
         if (fixed !== undefined) {
           // A fixed question is never reworded: the same words on every ask (a repeat does not become a different question), spoken as written, kept in the dialogue history as said. It offers no
           // weekday, no availability and no confirmation: it only asks.
           delivered = say(fixed);
-          if (delivered) { s.said(fixed); lastReply = fixed; deps.log(deps.firstClean !== undefined && next.field === deps.firstClean.field ? 'FIRST_CLEAN_ASKED' : 'FIXED_QUESTION_ASKED', { field: codeOf(next.field) }); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
+          if (delivered) { s.said(fixed); lastReply = fixed; deps.log(tpl !== undefined ? 'SCRIPTED_ASK' : deps.firstClean !== undefined && next.field === deps.firstClean.field ? 'FIRST_CLEAN_ASKED' : 'FIXED_QUESTION_ASKED', { field: codeOf(next.field), ...(tpl !== undefined ? { tpl: tpl.id } : {}) }); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
         } else delivered = await speak({ kind: 'ask', field: next.field, again: next.again, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}) }, statusOf(s, got));
         // Only a question that was actually produced and sent in full counts as asked, and can make the caller's next plain yes or no an answer to it.
         if (delivered) { askCount.set(next.field, (askCount.get(next.field) ?? 0) + 1); lastAsk = { field: next.field, prevAt, counted: true }; }
@@ -1028,6 +1052,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (next.kind === 'clarify') {
         clarified = true;
         deps.log('CLARIFY', { first: next.first ? 1 : 0, lines: covers });
+        if (deps.scripted !== undefined && carrier.converse === undefined) {
+          const q = deps.scripted.clarify(deps.categoryNames(tenant).filter((c) => c !== 'unknown' && !isDeclined(c)), next.first);
+          if (say(q.text)) { s.said(q.text); lastReply = q.text; deps.log('SCRIPTED_ASK', { field: 'CATEGORY', tpl: q.id }); } else deps.log('REPLY_SEND_FAILED', { failed_sends: 1 });
+          return;
+        }
         return speak(next.first ? { kind: 'clarify', categories: deps.categoryNames(tenant).filter((c) => c !== 'unknown' && !isDeclined(c)) } : { kind: 'clarify' });
       }
       deps.log('LISTEN', { lines: covers });

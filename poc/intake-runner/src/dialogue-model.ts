@@ -115,7 +115,7 @@ export function renderStatus(s: CallStatus | undefined): string {
 }
 
 /** "a, b, or c" (two: "a or b"). */
-function orList(items: readonly string[]): string {
+export function orList(items: readonly string[]): string {
   if (items.length <= 1) return items.join('');
   if (items.length === 2) return `${items[0]} or ${items[1]}`;
   return `${items.slice(0, -1).join(', ')}, or ${items[items.length - 1]}`;

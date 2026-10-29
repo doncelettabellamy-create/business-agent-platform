@@ -19,6 +19,7 @@ import { createRelayHandler } from './relay-handler.ts';
 import type { RelayHandler } from './relay-handler.ts';
 import { consentNoticeFor } from './opening.ts';
 import { requiredFieldsOf } from './cleaning-state.ts';
+import { scriptedQuestion, scriptedClarify } from './scripted-questions.ts';
 import { createPersona } from './persona.ts';
 import { startRealtimeCall } from './realtime-bridge.ts';
 import { CONTACT_TOOL_DEFINITIONS } from './call-state.ts';
@@ -110,6 +111,8 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     contactSettleMs: VOICE_CONTACT_SETTLE_MS, contactCollectMaxMs: VOICE_CONTACT_COLLECT_MAX_MS,
     // Fixed questions (founder-approved, 2026-10-28): the date and the time of day are asked in exactly these words, never worded by the model, and only for skills that have those fields.
     fixedQuestions: Object.fromEntries(Object.entries(FIXED_QUESTIONS).filter(([field]) => skill.fields.some((f) => f.name === field))),
+    // Scripted question table (founder-approved 2026-10-29): every other question for a required item, and the category question, is a fixed sentence chosen by the selected field (scripted-questions.ts), never the text model's wording. Native conversation (opt-in, inactive) keeps its own voice.
+    scripted: { ask: scriptedQuestion, clarify: scriptedClarify },
     intake,
     intakeContext: deps.intakeContext,
     dialogue, store: deps.store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,
