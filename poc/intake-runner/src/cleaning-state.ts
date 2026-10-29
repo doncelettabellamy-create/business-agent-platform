@@ -189,6 +189,11 @@ export interface CleaningState {
   lastBind(): { readonly result: BindResult; readonly why: string } | undefined;
   /** Folds one validated Intake pass into the state. `newest` is the caller's newest line. */
   merge(item: Pick<WorkItemV1, 'fields'>, newest: string, ctx?: EvidenceContext): MergeOutcome;
+  /**
+   * Forgets what the state holds for ONE field (accepted answer, bound candidate, conflict), so a value the server itself has just decided for that field (the property-type guard) is not put back over by an older accepted answer.
+   * Used only by that guard; every other field keeps the durability rule.
+   */
+  release(field: string): void;
   has(field: string): boolean;
   conflicts(): string[];
   names(): string[];
@@ -219,6 +224,7 @@ export function createCleaningState(options: { exclude?: readonly string[] } = {
   const usable = (field: string): boolean => typeof field === 'string' && field.length > 0 && field.length <= 60 && !/[\r\n:[\]<>]/.test(field) && !exclude.has(field);
   return {
     lastBind() { return lastVerdict; },
+    release(field) { if (disposed) return; accepted.delete(field); candidates.delete(field); conflicted.delete(field); answered.delete(field); },
     bind(field, line) {
       const out = (result: BindResult, why: string): BindResult => { lastVerdict = { result, why }; return result; };
       if (disposed || !usable(field) || typeof line !== 'string') return out('ambiguous', 'UNUSABLE');

@@ -8,13 +8,16 @@
 // Nothing is guessed or normalised: "Health" is not "house", "residential" is not "house", "condominium" is not "condo", and the caller's words are never replaced by a choice. Only `choice` is an unambiguous supported answer.
 
 export type PropertyAnswer = 'choice' | 'negated' | 'multi' | 'none';
+/** The configured choices a line affirms and the ones it negates (lower case, each once, in the order found). */
+export interface PropertyMentions { readonly affirmed: readonly string[]; readonly negated: readonly string[] }
 
 const NEGATORS = new Set(['not', 'no', 'never', 'without', 'nor', 'neither', 'isnt', 'arent', 'wasnt', 'werent', 'dont', 'doesnt', 'didnt', 'cant', 'cannot', 'wont', 'hasnt', 'havent', 'shouldnt', 'wouldnt', 'couldnt', 'hardly']);
 const escape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** Classifies the words against the configured choices. Empty or non-string input is `none`. */
-export function classifyPropertyAnswer(value: unknown, choices: readonly string[] | undefined): PropertyAnswer {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 200 || choices === undefined || choices.length === 0) return 'none';
+/** Which configured choices the words affirm and which they negate (a negator within three words before the choice, in the same clause). Empty or non-string input mentions nothing. */
+export function propertyMentions(value: unknown, choices: readonly string[] | undefined): PropertyMentions {
+  const none: PropertyMentions = { affirmed: [], negated: [] };
+  if (typeof value !== 'string' || value.length === 0 || value.length > 200 || choices === undefined || choices.length === 0) return none;
   const wanted = choices.map((c) => String(c).trim().toLowerCase()).filter((c) => c.length > 0);
   const affirmed = new Set<string>(); const negated = new Set<string>();
   for (const clause of value.toLowerCase().replace(/[‘’]/g, "'").split(/[,.;!?:()"]+/)) {
@@ -28,8 +31,19 @@ export function classifyPropertyAnswer(value: unknown, choices: readonly string[
       }
     }
   }
-  if (affirmed.size === 1 && negated.size === 0) return 'choice';
-  if (affirmed.size > 1) return 'multi';
-  if (negated.size > 0) return 'negated';
+  return { affirmed: [...affirmed], negated: [...negated] };
+}
+
+/** Classifies the words against the configured choices. Empty or non-string input is `none`. */
+export function classifyPropertyAnswer(value: unknown, choices: readonly string[] | undefined): PropertyAnswer {
+  const { affirmed, negated } = propertyMentions(value, choices);
+  if (affirmed.length === 1 && negated.length === 0) return 'choice';
+  if (affirmed.length > 1) return 'multi';
+  if (negated.length > 0) return 'negated';
   return 'none';
+}
+
+/** The one configured choice the words affirm (lower case), or undefined unless they are a `choice`. */
+export function propertyChoiceOf(value: unknown, choices: readonly string[] | undefined): string | undefined {
+  return classifyPropertyAnswer(value, choices) === 'choice' ? propertyMentions(value, choices).affirmed[0] : undefined;
 }

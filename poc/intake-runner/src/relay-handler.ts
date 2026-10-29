@@ -32,7 +32,7 @@ import type { EvidenceContext } from './cleaning-state.ts';
 import { MAX_CLARIFICATIONS } from './call-state.ts';
 import type { ContactField } from './call-state.ts';
 import { isBareAnswer, parseFirstClean } from './first-clean.ts';
-import { classifyPropertyAnswer } from './property-choice.ts';
+import { classifyPropertyAnswer, propertyChoiceOf, propertyMentions } from './property-choice.ts';
 import type { Contact } from './contact-capture.ts';
 import type { AddressState, ContactVault, StoredContact } from './contact-vault.ts';
 import type { Fresh } from './next-field.ts';
@@ -328,7 +328,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     // PROPERTY TYPE (founder-approved 2026-10-29; this field only). An answer that is not one of the configured choices is asked about ONCE, in fixed words listing the choices; an unambiguous supported answer is accepted;
     // anything else is kept as the caller's own masked words and the record is saved for a person (confirmed, needs-human, never ready or handed off). Nothing is guessed, replaced or normalised, and a negated choice is not accepted.
     const PROPERTY_FIELD = /^property type$/i;
-    const property: { field: string | undefined; pending: boolean; asked: boolean; first: string | undefined; reply: string | undefined; noted: boolean } = { field: undefined, pending: false, asked: false, first: undefined, reply: undefined, noted: false };
+    const property: { field: string | undefined; pending: boolean; asked: boolean; lines: string[]; firstIdx: number | undefined; replyIdx: number | undefined; noted: boolean } = { field: undefined, pending: false, asked: false, lines: [], firstIdx: undefined, replyIdx: undefined, noted: false };
+    const CORRECTION_CUE = /\b(?:actually|sorry|correction|i meant|i mean|make that|change (?:that|it)|instead)\b/i;
     let capture: { yes: boolean; text: string } | undefined;   // the caller's newest attributable first-cleaning answer (their own masked words)
     // The cleaning answers accepted so far (cleaning-state.ts): shared by the question choice and the saved record, so a detail once given is never asked for again, a correction replaces it, and a
     // contradiction is asked about instead of the stale value being kept.
@@ -378,11 +379,13 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     const trigger = deps.residential === undefined || deps.residential.keywords.length === 0 ? undefined
       : new RegExp(`(?<![A-Za-z0-9])(?:${[...deps.residential.keywords].sort((a, b) => b.length - a.length).map((k) => k.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')).join('|')})(?![A-Za-z0-9])`, 'gi');
     const neutral = (text: string): string => (residential === 'residential' && trigger !== undefined ? text.replace(trigger, 'property') : text);
-    const intakeText = (s: CallSession): string => { const held = cleaning.lines(); return neutral(s.maskedText() + (held.length > 0 ? `\n${held.join('\n')}` : '')) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '') + (property.reply !== undefined && property.field !== undefined && classifyPropertyAnswer(property.reply, deps.choicesFor?.(tenant, property.field)) === 'choice' ? `\n${property.field}: ${property.reply}` : ''); };
+    const intakeText = (s: CallSession): string => { const held = cleaning.lines(); return neutral(s.maskedText() + (held.length > 0 ? `\n${held.join('\n')}` : '')) + (capture !== undefined && deps.firstClean !== undefined ? `\n${deps.firstClean.field}: ${capture.text}` : '') + (property.replyIdx !== undefined && property.field !== undefined && classifyPropertyAnswer(property.lines[property.replyIdx], deps.choicesFor?.(tenant, property.field)) === 'choice' ? `\n${property.field}: ${property.lines[property.replyIdx]}` : ''); };
     /**
-     * The property-type guard (see the state above). Applied beside the first-cleaning guard to every Intake result. `canAsk` is false for the final run, which cannot ask anything. A supported answer from Intake is untouched. Otherwise: before the
-     * clarification was asked (and when it can be) the field is held so it is asked about once; after it, the caller's answer to it (a supported choice) is used if Intake did not return it, and anything unresolved is kept as said and marked for a person.
-     * Any change here means the sealed handoff no longer describes the item, so it is never handed off.
+     * The property-type guard (see the state above). Applied beside the first-cleaning guard to every Intake result. `canAsk` is false for the final run, which cannot ask anything. A choice returned by Intake is accepted unless the caller's own
+     * words say otherwise, wherever they were said: (1) the caller's answer to the property question or to the clarification is negated or names two choices; (2) a LATER line negates that choice ("this is not a house", in the request or in a reply
+     * to another question) and no explicit answer settled it since; (3) the caller's answer to the question names a different choice from the one Intake returned (a stale or wrong extraction), unless a later correction follows. A mere,
+     * un-negated mention of another property ("my sister has an apartment") never overwrites anything. When the doubt is raised and the clarification has not been asked (and can be), the field is held so it is asked about once; otherwise
+     * the caller's own words are kept as said and the item is marked for a person. Any change here means the sealed handoff no longer describes the item, so it is never handed off.
      */
     function guardProperty<T extends { item: WorkItemV1; handoff: HandoffEnvelopeV1 | null; handedOff: boolean; edited?: true }>(g: T, canAsk: boolean): T {
       const field = g.item.fields.find((x) => PROPERTY_FIELD.test(x.name));
@@ -390,25 +393,46 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (field === undefined || choices === undefined || choices.length === 0) return g;
       property.field = field.name;
       const held = field.found && typeof field.value === 'string' ? field.value : undefined;
-      // Intake can return just "house" for "not a house": the caller's own answer line to the property question (or to the clarification) is checked too, and a negated or two-choice answer is never accepted.
-      const answerLine = property.asked ? property.reply : property.first;
-      const lineKind = answerLine === undefined ? undefined : classifyPropertyAnswer(answerLine, choices);
       const heldKind = held === undefined ? undefined : classifyPropertyAnswer(held, choices);
-      if (heldKind === 'choice' && lineKind !== 'negated' && lineKind !== 'multi') return g;
-      if (held === undefined && property.reply === undefined) return g;   // nothing has been said about it yet
-      if (!property.asked && canAsk && held !== undefined && deps.scripted !== undefined && carrier.converse === undefined) {
+      const heldChoice = heldKind === 'choice' ? propertyChoiceOf(held, choices) : undefined;
+      const lineAt = (i: number | undefined): string | undefined => (i === undefined ? undefined : property.lines[i]);
+      const answerIdx = property.asked ? property.replyIdx : property.firstIdx;
+      const answerLine = lineAt(answerIdx);
+      const lineKind = answerLine === undefined ? undefined : classifyPropertyAnswer(answerLine, choices);
+      // The newest explicit answer that settled the property (a supported choice said to the question or to the clarification).
+      const settledAt = Math.max(-1, ...[property.firstIdx, property.replyIdx].filter((i): i is number => i !== undefined && classifyPropertyAnswer(property.lines[i], choices) === 'choice'));
+      // A later line that negates the choice Intake returned (not an answer line: those are judged above), newest first.
+      let contradictionIdx: number | undefined;
+      if (heldChoice !== undefined) property.lines.forEach((l, i) => { if (i > settledAt && i !== property.firstIdx && i !== property.replyIdx && propertyMentions(l, choices).negated.includes(heldChoice)) contradictionIdx = i; });
+      const contradiction = lineAt(contradictionIdx);
+      // The clarification answer against a stale or wrong extraction (unless the caller corrected it afterwards: Intake and the answer state handle corrections).
+      const replyLine = lineAt(property.replyIdx);
+      const replyChoice = property.asked && replyLine !== undefined ? propertyChoiceOf(replyLine, choices) : undefined;
+      const answerChoice = answerLine === undefined ? undefined : propertyChoiceOf(answerLine, choices);
+      const corrected = answerIdx !== undefined && property.lines.some((l, i) => i > answerIdx && CORRECTION_CUE.test(l));
+      const disagrees = heldChoice !== undefined && answerChoice !== undefined && answerChoice !== heldChoice && !corrected && contradictionIdx === undefined;
+      if (heldChoice !== undefined && lineKind !== 'negated' && lineKind !== 'multi' && contradictionIdx === undefined && !disagrees) return g;
+      if (held === undefined && replyLine === undefined) return g;   // nothing has been said about it yet
+      if (!property.asked && canAsk && held !== undefined && !disagrees && deps.scripted !== undefined && carrier.converse === undefined) {
         if (!property.pending) deps.log('PROPERTY_CLARIFY');
         property.pending = true;
+        cleaning.release(field.name);   // the guard's hold is authoritative: an older accepted answer must not be put back over it
         const missing = [field.name, ...g.item.missing_fields.filter((m) => m !== field.name)];
         const reasons = [...new Set([...g.item.reasons, 'missing_fields' as const, 'ambiguous_field' as const])];
         return { ...g, item: { ...g.item, fields: g.item.fields.map((x) => (x === field ? { ...x, value: null, confidence: null, found: false } : x)), missing_fields: missing, reasons, status: 'needs-human' as const }, handoff: null, handedOff: false, edited: true };
       }
-      const reply = property.reply;
-      const supported = reply !== undefined && classifyPropertyAnswer(reply, choices) === 'choice';
-      const value = supported ? (reply as string) : (heldKind === 'choice' || held === undefined ? (answerLine ?? held ?? (reply as string)) : held);   // never the choice Intake extracted from a negated answer
+      const asWords = (s: string): string => s.replace(/[.!?,;\s]+$/, '');   // the caller's own masked words, without the trailing full stop the read-back adds itself
+      const supported = disagrees || (replyChoice !== undefined && (contradictionIdx === undefined || contradictionIdx < (property.replyIdx as number)));
+      let value: string;
+      if (supported) value = asWords(disagrees ? (answerLine as string) : (replyLine as string));
+      else if (heldKind === 'choice' || held === undefined) {   // the choice Intake returned cannot be kept: the caller's newest relevant words are
+        const newest = [answerIdx, contradictionIdx].filter((i): i is number => i !== undefined).sort((x, y) => y - x)[0];
+        value = newest !== undefined ? asWords(property.lines[newest]) : (held ?? asWords(replyLine as string));
+      } else value = held;
       const missing = g.item.missing_fields.filter((m) => m !== field.name);
       let reasons = g.item.reasons.filter((r) => !(r === 'missing_fields' && missing.length === 0));
       if (!supported && !reasons.includes('human_review')) reasons = [...reasons, 'human_review' as const];
+      cleaning.release(field.name);   // the value decided here (the caller's words) replaces whatever was accepted before
       if (!property.noted) { property.noted = true; deps.log(supported ? 'PROPERTY_RESOLVED' : 'PROPERTY_UNRESOLVED'); }
       return { ...g, item: { ...g.item, fields: g.item.fields.map((x) => (x === field ? { ...x, value, confidence: x.confidence ?? 0.8, found: true } : x)), missing_fields: missing, reasons, status: reasons.length === 0 ? ('ready' as const) : ('needs-human' as const) }, handoff: null, handedOff: false, edited: true };
     }
@@ -1000,9 +1024,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         if (answer !== null && (activeAsk === deps.firstClean.field || !isBareAnswer(heard.line))) capture = { yes: answer, text: heard.line.trim().slice(0, 80) };
       }
       // The caller's line is the answer to the cleaning question that was just asked and cleanly delivered, when it plausibly is one (a vague or off-topic reply is not stored and the question is asked again).
-      if (activeAsk !== undefined && PROPERTY_FIELD.test(activeAsk)) {   // the caller's own masked words, the first thing said after the property question, and after the clarification
-        if (!property.asked) { if (property.first === undefined) property.first = heard.line.trim().slice(0, 80); }
-        else if (property.reply === undefined) property.reply = heard.line.trim().slice(0, 80);
+      // Every caller line, in order (masked, bounded): the property guard looks for a negation or a different choice wherever it was said. The answer to the property question and to the clarification are remembered by position.
+      if (property.lines.length < 80) property.lines.push(heard.line.trim().slice(0, 200));
+      if (activeAsk !== undefined && PROPERTY_FIELD.test(activeAsk) && property.lines.length > 0) {
+        if (!property.asked) { if (property.firstIdx === undefined) property.firstIdx = property.lines.length - 1; }
+        else if (property.replyIdx === undefined) property.replyIdx = property.lines.length - 1;
       }
       if (activeAsk !== undefined && CONTACT_OF_LABEL[activeAsk] === undefined && activeAsk !== deps.firstClean?.field) {
         const b = cleaning.bind(activeAsk, heard.line);

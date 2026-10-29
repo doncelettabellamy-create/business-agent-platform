@@ -1,7 +1,7 @@
 // property-choice.ts: whether a caller's words for the property type are one of the configured choices. Pure; invented words only.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyPropertyAnswer } from '../src/property-choice.ts';
+import { classifyPropertyAnswer, propertyMentions, propertyChoiceOf } from '../src/property-choice.ts';
 
 const CHOICES = ['house', 'apartment', 'condo', 'townhouse'];
 const kind = (v: string) => classifyPropertyAnswer(v, CHOICES);
@@ -28,4 +28,19 @@ test('a choice inside another word is not a match ("townhouse" is the townhouse 
   assert.equal(classifyPropertyAnswer('townhouse', ['house']), 'none');
   assert.equal(classifyPropertyAnswer('a lighthouse', ['house']), 'none');
   assert.equal(classifyPropertyAnswer('house', ['house', 'townhouse']), 'choice');
+});
+
+test('propertyMentions: which configured choices a line affirms and which it negates; an unrelated, un-negated mention affirms its own choice only', () => {
+  assert.deepEqual(propertyMentions('this is not a house', CHOICES), { affirmed: [], negated: ['house'] });
+  assert.deepEqual(propertyMentions('no pets, and it is not a house', CHOICES), { affirmed: [], negated: ['house'] });
+  assert.deepEqual(propertyMentions('it is not a house, it is an apartment', CHOICES), { affirmed: ['apartment'], negated: ['house'] });
+  assert.deepEqual(propertyMentions('my sister has an apartment', CHOICES), { affirmed: ['apartment'], negated: [] });
+  assert.deepEqual(propertyMentions('Health.', CHOICES), { affirmed: [], negated: [] });
+  assert.deepEqual(propertyMentions('', CHOICES), { affirmed: [], negated: [] });
+});
+
+test('propertyChoiceOf: the one affirmed choice, only for an unambiguous answer', () => {
+  assert.equal(propertyChoiceOf('it is an apartment', CHOICES), 'apartment');
+  assert.equal(propertyChoiceOf('Houses', CHOICES), 'house');
+  for (const v of ['not a house', 'house or apartment', 'Health.', 'my sister has an apartment but we have a house']) assert.equal(propertyChoiceOf(v, CHOICES), undefined, v);
 });

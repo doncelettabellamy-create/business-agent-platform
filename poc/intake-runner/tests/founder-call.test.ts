@@ -4306,3 +4306,84 @@ test('SCRIPTED PROPERTY if the extraction keeps returning the unsupported word a
   assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'needs-human', false]);
   assert.equal(diag(r, 'PROPERTY_RESOLVED').length, 1);
 });
+
+// ---------------------------------------------------------------- 2026-10-29: the property rule wherever the answer occurs (cases C and E of the offline check, plus explicit later contradictions; unrelated mentions must not overwrite the service property)
+const PR_NEG_OPEN = 'I need a regular cleaning, this is not a house, two bedrooms and two bathrooms';
+
+test('SCRIPTED PROPERTY a negation in the opening request is not accepted although the extraction returns "house": the clarification is asked, and an unambiguous answer after it is accepted', async () => {
+  const { r, sim, steps } = await prRun([], { JOB_PROPERTY_TYPE_CLARIFY: ['it is an apartment'] }, { open: PR_NEG_OPEN });
+  assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE_CLARIFY'], 'the plain question was not needed: the request itself raised the doubt');
+  assert.equal(diag(r, 'PROPERTY_CLARIFY').length, 1);
+  assert.match(prRb(sim) ?? '', /apartment/i);
+  await sqFinish(r, sim);
+  assert.match(sqVal(r, 'Property type') ?? '', /apartment/i);
+  assert.ok(!/^house$/i.test(sqVal(r, 'Property type') ?? ''));
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'ready', true]);
+});
+
+test('SCRIPTED PROPERTY a negation in the opening that the clarification does not settle is kept as the caller said it (never "house") and the record is held for a person: "Health" and "no house"', async () => {
+  for (const [reply, expect] of [['Health.', 'Health'], ['no house', 'no house']] as const) {
+    const { r, sim, steps } = await prRun([reply], { JOB_PROPERTY_TYPE_CLARIFY: [reply] }, { open: PR_NEG_OPEN });
+    assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE_CLARIFY'], reply);
+    assert.equal(prRb(sim), expect, reply);
+    await sqFinish(r, sim);
+    assert.equal(sqVal(r, 'Property type'), expect, reply);
+    assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'needs-human', false], reply);
+    assert.ok(sqRec(r).reasons.includes('human_review'), reply);
+  }
+});
+
+test('SCRIPTED PROPERTY the clarification answer wins over a stale extraction: the caller says "it is an apartment" and the extraction still returns "house" (from "not a house"); the caller\'s words are read back and saved and the record is held for a person', async () => {
+  const { r, sim, steps } = await prRun(['not a house'], { JOB_PROPERTY_TYPE: ['not a house'], JOB_PROPERTY_TYPE_CLARIFY: ['it is an apartment'] }, { force: 'house' });
+  assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY']);
+  assert.equal(prRb(sim), 'it is an apartment');
+  await sqFinish(r, sim);
+  assert.equal(sqVal(r, 'Property type'), 'it is an apartment');
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'needs-human', false], 'the server set it, so the sealed handoff does not describe it');
+});
+
+test('SCRIPTED PROPERTY an explicit later contradiction: "it is not a house" said to another question after the house was accepted raises the one clarification, and the answer to it is accepted', async () => {
+  const { r, sim, steps } = await prRun([], { JOB_PETS: ['no pets, and it is not a house'], JOB_PROPERTY_TYPE_CLARIFY: ['it is an apartment'] }, { open: 'I need a regular cleaning for my house, two bedrooms and two bathrooms' });
+  assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE_CLARIFY']);
+  assert.equal(diag(r, 'PROPERTY_CLARIFY').length, 1);
+  await sqFinish(r, sim);
+  assert.match(sqVal(r, 'Property type') ?? '', /apartment/i);
+  assert.equal(sqRec(r).confirmation, 'confirmed');
+});
+
+test('SCRIPTED PROPERTY an explicit contradiction at the read-back, after the one clarification was used, is kept as said and the record is held for a person (never "house")', async () => {
+  const { r, sim } = await prRun([], { JOB_PROPERTY_TYPE_CLARIFY: ['house'] }, { open: PR_NEG_OPEN });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  assert.match(prRb(sim) ?? '', /house/);
+  say(sim, 'no that is not right'); assert.equal((await reply(r, sim)).token, SAY.correct);
+  say(sim, 'actually it is not a house'); await reply(r, sim);
+  assert.match(prRb(sim) ?? '', /not a house/);
+  await sqFinish(r, sim);
+  assert.match(sqVal(r, 'Property type') ?? '', /not a house/);
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off], ['confirmed', 'needs-human', false]);
+  assert.equal(diag(r, 'PROPERTY_CLARIFY').length, 1, 'the clarification limit holds: never asked twice');
+});
+
+test('SCRIPTED PROPERTY an explicit later correction to another choice is taken (unchanged): "actually it is an apartment" after "house"', async () => {
+  const a = await prRun([], {}, { open: 'I need a regular cleaning for my house, two bedrooms and two bathrooms' });
+  say(a.sim, 'no that is not right'); assert.equal((await reply(a.r, a.sim)).token, SAY.correct);
+  say(a.sim, 'actually it is an apartment'); await reply(a.r, a.sim);
+  assert.match(prRb(a.sim) ?? '', /apartment/i);
+  await sqFinish(a.r, a.sim);
+  assert.match(sqVal(a.r, 'Property type') ?? '', /apartment/i);
+  assert.equal(diag(a.r, 'PROPERTY_CLARIFY').length, 0);
+});
+
+test('SCRIPTED PROPERTY an unrelated mention of another kind of property does not overwrite the service property: "my sister has an apartment" in the request, and in a reply to another question even when the extraction picks it up; the caller\'s own answer is kept', async () => {
+  const req = await prRun([], {}, { open: 'I need a regular cleaning for my house, my sister has an apartment, two bedrooms and two bathrooms' });
+  assert.deepEqual(prAsks(req.steps), []);
+  assert.equal(diag(req.r, 'PROPERTY_CLARIFY').length, 0);
+  await sqFinish(req.r, req.sim);
+  assert.deepEqual([sqVal(req.r, 'Property type'), sqRec(req.r).status, sqRec(req.r).handed_off], ['house', 'ready', true]);
+  const later = await prRun([], { JOB_PROPERTY_TYPE: ['it is a house'], JOB_PETS: ['no pets, my sister has an apartment'] });
+  assert.equal(prRb(later.sim), 'it is a house', 'the caller\'s own answer to the property question, in the caller\'s words');
+  await sqFinish(later.r, later.sim);
+  assert.equal(sqVal(later.r, 'Property type'), 'it is a house');
+  assert.deepEqual([sqRec(later.r).confirmation, sqRec(later.r).handed_off], ['confirmed', false], 'the server kept the caller\'s answer over the extraction, so a person checks it');
+  assert.equal(diag(later.r, 'PROPERTY_CLARIFY').length, 0);
+});

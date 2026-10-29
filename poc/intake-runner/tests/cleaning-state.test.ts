@@ -354,3 +354,17 @@ test('lastBind: a conflict-resolving answer is reported with the branch that acc
   assert.deepEqual(s.lastBind(), { result: 'bound', why: 'OK' });
   assert.deepEqual(s.conflicts(), []);
 });
+
+test('release: forgets what is held for ONE field (accepted answer, candidate, conflict) so a value the server decided is not put back over; other fields keep their durability', () => {
+  const s = createCleaningState();
+  s.merge(item([fe('Pets', 'no pets'), fe('Number of bedrooms', 'two bedrooms')]), 'no pets and two bedrooms', undefined);
+  assert.ok(s.has('Pets') && s.has('Number of bedrooms'));
+  s.release('Pets');
+  assert.ok(!s.has('Pets') && s.has('Number of bedrooms'));
+  const out = s.overlay(item([fe('Pets', null), fe('Number of bedrooms', null)], ['Pets', 'Number of bedrooms'], ['missing_fields'], 'needs-human'));
+  assert.deepEqual(out.restored, ['Number of bedrooms'], 'only the field that was not released is put back');
+  const t = createCleaningState();
+  t.bind('Pets', 'a dog'); t.release('Pets');
+  assert.deepEqual(t.lines(), []);
+  t.dispose(); t.release('Pets');   // no effect, no throw
+});
