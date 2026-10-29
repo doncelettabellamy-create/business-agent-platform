@@ -98,7 +98,8 @@ export function nameFrom(raw: unknown): string | undefined {
 }
 
 // Address words. A STREET word is a word of two or more letters that is not a number word and not only a unit designator ("apartment 4" is not a street). No particular street suffix is required.
-const NUMBER_WORD_ONLY = new RegExp(`^${NUM_WORD}$`, 'i');
+// A number word, or two joined by a hyphen as speech-to-text writes them ("forty-two", "twenty-one"): without the hyphenated form a house number said on its own was taken for a STREET NAME.
+const NUMBER_WORD_ONLY = new RegExp(`^${NUM_WORD}(?:-${NUM_WORD})?$`, 'i');
 const UNIT_WORD = new Set(['apartment', 'apt', 'unit', 'suite', 'ste', 'floor', 'fl', 'room', 'rm', 'number', 'no', 'lot', 'building', 'bldg', 'house', 'address', 'service', 'the', 'my', 'at', 'is', 'it', "it's", 'a', 'an', 'and']);
 const isStreetWord = (w: string): boolean => /^\p{L}{2,}[\p{L}'’.-]*$/u.test(w) && !NUMBER_WORD_ONLY.test(w) && !UNIT_WORD.has(w.toLowerCase());
 

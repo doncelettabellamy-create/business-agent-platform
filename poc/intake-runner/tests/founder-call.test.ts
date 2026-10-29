@@ -4075,3 +4075,97 @@ test('SCRIPTED DIAGNOSTICS the Deep-cleaning free-text fields log the branch tak
   faShapeOk(r);
   sim.end(); await sim.closed.catch(() => {}); await r.handler.idle();
 });
+
+// ---------------------------------------------------------------- 2026-10-29: a house number said as a hyphenated number word ("forty-two") is a NUMBER, not a street name (PID 47344 address loop)
+// Evidence (fixed codes only): the address answers came back NEED_NUMBER, NEED_NUMBER, NEED_NUMBER, SAME (n=1), NO_STREET_NUMBER (n=2) while only "What is the house number?" was asked, and the caller ended the call. The caller's words are
+// not logged. Offline, through this very path, the sequence of codes is reproduced when the number is said as a hyphenated number word: the number was taken for a street name, replaced by the next street piece, and so never joined. That a
+// similar synthetic scenario reproduces the logged codes does not prove those were the words said on the live call.
+const adReasons = (r: Rig) => diag(r, 'CONTACT_ANSWER').filter((l) => l.detail?.field === 'ADDRESS').map((l) => String(l.detail?.reason));
+const adTemplates = (r: Rig) => diag(r, 'SCRIPTED_ASK').filter((l) => l.detail?.field === 'SERVICE_ADDRESS').map((l) => String(l.detail?.tpl));
+const adStored = (r: Rig) => r.vault?.get(T, sqRec(r).call_ref);
+const adPrivate = (r: Rig) => assert.ok(!/forty|elm|oak|fifty/i.test(JSON.stringify(r.logs)), 'no address word in any log (the logs hold fixed codes and counts only)');
+
+test('SCRIPTED ADDRESS hyphenated house number first: "forty-two" is taken as the number, the street name is asked for, and the two join; saved with the contact stored', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  const steps = await sqConverse(r, sim, { answers: { ADDRESS: ['Forty-two'], ADDRESS_STREET: ['Elm Street'] } });
+  assert.deepEqual(adReasons(r), ['NEED_STREET', 'JOINED']);
+  assert.deepEqual(adTemplates(r), ['ADDRESS', 'ADDRESS_STREET'], 'the question matches what is held: the street name');
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), JSON.stringify(steps.map((s) => s.id)));
+  await sqFinish(r, sim);
+  assert.match(adStored(r)?.address ?? '', /forty-two elm street/i);
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).status, sqRec(r).handed_off, sqRec(r).address_status], ['confirmed', 'ready', true, 'caller_confirmed']);
+  adPrivate(r);
+});
+
+test('SCRIPTED ADDRESS street name first, then a hyphenated house number: the number is asked for and the two join', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { answers: { ADDRESS: ['Elm Street'], ADDRESS_NUMBER: ['Forty-two'] } });
+  assert.deepEqual(adReasons(r), ['NEED_NUMBER', 'JOINED']);
+  assert.deepEqual(adTemplates(r), ['ADDRESS', 'ADDRESS_NUMBER']);
+  await sqFinish(r, sim);
+  assert.match(adStored(r)?.address ?? '', /forty-two elm street/i);
+  adPrivate(r);
+});
+
+test('SCRIPTED ADDRESS the logged sequence cannot recur: a hyphenated number said again and again never turns into house-number questions only; the street name is asked for instead and the address completes', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { answers: { ADDRESS: ['Forty-two'], ADDRESS_STREET: ['Forty-two', 'Elm Street'] } });
+  assert.deepEqual(adReasons(r), ['NEED_STREET', 'SAME', 'JOINED']);
+  assert.ok(adTemplates(r).slice(1).every((t) => t === 'ADDRESS_STREET'), JSON.stringify(adTemplates(r)));
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+  await sqFinish(r, sim);
+  assert.match(adStored(r)?.address ?? '', /forty-two elm street/i);
+});
+
+for (const [label, first, second, expectFirst] of [
+  ['a whole address in digits', '42 Elm Street', undefined, 'CAPTURED'],
+  ['a whole address with a hyphenated number', 'Forty-two Elm Street', undefined, 'CAPTURED'],
+  ['a whole address with spaced number words', 'forty two Elm Street', undefined, 'CAPTURED'],
+  ['digits, then the street name', '42', 'Elm Street', 'NEED_STREET'],
+  ['spaced number words, then the street name', 'forty two', 'Elm Street', 'NEED_STREET'],
+  ['the street name, then digits', 'Elm Street', '42', 'NEED_NUMBER'],
+] as const) {
+  test(`SCRIPTED ADDRESS working forms are unchanged: ${label}`, async () => {
+    const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+    const sim = await r.connect();
+    await sqConverse(r, sim, { answers: second === undefined ? { ADDRESS: [first] } : { ADDRESS: [first], ADDRESS_STREET: [second], ADDRESS_NUMBER: [second] } });
+    assert.equal(adReasons(r)[0], expectFirst);
+    assert.equal(adTemplates(r).length, second === undefined ? 1 : 2, 'a whole address is asked once; split in two it takes one more question');
+    assert.ok(r.logs.some((l) => l.code === 'READBACK'));
+    await sqFinish(r, sim);
+    assert.match(adStored(r)?.address ?? '', /elm street/i);
+    assert.equal(sqRec(r).confirmation, 'confirmed');
+  });
+}
+
+test('SCRIPTED ADDRESS correction: at the address confirmation a caller says no and gives a corrected address with a hyphenated number; the corrected address is what is stored, the old one is never repeated', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { answers: { ADDRESS: ['42 Elm Street'] } });
+  say(sim, 'yes'); await reply(r, sim);   // the job read-back is confirmed; the address confirmation follows
+  say(sim, 'no that is wrong'); assert.equal((await reply(r, sim)).token, SAY.addressWrong);
+  say(sim, 'the address is Fifty-one Oak Avenue');
+  const again = await reply(r, sim);
+  assert.match(again.token, /Oak Avenue/); assert.ok(!/Elm/.test(again.token));
+  say(sim, 'yes'); await ended(sim, r);
+  assert.match(adStored(r)?.address ?? '', /fifty-one oak avenue/i);
+  assert.ok(!/elm/i.test(adStored(r)?.address ?? ''));
+  assert.deepEqual([sqRec(r).confirmation, sqRec(r).address_status], ['confirmed', 'caller_confirmed']);
+});
+
+test('SCRIPTED ADDRESS bounded retries: a caller who only ever repeats the house number is asked for the street name a bounded number of times and the call ends incomplete: unconfirmed, held for a person, nothing handed on, no address stored', async () => {
+  const r = await servicesRig({ ...SQ_RIG, claude: sqClaude() });
+  const sim = await r.connect();
+  await sqConverse(r, sim, { max: 40, answers: { ADDRESS: ['Forty-two'], ADDRESS_STREET: ['Forty-two'] } });
+  await ended(sim, r).catch(() => {});
+  assert.equal(diag(r, 'INCOMPLETE').length, 1);
+  assert.ok(!r.logs.some((l) => l.code === 'READBACK'));
+  assert.ok(adTemplates(r).length <= 4, `at most one first ask plus the bounded clarifications: ${adTemplates(r).length}`);
+  assert.ok(adTemplates(r).slice(1).every((t) => t === 'ADDRESS_STREET'));
+  const rec = sqRec(r);
+  assert.deepEqual([rec.confirmation, rec.status, rec.handed_off, rec.address_status], ['unconfirmed', 'needs-human', false, 'none']);
+  adPrivate(r);
+});

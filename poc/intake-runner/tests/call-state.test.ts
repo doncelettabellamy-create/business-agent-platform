@@ -363,3 +363,25 @@ test('selection keeps the field being completed: it is asked before any other mi
   assert.deepEqual(selectNext(fresh, 3, { ...history, keep: 'Callback phone number' }), { kind: 'ask', field: 'Callback phone number', again: true });
   assert.equal((selectNext(fresh, 3, { ...history, keep: 'Name' }) as { field: string }).field, 'Cleaning frequency', 'a kept field that is no longer missing changes nothing');
 });
+
+test('addressPiece: a house number said as a hyphenated number word is a NUMBER (speech-to-text writes "forty-two"); a hyphenated street name is still a street; whole addresses are unchanged', () => {
+  for (const [said, text] of [['forty-two', 'forty-two'], ['Forty-two.', 'Forty-two'], ['twenty-one', 'twenty-one'], ['the house number is ninety-six', 'ninety-six'], ['it is forty-two', 'forty-two']] as const) assert.deepEqual(addressPiece(said), { kind: 'number', text }, said);
+  assert.deepEqual(addressPiece('forty two'), { kind: 'number', text: 'forty two' }, 'spaced number words as before');
+  assert.deepEqual(addressPiece('42'), { kind: 'number', text: '42' });
+  for (const street of ['Mary-Anne Street', 'Fort-Lee', 'Elm Street']) assert.equal(addressPiece(street)?.kind, 'street', street);
+  for (const whole of ['42 Elm Street', 'Forty-two Elm Street', 'forty two Elm Street', 'forty-two, Elm Street']) assert.ok(addressFrom(whole) !== undefined, whole);
+  assert.equal(addressFrom('forty-two'), undefined, 'a house number alone is still not an address');
+});
+
+test('contact state: a hyphenated house number then the street name join; repeating the number is SAME and the street name is asked for; the street name first then the number joins', () => {
+  const s = createContactState();
+  assert.equal(s.collect('address', 'Forty-two').reason, 'NEED_STREET');
+  assert.equal(s.addressPart(), 'street name');
+  assert.equal(s.collect('address', 'Forty-two').reason, 'SAME');
+  assert.equal(s.addressPart(), 'street name', 'still the street name that is missing');
+  assert.equal(s.collect('address', 'Elm Street').reason, 'JOINED');
+  assert.equal(s.addressPart(), undefined);
+  const t = createContactState();
+  assert.equal(t.collect('address', 'Elm Street').reason, 'NEED_NUMBER');
+  assert.equal(t.collect('address', 'forty-two').reason, 'JOINED');
+});
