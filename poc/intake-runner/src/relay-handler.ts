@@ -96,6 +96,9 @@ export const SAY = Object.freeze({
   addressMissing: 'I did not catch an address. What is the service address?',
   addressStreet: 'Thank you. What is the street name?',
   addressNumber: 'Thank you. What is the house number?',
+  addressStreetAddress: 'Thank you. What is the street address?',
+  addressCity: 'Thank you. What is the city?',
+  addressZip: 'Thank you. What is the five-digit ZIP code?',
   addressRefused: 'Understood. I will not keep an address. Your request is recorded. Goodbye.',
   // addressWait: said in front of the address question when an answer came BEFORE that question was played in full (the measured rule is unchanged: that answer confirms nothing). The wording is a PROPOSAL awaiting the founder's confirmation.
   // addressUnconfirmed: founder-approved 2026-10-29, word for word; said only when the address confirmation is exhausted (the existing limits): the request is recorded but the address was not confirmed, and the caller is told so.
@@ -169,6 +172,8 @@ export interface RelayDeps {
    * `declineLine`. A declined request is saved unconfirmed with the reason commercial_declined, is never read back, never priced or booked, and never handed on.
    */
   residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string };
+  /** The service address needs a city and a five-digit ZIP code as well as the street address (call-state.ts). Asks only for the missing parts; the whole address is read back for confirmation. Default off. */
+  addressCityZip?: boolean;
   now(): number;
   nowIso(): string;
   killed(): boolean;
@@ -280,6 +285,8 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     || !fns.every((f) => typeof (deps as unknown as Record<string, unknown>)[f] === 'function')) {
     throw new RangeError('the relay handler needs every dependency');
   }
+  // City-and-ZIP capture belongs to the contact flow: without the contact vault there is no service-address item to complete, so the setting is ignored.
+  const cityZip = deps.addressCityZip === true && deps.contacts !== undefined;
   const replyRetryMs = deps.replyRetryMs ?? 4000;
   const replyFirstWordMs = deps.replyFirstWordMs ?? 5000;
   const replyGapMs = deps.replyGapMs ?? 4000;
@@ -860,7 +867,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     /** Reads the captured service address back to the caller (over the phone only) and asks for a yes or no. The dialogue history keeps a version without the address. */
     function askAddress(lead = false): void {
       const s = session as CallSession;
-      const address = s.revealContactParts().address;
+      const address = s.revealContactParts().address === undefined ? undefined : s.revealSpokenAddress();
       if (address === undefined) { phase = 'addressfix'; say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer(); return; }
       phase = 'address';
       lastAddressText = `${lead ? `${SAY.addressWait} ` : ''}I have your service address as ${address}. Please say yes or no. Is that correct?`;
@@ -905,7 +912,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (s.revealContactParts().address !== undefined) { addressUnclear = 0; askAddress(); return; }
       // One part of the address was heard on its own: it is kept and only the missing part is asked for (a few times at most, so this can never go on for ever).
       const part = s.addressPart();
-      if (part !== undefined && ++addressParts <= 3) { const line = part === 'street name' ? SAY.addressStreet : SAY.addressNumber; say(line); s.said(line); armConfirmTimer(); return; }
+      if (part !== undefined && ++addressParts <= (cityZip ? 6 : 3)) { const line = part === 'street name' ? SAY.addressStreet : part === 'house number' ? SAY.addressNumber : part === 'street address' ? SAY.addressStreetAddress : part === 'city' ? SAY.addressCity : SAY.addressZip; say(line); s.said(line); armConfirmTimer(); return; }
       if (++addressUnclear > 1) return await finishAddress('unconfirmed');
       say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer();
     }
@@ -990,7 +997,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const askedBefore = contactAsk;
       if (contactAsk !== undefined) {
         const took = heard.contact?.find((c) => c.field === contactAsk?.field);
-        madeProgress = took?.outcome === 'partial' && (took.reason === 'PIECE' || took.reason === 'NEED_STREET' || took.reason === 'NEED_NUMBER');
+        madeProgress = took?.outcome === 'partial' && (took.reason === 'PIECE' || took.reason === 'NEED_STREET' || took.reason === 'NEED_NUMBER' || took.reason === 'NEED_CITY' || took.reason === 'NEED_ZIP');
         // A number said in pieces is progress, not a failed attempt: the question is not counted against the item (once per ask; the credits per call are bounded, and a piece that adds nothing earns none).
         if (madeProgress && lastAsk?.counted && progressCredits < MAX_PROGRESS_CREDITS) { progressCredits++; askCount.set(lastAsk.field, Math.max(0, (askCount.get(lastAsk.field) ?? 1) - 1)); lastAsk.counted = false; }
         // Privacy-safe: the item's label, a fixed reason code and digit COUNTS (this line, and held after it). Never a value, a word of the caller's or a transcript.
@@ -1105,7 +1112,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         const contactField0 = deps.contacts === undefined ? undefined : CONTACT_OF_LABEL[next.field];
         const own = deps.fixedQuestions?.[next.field] ?? (deps.firstClean !== undefined && next.field === deps.firstClean.field ? deps.firstClean.question : undefined);
         const tpl: ScriptedQuestion | undefined = own === undefined && deps.scripted !== undefined && carrier.converse === undefined
-          ? deps.scripted.ask({ field: next.field, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}), ...(property.pending && !property.asked && PROPERTY_FIELD.test(next.field) ? { clarify: true } : {}), rejected: contactField0 !== undefined && contactRejected.get(contactField0) === true })
+          ? deps.scripted.ask({ field: next.field, ...(choices !== undefined && choices.length > 0 ? { choices } : {}), ...(part !== undefined ? { part } : {}), ...(phoneNeed !== undefined ? { phone: phoneNeed } : {}), ...(property.pending && !property.asked && PROPERTY_FIELD.test(next.field) ? { clarify: true } : {}), rejected: contactField0 !== undefined && contactRejected.get(contactField0) === true, ...(cityZip ? { cityZip: true } : {}) })
           : undefined;
         const fixed = own ?? tpl?.text;
         let delivered: boolean;
@@ -1193,7 +1200,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       seen.add(r); accepted++; active++; counted = true;
       tenant = t; callId = sid; ref = r;
       try { ctx = await deps.intakeContext(t, r); } catch { deps.log('CONTEXT_FAILED'); done = true; release(); return await hangUp(); }
-      session = createCallSession({ limits: deps.limits, names: deps.names, now: deps.now, killed: deps.killed });
+      session = createCallSession({ limits: deps.limits, names: deps.names, now: deps.now, killed: deps.killed, ...(cityZip ? { addressCityZip: true } : {}) });
       hardStop = setTimeout(() => { void track(finish(true).then(() => hangUp())); }, (deps.limits.maxMinutes + 1) * 60_000);
       hardStop.unref?.();
       deps.log('CALL_STARTED');

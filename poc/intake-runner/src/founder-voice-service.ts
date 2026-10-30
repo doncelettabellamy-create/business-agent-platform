@@ -113,6 +113,8 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     fixedQuestions: Object.fromEntries(Object.entries(FIXED_QUESTIONS).filter(([field]) => skill.fields.some((f) => f.name === field))),
     // Scripted question table (founder-approved 2026-10-29): every other question for a required item, and the category question, is a fixed sentence chosen by the selected field (scripted-questions.ts), never the text model's wording. Native conversation (opt-in, inactive) keeps its own voice.
     scripted: { ask: scriptedQuestion, clarify: scriptedClarify },
+    // The service address needs a city and a five-digit ZIP code too (founder-approved 2026-10-30): only the missing parts are asked for, and the whole address is read back for confirmation.
+    addressCityZip: true,
     intake,
     intakeContext: deps.intakeContext,
     dialogue, store: deps.store, limits: { maxTurns: config.max_turns, maxMinutes: config.max_minutes, maxChars: 4000 }, names: config.persona_names, maxCalls: config.max_calls,

@@ -26,6 +26,8 @@ export interface SessionConfig {
   now: () => number;
   /** True when the kill switch is on. */
   killed: () => boolean;
+  /** A service address is whole only with a street address, a city and a five-digit ZIP code (call-state.ts). Default off. */
+  addressCityZip?: boolean;
 }
 export type LimitReason = 'TURNS' | 'TIME' | 'CHARS' | 'KILLED';
 /** What the server captured from this line for a contact item (the one just asked for, or one the caller volunteered with an explicit cue). Fixed words only: never the value. */
@@ -71,7 +73,9 @@ export interface CallSession {
   /** Diagnostics only, counts and flags (never a value): which contact items are held, and how many digits of a number heard in pieces. */
   contactDiag(): { name: boolean; phone: boolean; address: boolean; phoneDigits: number };
   /** Which part of the service address is still needed after one part was heard (a fixed word, never the part): the street name, the house number, or none. */
-  addressPart(): 'street name' | 'house number' | undefined;
+  addressPart(): 'street name' | 'house number' | 'street address' | 'city' | 'ZIP code' | undefined;
+  /** The whole service address as it is spoken back to the caller (the ZIP code digit by digit). RAW personal data: over the phone only. Undefined until the address is whole. */
+  revealSpokenAddress(): string | undefined;
   /**
    * The caller's name, callback number and service address, only when all three are usable. RAW personal data: for the spoken read-back of the number
    * and the encrypted contact vault, nowhere else.
@@ -102,7 +106,7 @@ export function createCallSession(config: SessionConfig): CallSession {
   }
   const started = config.now();
   const masker = createMasker({ names: config.names });
-  const contact = createContactState();
+  const contact = createContactState({ cityZip: config.addressCityZip === true });
   let seenPhone: string | undefined;
   let lastWasVoice = false;   // the newest assistant entry in the dialogue came from the voice's own words (native conversation)
   const TYPE: Record<ContactField, PiiType> = { name: 'Person', phone: 'Contact detail', address: 'Address' };
@@ -193,6 +197,7 @@ export function createCallSession(config: SessionConfig): CallSession {
     addressPart() { return contact.addressPart(); },
     contactDiag() { parts(); return { name: contact.value('name') !== undefined, phone: contact.value('phone') !== undefined, address: contact.value('address') !== undefined, phoneDigits: contact.pendingDigits() }; },
     revealContactParts(): { name?: string; phone?: string; address?: string } { return parts(); },
+    revealSpokenAddress(): string | undefined { parts(); return contact.spokenAddress(); },
     forgetAddress(): void { masker.supersede('Address'); contact.clear('address'); },
     revealContact(): Contact | undefined {
       const c = parts();

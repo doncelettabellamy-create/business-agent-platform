@@ -93,7 +93,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean }; scripted?: boolean }
+interface RigOptions { contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean }; scripted?: boolean; addressCityZip?: boolean }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -122,6 +122,7 @@ async function rig(o: RigOptions = {}) {
       return r.context;
     },
     ...(o.scripted === true ? { scripted: { ask: scriptedQuestion, clarify: scriptedClarify } } : {}),
+    ...(o.addressCityZip === true ? { addressCityZip: true } : {}),
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
     limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
     killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(o.contactSettleMs === undefined ? {} : { contactSettleMs: o.contactSettleMs }), ...(o.contactCollectMaxMs === undefined ? {} : { contactCollectMaxMs: o.contactCollectMaxMs }), ...(o.fixedQuestions === undefined ? {} : { fixedQuestions: o.fixedQuestions }), ...(o.playbackMaxMs === undefined ? {} : { playbackMaxMs: o.playbackMaxMs }), ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
@@ -3583,7 +3584,8 @@ const SQ_SENTENCES: Map<string, string> = (() => {
   }
   for (let n = 1; n <= 9; n++) { const q = scriptedQuestion({ field: 'Callback phone number', phone: n }); m.set(q.text, q.id + '_' + n); }
   { const q = scriptedQuestion({ field: 'Callback phone number', phone: 'restate' }); m.set(q.text, q.id); }
-  for (const part of ['street name', 'house number'] as const) { const q = scriptedQuestion({ field: 'Service address', part }); m.set(q.text, q.id); }
+  for (const part of ['street name', 'house number', 'street address', 'city', 'ZIP code'] as const) { const q = scriptedQuestion({ field: 'Service address', part }); m.set(q.text, q.id); }
+  for (const rejected of [false, true]) { const q = scriptedQuestion({ field: 'Service address', rejected, cityZip: true }); m.set(q.text, q.id); }   // city-and-ZIP mode
   for (const first of [true, false]) { const q = scriptedClarify(sqCategoryNames, first); m.set(q.text, q.id); }
   return m;
 })();
@@ -4409,4 +4411,111 @@ test('SCRIPTED PROPERTY an unrelated mention of another kind of property does no
   assert.equal(sqVal(later.r, 'Property type'), 'it is a house');
   assert.deepEqual([sqRec(later.r).confirmation, sqRec(later.r).handed_off], ['confirmed', false], 'the server kept the caller\'s answer over the extraction, so a person checks it');
   assert.equal(diag(later.r, 'PROPERTY_CLARIFY').length, 0);
+});
+
+// ---------------------------------------------------------------- 2026-10-30: CITY AND ZIP in the private service-address flow (call-state.ts city-and-ZIP mode; relay-handler addressCityZip)
+// Same position as before: the address is collected with the other contact items and read back for a yes AFTER the job is confirmed. Only the missing part is asked for. Invented data only; canary values prove
+// that no city, ZIP code or street reaches a log or a saved record.
+const CZ_RIG = { ...SQ_RIG, addressCityZip: true } as const;
+const CZ = { street: '742 Evergreen Terrace', city: 'Springfield', zip: '91364' };
+const czSpoken = (r: Rig, sim: Sim): string[] => textTokens(sim).map((t) => SQ_SENTENCES.get(t)).filter((x): x is string => x !== undefined && /^ADDRESS/.test(x));
+/** Drives a whole call to the job read-back with the given answers to the address questions, says yes, and returns what was asked about the address. */
+async function czToAddressReadback(r: Rig, sim: Sim, answers: Record<string, string[]>) {
+  await sqConverse(r, sim, { answers });
+  assert.ok(r.logs.some((l) => l.code === 'READBACK'), 'the job read-back was reached');
+  say(sim, 'yes'); await reply(r, sim);   // the job is confirmed: the address read-back follows
+}
+const czReadback = (sim: Sim): string => textTokens(sim).filter((t) => /^I have your service address as /.test(t)).at(-1) ?? '';
+async function czFinish(r: Rig, sim: Sim, answer = 'yes') { say(sim, answer); await ended(sim, r); }
+const czNoLeak = (r: Rig, rec?: unknown) => { const all = JSON.stringify([r.logs, rec ?? r.store.list(T)]); for (const v of ['Evergreen', 'Springfield', '91364', 'Shelbyville', '90210', 'Oak Lane']) assert.ok(!all.includes(v), 'no address value in a log or a saved record: ' + v); };
+
+test('CITY AND ZIP whole address in one answer: nothing more is asked, the whole address is read back (ZIP digit by digit) after the job is confirmed, a yes confirms it, and it is stored whole', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await czToAddressReadback(r, sim, { ADDRESS: [`${CZ.street}, ${CZ.city}, ${CZ.zip}`] });
+  assert.deepEqual(czSpoken(r, sim), ['ADDRESS'], 'the address was asked once, with the city and ZIP code in the question');
+  assert.ok(textTokens(sim).includes('What is the service address, including the city and ZIP code?'));
+  assert.equal(czReadback(sim), `I have your service address as ${CZ.street}, ${CZ.city}, 9 1 3 6 4. Please say yes or no. Is that correct?`);
+  assert.deepEqual(addrLogs(r), ['ADDRESS_READBACK']);
+  await czFinish(r, sim);
+  assert.deepEqual(addrLogs(r), ['ADDRESS_READBACK', 'ADDRESS_CONFIRMED']);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec, r.vault)], ['confirmed', 'caller_confirmed', true]);
+  assert.equal(r.vault?.get(T, rec.call_ref)?.address, `${CZ.street}, ${CZ.city}, ${CZ.zip}`, 'the whole address is in the vault, and only there');
+  czNoLeak(r, rec);
+});
+
+test('CITY AND ZIP split answers: the street address, then only the city, then only the ZIP code, each asked once; parts already given are kept', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await czToAddressReadback(r, sim, { ADDRESS: [CZ.street], ADDRESS_CITY: [CZ.city], ADDRESS_ZIP: [CZ.zip] });
+  assert.deepEqual(czSpoken(r, sim), ['ADDRESS', 'ADDRESS_CITY', 'ADDRESS_ZIP']);
+  assert.ok(textTokens(sim).includes('Thank you. What is the city?') && textTokens(sim).includes('Thank you. What is the five-digit ZIP code?'));
+  assert.ok(czReadback(sim).includes(`${CZ.street}, ${CZ.city}, 9 1 3 6 4.`));
+  await czFinish(r, sim);
+  assert.equal(r.vault?.get(T, r.store.list(T)[0].call_ref)?.address, `${CZ.street}, ${CZ.city}, ${CZ.zip}`);
+  czNoLeak(r);
+});
+
+test('CITY AND ZIP a ZIP code given with the street needs only the city; a city given with the street needs only the ZIP code', async () => {
+  const a = await servicesRig(CZ_RIG); const simA = await a.connect();
+  await czToAddressReadback(a, simA, { ADDRESS: [`${CZ.street} ${CZ.zip}`], ADDRESS_CITY: [CZ.city] });
+  assert.deepEqual(czSpoken(a, simA), ['ADDRESS', 'ADDRESS_CITY'], 'only the city was missing');
+  assert.ok(czReadback(simA).includes(`${CZ.street}, ${CZ.city}, 9 1 3 6 4.`));
+  const b = await servicesRig(CZ_RIG); const simB = await b.connect();
+  await czToAddressReadback(b, simB, { ADDRESS: [`${CZ.street}, ${CZ.city}`], ADDRESS_ZIP: [CZ.zip] });
+  assert.deepEqual(czSpoken(b, simB), ['ADDRESS', 'ADDRESS_ZIP'], 'only the ZIP code was missing');
+  czNoLeak(a); czNoLeak(b);
+});
+
+test('CITY AND ZIP an invalid ZIP code is not taken: it is asked for again (bounded); a valid one on the third ask completes the address', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await czToAddressReadback(r, sim, { ADDRESS: [`${CZ.street}, ${CZ.city}`], ADDRESS_ZIP: ['9136', '913640', CZ.zip] });
+  assert.deepEqual(czSpoken(r, sim), ['ADDRESS', 'ADDRESS_ZIP', 'ADDRESS_ZIP', 'ADDRESS_ZIP']);
+  assert.ok(diag(r, 'CONTACT_ANSWER').some((l) => l.detail?.reason === 'BAD_ZIP'), 'the reason is logged as a fixed code');
+  assert.ok(czReadback(sim).includes('9 1 3 6 4.') && !czReadback(sim).includes('9 1 3 6 4 0'));
+  await czFinish(r, sim);
+  czNoLeak(r);
+});
+
+test('CITY AND ZIP a ZIP code that is never valid ends the call as a safe incomplete outcome: no read-back of the address, nothing confirmed, nothing in the vault', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await sqConverse(r, sim, { answers: { ADDRESS: [`${CZ.street}, ${CZ.city}`], ADDRESS_ZIP: ['9136', '00000', 'abcde', '12'] } });
+  assert.ok(czSpoken(r, sim).filter((x) => x === 'ADDRESS_ZIP').length <= 3, 'the ZIP code is asked at most three times');
+  assert.ok(r.logs.some((l) => l.code === 'INCOMPLETE') && !r.logs.some((l) => l.code === 'READBACK' || l.code === 'ADDRESS_READBACK'));
+  assert.deepEqual(r.vault?.list(T), []);
+  czNoLeak(r);
+});
+
+test('CITY AND ZIP a wrong address is corrected: only the new street is given, so the city and the ZIP code are asked for again; the old address is gone; the new one is read back and confirmed', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await czToAddressReadback(r, sim, { ADDRESS: [`${CZ.street}, ${CZ.city}, ${CZ.zip}`] });
+  say(sim, 'no that is wrong'); await reply(r, sim);
+  assert.equal(textTokens(sim).at(-1), SAY.addressWrong);
+  say(sim, '15 Oak Lane'); await reply(r, sim);
+  assert.equal(textTokens(sim).at(-1), SAY.addressCity, 'only the city is missing');
+  say(sim, 'Shelbyville'); await reply(r, sim);
+  assert.equal(textTokens(sim).at(-1), SAY.addressZip, 'then only the ZIP code');
+  say(sim, '9 0 2 1 0'); await reply(r, sim);
+  assert.equal(czReadback(sim), 'I have your service address as 15 Oak Lane, Shelbyville, 9 0 2 1 0. Please say yes or no. Is that correct?');
+  await czFinish(r, sim);
+  assert.deepEqual(addrLogs(r), ['ADDRESS_READBACK', 'ADDRESS_CORRECTION', 'ADDRESS_READBACK', 'ADDRESS_CONFIRMED']);
+  assert.equal(r.vault?.get(T, r.store.list(T)[0].call_ref)?.address, '15 Oak Lane, Shelbyville, 90210', 'only the corrected address is stored');
+  czNoLeak(r);
+});
+
+test('CITY AND ZIP the city is corrected while the ZIP code is being asked: the new city replaces the old one, the ZIP code is still asked, the other parts are kept', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await czToAddressReadback(r, sim, { ADDRESS: [`${CZ.street}, ${CZ.city}`], ADDRESS_ZIP: ['actually the city is Shelbyville', '90210'] });
+  assert.deepEqual(czSpoken(r, sim), ['ADDRESS', 'ADDRESS_ZIP', 'ADDRESS_ZIP']);
+  assert.equal(czReadback(sim), 'I have your service address as 742 Evergreen Terrace, Shelbyville, 9 0 2 1 0. Please say yes or no. Is that correct?');
+  await czFinish(r, sim);
+  czNoLeak(r);
+});
+
+test('CITY AND ZIP a no to the whole-address read-back that never gets a usable address ends honestly as unconfirmed (existing bound)', async () => {
+  const r = await servicesRig(CZ_RIG); const sim = await r.connect();
+  await czToAddressReadback(r, sim, { ADDRESS: [`${CZ.street}, ${CZ.city}, ${CZ.zip}`] });
+  for (const wrong of ['no', 'no', 'no']) { say(sim, wrong); try { await reply(r, sim); } catch { break; } }
+  assert.ok(r.logs.some((l) => l.code === 'ADDRESS_UNCONFIRMED'), 'the address step ended unconfirmed');
+  assert.ok(!r.logs.some((l) => l.code === 'ADDRESS_CONFIRMED'));
+  czNoLeak(r);
 });

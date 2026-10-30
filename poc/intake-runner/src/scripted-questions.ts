@@ -19,6 +19,8 @@ export interface ScriptedAsk {
   rejected?: boolean;
   /** The property-type clarification (asked once, when the first answer is not one of the configured choices): the fixed sentence lists the configured choices once. */
   clarify?: boolean;
+  /** The service address needs a city and a ZIP code too (call-state.ts city-and-ZIP mode): the opening question and its retry say so. */
+  cityZip?: boolean;
 }
 /** `id` is a fixed code (logged); `text` is spoken exactly as written. */
 export interface ScriptedQuestion { id: string; text: string }
@@ -58,9 +60,13 @@ export function scriptedQuestion(a: ScriptedAsk): ScriptedQuestion {
   if (f === key(CONTACT_FIELDS.address)) {
     if (a.part === 'street name') return { id: 'ADDRESS_STREET', text: 'Thank you. What is the street name?' };
     if (a.part === 'house number') return { id: 'ADDRESS_NUMBER', text: 'Thank you. What is the house number?' };
+    if (a.part === 'street address') return { id: 'ADDRESS_STREET_ADDRESS', text: 'Thank you. What is the street address?' };
+    if (a.part === 'city') return { id: 'ADDRESS_CITY', text: 'Thank you. What is the city?' };
+    if (a.part === 'ZIP code') return { id: 'ADDRESS_ZIP', text: 'Thank you. What is the five-digit ZIP code?' };
+    const whole = a.cityZip === true ? 'What is the service address, including the city and ZIP code?' : 'What is the service address?';
     return a.rejected === true
-      ? { id: 'ADDRESS_RETRY', text: 'Sorry, I missed that. What is the service address?' }
-      : { id: 'ADDRESS', text: 'What is the service address?' };
+      ? { id: 'ADDRESS_RETRY', text: `Sorry, I missed that. ${whole}` }
+      : { id: 'ADDRESS', text: whole };
   }
   const choices = (a.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
   const offer = choices.length > 0 ? ` You can say ${orList(choices)}.` : '';

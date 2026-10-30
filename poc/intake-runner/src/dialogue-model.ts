@@ -29,7 +29,7 @@ export interface DialogueClient {
  * fields and never chooses the field. Field and category names come from the skill configuration.
  */
 /** Which part of a service address is still needed after the other was heard: a fixed word, never part of the address itself. */
-export type AddressPart = 'street name' | 'house number';
+export type AddressPart = 'street name' | 'house number' | 'street address' | 'city' | 'ZIP code';
 export type Directive =
   | { kind: 'open' }
   | { kind: 'ask'; field: string; again?: boolean; choices?: readonly string[]; part?: AddressPart; phone?: number | 'restate' }

@@ -34,9 +34,10 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   NO_DIGITS         the line held no digit words.   TOO_MANY         more than fifteen digits: start over.
  *   NOT_A_NAME        not a usable name.              NO_STREET_NUMBER an address line without a street number.   NOT_AN_ADDRESS  not a usable address.
  *   NEED_STREET       a house number was heard without a street name: it is held and only the street name is asked.   NEED_NUMBER   a street name without a house number.   JOINED   the held part and the new part made the address.
+ *   NEED_CITY / NEED_ZIP   (city-and-ZIP mode only) the street address is held and the city, or the ZIP code, is still needed: only that part is asked.   BAD_ZIP   the ZIP code heard was not five digits (or was all zeros): nothing was taken.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'JOINED' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'JOINED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -167,13 +168,38 @@ export interface ContactState {
   /** The caller declined to go on: forgets the pieces held for one item (a phone number, or one part of an address). */
   abandon(field: ContactField): void;
   /** Which part of the service address is still needed after one part was heard (never the part itself): the street name, the house number, or none. */
-  addressPart(): 'street name' | 'house number' | undefined;
+  addressPart(): 'street name' | 'house number' | 'street address' | 'city' | 'ZIP code' | undefined;
+  /** The held address as it is SPOKEN back (the ZIP code digit by digit), for the read-back to the caller over the phone only. RAW personal data. Undefined until the address is whole. */
+  spokenAddress(): string | undefined;
   status(): ContactStatus;
   dispose(): void;
 }
 
-export function createContactState(): ContactState {
+/** Options. `cityZip`: a service address is whole only with a street address, a city and a five-digit ZIP code (each may be said in any order or across answers; only the missing part is asked for). Default off: the street address alone is the whole address. */
+export interface ContactStateOptions { readonly cityZip?: boolean }
+
+// City and ZIP parsing (city-and-ZIP mode). Pure. A ZIP code is five digits (ZIP+4 is cut to its first five); it is read from the END of a line only, so a house number is never taken for one.
+const CITY_WORD = /^\p{L}[\p{L}'’.-]*$/u;
+const CUE_CITY = /\b(?:the )?(?:city|town) is\s+([^.,!?;]{2,40})/i;
+const CUE_ZIP = /\b(?:the )?(?:zip(?: ?code)?|postal code) is\s+([^!?;]{3,30})/i;
+/** A city said on its own: 1 to 3 words of letters; never a filler, an address word, a number word or a unit. Title-cased. */
+export function cityFrom(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw.length > 80) return undefined;
+  const t = clean(raw).replace(/^(?:(?:no|yes|yeah|well|um|uh|okay|ok|sure|so)[,.\s]+)*(?:(?:the\s+)?(?:city|town)\s+(?:is\s+)?|it(?:'s|\s+is)\s+(?:in\s+)?|in\s+|actually[,\s]+(?:it(?:'s|\s+is)\s+)?)?/i, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '');
+  const words = t.split(' ').filter((w) => w.length > 0);
+  if (words.length < 1 || words.length > 3 || t.length > 40) return undefined;
+  if (!words.every((w) => CITY_WORD.test(w) && !FILLER.has(w.toLowerCase()) && !NOT_A_STREET.has(w.toLowerCase()) && !NUMBER_WORD_ONLY.test(w) && !UNIT_WORD.has(w.toLowerCase()) && !ROAD_WORD.has(w.toLowerCase().replace(/\.$/, '')))) return undefined;
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+/** Five digits, not all zero. */
+const zipOk = (d: string): boolean => /^\d{5}$/.test(d) && d !== '00000';
+
+export function createContactState(options: ContactStateOptions = {}): ContactState {
+  const cityZip = options.cityZip === true;
   let values: { name?: string; phone?: string; address?: string } = {};
+  let aStreet = ''; let aCity = ''; let aZip = '';   // city-and-ZIP mode: the three parts of the address, held until all are known
+  const assemble = (): void => { if (aStreet !== '' && aCity !== '' && aZip !== '') values.address = `${aStreet}, ${aCity}, ${aZip}`.slice(0, 200); else delete values.address; };
+  const dropParts = (): void => { aStreet = ''; aCity = ''; aZip = ''; pendNumber = ''; pendStreet = ''; };
   let pending = '';   // digits of a phone number heard in pieces
   let phoneAmbiguous = false;   // the pieces heard could not be fitted together and were forgotten: the caller is asked for the whole number again
   let pendNumber = ''; let pendStreet = '';   // one part of a service address heard on its own, held until the other arrives
@@ -225,9 +251,90 @@ export function createContactState(): ContactState {
     return { field: 'phone', outcome: 'captured', learn: digitRuns(m[1]), reason: 'CORRECTED_LAST4', digits: 4, total: values.phone.length };
   }
 
+  /**
+   * City-and-ZIP mode: takes a caller's line as (part of) the service address. Parts already held are KEPT; a part said again replaces only its own part (a correction), and only the missing
+   * part is then asked for. Said in any order, whole or in pieces: "1427 Sample Street, Springfield, 91364", "Springfield" later, "91364" later. A ZIP code is five digits (not all zero), read from
+   * the END of a line only; a house number is never taken for one. Never a postal check and never a service-area check: the caller confirms the whole address aloud.
+   */
+  function collectAddressCZ(raw: string): CollectResult {
+    const hadParts = aStreet !== '' || aCity !== '' || aZip !== '' || pendNumber !== '' || pendStreet !== '';
+    const t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '');
+    if (t0.length < 1 || t0.length > 160 || /[@\[\]<>]/.test(t0)) return { field: 'address', outcome: 'unclear', learn: [], reason: 'NOT_AN_ADDRESS' };
+    let t = t0; let zip: string | undefined; let badZip = false; const learn: string[] = [];
+    // 1. The ZIP code: the last run of digits, when it ends the line.
+    const runs = [...t.matchAll(DIGIT_RUNS)]; const last = runs[runs.length - 1];
+    if (last !== undefined && t.slice((last.index ?? 0) + last[0].length).replace(/[\s,.]+/g, '') === '') {
+      const before = t.slice(0, last.index ?? 0).replace(/[\s,]+$/, '');
+      const digits = digitsOf(last[0]) ?? '';
+      const alone = before === '';
+      if (alone ? aStreet !== '' : digits.length >= 5 || (digits.length >= 3 && runs.length >= 2)) {
+        const five = digits.length === 9 ? digits.slice(0, 5) : digits;   // ZIP+4: the first five only
+        if (zipOk(five)) { zip = five; learn.push(last[0]); if (five !== last[0]) learn.push(five); } else badZip = true;
+        t = before;
+      }
+    }
+    // 2. The rest: a street address, a city, or both; or one part of a street (a house number, a street name).
+    let street: string | undefined; let city: string | undefined; let piece: AddressPiece | undefined;
+    if (t !== '') {
+      const segs = t.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+      if (segs.length >= 2) {
+        const c = cityFrom(segs[segs.length - 1]); const rest = segs.slice(0, -1).join(', ');
+        const s0 = addressFrom(rest);
+        if (s0 !== undefined) { street = s0; city = c; }
+        else if (c !== undefined && aStreet === '') { piece = addressPiece(rest); city = piece === undefined ? undefined : c; }
+        else if (c !== undefined) city = c;
+      } else {
+        const s = segs[0] ?? '';
+        const sa = addressFrom(s);
+        if (sa !== undefined) {
+          // "1427 Sample Street Springfield": the words after the last road word, if they make a city, are the city. Without a road word nothing is guessed (the city is asked).
+          const words = sa.split(' '); let idx = -1;
+          words.forEach((w, i) => { if (i >= 1 && ROAD_WORD.has(w.toLowerCase().replace(/\.$/, ''))) idx = i; });
+          const c = idx >= 1 && idx < words.length - 1 ? cityFrom(words.slice(idx + 1).join(' ')) : undefined;
+          if (c !== undefined) { street = words.slice(0, idx + 1).join(' '); city = c; } else street = sa;
+        } else {
+          const c = cityFrom(s);
+          // A bare city fills an EMPTY city only; replacing a held one takes the words "the city is ..." (or a whole new address), so an off-topic answer to the ZIP question cannot overwrite it.
+          if (c !== undefined && aStreet !== '') { if (aCity === '') city = c; } else if (aStreet === '') piece = addressPiece(s);
+        }
+      }
+    }
+    // 3. Apply. A street said whole replaces the street; pieces join as in the street-only flow; a city or ZIP replaces its own part only.
+    let changed = false; const parsed = street !== undefined || piece !== undefined || city !== undefined || zip !== undefined;
+    if (street !== undefined) { if (aStreet !== street) changed = true; aStreet = street; pendNumber = ''; pendStreet = ''; learn.push(street); }
+    else if (piece !== undefined) {
+      const number = piece.kind === 'number' ? piece.text : pendNumber;
+      const name = piece.kind === 'street' ? piece.text : pendStreet;
+      const joined = number !== '' && name !== '' ? addressFrom(`${number} ${name}`) : undefined;
+      if (joined !== undefined) { aStreet = joined; pendNumber = ''; pendStreet = ''; changed = true; learn.push(joined); }
+      else if (piece.kind === 'number' && pendNumber !== piece.text) { pendNumber = piece.text; changed = true; if (/\d{3,}/.test(piece.text) || piece.text.split(' ').length >= 2) learn.push(piece.text); }
+      else if (piece.kind === 'street' && pendStreet !== piece.text) { pendStreet = piece.text; changed = true; learn.push(piece.text); }
+    }
+    if (city !== undefined) { if (aCity !== city) changed = true; aCity = city; learn.push(city); }
+    if (zip !== undefined) { if (aZip !== zip) changed = true; aZip = zip; }
+    assemble();
+    const out = [...new Set(learn)];
+    if (values.address !== undefined) return { field: 'address', outcome: 'captured', learn: out, reason: hadParts ? 'JOINED' : 'CAPTURED' };
+    if (!changed) {
+      if (parsed) return { field: 'address', outcome: 'partial', learn: [], reason: 'SAME' };
+      return { field: 'address', outcome: 'unclear', learn: [], reason: badZip ? 'BAD_ZIP' : ADDRESS_NUMBER.test(raw) ? 'NOT_AN_ADDRESS' : 'NO_STREET_NUMBER' };
+    }
+    const reason: CollectReason = pendNumber !== '' || (aStreet === '' && pendStreet === '') ? 'NEED_STREET' : pendStreet !== '' ? 'NEED_NUMBER' : aCity === '' ? 'NEED_CITY' : 'NEED_ZIP';
+    return { field: 'address', outcome: 'partial', learn: out, reason };
+  }
+  /** A city or a ZIP code said as a correction ("the city is ...", "the zip code is ..."): replaces that part only. */
+  function setPartCZ(kind: 'city' | 'zip', value: string | undefined, learnAs: string): CollectResult {
+    if (value === undefined) return { field: 'address', outcome: 'unclear', learn: [], reason: kind === 'zip' ? 'BAD_ZIP' : 'NOT_AN_ADDRESS' };
+    if (kind === 'city') aCity = value; else aZip = value;
+    assemble();
+    if (values.address !== undefined) return { field: 'address', outcome: 'captured', learn: [learnAs], reason: 'JOINED' };
+    return { field: 'address', outcome: 'partial', learn: [learnAs], reason: aStreet === '' ? 'NEED_STREET' : aCity === '' ? 'NEED_CITY' : 'NEED_ZIP' };
+  }
+
   return {
     collect(field, raw, replace = false) {
       if (disposed || typeof raw !== 'string') return { field, outcome: 'unclear', learn: [], reason: 'INACTIVE' };
+      if (field === 'address' && cityZip) return collectAddressCZ(raw);
       if (field === 'name') {
         const n = nameFrom(raw);
         if (n === undefined) return { field, outcome: 'unclear', learn: [], reason: 'NOT_A_NAME' };
@@ -265,24 +372,41 @@ export function createContactState(): ContactState {
       if (ph !== null) { const r = this.collect('phone', ph[1], true); if (r.outcome !== 'unclear') out.push(r); }
       const ad = CUE_ADDRESS.exec(raw);
       if (ad !== null) { const r = this.collect('address', ad[1], true); if (r.outcome !== 'unclear') out.push(r); }
+      if (cityZip) {
+        const cc = CUE_CITY.exec(raw); if (cc !== null) { const v = cityFrom(cc[1]); if (v !== undefined) out.push(setPartCZ('city', v, v)); }
+        const zc = CUE_ZIP.exec(raw); if (zc !== null) { const d = digitsOf(zc[1]) ?? ''; const f = d.length === 9 ? d.slice(0, 5) : d; out.push(setPartCZ('zip', zipOk(f) ? f : undefined, zc[1].trim())); }
+      }
       return out;
     },
-    clear(field) { delete values[field]; if (field === 'phone') { pending = ''; phoneAmbiguous = false; } if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
-    set(field, value) { if (disposed) return; values[field] = value; if (field === 'phone') pending = ''; if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
-    fallback(field, value) { if (!disposed && values[field] === undefined && typeof value === 'string' && value.length > 0) values[field] = value; },
+    clear(field) { delete values[field]; if (field === 'phone') { pending = ''; phoneAmbiguous = false; } if (field === 'address') { dropParts(); } },
+    set(field, value) { if (disposed) return; values[field] = value; if (field === 'phone') pending = ''; if (field === 'address') { dropParts(); } },
+    fallback(field, value) {
+      if (disposed || values[field] !== undefined || typeof value !== 'string' || value.length === 0) return;
+      // City-and-ZIP mode: the masker's guess is only ever a street address (and what came with it) and fills a part that is empty; it can never make the address whole by itself.
+      if (field === 'address' && cityZip) { if (aStreet === '') { const keep = [aCity, aZip]; collectAddressCZ(value); if (aCity === '' && keep[0] !== '') aCity = keep[0]; if (aZip === '' && keep[1] !== '') aZip = keep[1]; assemble(); } return; }
+      values[field] = value;
+    },
     value(field) { return disposed ? undefined : values[field]; },
     parts() { return disposed ? {} : { ...values }; },
     pendingPhone() { return !disposed && pending.length > 0 && values.phone === undefined; },
     pendingDigits() { return disposed || values.phone !== undefined ? 0 : pending.length; },
     phoneNeed() { if (disposed || values.phone !== undefined) return undefined; if (pending.length >= 1 && pending.length <= 9) return 10 - pending.length; return phoneAmbiguous ? 'restate' : undefined; },
-    abandon(field) { if (field === 'phone') { pending = ''; phoneAmbiguous = false; } else if (field === 'address') { pendNumber = ''; pendStreet = ''; } },
-    addressPart() { return disposed || values.address !== undefined ? undefined : pendNumber !== '' ? 'street name' : pendStreet !== '' ? 'house number' : undefined; },
+    abandon(field) { if (field === 'phone') { pending = ''; phoneAmbiguous = false; } else if (field === 'address') { dropParts(); } },
+    addressPart() {
+      if (disposed || values.address !== undefined) return undefined;
+      if (pendNumber !== '') return 'street name';
+      if (pendStreet !== '') return 'house number';
+      if (!cityZip) return undefined;
+      if (aStreet === '') return aCity !== '' || aZip !== '' ? 'street address' : undefined;
+      return aCity === '' ? 'city' : 'ZIP code';
+    },
+    spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aZip.split('').join(' ')}` : values.address; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);
       return { captured, missing };
     },
-    dispose() { disposed = true; values = {}; pending = ''; phoneAmbiguous = false; pendNumber = ''; pendStreet = ''; },
+    dispose() { disposed = true; values = {}; pending = ''; phoneAmbiguous = false; dropParts(); },
   };
 }
 

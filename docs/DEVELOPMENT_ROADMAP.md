@@ -667,6 +667,28 @@ The founder's audition selected the ElevenLabs voice Jack John (`7EzWGsX10sAS4c9
 
 **Still pending (not started).** Selective acknowledgements ("Thanks.", "Got it."); structured city and ZIP capture; homeowner or renter and company-specific authorization rules; service-area checks; the speaker adapter and the voice integration (`DRF-10`); GPT-Live; booking stays paused at `2f23a51`. The running server (PID 22132, build `a9b326c`) does not load this wording until the founder restarts it; no restart, key, configuration, Twilio change or call was made.
 
+## 5a-35. City and ZIP code in Drew's private service-address flow (2026-10-30; code and offline tests; NOT loaded by the running server; NOT tested live)
+
+**Where it sits (unchanged).** The service address is still collected with the other contact items, still held only in memory and the encrypted contact vault, and still read back for a yes **after the job is confirmed**. What changed is what makes it whole: with the setting on (`addressCityZip`, enabled for Drew's voice service and only when the contact vault is on) an address is complete only with a **street address, a city and a five-digit ZIP code**. The older ConversationRelay phone service and any call without the vault are unchanged (the setting is off there).
+
+**Behaviour.**
+- The first question is "What is the service address, including the city and ZIP code?" (the retry is "Sorry, I missed that." in front of the same question).
+- Parts are **kept**: only what is missing is asked for, in this order: the street pieces (the existing street name / house number follow-ups), then "Thank you. What is the city?", then "Thank you. What is the five-digit ZIP code?". A street, city and ZIP code may be said whole, in any order, or across answers; "the city is ..." and "the zip code is ..." replace only that part; a bare word never overwrites a held city.
+- A ZIP code is five digits, not all zero, read from the **end** of a line only (a house number or a unit number is never a ZIP code); ZIP+4 is cut to its first five; four or six digits, all zeros or words are **not taken** and the ZIP code is asked again with the fixed reason `BAD_ZIP`.
+- The **whole address is read back** for the yes (the ZIP code digit by digit: "1427 Sample Street, Springfield, 9 1 3 6 4"); a no clears all three parts and the existing correction path asks again, naming only what is still missing.
+- **Bounded**: the ZIP code (like any item) is asked at most three times before the call ends as a safe incomplete outcome; follow-ups after a no are capped (six in this mode, three before). The measured-confirmation rule, the early-yes hold, the wait instruction and the exhausted-address ending are untouched.
+- **Never a postal check and never a service-area check**: the caller confirms the address aloud; `address_status` keeps its meaning.
+
+**Privacy (checked by tests with canary values).** The city, ZIP code and street are raw personal data like the rest of the address: they are taught to the masker so a model never reads them, spoken only to the caller, stored only in the encrypted vault, and never appear in a log, a saved record or the dashboard; logs carry fixed reason codes only (`NEED_CITY`, `NEED_ZIP`, `BAD_ZIP`).
+
+**Wording vs logic.** Three new fixed lines (the city and ZIP follow-ups and the street-address follow-up) and the new opener are wording; the parsing, the part tracking, the whole-address read-back and the setting are logic. Consent, read-back and recovery wording is unchanged.
+
+**Known limits (accepted, not hidden).** A city said before any street ("Springfield 91364" as the first answer) is taken for a street name, so the house number is asked next; a bare number with no street yet is a house number, not a ZIP code; a city that is also a common word may be masked in later lines; the city is not checked against the ZIP code or anywhere else.
+
+**Tests.** `tests/address-city-zip.test.ts` (12: whole, split and out-of-order answers, spoken ZIP digits, ZIP+4, invalid ZIP codes, house and unit numbers, kept parts, corrections, city rules, spoken form, default off, tool surface, masker privacy, wording); eight whole-call tests in `tests/founder-call.test.ts` (whole answer, split answers, ZIP-only or city-only missing, an invalid ZIP asked again then accepted, a never-valid ZIP ending incomplete, a wrong address corrected, a city corrected mid-collection, a repeated no ending unconfirmed) with no address value in any log or record. Removing the setting or weakening the ZIP rule makes them fail (checked). Existing address and confirmation tests run unchanged with the setting off. Full suite: see the commit.
+
+**Still pending (not started).** Service-area checks, homeowner or renter and company authorization rules, acknowledgements, the speaker adapter and voice integration (`DRF-10`), GPT-Live, and a live check of this flow. Booking stays paused at `2f23a51`. The running server (PID 22132, build `a9b326c`) does not load any of this until the founder restarts it.
+
 ## 5c. Status board and preservation checkpoint (2026-10-28; checkpoint at commit `6470b86`, workflow added in the commit after it)
 
 **This section is the current summary. Sections 5 and 5b are dated snapshots.** It keeps three things apart, as `docs/PRODUCT_CONTINUITY.md` rule 5 requires: what the founder approved, what is **tested offline** (an automated test passes against stand-ins and offline models: it says nothing about the live service), and what the founder **saw on a live call** (a recorded result). A test passing is never written here as "works live".
