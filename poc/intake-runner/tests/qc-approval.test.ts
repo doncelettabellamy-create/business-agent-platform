@@ -528,5 +528,5 @@ t('inventory: QC judges with two read-only calls, settles in one place only, and
   assert.ok(!/from\s+'\.\/(processing-entry|intake-entry|tenant-boundary|live-run|approval-store-sqlite|approver-context|mock-tools)\.ts'/.test(code.replace(/import type[^;]*mock-tools\.ts';/, '')));
   assert.ok(/import type \{[^}]*ApprovalStore[^}]*\} from '\.\/approval-store\.ts'/.test(code) && /import \{ verifyEventLog \} from '\.\/approval-store\.ts'/.test(code), 'only the log checker is a value import');
   const files = readdirSync(dirSrc).filter((f) => f.endsWith('.ts'));
-  assert.deepEqual(files.filter((f) => /humanApprovalExpectations/.test(strip(readFileSync(new URL(f, dirSrc), 'utf8')))), ['processing-entry.ts'], 'one place says which tools need a human');
+  assert.deepEqual(files.filter((f) => /^export function humanApprovalExpectations\(/m.test(readFileSync(new URL(f, dirSrc), 'utf8'))), ['processing-entry.ts'], 'one place DEFINES which tools need a human (a composition root may call it, never redefine it)');
 });
