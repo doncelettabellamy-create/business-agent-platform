@@ -932,7 +932,9 @@ test('option A: the approved global limit still ends a call that keeps getting d
 // ---------------------------------------------------------------- closing line and preview safety
 test('closing: the confirmed line is exact and promises no follow-up; a spoken follow-up promise appears in no closing line', async () => {
   assert.equal(SAY.thanks, 'Thank you. Your request is recorded. Goodbye.');
-  for (const k of Object.keys(SAY) as Array<keyof typeof SAY>) assert.ok(!FOLLOW_UP.test(SAY[k]), `${k}: ${SAY[k]}`);
+  // The founder approved ONE closing line that says someone will need to verify the address (2026-10-29); it is named here and exact. Every other fixed line must still promise nothing.
+  assert.equal(SAY.addressUnconfirmed, 'Your request is recorded, but I could not confirm the address. Someone will need to verify it with you. Goodbye.');
+  for (const k of Object.keys(SAY) as Array<keyof typeof SAY>) if (k !== 'addressUnconfirmed') assert.ok(!FOLLOW_UP.test(SAY[k]), `${k}: ${SAY[k]}`);
   const r = await rig();
   const sim = await r.connect();
   await toReadback(r, sim);
@@ -1921,6 +1923,8 @@ test('address confirmation: three wrong addresses in a row end it unconfirmed wi
   assert.deepEqual([c?.address_state, c?.address], ['unconfirmed', undefined], 'an address the caller called wrong is not kept');
   assert.equal(rec.confirmation, 'confirmed', 'the job and the number were confirmed earlier');
   assert.ok(r.logs.some((l) => l.code === 'ADDRESS_UNCONFIRMED'));
+  assert.ok(sim.messages.some((m) => m.token === SAY.addressUnconfirmed), 'three wrong addresses: the caller is told the address could not be confirmed');
+  assert.ok(!sim.messages.some((m) => m.token === SAY.thanks));
 });
 
 test('address confirmation: a refusal keeps no address, says so plainly, still keeps the name and number the caller confirmed, and never becomes eligible', async () => {
@@ -1953,6 +1957,7 @@ test('address confirmation: unclear answers are asked again once and then end un
   say(sim, 'banana'); await ended(sim, r);
   const c = r.vault?.get(T, r.store.list(T)[0].call_ref);
   assert.deepEqual([c?.address_state, /Elm/.test(c?.address ?? '')], ['unconfirmed', true]);
+  assert.ok(sim.messages.some((m) => m.token === SAY.addressUnconfirmed), 'two unclear answers: the caller is told the address could not be confirmed');
 });
 
 test('address confirmation: an interrupted question cannot be answered: a yes after being talked over is ignored and the question comes again; a full report or a later clean question works', async () => {
@@ -1961,7 +1966,7 @@ test('address confirmation: an interrupted question cannot be answered: a yes af
   say(sim, 'yes'); await reply(r, sim);
   sim.send({ type: 'interrupt', utteranceUntilInterrupt: 'I have your service', durationUntilInterruptMs: 300 });
   await new Promise((res) => setTimeout(res, 40));
-  say(sim, 'yes'); assert.equal((await reply(r, sim)).token, ADDRESS_Q, 'asked again: the yes was not taken as an answer');
+  say(sim, 'yes'); assert.equal((await reply(r, sim)).token, `${SAY.addressWait} ${ADDRESS_Q}`, 'asked again, with the fixed instruction to wait: the yes was not taken as an answer');
   assert.ok(r.logs.some((l) => l.code === 'ADDRESS_ANSWER_IGNORED') && !r.logs.some((l) => l.code === 'ADDRESS_CONFIRMED'));
   assert.equal(r.vault?.list(T).length, 0);
   say(sim, 'yes'); await ended(sim, r);
@@ -1982,7 +1987,7 @@ test('address confirmation: an interrupted question cannot be answered: a yes af
   say(s3, 'yes'); await reply(none, s3);
   s3.send({ type: 'interrupt', durationUntilInterruptMs: 300 });
   await new Promise((res) => setTimeout(res, 40));
-  say(s3, 'yes'); assert.equal((await reply(none, s3)).token, ADDRESS_Q);
+  say(s3, 'yes'); assert.equal((await reply(none, s3)).token, `${SAY.addressWait} ${ADDRESS_Q}`);
   s3.end(); await s3.closed; await none.handler.idle();
 });
 
@@ -1995,7 +2000,7 @@ test('address confirmation: a question whose write was refused (never reached th
   await waitFor(() => r.logs.some((l) => l.code === 'ADDRESS_READBACK'));
   failing = false; await r.handler.idle();
   say(sim, 'yes');                                              // the caller heard nothing, so this yes is not an answer to the address question
-  assert.equal((await reply(r, sim)).token, ADDRESS_Q);
+  assert.equal((await reply(r, sim)).token, `${SAY.addressWait} ${ADDRESS_Q}`);
   assert.ok(r.logs.some((l) => l.code === 'ADDRESS_ANSWER_IGNORED') && !r.logs.some((l) => l.code === 'ADDRESS_CONFIRMED'));
   assert.equal(r.store.list(T).length, 0);
   say(sim, 'yes'); await ended(sim, r);

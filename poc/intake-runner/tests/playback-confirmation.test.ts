@@ -17,6 +17,8 @@ import { consentNoticeFor } from '../src/opening.ts';
 import type { DialogueModel } from '../src/dialogue-model.ts';
 import type { ModelProvider, ModelRequest } from '../src/model-gateway.ts';
 import { createRealtimeTransport } from '../src/realtime-transport.ts';
+import { toOwnerCall, OWNER_TEXT } from '../src/owner-view.ts';
+import { eligibleForProcessing } from '../src/intake-record-store.ts';
 import { createRealtimeSim } from './helpers/realtime-sim.ts';
 import type { RealtimeSim, RealtimeSimOptions } from './helpers/realtime-sim.ts';
 
@@ -163,7 +165,7 @@ const heldList = (r: Rig) => r.logs.filter((l) => l.code === 'CONFIRM_HELD').map
 const settled = (r: Rig) => r.logs.filter((l) => l.code === 'PLAYBACK_SETTLED').length;
 /** Waits until the newest speech has been played in full and the call logic has the verdict. */
 async function heardInFull(r: Rig, n = settled(r) + 1) { await r.sim.waitFor(() => settled(r) >= n, 30_000); await r.sim.idle(); await r.handler.idle(); await sleepMs(20); }
-const ADDR_SPOKEN = (r: Rig) => r.sim.spoken.filter((s) => s.startsWith('I have your service address as'));
+const ADDR_SPOKEN = (r: Rig) => r.sim.spoken.filter((s) => s.includes('I have your service address as'));   // the repeated question may carry the fixed wait instruction in front
 
 test('CONFIRM live replay (job): the details and question were heard in full, an unclear line followed, and the caller\'s yes came over the repeated question: it is held, only the question is asked again, and a fresh yes after it was heard goes on', async () => {
   const r = await rig({ mpc: 20, confirmWaitMs: 8000 });
@@ -300,4 +302,92 @@ test('CONFIRM the log holds fixed codes and millisecond counts only: the measure
   assert.ok(played !== undefined && played.sent_ms === played.acked_ms && (played.sent_ms as number) > 0, JSON.stringify(sets));
   const logged = JSON.stringify(r.logs.map((l) => [l.code, l.detail]));
   assert.ok(!/burst pipe|Evergreen|priya|raman/i.test(logged) && !/\d{5,}/.test(logged.replace(/"[a-z_]*ms":\d+/g, '')), 'no caller word or digit string in any log');
+});
+
+// ---- 2026-10-29: the address confirmation (record #28 of the PID 22132 call 2). Two affirmations were each held by the measured rule (the question was not acknowledged in full when speech began), the step ended unconfirmed, and the caller heard only
+// that the request was recorded. The bounded repair, founder-approved: an affirmation that comes before the question was played in full is held as before (the measured rule is NOT loosened) and the question is asked again with a fixed instruction to wait and
+// answer again; a fresh yes after the whole question confirms; if the recovery is exhausted (the existing limit) the caller is told plainly that the address still needs verification. These tests check what was SAID and SAVED; what a caller heard is not
+// established by audio that was or was not acknowledged.
+/** The closing line is recorded as heard a moment after the hang-up flag: wait for whichever ending was said. */
+const closingSpoken = (r: Rig) => r.sim.waitFor(() => r.sim.spoken.some((s) => s === SAY.thanks || s === SAY.addressUnconfirmed || s === SAY.addressRefused), 15_000).then(() => r.sim.idle());
+const witnessOf = (r: Rig) => ({ addressState: (tenant: string, callRef: string) => r.vault.get(tenant, callRef)?.address_state });
+
+test('CONFIRM address exhausted (record #28 reproduced): two affirmations over the address question are each held and confirm nothing; the question is asked again with the wait instruction; the call ends by telling the caller the address could not be confirmed; address unverified, follow-up for the owner, no ADDRESS_CONFIRMED, never eligible for processing', async () => {
+  assert.equal(typeof SAY.addressUnconfirmed, 'string', 'the approved ending exists');
+  assert.equal(SAY.addressUnconfirmed, 'Your request is recorded, but I could not confirm the address. Someone will need to verify it with you. Goodbye.');
+  assert.equal(typeof SAY.addressWait, 'string', 'the fixed instruction exists');
+  const r = await rig({ mpc: 25, confirmWaitMs: 8000 });
+  await toReadback(r);
+  await heardInFull(r);                                        // the job read-back reached the line in full (the live call: 31,400 of 31,400 ms)
+  r.sim.say('yes');                                            // the job is confirmed; the address question follows
+  await r.sim.waitFor(() => has(r, 'ADDRESS_READBACK'), 15_000);
+  await r.sim.waitFor(() => r.sim.playing(), 5000);
+  r.sim.say('yes');                                            // the first affirmation, before the address question was acknowledged in full
+  await r.sim.waitFor(() => heldList(r).length >= 1, 10_000);
+  await r.sim.waitFor(() => r.logs.filter((l) => l.code === 'ADDRESS_READBACK').length >= 2, 10_000);   // the question is asked again
+  await r.sim.waitFor(() => r.sim.playing(), 5000);
+  r.sim.say('yes');                                            // the second affirmation, shortly into the replay (the live call: 0 ms acknowledged)
+  await r.sim.waitFor(() => has(r, 'ADDRESS_UNCONFIRMED'), 10_000);
+  await r.sim.waitFor(() => r.sim.hungUp, 15_000);
+  await closingSpoken(r);
+  assert.deepEqual(heldList(r), ['ADDRESS/CUT', 'ADDRESS/CUT'], 'both affirmations were held by the measured rule');
+  assert.equal(has(r, 'ADDRESS_CONFIRMED'), false, 'a held affirmation never confirms');
+  // The replay was cut, so the simulator records no transcript of it; what was REQUESTED from the voice service is what shows the instruction was put in front of the question.
+  const asked = (r.sim as any).sent.map((m: unknown) => JSON.stringify(m)).filter((m: string) => m.includes('I have your service address as'));
+  assert.equal(asked.length, 2, 'the address question was requested twice');
+  assert.ok(!asked[0].includes(SAY.addressWait) && asked[1].includes(SAY.addressWait), 'the second request, and only it, carries the fixed wait instruction');
+  assert.ok(r.sim.spoken.includes(SAY.addressUnconfirmed), 'the caller was told the address could not be confirmed');
+  assert.ok(!r.sim.spoken.includes(SAY.thanks), 'not the ending of a confirmed address');
+  assert.equal(r.sim.spoken.at(-1), SAY.addressUnconfirmed, 'it is the last thing said');
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.status, rec.address_status], ['confirmed', 'ready', 'unverified'], 'the job was confirmed; the address was not');
+  assert.equal(r.vault.get(T, rec.call_ref)?.address_state, 'unconfirmed', 'the contact is stored with the address marked not confirmed');
+  assert.equal(eligibleForProcessing(rec, witnessOf(r)), false, 'an unverified address can never authorise anything downstream');
+  const owner = toOwnerCall(rec);
+  assert.equal(owner.needsFollowUp, true);
+  assert.ok(owner.nextActions.includes(OWNER_TEXT.verifyAddress), 'the owner is told to verify the address');
+  assert.ok(!/742|evergreen/i.test(JSON.stringify(owner)), 'no address in the owner view');
+  assert.ok(!/742|evergreen/i.test(JSON.stringify(r.logs)), 'no address in any log');
+});
+
+test('CONFIRM address recovery: an early affirmation is held, the question comes again with the wait instruction, and a fresh yes after the WHOLE replayed question confirms the address; the ending is the ordinary one and the record is eligible', async () => {
+  const r = await rig({ mpc: 25, confirmWaitMs: 8000 });
+  await toReadback(r);
+  await heardInFull(r);
+  r.sim.say('yes');
+  await r.sim.waitFor(() => has(r, 'ADDRESS_READBACK'), 15_000);
+  await r.sim.waitFor(() => r.sim.playing(), 5000);
+  r.sim.say('yes');                                            // held once
+  await r.sim.waitFor(() => ADDR_SPOKEN(r).length >= 1, 20_000);               // the repeated question played in full
+  assert.ok(r.sim.spoken.some((s) => s.startsWith(SAY.addressWait + ' ')), 'with the wait instruction');
+  await heardInFull(r, settled(r));
+  assert.equal(has(r, 'ADDRESS_CONFIRMED'), false, 'the early yes did not become valid later');
+  r.sim.say('yes');                                            // a fresh yes after the whole question
+  await r.sim.waitFor(() => has(r, 'ADDRESS_CONFIRMED'), 10_000);
+  await r.sim.waitFor(() => r.sim.hungUp, 15_000);
+  await closingSpoken(r);
+  assert.ok(r.sim.spoken.includes(SAY.thanks));
+  assert.ok(!r.sim.spoken.includes(SAY.addressUnconfirmed));
+  assert.equal(has(r, 'ADDRESS_UNCONFIRMED'), false);
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.address_status], ['confirmed', 'caller_confirmed']);
+  assert.equal(r.vault.get(T, rec.call_ref)?.address_state, 'confirmed');
+});
+
+test('CONFIRM address ordinary: a yes after the whole address question confirms it with no hold, no instruction and the ordinary ending', async () => {
+  const r = await rig({ mpc: 25, confirmWaitMs: 8000 });
+  await toReadback(r);
+  await heardInFull(r);
+  r.sim.say('yes');
+  await r.sim.waitFor(() => has(r, 'ADDRESS_READBACK'), 15_000);
+  await heardInFull(r, settled(r) + 1);                        // the whole address question reached the line
+  r.sim.say('yes');
+  await r.sim.waitFor(() => has(r, 'ADDRESS_CONFIRMED'), 10_000);
+  await r.sim.waitFor(() => r.sim.hungUp, 15_000);
+  await closingSpoken(r);
+  assert.deepEqual(heldList(r), []);
+  assert.ok(!r.sim.spoken.some((s) => s.startsWith(SAY.addressWait)), 'no instruction when nothing was held');
+  assert.ok(r.sim.spoken.includes(SAY.thanks) && !r.sim.spoken.includes(SAY.addressUnconfirmed), 'last spoken: ' + JSON.stringify(r.sim.spoken.slice(-3).map((s) => s.slice(0, 50))));
+  const [rec] = r.store.list(T);
+  assert.deepEqual([rec.confirmation, rec.address_status, eligibleForProcessing(rec, witnessOf(r))], ['confirmed', 'caller_confirmed', true]);
 });

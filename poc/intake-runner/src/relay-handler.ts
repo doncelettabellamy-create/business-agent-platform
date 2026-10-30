@@ -97,6 +97,10 @@ export const SAY = Object.freeze({
   addressStreet: 'Thank you. What is the street name?',
   addressNumber: 'Thank you. What is the house number?',
   addressRefused: 'Understood. I will not keep an address. Your request is recorded. Goodbye.',
+  // addressWait: said in front of the address question when an answer came BEFORE that question was played in full (the measured rule is unchanged: that answer confirms nothing). The wording is a PROPOSAL awaiting the founder's confirmation.
+  // addressUnconfirmed: founder-approved 2026-10-29, word for word; said only when the address confirmation is exhausted (the existing limits): the request is recorded but the address was not confirmed, and the caller is told so.
+  addressWait: 'Please wait until I have finished, then answer.',
+  addressUnconfirmed: 'Your request is recorded, but I could not confirm the address. Someone will need to verify it with you. Goodbye.',
   unconfirmed: 'Thank you. I could not confirm the details. Goodbye.',
   incomplete: 'Thank you. I could not get all the details I need, so I cannot complete this request. Goodbye.',
 });
@@ -854,12 +858,12 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     }
 
     /** Reads the captured service address back to the caller (over the phone only) and asks for a yes or no. The dialogue history keeps a version without the address. */
-    function askAddress(): void {
+    function askAddress(lead = false): void {
       const s = session as CallSession;
       const address = s.revealContactParts().address;
       if (address === undefined) { phase = 'addressfix'; say(SAY.addressMissing); s.said(SAY.addressMissing); armConfirmTimer(); return; }
       phase = 'address';
-      lastAddressText = `I have your service address as ${address}. Please say yes or no. Is that correct?`;
+      lastAddressText = `${lead ? `${SAY.addressWait} ` : ''}I have your service address as ${address}. Please say yes or no. Is that correct?`;
       openUnit('address', lastAddressText, say(lastAddressText));   // a refused write is never heard
       s.said(SAY.addressAsk);
       deps.log('ADDRESS_READBACK', { n: addressTries + 1 });
@@ -868,7 +872,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
     async function finishAddress(state: AddressState): Promise<void> {
       addressState = state;
       deps.log(state === 'confirmed' ? 'ADDRESS_CONFIRMED' : state === 'refused' ? 'ADDRESS_REFUSED' : 'ADDRESS_UNCONFIRMED');
-      const line = state === 'refused' ? SAY.addressRefused : SAY.thanks;
+      const line = state === 'refused' ? SAY.addressRefused : state === 'unconfirmed' ? SAY.addressUnconfirmed : SAY.thanks;   // exhausted: say plainly that the address was not confirmed
       say(line, true);
       const at = deps.now();
       await finish(true, readBack);
@@ -881,7 +885,7 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (a === 'yes' && !heardFirst) {   // a yes before the whole question was played to the line confirms nothing, now or later: the question is asked again and a fresh yes is needed
         logHeld(unit?.why || 'EARLY'); deps.log('ADDRESS_ANSWER_IGNORED');
         if (++addressUnclear > 1) return await finishAddress('unconfirmed');
-        askAddress();
+        askAddress(true);   // the question again, with the instruction to wait until it is finished
         return;
       }
       if (a === 'yes') return await finishAddress('confirmed');
