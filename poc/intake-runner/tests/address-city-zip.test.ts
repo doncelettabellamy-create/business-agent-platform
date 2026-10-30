@@ -11,7 +11,7 @@ const STREET = '1427 Sample Street';
 const state = () => createContactState({ cityZip: true });
 const say = (s: ReturnType<typeof state>, ...lines: string[]) => lines.map((l) => { const r = s.collect('address', l); return `${r.outcome}:${r.reason}`; });
 
-test('whole or split, in any order: the address is whole only with a street address, a city and a five-digit ZIP code', () => {
+test('whole, or street first and then the city and ZIP code in either order: the address is whole only with a street address, a city and a five-digit ZIP code', () => {
   for (const lines of [
     [`${STREET}, Springfield, 91364`],
     [`${STREET} Springfield 91364`],

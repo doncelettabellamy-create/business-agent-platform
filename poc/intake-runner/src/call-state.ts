@@ -175,7 +175,7 @@ export interface ContactState {
   dispose(): void;
 }
 
-/** Options. `cityZip`: a service address is whole only with a street address, a city and a five-digit ZIP code (each may be said in any order or across answers; only the missing part is asked for). Default off: the street address alone is the whole address. */
+/** Options. `cityZip`: a service address is whole only with a street address, a city and a five-digit ZIP code (the street address first, then the city and ZIP code together with it, in either order, or across answers; a city or ZIP code said before any street is not reliably handled; only the missing part is asked for). Default off: the street address alone is the whole address. */
 export interface ContactStateOptions { readonly cityZip?: boolean }
 
 // City and ZIP parsing (city-and-ZIP mode). Pure. A ZIP code is five digits (ZIP+4 is cut to its first five); it is read from the END of a line only, so a house number is never taken for one.
@@ -253,7 +253,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
 
   /**
    * City-and-ZIP mode: takes a caller's line as (part of) the service address. Parts already held are KEPT; a part said again replaces only its own part (a correction), and only the missing
-   * part is then asked for. Said in any order, whole or in pieces: "1427 Sample Street, Springfield, 91364", "Springfield" later, "91364" later. A ZIP code is five digits (not all zero), read from
+   * part is then asked for. Said whole or in pieces, street first: "1427 Sample Street, Springfield, 91364", or "1427 Sample Street", then "Springfield" and "91364" in either order (a city or ZIP code before any street is not reliably handled). A ZIP code is five digits (not all zero), read from
    * the END of a line only; a house number is never taken for one. Never a postal check and never a service-area check: the caller confirms the whole address aloud.
    */
   function collectAddressCZ(raw: string): CollectResult {
