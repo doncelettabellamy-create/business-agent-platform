@@ -635,6 +635,38 @@ The founder prefers **GPT-Live-1.1, the full speech-to-speech model**, for the d
 
 The founder's audition selected the ElevenLabs voice Jack John (`7EzWGsX10sAS4c9m9cPf`) with Flash v2.5 at speed 0.95. **Recorded as the preferred candidate, not a production approval**; digit pauses and phone-quality delivery are unverified, as are the voice's API availability and license, the cost, latency and the privacy position (full list in `DRF-10`). Voice, pacing and wording are assessed separately. The earlier statement that read-backs stay uncleared is **corrected**: read-backs and questions are interruptible and are cut by caller speech (record #28 `CUT`, `CONFIRM_HELD`); only the consent notice and the goodbyes are non-interruptible. **Next task proposed, not authorized: the smallest offline speaker-adapter prototype** (stand-in speaker, no network or key). Booking stays paused at checkpoint `2f23a51` with its tests; GPT-Live stays paused; M1 position unchanged. No code, key, paid request, configuration, Twilio change, restart or call.
 
+## 5a-34. Shorter, friendlier wording for Drew's existing questions (founder-approved 2026-10-30; wording only; tested offline; NOT loaded by the running server)
+
+**What changed (17 spoken lines; question order, answer meaning, validation and intake state unchanged).**
+
+| Line | Before | After |
+|---|---|---|
+| Opening (model fallback) | Hello, thanks for calling. How can I help you today? | Thanks for calling. How can I help you today? |
+| Residential question | {business} cleans houses, apartments, condos and townhouses. We don't offer commercial cleaning. Is your request for a residential property? | Is this cleaning for a home? (the founder's exact words) |
+| Property type (with choices) | What type of property is it? You can say house, apartment, condo, or townhouse. | What type of property is it: house, apartment, condo, or townhouse? |
+| Bedrooms | How many bedrooms does the home have? | How many bedrooms? |
+| Bathrooms | How many bathrooms does the home have? | How many bathrooms? |
+| Pets | Do you have any pets in the home? | Do you have any pets? |
+| Frequency | How often would you like the cleaning? | How often would you like us to clean? |
+| Last clean | When was the last time the home was professionally cleaned? | When was it last professionally cleaned? |
+| Focus areas | Are there any areas you would like us to focus on? | Any areas you would like us to focus on? |
+| Extras | Is there anything extra you would like included in the cleaning? | Would you like anything extra included? |
+| Date | What date would you prefer for the cleaning? | What date works best for you? |
+| Time | What time of day would you prefer? | What time of day works best? |
+| Name retry | I did not catch your name. May I have your name, please? | Sorry, I missed that. What is your name? |
+| Phone | What is the best phone number to reach you? | What is the best number to reach you? |
+| Phone retry | I did not catch a phone number. What is the best phone number to reach you? | Sorry, I missed that. What is the best number to reach you? |
+| Phone restate | Could you say the whole phone number again, from the start? | Could you say the whole number again, from the start? |
+| Address capture retry | I did not catch an address. What is the service address? | Sorry, I missed that. What is the service address? |
+
+**Protected lines, unchanged (verified from the diff).** The consent notice and disclosure; the job and address read-backs; "Please say yes or no. Is that correct?" and the yes/no retry; "Sorry about that. What should I change?"; the address-wrong and address-missing recovery lines; the wait instruction; the exhausted-address ending; the goodbyes; the first-cleaning question; and "Will the home be empty during the cleaning?" (its natural shortening would have reversed what a yes means). The address capture retry (above) is a capture line asked before any read-back; its recovery twin ("I did not catch an address. What is the service address?") is unchanged, so the two now differ; the founder accepted that.
+
+**Corrections made while doing this (disclosed).** Two protected lines (the yes/no retry and the address-missing recovery line) were changed by mistake and reverted before the final run. The earlier proposal for the residential question ("We clean homes, not businesses. Is this for a home?") was replaced by the founder's exact "Is this cleaning for a home?" (the commercial decline line, "only cleans residential properties", is unchanged).
+
+**Tests.** Tests that pinned the old strings were changed to check shape and meaning instead of mirroring wording: each job question is one short question that asks for its own item; the property-type question offers every configured choice; retries open with the one approved apology and only retries may; the date and time questions are one short question each without price or promise wording; the "Home empty" polarity and the unchanged fixed lines stay pinned exactly; the residential question's exact words are pinned once, in `founder-voice-service.test.ts`. One full suite; see the commit message for the result.
+
+**Still pending (not started).** Selective acknowledgements ("Thanks.", "Got it."); structured city and ZIP capture; homeowner or renter and company-specific authorization rules; service-area checks; the speaker adapter and the voice integration (`DRF-10`); GPT-Live; booking stays paused at `2f23a51`. The running server (PID 22132, build `a9b326c`) does not load this wording until the founder restarts it; no restart, key, configuration, Twilio change or call was made.
+
 ## 5c. Status board and preservation checkpoint (2026-10-28; checkpoint at commit `6470b86`, workflow added in the commit after it)
 
 **This section is the current summary. Sections 5 and 5b are dated snapshots.** It keeps three things apart, as `docs/PRODUCT_CONTINUITY.md` rule 5 requires: what the founder approved, what is **tested offline** (an automated test passes against stand-ins and offline models: it says nothing about the live service), and what the founder **saw on a live call** (a recorded result). A test passing is never written here as "works live".

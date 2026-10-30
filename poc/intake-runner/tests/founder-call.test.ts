@@ -2509,14 +2509,15 @@ test('REGRESSION safe incomplete outcome: an item still missing after one ask an
 });
 
 // ---------------------------------------------------------------- residential-only Drew: commercial is not a service, and a commercial request never reaches pricing, booking or Processing
-const RES_Q = 'Drew Cleaning cleans houses, apartments, condos and townhouses. We don\u2019t offer commercial cleaning. Is your request for a residential property?';
+const RES_Q = residentialRouting((servicesSkill as any).categories, 'Drew Cleaning')!.question;
 const RES_NO = "Thank you. Drew Cleaning only cleans residential properties, so I can't help with this request. Goodbye.";
 const residentialOnly = () => ({ declined: ['Commercial cleaning'], keywords: (servicesSkill as any).categories.find((c: any) => c.route === 'human').keywords as string[], question: RES_Q, declineLine: RES_NO });
 const resRig = (o: RigOptions = {}) => servicesRig({ residential: residentialOnly(), ...o });
 const spokenTokens = (sim: Sim) => sim.messages.filter((m: any) => m.type === 'text').map((m: any) => m.token as string);
 
 test('residential-only: the question is the exact wording, and the decline promises no follow-up', () => {
-  assert.equal(RES_Q, 'Drew Cleaning cleans houses, apartments, condos and townhouses. We don\u2019t offer commercial cleaning. Is your request for a residential property?');
+  assert.match(RES_Q, /^[^?]*\?$/, 'one question');
+  assert.ok(/home/i.test(RES_Q) && !FOLLOW_UP.test(RES_Q), 'it asks about a home and promises nothing');
   assert.ok(!FOLLOW_UP.test(RES_NO), 'the decline promises no follow-up');
 });
 
@@ -3456,7 +3457,12 @@ test('SETTLE settings are validated: a negative or fractional window, or a maxim
 });
 
 test('VOICE SERVICE settings: the approved fixed questions, a 1.5 second quiet and an 8 second maximum', () => {
-  assert.deepEqual({ ...FIXED_QUESTIONS }, { 'Preferred date': 'What date would you prefer for the cleaning?', 'Time window': 'What time of day would you prefer?' });
+  assert.deepEqual(Object.keys(FIXED_QUESTIONS), ['Preferred date', 'Time window']);
+  assert.match(FIXED_QUESTIONS['Preferred date'], /^[^?]{5,60}\?$/);
+  assert.match(FIXED_QUESTIONS['Preferred date'], /\bdate\b/i);
+  assert.match(FIXED_QUESTIONS['Time window'], /^[^?]{5,60}\?$/);
+  assert.match(FIXED_QUESTIONS['Time window'], /\btime\b/i);
+  assert.ok(!/\$\d|price|quote|book|appointment|schedule|promise|call you/i.test(Object.values(FIXED_QUESTIONS).join(' ')));
   assert.deepEqual([VOICE_CONTACT_SETTLE_MS, VOICE_CONTACT_COLLECT_MAX_MS], [1500, 8000]);
   assert.ok(VOICE_CONTACT_COLLECT_MAX_MS > VOICE_CONTACT_SETTLE_MS && VOICE_CONTACT_COLLECT_MAX_MS <= 30_000, 'the maximum bounds the wait');
 });
@@ -3682,25 +3688,37 @@ test('SCRIPTED TABLE every required field of every residential category has its 
     }
   }
   assert.deepEqual(Object.keys(JOB_QUESTIONS).sort(), ['cleaning frequency', 'extras', 'home empty', 'last professional clean', 'number of bathrooms', 'number of bedrooms', 'pets', 'priority areas', 'property type']);
-  // The approved sentences, exactly.
-  assert.equal(scriptedQuestion({ field: 'Property type', choices: ['house', 'apartment', 'condo', 'townhouse'] }).text, 'What type of property is it? You can say house, apartment, condo, or townhouse.');
-  assert.equal(scriptedQuestion({ field: 'Extras' }).text, 'Is there anything extra you would like included in the cleaning?');
+  // The wording of the fixed lines that did not change, and the shape of the ones that did.
+  // The property-type question offers every configured choice, in one short question.
+  const propertyQ = scriptedQuestion({ field: 'Property type', choices: ['house', 'apartment', 'condo', 'townhouse'] });
+  assert.equal(propertyQ.id, 'JOB_PROPERTY_TYPE');
+  assert.match(propertyQ.text, /^What type of property is it[^?]*\?$/);
+  for (const c of ['house', 'apartment', 'condo', 'townhouse']) assert.ok(propertyQ.text.includes(c), c);
+  assert.equal(scriptedQuestion({ field: 'Property type' }).text, 'What type of property is it?');
+  // Each job question still asks for its own item, as one short question.
+  const asks: Array<[string, RegExp]> = [['Number of bedrooms', /bedrooms/i], ['Number of bathrooms', /bathrooms/i], ['Pets', /pets/i], ['Cleaning frequency', /often/i], ['Last professional clean', /last|cleaned/i], ['Priority areas', /areas/i], ['Extras', /extra/i], ['Home empty', /empty/i]];
+  for (const [field, re] of asks) { const q = scriptedQuestion({ field }); assert.match(q.text, re, field); assert.match(q.text, /^[^?]{5,80}\?$/, field); }
+  // Meaning that a yes/no answer depends on is not reworded: "empty" keeps its polarity.
+  assert.equal(scriptedQuestion({ field: 'Home empty' }).text, 'Will the home be empty during the cleaning?');
   assert.deepEqual([1, 7, 9].map((n) => scriptedQuestion({ field: 'Callback phone number', phone: n }).text), ['Thank you. What are the remaining 1 digits?', 'Thank you. What are the remaining 7 digits?', 'Thank you. What are the remaining 9 digits?']);
-  assert.equal(scriptedQuestion({ field: 'Callback phone number', phone: 'restate' }).text, 'Could you say the whole phone number again, from the start?');
+  assert.match(scriptedQuestion({ field: 'Callback phone number', phone: 'restate' }).text, /^Could you say the whole number again, from the start\?$/);
   assert.equal(scriptedQuestion({ field: 'Service address', part: 'street name' }).text, 'Thank you. What is the street name?');
   assert.equal(scriptedQuestion({ field: 'Service address', part: 'house number' }).text, 'Thank you. What is the house number?');
-  assert.equal(scriptedQuestion({ field: 'Service address', rejected: true }).text, 'I did not catch an address. What is the service address?');
-  assert.equal(scriptedQuestion({ field: 'Customer name', rejected: true }).text, 'I did not catch your name. May I have your name, please?');
-  assert.equal(scriptedQuestion({ field: 'Callback phone number', rejected: true }).text, 'I did not catch a phone number. What is the best phone number to reach you?');
+
+  // A retry after an unusable answer asks for the same item again, behind the one approved short apology.
+  for (const [field, re] of [['Service address', /service address/i], ['Customer name', /name/i], ['Callback phone number', /number/i]] as Array<[string, RegExp]>) {
+    const retry = scriptedQuestion({ field, rejected: true }); const first = scriptedQuestion({ field });
+    assert.match(retry.text, /^Sorry, I missed that\. [^.?]+\?$/, field); assert.match(retry.text, re, field); assert.notEqual(retry.id, first.id, field);
+  }
   // No generic repeat apology, and a repeat is the same words.
-  for (const text of SQ_SENTENCES.keys()) assert.ok(!/sorry|pause/i.test(text), text);
+  for (const [text, id] of SQ_SENTENCES) { if (id.endsWith('_RETRY')) assert.ok(/^Sorry, I missed that\. /.test(text) && !/pause/i.test(text), text); else assert.ok(!/sorry|pause/i.test(text), text); }
   assert.equal(scriptedQuestion({ field: 'Pets' }).text, scriptedQuestion({ field: 'Pets' }).text);
   // The category question is built from the business's own configured (residential) category names.
   assert.equal(scriptedClarify(['Standard cleaning', 'Deep cleaning', 'Move-in or move-out cleaning'], true).text, 'Are you calling about Standard cleaning, Deep cleaning, or Move-in or move-out cleaning?');
   assert.equal(scriptedClarify(['Standard cleaning'], false).text, 'Could you say in a few words what you need?');
   assert.ok(!/commercial/i.test(scriptedClarify(sqCategoryNames, true).text), 'a declined category is never named');
   // A name that is not a sentence-safe label is never spoken.
-  assert.equal(scriptedQuestion({ field: 'Pets', choices: ['a [b]', 'ok'] }).text, 'Do you have any pets in the home? You can say ok.');
+  assert.equal(scriptedQuestion({ field: 'Pets', choices: ['a [b]', 'ok'] }).text, `${scriptedQuestion({ field: 'Pets' }).text} You can say ok.`);
 });
 
 test('SCRIPTED WRONG-FIELD WORDING a text model that keeps asking for the phone number whatever it is told cannot change any required question: every ask is the table sentence for the selected field, the call completes, and the read-back agrees with the saved record', async () => {

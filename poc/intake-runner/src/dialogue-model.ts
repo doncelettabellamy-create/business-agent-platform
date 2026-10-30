@@ -127,7 +127,7 @@ export function orList(items: readonly string[]): string {
 export function fallbackText(d: Directive): string {
   const good = (s: unknown): s is string => typeof s === 'string' && NAME.test(s) && s.trim().length > 0;
   switch (d?.kind) {
-    case 'open': return 'Hello, thanks for calling. How can I help you today?';
+    case 'open': return 'Thanks for calling. How can I help you today?';
     case 'ask': {
       const choices = (d.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
       const offer = choices.length > 0 ? ` You can say ${orList(choices)}, or tell me in your own words.` : '';

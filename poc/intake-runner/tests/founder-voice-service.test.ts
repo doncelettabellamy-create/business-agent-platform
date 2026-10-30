@@ -412,7 +412,7 @@ test('residential-only wiring: Drew\'s service declines the skill\'s person-rout
   const r = residentialRouting(cleaning.categories, 'Drew Cleaning');
   assert.ok(r !== undefined);
   assert.deepEqual(r.declined, ['Commercial cleaning']);
-  assert.equal(r.question, 'Drew Cleaning cleans houses, apartments, condos and townhouses. We don’t offer commercial cleaning. Is your request for a residential property?');
+  assert.equal(r.question, 'Is this cleaning for a home?');   // the founder's wording (2026-10-30), pinned once
   assert.ok(r.keywords.includes('office') && r.keywords.includes('commercial'));
   assert.ok(!/call|follow|contact/i.test(r.declineLine));
   assert.equal(residentialRouting(plumbing.categories, 'Drew Cleaning'), undefined);

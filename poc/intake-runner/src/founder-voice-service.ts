@@ -70,7 +70,7 @@ export function residentialRouting(categories: readonly { name: string; route?: 
   return {
     declined: declined.map((c) => c.name),
     keywords: declined.flatMap((c) => [...(c.keywords ?? [])]),
-    question: `${businessName} cleans houses, apartments, condos and townhouses. We don’t offer commercial cleaning. Is your request for a residential property?`,
+    question: 'Is this cleaning for a home?',
     declineLine: `Thank you. ${businessName} only cleans residential properties, so I can't help with this request. Goodbye.`,
   };
 }
@@ -79,7 +79,7 @@ export function residentialRouting(categories: readonly { name: string; route?: 
 export const VOICE_CONTACT_SETTLE_MS = 1500;
 export const VOICE_CONTACT_COLLECT_MAX_MS = 8000;
 /** Questions spoken in exactly these words (founder-approved 2026-10-28). They offer no weekday, no availability and no confirmation. */
-export const FIXED_QUESTIONS: Readonly<Record<string, string>> = Object.freeze({ 'Preferred date': 'What date would you prefer for the cleaning?', 'Time window': 'What time of day would you prefer?' });
+export const FIXED_QUESTIONS: Readonly<Record<string, string>> = Object.freeze({ 'Preferred date': 'What date works best for you?', 'Time window': 'What time of day works best?' });
 /** The first-cleaning question, in the exact approved words (2026-10-28). Yes means first cleaning; no means returning customer. */
 export const firstCleanQuestion = (business: string): string => `Is this your first cleaning with ${business}?`;
 

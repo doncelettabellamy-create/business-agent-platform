@@ -106,7 +106,7 @@ export const SAY = Object.freeze({
 });
 
 /**
- * The caller's answer to "Is your request for a residential property?" (their MASKED words), by fixed rules: a plain yes is residential, a plain no is commercial, a residential word alone is residential,
+ * The caller's answer to "Is this cleaning for a home?" (their MASKED words), by fixed rules: a plain yes is residential, a plain no is commercial, a residential word alone is residential,
  * a commercial word alone is commercial, and anything that mixes the two or says neither is unclear. "No, it's my house" and "yes, it's my office" contradict themselves, so they are unclear too. Pure.
  */
 export function residentialAnswer(line: string, commercialWords: readonly string[] = []): 'residential' | 'commercial' | 'unclear' {

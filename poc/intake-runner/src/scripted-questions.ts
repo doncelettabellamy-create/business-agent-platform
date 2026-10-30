@@ -27,15 +27,15 @@ const NAME = /^[^\r\n[\]<>]{1,80}$/;
 /** The job fields' questions, by the configured label (compared without case or surrounding space). Only the wording is here; whether a field is required comes from the skill's category. */
 export const JOB_QUESTIONS: Readonly<Record<string, string>> = Object.freeze({
   'property type': 'What type of property is it?',
-  'number of bedrooms': 'How many bedrooms does the home have?',
-  'number of bathrooms': 'How many bathrooms does the home have?',
-  'pets': 'Do you have any pets in the home?',
-  'cleaning frequency': 'How often would you like the cleaning?',
-  'last professional clean': 'When was the last time the home was professionally cleaned?',
-  'priority areas': 'Are there any areas you would like us to focus on?',
+  'number of bedrooms': 'How many bedrooms?',
+  'number of bathrooms': 'How many bathrooms?',
+  'pets': 'Do you have any pets?',
+  'cleaning frequency': 'How often would you like us to clean?',
+  'last professional clean': 'When was it last professionally cleaned?',
+  'priority areas': 'Any areas you would like us to focus on?',
   'home empty': 'Will the home be empty during the cleaning?',
   // Offers no extra, service or price of its own.
-  'extras': 'Is there anything extra you would like included in the cleaning?',
+  'extras': 'Would you like anything extra included?',
 });
 
 const key = (s: string): string => s.trim().toLowerCase().replace(/\s+/g, ' ');
@@ -46,25 +46,27 @@ const good = (s: unknown): s is string => typeof s === 'string' && NAME.test(s) 
 export function scriptedQuestion(a: ScriptedAsk): ScriptedQuestion {
   const f = key(String(a.field));
   if (f === key(CONTACT_FIELDS.name)) return a.rejected === true
-    ? { id: 'NAME_RETRY', text: 'I did not catch your name. May I have your name, please?' }
+    ? { id: 'NAME_RETRY', text: 'Sorry, I missed that. What is your name?' }
     : { id: 'NAME', text: 'May I have your name, please?' };
   if (f === key(CONTACT_FIELDS.phone)) {
     if (typeof a.phone === 'number' && Number.isInteger(a.phone) && a.phone >= 1 && a.phone <= 9) return { id: 'PHONE_REMAINING', text: `Thank you. What are the remaining ${a.phone} digits?` };
-    if (a.phone === 'restate') return { id: 'PHONE_RESTATE', text: 'Could you say the whole phone number again, from the start?' };
+    if (a.phone === 'restate') return { id: 'PHONE_RESTATE', text: 'Could you say the whole number again, from the start?' };
     return a.rejected === true
-      ? { id: 'PHONE_RETRY', text: 'I did not catch a phone number. What is the best phone number to reach you?' }
-      : { id: 'PHONE', text: 'What is the best phone number to reach you?' };
+      ? { id: 'PHONE_RETRY', text: 'Sorry, I missed that. What is the best number to reach you?' }
+      : { id: 'PHONE', text: 'What is the best number to reach you?' };
   }
   if (f === key(CONTACT_FIELDS.address)) {
     if (a.part === 'street name') return { id: 'ADDRESS_STREET', text: 'Thank you. What is the street name?' };
     if (a.part === 'house number') return { id: 'ADDRESS_NUMBER', text: 'Thank you. What is the house number?' };
     return a.rejected === true
-      ? { id: 'ADDRESS_RETRY', text: 'I did not catch an address. What is the service address?' }
+      ? { id: 'ADDRESS_RETRY', text: 'Sorry, I missed that. What is the service address?' }
       : { id: 'ADDRESS', text: 'What is the service address?' };
   }
   const choices = (a.choices ?? []).slice(0, 10).filter(good).map((c) => c.trim());
   const offer = choices.length > 0 ? ` You can say ${orList(choices)}.` : '';
   if (a.clarify === true && f === 'property type' && choices.length > 0) return { id: 'JOB_PROPERTY_TYPE_CLARIFY', text: `Just to be sure, is it a ${orList(choices)}?` };
+  // The offered choices are part of the question itself ("... is it: house, apartment, condo, or townhouse?") for the property type, so the sentence stays one short question.
+  if (f === 'property type' && choices.length > 0) return { id: 'JOB_PROPERTY_TYPE', text: `What type of property is it: ${orList(choices)}?` };
   const own = JOB_QUESTIONS[f];
   if (own !== undefined) return { id: `JOB_${idOf(a.field)}`, text: `${own}${offer}` };
   return { id: 'GENERIC', text: good(a.field) ? `Can you tell me about ${a.field.trim().toLowerCase()}?${offer}` : 'Could you tell me a little more about that?' };
