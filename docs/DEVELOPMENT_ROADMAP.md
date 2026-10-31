@@ -693,7 +693,7 @@ The founder's audition selected the ElevenLabs voice Jack John (`7EzWGsX10sAS4c9
 
 ## 5a-36. CI is RED on `fbb2a6e`: two separate test failures, PARKED with their evidence (2026-10-30; nothing fixed, nothing rerun to get green)
 
-**Status, stated plainly: CI for `fbb2a6e` (Actions run #37) FAILED.** The earlier commits `2f23a51`, `866bea3` and `140f6b0` passed CI. `fbb2a6e` changed only documentation, two code comments and one test title, so it cannot have changed the runtime of either failing test. The two failures are different tests and are tracked separately.
+**CI history, stated plainly (updated 2026-10-31): RED on `fbb2a6e` (Actions run #37) and on `b444df8` (run #38); GREEN on `d1bee6b` (the commit that fixed the race in the speaker adapter's own tests).** A green run does not explain or close failure 1 or failure 2 below: both stay OPEN, and green on one commit says nothing about the intermittent failures in the pattern note. The original report follows. **CI for `fbb2a6e` FAILED.** The earlier commits `2f23a51`, `866bea3` and `140f6b0` passed CI. `fbb2a6e` changed only documentation, two code comments and one test title, so it cannot have changed the runtime of either failing test. The two failures are different tests and are tracked separately.
 
 **1. The CI failure (GitHub Actions, Linux runner).** Source: the run page's annotations (the full log needs a GitHub sign-in).
 - Test: `tests/founder-voice-service.test.ts:146`, "full call: the notice, a yes, the cleaning questions, the fixed read-back and a saved confirmed record, all over the stream, with the Drew persona on every spoken line" (299 ms).
