@@ -347,7 +347,9 @@ test('CONFIRM address exhausted (record #28 reproduced): two affirmations over t
   assert.equal(owner.needsFollowUp, true);
   assert.ok(owner.nextActions.includes(OWNER_TEXT.verifyAddress), 'the owner is told to verify the address');
   assert.ok(!/742|evergreen/i.test(JSON.stringify(owner)), 'no address in the owner view');
-  assert.ok(!/742|evergreen/i.test(JSON.stringify(r.logs)), 'no address in any log');
+  // The log entries of this rig carry an epoch-millisecond timestamp (`at`); a plain "742" search matched digits inside it on about one run in twelve (CI run #41, reproduced locally: the match was inside "at":...742), which is not an address.
+  // The timestamp is left out of the search; the street name and the number followed by the street are what an address in a log would look like.
+  assert.ok(!/evergreen|\b742\s+(?:evergreen|terrace)/i.test(JSON.stringify(r.logs.map(({ at: _at, ...rest }) => rest))), 'no address in any log');
 });
 
 test('CONFIRM address recovery: an early affirmation is held, the question comes again with the wait instruction, and a fresh yes after the WHOLE replayed question confirms the address; the ending is the ordinary one and the record is eligible', async () => {
