@@ -20,6 +20,12 @@ import type { RealtimeEffort, RealtimeTranscription } from './realtime-settings.
 import { personaProblems } from './persona.ts';
 import type { PersonaConfig } from './persona.ts';
 import { fixtureDigest } from './reviewed-fixtures.ts';
+import { speakerSettingsProblems } from './speaker-adapter.ts';
+import type { SpeakerSettings } from './speaker-adapter.ts';
+import { consentNoticeFor } from './opening.ts';
+
+/** Who SPEAKS. The default (this section absent) is OpenAI. Present, the fixed lines are spoken by ElevenLabs (src/speaker-adapter.ts, src/elevenlabs-speech-source.ts) while OpenAI still listens. Only the approved candidate values are accepted. */
+export interface SpeakerConfig { provider: 'elevenlabs'; voice_id: string; model_id: string; speed: number }
 
 export interface FounderVoiceConfig {
   approval_id: string;
@@ -44,9 +50,18 @@ export interface FounderVoiceConfig {
   transcription?: RealtimeTranscription;
   /** Optional. 'scripted' (default): the voice only speaks words the server hands it. 'native': the voice converses in its own words and may call the server's validated contact tools; the voice service keeps the call's turns for the call. */
   conversation?: 'scripted' | 'native';
+  /** Optional. Absent (the default): OpenAI speaks, exactly as before. Present: ElevenLabs speaks. Part of the approval digest, so adding it needs a new approval; it also needs the ElevenLabs key and a consent notice that names ElevenLabs. */
+  speaker?: SpeakerConfig;
 }
 const KEYS = 'approval_id,max_openai_calls,openai_model,persona,realtime_model,transcription_model,voice'.split(',');
-const OPTIONAL = ['safety_identifier', 'realtime_reasoning', 'text_reasoning', 'transcription', 'conversation'];
+const OPTIONAL = ['safety_identifier', 'realtime_reasoning', 'text_reasoning', 'transcription', 'conversation', 'speaker'];
+const SPEAKER_KEYS = 'model_id,provider,speed,voice_id';
+const asSettings = (s: Record<string, unknown>): unknown => ({ provider: s.provider, voiceId: s.voice_id, modelId: s.model_id, speed: s.speed, outputFormat: 'ulaw_8000' });
+/** The speaker settings the config selects, or undefined (the default: OpenAI speaks). The voice config must be valid. */
+export function speakerSettingsOf(voice: FounderVoiceConfig): SpeakerSettings | undefined {
+  const s = voice.speaker;
+  return s === undefined ? undefined : asSettings(s as unknown as Record<string, unknown>) as SpeakerSettings;
+}
 const ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const VOICE = /^[a-z][a-z0-9_-]{0,31}$/;
 const SAFETY = /^[A-Za-z0-9_.-]{1,64}$/;
@@ -69,6 +84,11 @@ export function founderVoiceConfigProblems(cfg: unknown): string[] {
   if ('realtime_reasoning' in c && !isRealtimeEffort(c.realtime_reasoning)) p.push('realtime_reasoning must be minimal, low, medium, high or xhigh');
   if ('text_reasoning' in c && !(typeof c.text_reasoning === 'string' && (OPENAI_EFFORTS as readonly string[]).includes(c.text_reasoning))) p.push('text_reasoning must be none, minimal, low, medium, high, xhigh or max');
   if ('conversation' in c && c.conversation !== 'scripted' && c.conversation !== 'native') p.push('conversation must be scripted or native');
+  if ('speaker' in c) {
+    const s = c.speaker;
+    if (!isRecord(s) || Object.keys(s).sort().join(',') !== SPEAKER_KEYS || speakerSettingsProblems(asSettings(s as Record<string, unknown>)).length > 0) p.push('speaker must be { provider elevenlabs, voice_id, model_id, speed } with the approved candidate values');
+    else if (c.conversation === 'native') p.push('the speaker works with scripted conversation only');
+  }
   if ('transcription' in c) {
     for (const m of transcriptionHintProblems(c.transcription)) p.push(m);
     if (typeof c.transcription_model === 'string' && !HINT_TRANSCRIBERS.includes(c.transcription_model)) p.push('transcription hints are documented only for gpt-transcribe and gpt-live-transcribe');
@@ -95,7 +115,7 @@ export interface VoiceGateInput {
   callConfig: unknown;
   voiceConfig: unknown;
   /** What the entry read from the environment: presence and equality only, never a secret's value. */
-  env: { allowLive: string | undefined; callApprovedDigest: string | undefined; voiceApprovedDigest: string | undefined; twilioTokenPresent: boolean; openaiKeyPresent: boolean };
+  env: { allowLive: string | undefined; callApprovedDigest: string | undefined; voiceApprovedDigest: string | undefined; twilioTokenPresent: boolean; openaiKeyPresent: boolean; /** Only asked when the voice config selects the ElevenLabs speaker. */ elevenlabsKeyPresent?: boolean };
   nowIso: string;
 }
 /** Empty means a live voice call may start. */
@@ -105,6 +125,13 @@ export function founderVoiceGateProblems(input: VoiceGateInput): string[] {
   if (v.length > 0) return [...p, ...v];
   if (founderConfigProblems(input.callConfig).length === 0 && input.env.voiceApprovedDigest !== founderVoiceDigest(input.callConfig, input.voiceConfig)) p.push('FOUNDER_VOICE_APPROVED_DIGEST does not match this voice config and call config');
   if (!input.env.openaiKeyPresent) p.push('the OpenAI key is not set');
+  // The ElevenLabs speaker (off by default): its key must be present, and the consent notice must tell the caller who the speech provider is (the text of every spoken line goes to it).
+  if ((input.voiceConfig as FounderVoiceConfig).speaker !== undefined) {
+    if (input.env.elevenlabsKeyPresent !== true) p.push('the ElevenLabs key is not set');
+    let notice = '';
+    try { if (founderConfigProblems(input.callConfig).length === 0) notice = consentNoticeFor((input.callConfig as FounderCallConfig).opening); } catch { notice = ''; }
+    if (!/eleven\s?labs/i.test(notice)) p.push('the consent notice does not name ElevenLabs as a speech provider');
+  }
   return p;
 }
 

@@ -29,6 +29,8 @@ import type { WireVoice } from './helpers/realtime-wire-sim.ts';
 import { JACK_SPEAKER, withSpeaker } from '../src/speaker-adapter.ts';
 import type { SpeechSource } from '../src/speaker-adapter.ts';
 import type { VoiceSocket } from '../src/realtime-bridge.ts';
+import { withSelectedSpeaker } from '../src/founder-voice-speaker.ts';
+import type { SpeakerSettings } from '../src/speaker-adapter.ts';
 import { createStandInSource } from './helpers/speaker-stand-in.ts';
 import type { StandIn, StandInOptions } from './helpers/speaker-stand-in.ts';
 
@@ -91,7 +93,7 @@ function wsOver(v: WireVoice): WebSocketLike {
   return ws;
 }
 
-async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig>; voiceMsPerChar?: number; realTimePlayout?: boolean; speaker?: SpeechSource } = {}) {
+async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig>; voiceMsPerChar?: number; realTimePlayout?: boolean; speaker?: SpeechSource; selection?: { settings: SpeakerSettings; deps: { getKey: () => string | undefined; fetch: typeof globalThis.fetch } } } = {}) {
   const callConfig: FounderCallConfig = {
     approval_id: 'voice-test', tenant: T, numbers: [N1], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'],
     kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
@@ -104,7 +106,7 @@ async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; 
   const logs: Array<{ code: string; detail?: Record<string, unknown> }> = [];
   const diagLines: Array<{ code: string; [k: string]: unknown }> = [];
   // Opt-in (tests of the offline speaker adapter only): the listening stays with the OpenAI stand-in, the speaking goes to the given source. Absent, nothing changes.
-  const speak = (d: (code: never, detail?: Record<string, number | string | boolean>) => void, real: VoiceSocket): VoiceSocket => (o.speaker === undefined ? real : withSpeaker(real, o.speaker, JACK_SPEAKER, { diag: (code, detail) => { d(code as never, detail as never); } }));
+  const speak = (d: (code: never, detail?: Record<string, number | string | boolean>) => void, real: VoiceSocket): VoiceSocket => (o.selection !== undefined ? (withSelectedSpeaker(() => real, o.selection.settings, o.selection.deps) as (diag: typeof d) => VoiceSocket)(d) : o.speaker === undefined ? real : withSpeaker(real, o.speaker, JACK_SPEAKER, { diag: (code, detail) => { d(code as never, detail as never); } }));
   const service = createFounderVoiceService({
     diag: (code, detail) => { diagLines.push({ code, ...detail }); },
     config: callConfig, voice: voiceConfig,
@@ -570,4 +572,73 @@ test('speaker adapter, speaker failure: a failed line is reported as not heard a
   assert.ok(!d.has('CONFIRMED') && !d.has('READBACK'), 'no read-back was heard, so nothing was confirmed');
   assert.ok(d.store.list(T).every((x) => x.confirmation !== 'confirmed'));
   dsim.end();
+});
+
+
+// ---------------------------------------------------------------- the SWITCH ON, through the whole service (the ElevenLabs client against a fetch stand-in; no network, no key)
+/** A provider stand-in: for each request it returns audio whose length follows the text (msPerChar of mu-law), all at once, and records the request. */
+function elevenStandIn(msPerChar: number) {
+  const calls: Array<{ text: string; url: string; key: string | undefined; aborted: () => boolean }> = [];
+  const f = (async (url: string, init: { headers: Record<string, string>; body: string; signal: AbortSignal }) => {
+    const text = JSON.parse(init.body).text as string;
+    calls.push({ text, url, key: init.headers['xi-api-key'], aborted: () => init.signal.aborted });
+    const total = Math.max(1, text.length * msPerChar * 8);
+    return new Response(new ReadableStream<Uint8Array>({ start(c) { for (let at = 0; at < total; at += 1600) c.enqueue(new Uint8Array(Math.min(1600, total - at)).fill(0xff)); c.close(); } }), { status: 200, headers: { 'content-type': 'audio/basic' } });
+  }) as unknown as typeof globalThis.fetch;
+  return { fetch: f, calls };
+}
+const XI_CANARY = 'xi-canary-not-a-real-key-0123456789';
+
+test('switch ON through the whole service: the client speaks every line, OpenAI is never asked to speak, an early yes is held and never confirms, a fresh yes after the whole read-back does, and the record is the baseline\'s', { timeout: 120_000 }, async () => {
+  const base = await wholeCall();
+  const eleven = elevenStandIn(25);
+  const r = await rig({ selection: { settings: JACK_SPEAKER, deps: { getKey: () => XI_CANARY, fetch: eleven.fetch } }, realTimePlayout: true });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'), 30_000, () => where(r, sim));
+  const done = (n: number) => until(() => diagCount(r, 'ADAPTER_REPLY_DONE') >= n, 30_000, () => where(r, sim));
+  r.voices[0].hear('yes I agree'); await done(2); await r.handler.idle();
+  r.voices[0].hear('Hi, I have a burst pipe in the kitchen'); await done(3); await r.handler.idle();
+  r.voices[0].hear('The address is 42 Elm Street');
+  await until(() => eleven.calls.length >= 4, 30_000, () => where(r, sim));
+  assert.ok(/^Let me check what I have/.test(eleven.calls[3].text));
+  await pause(500);
+  r.voices[0].hear('yes that is right');   // far too early
+  await until(() => r.has('CONFIRM_HELD'), 30_000, () => where(r, sim));
+  assert.ok(!r.has('CONFIRMED'), 'an early yes confirms nothing');
+  const before = diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.played === true);
+  await until(() => diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.played === true) > before && eleven.calls.length >= 5, 40_000, () => where(r, sim));
+  await r.handler.idle();
+  assert.ok(!r.has('CONFIRMED'));
+  r.voices[0].hear('yes that is right');
+  await sim.closed; await r.handler.idle();
+  assert.deepEqual(stable(r.store.list(T)[0]), stable(base.rec), 'the same saved record as the OpenAI-spoken call');
+  assert.equal(r.voices[0].received.filter((m: any) => m.type === 'response.create').length, 0, 'OpenAI was never asked to speak');
+  assert.ok(eleven.calls.every((c) => c.url === 'https://api.elevenlabs.io/v1/text-to-speech/7EzWGsX10sAS4c9m9cPf/stream?output_format=ulaw_8000' && c.key === XI_CANARY));
+  assert.equal(eleven.calls[0].text, r.notice, 'the consent notice is spoken first, word for word, through the client');
+  const all = JSON.stringify([r.logs, r.diagLines]);
+  for (const s of [...SECRETS, FAKE_KEY, XI_CANARY, 'burst pipe', 'Elm']) assert.ok(!all.includes(s), 'a log line holds: ' + s);
+});
+
+test('switch ON through the whole service: a caller who talks over the opening cancels it, the phone is cleared, and the call still ends with the baseline record', { timeout: 120_000 }, async () => {
+  const base = await wholeCall();
+  const eleven = elevenStandIn(25);
+  const r = await rig({ selection: { settings: JACK_SPEAKER, deps: { getKey: () => XI_CANARY, fetch: eleven.fetch } }, realTimePlayout: true });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'), 30_000, () => where(r, sim));
+  const media = (): number => sim.messages.filter((m: any) => m.event === 'media').length;
+  const played = (): number => diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.played === true);
+  const m0 = media();
+  r.voices[0].hear('yes I agree');
+  await until(() => eleven.calls.length >= 2 && media() >= m0 + 4, 30_000, () => where(r, sim));
+  r.voices[0].hear('Hi, I have a burst pipe in the kitchen');   // over the opening
+  await until(() => sim.messages.some((m: any) => m.event === 'clear'), 30_000, () => where(r, sim));
+  // The provider (like the real one) delivers faster than the phone plays, so by now the stream has ENDED: the transport's cancel finds no active line and gets the voice service's own harmless error, while the bridge
+  // has already cleared the phone. (A cancel of a line still being received is proven with the slow stand-in source above.)
+  await until(() => diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.interrupted === true) >= 1, 30_000, () => where(r, sim));
+  assert.equal(diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.interrupted === true), 1, 'exactly the opening was talked over');
+  await until(() => played() >= 2, 40_000, () => where(r, sim)); await r.handler.idle();
+  r.voices[0].hear('The address is 42 Elm Street'); await until(() => played() >= 3, 40_000, () => where(r, sim)); await r.handler.idle();
+  r.voices[0].hear('yes that is right');
+  await sim.closed; await r.handler.idle();
+  assert.deepEqual(stable(r.store.list(T)[0]), stable(base.rec), 'the intake state is the same as the call that was not interrupted');
 });

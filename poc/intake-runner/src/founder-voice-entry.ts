@@ -19,12 +19,13 @@ import { createDashboardServer } from './dashboard-server.ts';
 import { createRelayWsServer } from './ws-server.ts';
 import { founderConfigDigest, founderConfigProblems, relayPathFor, signedUrlCandidates } from './founder-call-gate.ts';
 import type { FounderCallConfig } from './founder-call-gate.ts';
-import { effectiveVoiceSettings, founderVoiceConfigProblems, founderVoiceDigest, founderVoiceGateProblems, voiceBounds } from './founder-voice-gate.ts';
+import { effectiveVoiceSettings, founderVoiceConfigProblems, founderVoiceDigest, founderVoiceGateProblems, speakerSettingsOf, voiceBounds } from './founder-voice-gate.ts';
 import type { FounderVoiceConfig } from './founder-voice-gate.ts';
 import { contactsPathFor, createContactVault, keyFromEnv } from './contact-vault.ts';
 import { createOpenAIHttpClient } from './openai-http-client.ts';
 import { createOpenAiVoiceSocket } from './openai-voice-socket.ts';
 import { createFounderVoiceService } from './founder-voice-service.ts';
+import { withSelectedSpeaker } from './founder-voice-speaker.ts';
 import { streamTwimlFor } from './stream-twiml.ts';
 import { fileDiagSink } from './call-diag.ts';
 
@@ -49,9 +50,11 @@ if (problems.length > 0) { for (const p of problems) console.error(`config probl
 const callDigest = founderConfigDigest(config);
 const voiceDigest = founderVoiceDigest(config, voice);
 const bounds = voiceBounds(config, voice);
+const speaker = speakerSettingsOf(voice);   // undefined unless the voice config selects ElevenLabs (the default: OpenAI speaks)
 console.log(`Mode: ${serve ? 'SERVE REQUESTED (gate checks follow)' : 'DRY RUN (nothing is opened, read or sent)'}   [OpenAI voice route]`);
 console.log(`Call config: ${configPath}   tenant: ${config.tenant}   numbers: ${config.numbers.length}   expires: ${config.expires}`);
 console.log(`Voice config: ${voicePath}   text model: ${voice.openai_model}   voice model: ${voice.realtime_model}   transcription model: ${voice.transcription_model}   voice: ${voice.voice}`);
+console.log(speaker === undefined ? 'Speaker: OpenAI speaks (the default; the ElevenLabs speaker is OFF)' : `Speaker: ElevenLabs ON (voice ${speaker.voiceId}, model ${speaker.modelId}, speed ${speaker.speed}); the TEXT of every spoken line, read-backs included, goes to ElevenLabs; OpenAI still hears the caller`);
 const eff = effectiveVoiceSettings(voice);
 console.log(`Settings (defaults filled in): voice reasoning ${eff.realtimeReasoning}; text reasoning ${eff.textReasoning}; transcription hints: ${eff.transcription === undefined ? 'none' : `${eff.transcription.languages?.length ?? 0} language(s), ${eff.transcription.keywords?.length ?? 0} keyword(s)`}. UNVERIFIED until a live call: whether each model accepts these values.`);
 console.log(`Bounds: at most ${bounds.calls} calls of ${bounds.minutesPerCall} minutes (${bounds.maxVoiceMinutes} voice minutes in all), ${config.max_turns} caller turns each, ${bounds.maxOpenaiCalls} OpenAI text calls for the whole run. No dollar ceiling is computed: OpenAI prices for these models are not on file and the voice cost per minute is unverified.`);
@@ -65,6 +68,7 @@ const gate = founderVoiceGateProblems({
   env: {
     allowLive: process.env.INTAKE_ALLOW_LIVE_CALLS, callApprovedDigest: process.env.FOUNDER_CALL_APPROVED_DIGEST, voiceApprovedDigest: process.env.FOUNDER_VOICE_APPROVED_DIGEST,
     twilioTokenPresent: typeof twilioToken === 'string' && twilioToken.length >= 8, openaiKeyPresent: typeof process.env.OPENAI_API_KEY === 'string' && process.env.OPENAI_API_KEY.length >= 8,
+    elevenlabsKeyPresent: typeof process.env.ELEVENLABS_API_KEY === 'string' && process.env.ELEVENLABS_API_KEY.length >= 8,
   },
 });
 console.log('\nGate (every line must be [ok] to serve):');
@@ -100,7 +104,8 @@ const store = createIntakeRecordStore({ path: config.db_path });
 const service = createFounderVoiceService({
   config, voice, textClient,
   diag: sink,
-  openVoice: (d) => createOpenAiVoiceSocket({ model: voice.realtime_model, getKey, ...(voice.safety_identifier === undefined ? {} : { safetyIdentifier: voice.safety_identifier }), diag: (code, detail) => d(code as never, detail) }),
+  // OpenAI speaks unless the voice config selects the ElevenLabs speaker (the opener is then returned unchanged). The ElevenLabs key is read here, at the moment a line starts, and nowhere else.
+  openVoice: withSelectedSpeaker((d) => createOpenAiVoiceSocket({ model: voice.realtime_model, getKey, ...(voice.safety_identifier === undefined ? {} : { safetyIdentifier: voice.safety_identifier }), diag: (code, detail) => d(code as never, detail) }), speaker, { getKey: () => process.env.ELEVENLABS_API_KEY, fetch: globalThis.fetch }),
   store, ...(contacts === undefined ? {} : { contacts }),
   async intakeContext(t, ref) {
     if (t !== tenant) throw new Error('tenant');

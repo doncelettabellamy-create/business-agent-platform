@@ -243,14 +243,15 @@ test('settings: only the approved candidate is accepted - a different voice shap
   assert.throws(() => createElevenLabsSpeechSource({ getKey: () => KEY, fetch: counting, headersTimeoutMs: 0 }), RangeError);
 });
 
-test('inactive: nothing in src imports the client, it reads no environment, opens no connection of its own and holds no key; the current speaker path names neither it nor the adapter', () => {
+test('contained: only the switch module imports the client, it reads no environment, opens no connection of its own and holds no key; the call logic, the bridge, the transport and the voice service name neither it nor the adapter', () => {
   const code = (f: string) => readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const own = code('elevenlabs-speech-source.ts');
   for (const bad of [/process\./, /node:/, /\bimport\s*\(/, /new\s+WebSocket/, /\bfetch\s*\(/, /require\s*\(/, /console\./, /\bsk-[A-Za-z0-9]/, /ELEVEN_?LABS_API_KEY/i, /https?:\/\/(?!api\.elevenlabs\.io)/]) assert.ok(!bad.test(own), String(bad));
   assert.equal((own.match(/xi-api-key/g) ?? []).length, 1, 'the key header is named once');
   assert.equal(readFileSync(new URL('../src/elevenlabs-speech-source.ts', import.meta.url), 'utf8').split("'xi-api-key': key").length - 1, 1);
   for (const f of readdirSync(new URL('../src/', import.meta.url)).filter((n) => n.endsWith('.ts') && n !== 'elevenlabs-speech-source.ts')) {
-    assert.ok(!/elevenlabs-speech-source/.test(code(f)), `${f}: nothing may import the inactive client yet`);
+    assert.equal(/elevenlabs-speech-source/.test(code(f)), f === 'founder-voice-speaker.ts', `${f}: only the switch module (founder-voice-speaker.ts) may import the client`);
+    assert.equal(/speaker-adapter/.test(code(f)), ['founder-voice-speaker.ts', 'founder-voice-gate.ts', 'elevenlabs-speech-source.ts'].includes(f), `${f}: only the switch, the gate (settings checks) and the client may use the adapter`);
   }
-  for (const f of ['founder-voice-service.ts', 'founder-voice-entry.ts', 'relay-handler.ts', 'realtime-bridge.ts', 'realtime-transport.ts']) assert.ok(!/speaker-adapter|elevenlabs/i.test(code(f)), `${f}: the current speaker path does not name the adapter or the client`);
+  for (const f of ['founder-voice-service.ts', 'relay-handler.ts', 'realtime-bridge.ts', 'realtime-transport.ts', 'call-session.ts', 'call-state.ts']) assert.ok(!/speaker-adapter|elevenlabs|founder-voice-speaker/i.test(code(f)), `${f}: the current speaker path does not name the adapter or the client`);
 });
