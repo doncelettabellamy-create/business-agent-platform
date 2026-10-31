@@ -38,6 +38,11 @@ export type TransportEvent =
    */
   | { kind: 'reply_failed' }
   /**
+   * The speaker cannot go on (a speech source failed after audio started, or its fallback failed): no further line will be spoken and the connection is about to close. The call logic saves what was
+   * collected as an incomplete, unconfirmed call and ends it. Only a carrier that speaks through the speaker adapter sends this.
+   */
+  | { kind: 'speaker_down' }
+  /**
    * Native conversation only: the voice asked for one of the server's tools. `args` is whatever the voice sent (parsed JSON, or undefined when it was not JSON): the receiver validates it, runs
    * nothing it does not know, and answers with `toolResult`. The callId is the voice service's own.
    */

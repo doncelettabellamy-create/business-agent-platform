@@ -51,6 +51,8 @@ Then run `git log -3`, `git status` and compare with `origin/main`; check the li
 
 **CI history (roadmap 5a-36): RED on `fbb2a6e` and `b444df8`, GREEN on `d1bee6b`.** The green run does not close anything: two separate test failures stay OPEN and PARKED with their evidence: `tests/founder-voice-service.test.ts:146` (CI: a `response.cancel` of a reply that is not playing was refused by the test voice stand-in; cause not established; 10 of 10 loaded local reruns passed) and `tests/call-diagnostics.test.ts:189` (local: `2 !== 3`, large audio piece). Nothing was rerun to get green; neither is fixed.
 
+**First-test fallback built (roadmap 5a-40, offline): OpenAI may take over a line only if zero Jack audio was handed on; a failure after audio started, or a failed fallback, ends the call within a bound and saves an incomplete, unconfirmed record that is never handed on. Not enabled.**
+
 **The speaker SWITCH exists and is OFF (roadmap 5a-39): an optional `speaker` section in the voice config (absent = OpenAI speaks, digest unchanged); present, it needs a new approval, `ELEVENLABS_API_KEY`, and a consent notice that names ElevenLabs; tested with mocks only; nothing enabled, no key, no restart.**
 
 **The ElevenLabs streaming client now exists INACTIVE (roadmap 5a-38, `src/elevenlabs-speech-source.ts`): tested against a loopback mock server for the request shape, audio format and order, cancellation, late audio, timeouts and provider errors; nothing imports it, no key, no live use; real provider behaviour is unverified.**

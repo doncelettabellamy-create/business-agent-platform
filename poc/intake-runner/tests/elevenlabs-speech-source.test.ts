@@ -137,17 +137,26 @@ test('timeouts: no response headers within the bound fails the line once and dro
   await until(() => slow.aborted() === 1);
   assert.deepEqual(c.order, ['fail']);
   assert.ok(lines.some((l) => l.code === 'ELEVENLABS_FAILED' && l.why === 'TIMEOUT_HEADERS'));
-  // Through the adapter: headers arrive, then silence (never any audio) -> NO_AUDIO; some audio, then silence -> STALLED. Both cancel the provider request.
+  // Through the adapter: headers arrive, then silence with NO audio -> NO_AUDIO -> OpenAI is asked to speak the line (the fallback; this stand-in never answers, so the call ends); some audio, then silence -> STALLED -> no
+  // fallback, the call ends. Both cancel the provider request.
   for (const [piece, why] of [[0, 'NO_AUDIO'], [300, 'STALLED']] as Array<[number, string]>) {
     const m = await mockServer((_q, res) => { audio(res); if (piece > 0) res.write(Buffer.from(pattern(piece))); });
     const inner: SpeakerSocket & { sent: any[] } = { sent: [], send(x: string) { inner.sent.push(JSON.parse(x)); return true; }, close() {}, onOpen() {}, onMessage() {}, onClose() {} };
     const d = diagInto();
-    const sp = withSpeaker(inner, createElevenLabsSpeechSource(config(m.origin, { diag: d.diag })), JACK_SPEAKER, { diag: d.diag, firstAudioMs: 150, gapMs: 150 });
+    const sp = withSpeaker(inner, createElevenLabsSpeechSource(config(m.origin, { diag: d.diag })), JACK_SPEAKER, { diag: d.diag, firstAudioMs: 150, gapMs: 150, fallbackFirstAudioMs: 120, endDelayMs: 40 });
     const events: any[] = []; sp.onMessage = (x: string) => { events.push(JSON.parse(x)); };
     sp.send(JSON.stringify({ type: 'response.create', response: { instructions: `${SPEAK_ONLY} ${SAY_PREFIX}Hello there.`, metadata: { id: 'r1' } } }));
     await until(() => events.some((e) => e.type === 'response.done'));
     assert.equal(events.find((e) => e.type === 'response.done').response.status, 'failed', why);
-    assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FAILED' && l.why === why), why);
+    if (piece === 0) {
+      assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FALLBACK' && l.why === 'NO_AUDIO'), 'zero audio handed on: OpenAI is asked to speak the line');
+      assert.equal(inner.sent.filter((x) => x.type === 'response.create').length, 1);
+      assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FAILED' && l.why === 'FALLBACK_NO_AUDIO'), 'and this stand-in never answers, so the call ends');
+    } else {
+      assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FAILED' && l.why === why), why);
+      assert.equal(inner.sent.filter((x) => x.type === 'response.create').length, 0, 'audio had been handed on: no fallback');
+    }
+    await until(() => events.some((e) => e.type === 'x_speaker_down'));
     assert.equal(events.filter((e) => e.type === 'response.output_audio_transcript.done').length, 0, `${why}: no transcript for a failed line`);
     await until(() => m.aborted() === 1);
   }
@@ -186,12 +195,13 @@ test('other provider failures: a non-audio success, a reset before the headers, 
   // empty 200: the client ends the stream; the ADAPTER turns "no audio at all" into a failed line
   const empty = await mockServer((_q, res) => { audio(res); res.end(); });
   const inner: SpeakerSocket = { send: () => true, close() {}, onOpen() {}, onMessage() {}, onClose() {} };
-  const d = diagInto(); const sp = withSpeaker(inner, createElevenLabsSpeechSource(config(empty.origin)), JACK_SPEAKER, { diag: d.diag });
+  const d = diagInto(); const sp = withSpeaker(inner, createElevenLabsSpeechSource(config(empty.origin)), JACK_SPEAKER, { diag: d.diag, fallbackFirstAudioMs: 100, endDelayMs: 40 });
   const ev: any[] = []; sp.onMessage = (x: string) => { ev.push(JSON.parse(x)); };
   sp.send(JSON.stringify({ type: 'response.create', response: { instructions: `${SPEAK_ONLY} ${SAY_PREFIX}Hello there.`, metadata: { id: 'r1' } } }));
   await until(() => ev.some((e) => e.type === 'response.done'));
   assert.equal(ev.find((e) => e.type === 'response.done').response.status, 'failed');
-  assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FAILED' && l.why === 'EMPTY'));
+  assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FALLBACK' && l.why === 'EMPTY'), 'an empty body is zero audio: OpenAI is asked to speak the line');
+  assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FAILED' && l.why === 'FALLBACK_NO_AUDIO'), 'and this stand-in never answers, so the call ends');
   // refused connection
   const gone = await mockServer(() => {}); const origin = gone.origin; await gone.close();
   const c3 = collector(); createElevenLabsSpeechSource(config(origin)).start(REQUEST, c3.sink);
@@ -216,11 +226,11 @@ test('the key: asked for when a line starts and not before; no key means the lin
   assert.equal(hits, 0, 'no request was made');
   // Through the adapter a missing key is a line that failed to start.
   const inner: SpeakerSocket = { send: () => true, close() {}, onOpen() {}, onMessage() {}, onClose() {} };
-  const d = diagInto(); const sp = withSpeaker(inner, src, JACK_SPEAKER, { diag: d.diag });
+  const d = diagInto(); const sp = withSpeaker(inner, src, JACK_SPEAKER, { diag: d.diag, fallbackFirstAudioMs: 100, endDelayMs: 40 });
   const ev: any[] = []; sp.onMessage = (x: string) => { ev.push(JSON.parse(x)); };
   sp.send(JSON.stringify({ type: 'response.create', response: { instructions: `${SPEAK_ONLY} ${SAY_PREFIX}Hello there.`, metadata: { id: 'r1' } } }));
   await until(() => ev.some((e) => e.type === 'response.done'));
-  assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FAILED' && l.why === 'START_FAILED'));
+  assert.ok(d.lines.some((l) => l.code === 'SPEAKER_FALLBACK' && l.why === 'START_FAILED'), 'no key is zero audio: OpenAI is asked to speak the line');
   assert.ok(!JSON.stringify(d.lines).includes('KEY-'));
 });
 

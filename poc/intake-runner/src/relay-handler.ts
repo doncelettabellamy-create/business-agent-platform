@@ -1237,6 +1237,18 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       if (ev.kind === 'setup') { if (!setupSeen && !done) { setupSeen = true; chain = chain.then(() => onSetup({ to: ev.to, callSid: ev.callSid })).catch(() => deps.log('HANDLER_ERROR')); } return; }
       if (!setupSeen) { if (++bad > 5) carrier.close(1008); return; }
       if (ev.kind === 'tool') { onTool(ev); return; }
+      if (ev.kind === 'speaker_down') {
+        // The speaker cannot go on (the adapter's source failed after audio started, or its fallback failed). Nothing more can be spoken, so the call ends: what was collected is saved as an INCOMPLETE,
+        // UNCONFIRMED call (never handed on), and nothing the caller says from now on counts as an answer. A line that was not heard never confirms anything.
+        if (done) return;
+        deps.log('SPEAKER_DOWN');
+        incompleteCall = true;
+        activeAsk = undefined;
+        if (unit !== undefined && unit.heard !== false) { unit.heard = undefined; markHeard(unit, false, 'LOST'); }
+        chain = chain.then(async () => { if (done) return; await finish(true); await hangUp(); }).catch(() => deps.log('HANDLER_ERROR'));
+        void track(chain);
+        return;
+      }
       if (ev.kind === 'reply_failed') {
         // A question the caller did not hear is not delivered: nothing may treat their next plain yes or no as its answer.
         failedSends++; deps.log('REPLY_NOT_PLAYED');

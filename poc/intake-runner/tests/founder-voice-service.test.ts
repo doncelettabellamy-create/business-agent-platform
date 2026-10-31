@@ -25,12 +25,12 @@ import { scriptedQuestion } from '../src/scripted-questions.ts';
 import { connectRelay } from './helpers/twilio-sim.ts';
 import type { Sim } from './helpers/twilio-sim.ts';
 import { b64, createWireVoice } from './helpers/realtime-wire-sim.ts';
-import type { WireVoice } from './helpers/realtime-wire-sim.ts';
+import type { Behaviour, WireVoice } from './helpers/realtime-wire-sim.ts';
 import { JACK_SPEAKER, withSpeaker } from '../src/speaker-adapter.ts';
 import type { SpeechSource } from '../src/speaker-adapter.ts';
 import type { VoiceSocket } from '../src/realtime-bridge.ts';
 import { withSelectedSpeaker } from '../src/founder-voice-speaker.ts';
-import type { SpeakerSettings } from '../src/speaker-adapter.ts';
+import type { SpeakerOptions, SpeakerSettings } from '../src/speaker-adapter.ts';
 import { createStandInSource } from './helpers/speaker-stand-in.ts';
 import type { StandIn, StandInOptions } from './helpers/speaker-stand-in.ts';
 
@@ -93,7 +93,7 @@ function wsOver(v: WireVoice): WebSocketLike {
   return ws;
 }
 
-async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig>; voiceMsPerChar?: number; realTimePlayout?: boolean; speaker?: SpeechSource; selection?: { settings: SpeakerSettings; deps: { getKey: () => string | undefined; fetch: typeof globalThis.fetch } } } = {}) {
+async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; emptyDialogue?: boolean; contacts?: boolean; voice?: Partial<FounderVoiceConfig>; voiceMsPerChar?: number; realTimePlayout?: boolean; speaker?: SpeechSource; speakerOpts?: SpeakerOptions; voiceBehave?: (text: string, n: number) => Behaviour; selection?: { settings: SpeakerSettings; deps: { getKey: () => string | undefined; fetch: typeof globalThis.fetch } } } = {}) {
   const callConfig: FounderCallConfig = {
     approval_id: 'voice-test', tenant: T, numbers: [N1], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'],
     kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
@@ -106,14 +106,14 @@ async function rig(o: { key?: () => string | undefined; failDialogue?: boolean; 
   const logs: Array<{ code: string; detail?: Record<string, unknown> }> = [];
   const diagLines: Array<{ code: string; [k: string]: unknown }> = [];
   // Opt-in (tests of the offline speaker adapter only): the listening stays with the OpenAI stand-in, the speaking goes to the given source. Absent, nothing changes.
-  const speak = (d: (code: never, detail?: Record<string, number | string | boolean>) => void, real: VoiceSocket): VoiceSocket => (o.selection !== undefined ? (withSelectedSpeaker(() => real, o.selection.settings, o.selection.deps) as (diag: typeof d) => VoiceSocket)(d) : o.speaker === undefined ? real : withSpeaker(real, o.speaker, JACK_SPEAKER, { diag: (code, detail) => { d(code as never, detail as never); } }));
+  const speak = (d: (code: never, detail?: Record<string, number | string | boolean>) => void, real: VoiceSocket): VoiceSocket => (o.selection !== undefined ? (withSelectedSpeaker(() => real, o.selection.settings, o.selection.deps) as (diag: typeof d) => VoiceSocket)(d) : o.speaker === undefined ? real : withSpeaker(real, o.speaker, JACK_SPEAKER, { diag: (code, detail) => { d(code as never, detail as never); }, ...o.speakerOpts }));
   const service = createFounderVoiceService({
     diag: (code, detail) => { diagLines.push({ code, ...detail }); },
     config: callConfig, voice: voiceConfig,
     textClient: createOpenAIHttpClient({ getKey: () => FAKE_KEY, fetch: text.fetch }),
     openVoice: (d) => speak(d, createOpenAiVoiceSocket({
       model: voiceConfig.realtime_model, getKey: o.key ?? (() => FAKE_KEY), connectTimeoutMs: 3000, diag: (code, detail) => { d(code as never, detail); },
-      factory: (url, init) => { handshakes.push({ url, headers: init.headers }); const v = createWireVoice({ msPerChar: o.voiceMsPerChar ?? 1, autoOpen: false }); voices.push(v); return wsOver(v); },
+      factory: (url, init) => { handshakes.push({ url, headers: init.headers }); const v = createWireVoice({ msPerChar: o.voiceMsPerChar ?? 1, autoOpen: false, ...(o.voiceBehave === undefined ? {} : { behave: o.voiceBehave }) }); voices.push(v); return wsOver(v); },
     })),
     store,
     async intakeContext(tenant, ref) {
@@ -538,42 +538,111 @@ test('speaker adapter, interruption: a caller who talks over the opening cancels
   assert.deepEqual(stable(r.store.list(T)[0]), stable(base.rec), 'the intake state is the same as the call that was not interrupted');
 });
 
-test('speaker adapter, speaker failure: a failed line is reported as not heard and asked again when the caller speaks, and the call ends as the baseline; a source that always fails never produces a confirmed record', { timeout: 120_000 }, async () => {
-  const base = await wholeCall();
-  // One line fails part-way (the third line, the first question).
-  const flaky = createStandInSource({ msPerChar: 2, behave: (_q, n) => (n === 3 ? { failAfter: 1 } : 'ok') });
-  const r = await rig({ speaker: flaky });
+const FAST = { firstAudioMs: 300, gapMs: 300, fallbackFirstAudioMs: 600, fallbackGapMs: 600, endDelayMs: 100 } as const;
+/** The plumbing call up to the point where the third spoken line (the first question) is requested; returns the rig and its phone. */
+async function callUntilQuestion(r: Rig) {
   const sim = await r.connect(); r.start(sim);
   await until(() => r.has('CALL_STARTED'), 30_000, () => where(r, sim));
   const verdicts = (): number => diagCount(r, 'ADAPTER_REPLY_DONE');
   r.voices[0].hear('yes I agree'); await until(() => verdicts() >= 2, 30_000, () => where(r, sim)); await r.handler.idle();
-  r.voices[0].hear('Hi, I have a burst pipe in the kitchen');
-  await until(() => diagCount(r, 'SPEAKER_FAILED') >= 1 && r.has('REPLY_NOT_PLAYED') && verdicts() >= 3, 30_000, () => where(r, sim));
-  await r.handler.idle();
-  assert.ok(diagCount(r, 'ADAPTER_REPLY_FAILED') >= 1, 'the call logic was told the line was not heard');
-  assert.equal(diagCount(r, 'SPEAKER_DONE'), 2, 'the failed question was not counted as spoken');
-  // The existing call logic does not speak on its own after a failed line: it waits for the caller (the silence reprompt, DRF-08, is not built). The caller, hearing nothing, speaks again; the question is asked again.
-  r.voices[0].hear('hello?'); await until(() => verdicts() >= 4, 30_000, () => where(r, sim)); await r.handler.idle();
-  r.voices[0].hear('The address is 42 Elm Street'); await until(() => verdicts() >= 5, 30_000, () => where(r, sim)); await r.handler.idle();
+  return { sim, verdicts };
+}
+const incompleteRecord = (rec: any): void => {
+  assert.deepEqual([rec.confirmation, rec.handed_off, rec.status], ['unconfirmed', false, 'needs-human'], 'never confirmed, never handed on');
+  assert.ok(rec.reasons.includes('incomplete_call') && rec.reasons.includes('not_confirmed'), 'marked incomplete: ' + JSON.stringify(rec.reasons));
+};
+
+test('speaker adapter, FALLBACK: when the source gives zero audio for a line, OpenAI speaks that same line, the call goes on, and the saved record is the baseline\'s', { timeout: 120_000 }, async () => {
+  const base = await wholeCall();
+  const src = createStandInSource({ msPerChar: 2, behave: (_q, n) => (n === 3 ? 'fail-start' : 'ok') });
+  const r = await rig({ speaker: src, speakerOpts: FAST });
+  const { sim, verdicts } = await callUntilQuestion(r);
+  r.voices[0].hear('Hi, I have a burst pipe in the kitchen'); await until(() => verdicts() >= 3, 30_000, () => where(r, sim)); await r.handler.idle();
+  assert.equal(diagCount(r, 'SPEAKER_FALLBACK'), 1);
+  assert.equal(r.voices[0].received.filter((m: any) => m.type === 'response.create').length, 1, 'OpenAI was asked to speak exactly one line');
+  assert.equal(r.voices[0].spoken[0], base.spoken[2], 'the same words as the baseline question');
+  r.voices[0].hear('The address is 42 Elm Street'); await until(() => verdicts() >= 4, 30_000, () => where(r, sim)); await r.handler.idle();
   r.voices[0].hear('yes that is right');
   await sim.closed; await r.handler.idle();
-  assert.deepEqual(stable(r.store.list(T)[0]), stable(base.rec), 'the intake state is the same after a failed line');
-  // A source that never works after the notice: the call must not confirm anything.
-  const dead = createStandInSource({ behave: (_q, n) => (n <= 1 ? 'ok' : 'fail-start') });
-  const d = await rig({ speaker: dead });
-  const dsim = await d.connect(); d.start(dsim);
-  await until(() => d.has('CALL_STARTED'), 30_000, () => where(d, dsim));
-  d.voices[0].hear('yes I agree');
-  await until(() => diagCount(d, 'SPEAKER_FAILED') >= 1, 30_000, () => where(d, dsim));
-  d.voices[0].hear('Hi, I have a burst pipe in the kitchen');
-  await pause(600);
-  d.voices[0].hear('yes that is right');
-  await pause(600);
-  assert.ok(!d.has('CONFIRMED') && !d.has('READBACK'), 'no read-back was heard, so nothing was confirmed');
-  assert.ok(d.store.list(T).every((x) => x.confirmation !== 'confirmed'));
-  dsim.end();
+  assert.ok(!r.has('SPEAKER_DOWN'));
+  assert.deepEqual(stable(r.store.list(T)[0]), stable(base.rec), 'the intake state is the same after a fallback line');
+  assert.deepEqual(src.requests.map((q) => q.text).filter((x, i) => i !== 2), base.spoken.filter((_x, i) => i !== 2), 'every other line went to the source');
 });
 
+test('speaker adapter, the source fails AFTER audio started: no fallback, the call ends within the bound, what was collected is saved INCOMPLETE and unconfirmed, nothing is handed on, nothing more is spoken', { timeout: 120_000 }, async () => {
+  const src = createStandInSource({ msPerChar: 2, behave: (_q, n) => (n === 3 ? { failAfter: 1 } : 'ok') });
+  const r = await rig({ speaker: src, speakerOpts: FAST });
+  const { sim } = await callUntilQuestion(r);
+  const t0 = Date.now();
+  r.voices[0].hear('Hi, I have a burst pipe in the kitchen');
+  await sim.closed; await r.handler.idle();
+  assert.ok(Date.now() - t0 < 8000, 'within the defined time');
+  assert.ok(r.has('SPEAKER_DOWN'));
+  assert.equal(diagCount(r, 'SPEAKER_FALLBACK'), 0, 'audio had been handed on: no fallback');
+  assert.equal(r.voices[0].received.filter((m: any) => m.type === 'response.create').length, 0, 'OpenAI was never asked to speak');
+  assert.ok(!r.has('CONFIRMED') && !r.has('READBACK'));
+  incompleteRecord(r.store.list(T)[0]);
+  assert.equal(src.requests.length, 3, 'no line was spoken after the failure');
+  assert.equal(diagCount(r, 'SPEAKER_FAILED', (d) => d.why === 'SOURCE_ERROR'), 1);
+});
+
+test('speaker adapter, the FALLBACK fails too: the call ends within the bound, saved incomplete and unconfirmed, and the unheard line never counts as heard', { timeout: 120_000 }, async () => {
+  const src = createStandInSource({ msPerChar: 2, behave: (_q, n) => (n === 3 ? 'fail-start' : 'ok') });
+  const r = await rig({ speaker: src, speakerOpts: FAST, voiceBehave: () => 'fail' });
+  const { sim } = await callUntilQuestion(r);
+  const t0 = Date.now();
+  r.voices[0].hear('Hi, I have a burst pipe in the kitchen');
+  await sim.closed; await r.handler.idle();
+  assert.ok(Date.now() - t0 < 8000);
+  assert.ok(r.has('SPEAKER_DOWN') && r.has('REPLY_NOT_PLAYED'));
+  assert.equal(diagCount(r, 'SPEAKER_FAILED', (d) => d.why === 'FALLBACK_FAILED'), 1);
+  assert.ok(!r.has('CONFIRMED'));
+  incompleteRecord(r.store.list(T)[0]);
+});
+
+test('speaker adapter, a read-back OpenAI speaks as the fallback needs the WHOLE line: an early yes during it is held (CONFIRM_HELD) and never confirms; a fresh yes after the whole read-back does', { timeout: 120_000 }, async () => {
+  const base = await wholeCall();
+  const src = createStandInSource({ msPerChar: 25, behave: (_q, n) => (n === 4 ? 'fail-start' : 'ok') });   // the first read-back (the fourth line) is spoken by OpenAI; its repeat by the source
+  const r = await rig({ speaker: src, speakerOpts: FAST, realTimePlayout: true, voiceMsPerChar: 25 });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.has('CALL_STARTED'), 30_000, () => where(r, sim));
+  const done = (n: number) => until(() => diagCount(r, 'ADAPTER_REPLY_DONE') >= n, 30_000, () => where(r, sim));
+  r.voices[0].hear('yes I agree'); await done(2); await r.handler.idle();
+  r.voices[0].hear('Hi, I have a burst pipe in the kitchen'); await done(3); await r.handler.idle();
+  r.voices[0].hear('The address is 42 Elm Street');
+  await until(() => diagCount(r, 'SPEAKER_FALLBACK') >= 1 && r.voices[0].received.some((m: any) => m.type === 'response.create'), 30_000, () => where(r, sim));
+  await pause(500);
+  r.voices[0].hear('yes that is right');   // far too early: OpenAI is still speaking the read-back
+  await until(() => r.has('CONFIRM_HELD'), 30_000, () => where(r, sim));
+  assert.ok(!r.has('CONFIRMED'), 'an early yes confirms nothing');
+  const held = r.logs.find((l) => l.code === 'CONFIRM_HELD');
+  assert.ok(typeof held?.detail?.sent_ms === 'number' && (held.detail.acked_ms as number) < (held.detail.sent_ms as number), 'the hold is measured: acknowledged is below sent');
+  const before = diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.played === true);
+  await until(() => diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.played === true) > before && src.requests.length >= 5, 40_000, () => where(r, sim));
+  await r.handler.idle();
+  assert.ok(!r.has('CONFIRMED'));
+  r.voices[0].hear('yes that is right');
+  await sim.closed; await r.handler.idle();
+  assert.deepEqual(stable(r.store.list(T)[0]), stable(base.rec), 'the saved record is the baseline\'s');
+  assert.ok(r.logs.map((l) => l.code).indexOf('CONFIRM_HELD') < r.logs.map((l) => l.code).indexOf('CONFIRMED'));
+});
+
+test('speaker adapter, the CONSENT NOTICE falls back too: OpenAI speaks it word for word, no caller audio reaches OpenAI until it has been played in full, and the call then goes on', { timeout: 120_000 }, async () => {
+  const src = createStandInSource({ msPerChar: 2, behave: (_q, n) => (n === 1 ? 'fail-start' : 'ok') });
+  const r = await rig({ speaker: src, speakerOpts: FAST, voiceMsPerChar: 12 });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.voices.length === 1 && r.voices[0].received.some((m: any) => m.type === 'response.create'), 30_000, () => where(r, sim));
+  sim.send({ event: 'media', media: { payload: b64(160) } });
+  await pause(40);
+  assert.equal(r.voices[0].appended(), 0, 'no caller audio reaches OpenAI before the notice has been played');
+  await until(() => r.has('CALL_STARTED'), 30_000, () => where(r, sim));
+  assert.equal(r.voices[0].spoken[0], r.notice, 'the notice, word for word, spoken by OpenAI');
+  assert.equal(diagCount(r, 'ADAPTER_REPLY_DONE', (d) => d.played === true), 1);
+  r.voices[0].hear('yes I agree');
+  await until(() => diagCount(r, 'ADAPTER_REPLY_DONE') >= 2, 30_000, () => where(r, sim));
+  assert.ok(r.has('CONSENT_GRANTED') && !r.has('SPEAKER_DOWN'));
+  assert.equal(src.requests.length, 2, 'the next line went to the source');
+});
 
 // ---------------------------------------------------------------- the SWITCH ON, through the whole service (the ElevenLabs client against a fetch stand-in; no network, no key)
 /** A provider stand-in: for each request it returns audio whose length follows the text (msPerChar of mu-law), all at once, and records the request. */

@@ -396,6 +396,10 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         emit({ kind: 'error' });
         return;
       }
+      case 'x_speaker_down':   // sent by the speaker adapter (never by the voice service) when the speaker cannot go on: the call logic is told, and the connection closes right after
+        diag('ADAPTER_SPEAKER_DOWN', { phase });
+        if (phase === 'live') emit({ kind: 'speaker_down' });
+        return;
       default:
         if (BENIGN.has(m.type)) return;   // routine bookkeeping from the voice service: not a frame the call logic should count
         emit({ kind: 'other' });

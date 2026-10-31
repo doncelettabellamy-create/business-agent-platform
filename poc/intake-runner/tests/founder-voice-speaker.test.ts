@@ -115,14 +115,16 @@ test('ON: with the settings each call\'s socket is wrapped - the line goes to th
   assert.ok(!JSON.stringify(diag).includes(XI));
 });
 
-test('ON, no key: the line cannot start and fails honestly; OpenAI is not asked to speak in its place', async () => {
+test('ON, no key: the provider cannot be asked (no request is made), so zero audio is handed on and OpenAI is asked to speak the line as the fallback - the same words, once', async () => {
   const { open, sent } = fakeOpen(); const p = providerStandIn();
-  const socket = withSelectedSpeaker(open, JACK_SPEAKER, { getKey: () => undefined, fetch: p.fetch })(() => {});
-  const events: any[] = []; socket.onMessage = (t: string) => { events.push(JSON.parse(t)); };
+  const diag: Array<{ code: string; [k: string]: unknown }> = [];
+  const socket = withSelectedSpeaker(open, JACK_SPEAKER, { getKey: () => undefined, fetch: p.fetch })(((code: string, detail?: Record<string, unknown>) => { diag.push({ code, ...detail }); }) as never);
   socket.send(request('Hello there.'));
-  await until(() => events.some((e) => e.type === 'response.done'));
-  assert.equal(events.find((e) => e.type === 'response.done').response.status, 'failed');
-  assert.deepEqual([sent.length, p.calls.length], [0, 0], 'no silent fallback to OpenAI speaking, and no request');
+  await until(() => sent.some((m) => m.type === 'response.create'));
+  assert.equal(p.calls.length, 0, 'no request to the provider');
+  assert.equal(sent.filter((m) => m.type === 'response.create').length, 1);
+  assert.ok(String(sent[0].response.instructions).endsWith('Hello there.'));
+  assert.ok(diag.some((d) => d.code === 'SPEAKER_FALLBACK' && d.why === 'START_FAILED'));
 });
 
 // ================================================================ the entry (child process: dry run and refused serve only)
