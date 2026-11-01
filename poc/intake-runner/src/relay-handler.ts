@@ -424,7 +424,11 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
       const disagrees = heldChoice !== undefined && answerChoice !== undefined && answerChoice !== heldChoice && !corrected && contradictionIdx === undefined;
       if (heldChoice !== undefined && lineKind !== 'negated' && lineKind !== 'multi' && contradictionIdx === undefined && !disagrees) return g;
       if (held === undefined && replyLine === undefined) return g;   // nothing has been said about it yet
-      if (!property.asked && canAsk && held !== undefined && !disagrees && deps.scripted !== undefined && carrier.converse === undefined) {
+      // A CLEAR answer is kept (founder test call, 2026-11-01). The caller's own answer to the question is one unambiguous configured choice, nothing said after it mentions any choice (so no negation, second choice or
+      // contradiction can be hiding), and the extraction returned something that is not a choice ("home", said earlier in the request). Nothing is asked: the caller's own words are the value, as on the clarification path below.
+      const clearAnswer = !property.asked && held !== undefined && heldChoice === undefined && answerIdx !== undefined && lineKind === 'choice'
+        && !property.lines.some((l, i) => i > answerIdx && i !== property.replyIdx && (() => { const m = propertyMentions(l, choices); return m.affirmed.length > 0 || m.negated.length > 0; })());
+      if (!property.asked && canAsk && held !== undefined && !disagrees && !clearAnswer && deps.scripted !== undefined && carrier.converse === undefined) {
         if (!property.pending) deps.log('PROPERTY_CLARIFY');
         property.pending = true;
         cleaning.release(field.name);   // the guard's hold is authoritative: an older accepted answer must not be put back over it
@@ -433,9 +437,9 @@ export function createRelayHandler(deps: RelayDeps): RelayHandler {
         return { ...g, item: { ...g.item, fields: g.item.fields.map((x) => (x === field ? { ...x, value: null, confidence: null, found: false } : x)), missing_fields: missing, reasons, status: 'needs-human' as const }, handoff: null, handedOff: false, edited: true };
       }
       const asWords = (s: string): string => s.replace(/[.!?,;\s]+$/, '');   // the caller's own masked words, without the trailing full stop the read-back adds itself
-      const supported = disagrees || (replyChoice !== undefined && (contradictionIdx === undefined || contradictionIdx < (property.replyIdx as number)));
+      const supported = disagrees || clearAnswer || (replyChoice !== undefined && (contradictionIdx === undefined || contradictionIdx < (property.replyIdx as number)));
       let value: string;
-      if (supported) value = asWords(disagrees ? (answerLine as string) : (replyLine as string));
+      if (supported) value = asWords(disagrees || clearAnswer ? (answerLine as string) : (replyLine as string));
       else if (heldKind === 'choice' || held === undefined) {   // the choice Intake returned cannot be kept: the caller's newest relevant words are
         const newest = [answerIdx, contradictionIdx].filter((i): i is number => i !== undefined).sort((x, y) => y - x)[0];
         value = newest !== undefined ? asWords(property.lines[newest]) : (held ?? asWords(replyLine as string));

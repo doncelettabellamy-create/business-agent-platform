@@ -4332,6 +4332,37 @@ test('SCRIPTED PROPERTY if the extraction keeps returning the unsupported word a
   assert.equal(diag(r, 'PROPERTY_RESOLVED').length, 1);
 });
 
+// ---------------------------------------------------------------- 2026-11-01: a CLEAR answer is kept. Founder test call: "It's a house." to the property question was asked about again (one clarification) because the extraction returned something that is not
+// a configured choice ("home"). The caller's own answer is one unambiguous choice and nothing said later mentions a choice, so nothing is asked and the caller's own words are the value. Negation, two choices, a later mention and an unsupported answer are unchanged.
+// The extraction can only return words that are in the conversation, so the non-choice word is one the caller said earlier (here in the request, "my home").
+const PR_CLEAR = [['home', 'I need a regular cleaning for my home, two bedrooms and two bathrooms'], ['residential', 'I need a regular residential cleaning, two bedrooms and two bathrooms']] as const;
+test('SCRIPTED PROPERTY a clear answer is retained: "It\'s a house." is not asked about again although the extraction returns "home" or "residential"; the caller\'s own words are saved, and because the server set the value the record is held for a person', async () => {
+  for (const [wrong, open] of PR_CLEAR) {
+    const { r, sim, steps } = await prRun(["It's a house."], { JOB_PROPERTY_TYPE: ["It's a house."], JOB_PROPERTY_TYPE_CLARIFY: ['house'] }, { force: wrong, open });
+    assert.deepEqual(prAsks(steps), ['JOB_PROPERTY_TYPE'], `${wrong}: asked once, never clarified`);
+    assert.equal(diag(r, 'PROPERTY_CLARIFY').length, 0, wrong);
+    assert.equal(prRb(sim), "It's a house", wrong);
+    await sqFinish(r, sim);
+    assert.equal(sqVal(r, 'Property type'), "It's a house", wrong);
+    assert.deepEqual([sqRec(r).confirmation, sqRec(r).handed_off], ['confirmed', false], `${wrong}: the server set the value, so a person checks it`);
+    prNoWords(r, "a house");
+  }
+});
+
+test('SCRIPTED PROPERTY the clear-answer rule never overrides a doubt: a later line that mentions a choice ("it is not a house", "my sister has an apartment") still raises the one clarification, and an unsupported or negated answer is still asked about', async () => {
+  const open = PR_CLEAR[0][1];
+  const later = await prRun(["It's a house."], { JOB_PROPERTY_TYPE: ["It's a house."], JOB_PETS: ['no pets, and it is not a house'], JOB_PROPERTY_TYPE_CLARIFY: ['it is an apartment'] }, { force: 'home', open });
+  assert.deepEqual(prAsks(later.steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY']);
+  assert.equal(diag(later.r, 'PROPERTY_CLARIFY').length, 1);
+  const sister = await prRun(["It's a house."], { JOB_PROPERTY_TYPE: ["It's a house."], JOB_PETS: ['no pets, my sister has an apartment'], JOB_PROPERTY_TYPE_CLARIFY: ['house'] }, { force: 'home', open });
+  assert.equal(diag(sister.r, 'PROPERTY_CLARIFY').length, 1, 'a later mention of any choice keeps the clarification, as before');
+  for (const [said, why] of [['not a house', 'negated'], ['house or apartment', 'two choices'], ['Health.', 'unsupported']] as const) {
+    const x = await prRun([said], { JOB_PROPERTY_TYPE: [said], JOB_PROPERTY_TYPE_CLARIFY: ['house'] }, { force: 'home', open });
+    assert.deepEqual(prAsks(x.steps), ['JOB_PROPERTY_TYPE', 'JOB_PROPERTY_TYPE_CLARIFY'], why);
+    assert.equal(diag(x.r, 'PROPERTY_CLARIFY').length, 1, why);
+  }
+});
+
 // ---------------------------------------------------------------- 2026-10-29: the property rule wherever the answer occurs (cases C and E of the offline check, plus explicit later contradictions; unrelated mentions must not overwrite the service property)
 const PR_NEG_OPEN = 'I need a regular cleaning, this is not a house, two bedrooms and two bathrooms';
 
