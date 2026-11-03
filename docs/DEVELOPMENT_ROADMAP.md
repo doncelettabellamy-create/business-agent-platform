@@ -4,7 +4,106 @@
 
 Written 2026-10-26. Documentation only. This file orders the work and records what is verified; it decides nothing. The authority for platform rules stays with `docs/PRODUCT_CONTINUITY.md` (including the permanent dashboard decision), `docs/MASTER_BUILD_REGISTER.md` and `docs/FOUNDER_PHONE_TEST_RUNBOOK.md`. Where this file and those disagree, those win and this file is the one to fix.
 
+## 0. THE AUTHORITATIVE MILESTONE ROADMAP AND DEFINITION OF DONE (established 2026-11-02; this section wins over any other milestone, order or reporting rule in these documents)
+
+**How this section was made.** The founder instructed on 2026-11-02 that ONE milestone roadmap and ONE Definition of Done exist, reconciled with the existing records and not duplicated. The decisions below that the founder has already made are marked as such; the **milestone breakdown (CL-0 to CL-6) and the names of the five report parts were drafted by the assistant from the existing records and stand until the founder edits them in writing.** Other documents point here (`docs/ROADMAP_BACKLOG.md`, `docs/PRODUCT_CONTINUITY.md`, the handoff); they do not repeat it.
+
+### 0.1 What the product is, and what is inactive
+- **Vision (finalized 2026-11-02 at the founder's instruction; the founder edits it in writing).** **Drew is an AI-native operations platform for residential cleaning companies, not merely a receptionist.** It is **one AI agent** that does a cleaning company's front-office work: it takes the request, quotes within limits the owner sets, books in the company's own scheduling software, checks that every action really happened, follows up on lost revenue, and reports what happened, all under controls the owner sets and with every claim backed by evidence. **Answering the call is the first capability being tested; it is not the limit of the product.** What exists today and what is only a goal are kept apart in 0.1a, and nothing in this vision authorizes or schedules any work.
+- **One residential-cleaning AI agent** (founder decision, 2026-11-02): `poc/intake-runner/src/fast-call-handler.ts` and its dependencies. The four-agent direction (Intake, Processing, QC, Reporting) is **retired**; its code and records are **historical** unless the single agent actively uses them (record 5a-52).
+- **Preserved, unchanged:** the owner dashboard (section 1a, `docs/PRODUCT_CONTINUITY.md`), the simulated-booking checkpoint `2f23a51`, and the commit checkpoints `866bea3`, `140f6b0`, `8c69764`, `c3c7a7b`. All five commits are in `main`; no commit of the 2026-11-02 series (C1 `6b89658`, C2 `2e298a3`, C3 `a85cfe4`) touches `prototype/`, `dashboard-server.ts`, `owner-view.ts` or `simulated-booking.ts` (checked 2026-11-02 against `1362bd4`). **CL-1's paused test is preserved with every safeguard it has:** texts OFF unless `FAST_TEXTS` is exactly `on`; Jobber writes OFF unless `JOBBER_ALLOW_WRITES=test-account` and only for the pinned test account; the approved-caller restriction; the consent gates; duplicate prevention and the independent read-back; and the live-call evidence in the log and in roadmap sections 5a-14 to 5a-52. None of this changes with the scope decision below.
+- **Product scope (founder decision, 2026-11-02). Residential cleaning is the SOLE ACTIVE product and test.** **Carpet cleaning, window cleaning and pressure washing are RESEARCH CANDIDATES only: they are not build commitments, are not scheduled, and no design, code, configuration or build task exists for them.** A candidate can become a task only by the founder's written approval naming it, and only after the Cleaning gate (0.3); research alone is never approval to build (section 1b rule 8). **The earlier industry order (Cleaning -> Towing -> Plumbing -> HVAC) and the four-agent expansion are RETIRED and HISTORICAL:** towing, plumbing and HVAC are not planned and are kept in section 2 only as the record of how the earlier plan was reasoned. Other industries are not planned.
+- **GPT-Live stays paused.** `DRF-03` (recovery workflows) and `DRF-07` to `DRF-09` stay inactive; `DRF-10` (Jack's voice) is in use.
+
+### 0.1a Current test capabilities versus Phase 3 goals (2026-11-02; adds no requirement and no milestone: every goal below is an existing requirement, named by its ID)
+
+**Phases, in this document's own numbering** (this replaces the four-agent phases 0 to 3 of section 5e, which are historical): **Phase 1 = the current test** (CL-0 to CL-2). **Phase 2 = a reusable, owner-visible, production-ready agent** (CL-3 to CL-5). **Phase 3 = the platform goals** (CL-6 and the requirements `DRF-03` to `DRF-06`).
+
+**A. Current test capabilities (Phase 1). All BUILT and TESTED OFFLINE; none VERIFIED LIVE for the fast flow; the live test is PAUSED (CL-1).**
+| Capability | Where | Today |
+|---|---|---|
+| Answer as an honest AI; only approved test callers get past the opening | `fast-call-handler.ts`, `opening.ts`, `twilio-messaging.ts` | Tested offline |
+| Take name, address with city and ZIP, day and time, home size, by deterministic parsers | `fast-parsers.ts`, `call-state.ts` | Tested offline |
+| Offer only a time inside the stated hours that Jobber's calendar shows free | `fast-availability.ts`, `jobber-connector.ts` | Tested offline |
+| One fixed offer: $199 for two bedrooms and two bathrooms | `fast-call-handler.ts`, config `fast_test` | Tested offline |
+| Measured confirmations (a yes counts only after the line played) | `fast-call-handler.ts` | Seen live earlier on the older flow; the fast flow never live |
+| Book in the Jobber Developer Test Account with duplicate prevention and an independent read-back | `jobber-booking.ts` | Tested offline; no write has ever run |
+| Texts and consent: owner's setup consent, caller's spoken consent, minimal protected evidence; texts OFF by default | `fast-sms-copy.ts`, `fast-consent.ts`, `founder-voice-fast.ts` | Tested offline; never sent; blocked on Twilio approval |
+| Private setup, protected storage, the preserved owner dashboard | `fast-test-*.ts`, `jobber-dpapi.ts`, `prototype/intake-work-items/` | The dashboard does not show fast-call bookings |
+
+**B. Phase 3 goals. GOALS ONLY: PLANNED, not scheduled, not authorized, not built beyond what the "today" column says. None becomes a task except by the founder's written approval, and none starts before Phase 2's gate.**
+| Goal | In plain English | Existing record | What exists today | Status |
+|---|---|---|---|---|
+| **Authorized actions** | The owner decides what the agent may do on its own (book, quote within limits, reschedule, follow up) and what needs a person; every action is checked against that authority before it happens | `DRF-01`, `DRF-02`; register `FND-07`, `FND-16`, `FND-24` | Only a standing test-approval switch in the configuration, three fixed approvals in the booking gate, and a Jobber allowlist pinned to the test account. No owner-defined policy | PLANNED |
+| **Verified outcomes** | An action counts as done only when read back independently; the agent and the owner are told what is verified and what is not | `DRF-02`, `DRF-04` | The booking read-back by job id and the text-delivery check, tested offline for the test path | Test path BUILT and TESTED OFFLINE; as a platform guarantee PLANNED |
+| **Owner controls** | The owner can see what happened and steer it: approve, decline, pause, change settings, with a login | Section 1a (the preserved dashboard), `DRF-01`, `DRF-06`; `FND-02`, `FND-27`, `FND-28` | A read-only dashboard with no login, a kill-switch file, and digest-bound configuration changes. Fast bookings do not appear on it | PLANNED |
+| **Revenue recovery** | Follow up unbooked quotes and past customers, with consent, measured by money actually booked | `DRF-03`, `DRF-04` | Nothing built. Blocked on the founder's retention, consent and deletion decisions and on a legal check | PLANNED, BLOCKED |
+| **Operational reporting** | Plain numbers: calls taken, bookings verified, outcomes, recovered revenue, call quality | `DRF-04`, `DRF-05`, `DRF-06` | Fixed-code logs and the retired reporting modules (historical); no report for fast calls | PLANNED |
+
+**Rules for this table.** Section A is not a claim that any Phase 3 goal exists. The five older "offers" of section 5e are packaging over these goals, not extra scope: AI Receptionist & Booking is Phases 1 and 2 plus CL-6; Estimate Follow-up and Customer Reactivation are revenue recovery; Membership Renewal applies only to a company that has memberships and stays inactive; Owner Dashboard & Alerts is owner controls and reporting. Nothing here expands scope, adds a requirement, or changes the paused test, its safeguards, the dashboard, or any recorded decision.
+
+
+### 0.2 Status words, and the Definition of Done
+| Word | Means | Evidence required |
+|---|---|---|
+| **PLANNED** | Written down only | The record |
+| **BUILT** | The code exists | The file path and the commit |
+| **TESTED OFFLINE** | Automated tests pass against stand-ins | The suite result (count, pass, fail), the commit, and the CI run; safety rules also need a mutation check that fails when the rule is broken |
+| **VERIFIED LIVE** | Seen on the real service | A named, privacy-safe source: log codes, a saved record, Jobber's own record, a delivery status; and the date |
+| **UNVERIFIED** | A claim with no evidence yet | Say so, in the same sentence |
+| **PARTIAL / BLOCKED / PAUSED** | Some parts met / cannot proceed (name the blocker) / the founder has stopped it (name the condition) | The record |
+| **DONE** | Accepted by the founder against this definition | See below |
+
+**A milestone is DONE only when every one of these holds, with the evidence cited by file, commit, CI run or log, not asserted:**
+1. **Each acceptance item has evidence at the level the milestone names.** Tests passing is never written as working live.
+2. **Every defect found while doing it has a regression test,** and no protected test was changed to make a repair pass without being reported first.
+3. **CI is green on the pushed commit** that contains the work.
+4. **The records are updated in the same change:** the milestone table (0.3) and the roadmap record; the status words match the evidence.
+5. **Protected work is unchanged** (0.1), and a secret and private-data scan of what was committed is clean.
+6. **Irreplaceable private records created by the milestone have a verified backup** (`docs/PRIVATE_BACKUP_AND_RESTORE.md`: a restore must have passed); keys that can be re-issued are not backed up.
+7. **The founder accepts it in writing,** after being shown the evidence. Nobody else, and no test result, can set DONE.
+
+**Evidence before DONE; no self-declared DONE.** A report may say a milestone is "evidence complete", never DONE, until item 7.
+
+### 0.3 The milestones (Cleaning; one agent). Status as of 2026-11-02
+| ID | Milestone | Acceptance (what must be shown) | Status and evidence | Blockers |
+|---|---|---|---|---|
+| **CL-0** | **Protect what exists** | Code on GitHub with green CI; records reconciled; private files backed up with a passed restore | **PARTIAL.** Code pushed (`a85cfe4`) and CI run #49 **success** (VERIFIED, 6.5 min, Linux); docs reconciled (C3). **Backup NOT done:** no verified backup of the private files (`PRIVATE_BACKUP_AND_RESTORE.md`, section 8 decisions open) | Founder decisions on the backup tool, cloud destination, passphrase, USB drive, restore test |
+| **CL-1** | **One complete Drew test call with texts OFF: real Jobber booking, verified** | **Three consecutive verified clean live completions** (the standard the founder set for the earlier M1; the founder may set another number): caller-ID check, greeting, intake, schedule checked against Jobber, $199 offer, measured confirmations, a Jobber test-account booking whose independent read-back is `booked_verified`, visit time correct in Central time, no duplicate on a retry, texts reported as skipped and no text request made, no personal detail in any log | **BUILT and TESTED OFFLINE** (1863 tests, 1861 pass, 0 fail, 2 todo; CI #49). **Never run live**; no Jobber write has ever happened (the ledger file does not exist) | **PAUSED by the founder** pending Twilio SMS approval; the running server is the old build; Jobber token scopes **UNVERIFIED**; no verified backup (CL-0) |
+| **CL-2** | **Texts ON and verified** | Twilio campaign approved and the Drew number added to the Messaging Service; STOP, START and HELP seen to work; the owner's consent recorded (done: reported by status; content not inspected) and each caller's spoken consent recorded; both texts delivered, with delivery verified; wording matches the approved samples | **BUILT and TESTED OFFLINE.** Never sent | **BLOCKED:** campaign "In progress", 0 senders (2026-11-02, not re-read since); HELP text and the "provided before consent" claim (true only through private setup) open; legal review |
+| **CL-3** | **Owner visibility and records** | Every fast-call booking is saved durably and shown on the **preserved dashboard** (additions only); the booking gate is computed from the saved record, not set to constants | **PLANNED.** Known gap: today only a `FAST_OUTCOME` log line records a booking (`fast-call-handler.ts`, the `gate` literals) | CL-1 evidence; the founder's decision on the record design |
+| **CL-4** | **A reusable cleaning agent (profile-driven)** | A new cleaning company is set up from one reviewed profile without code changes: name, greeting, services and prices (the `$399`/`$499` cases and the $25 rule are undecided), hours, duration, state, sender label; one company can never affect another (tested). Maps to `DRF-01` | **PLANNED.** Today one company is hand-configured and the 2-bed/2-bath $199 offer is a single setting | CL-1 to CL-3; pricing decisions |
+| **CL-5** | **Production foundation for SaaS** | Owner login, tenant isolation, encryption at rest, retention and deletion policy, hosting off the founder's machine, monitoring, tested backups with DPAPI-independent recovery, privacy and legal review (AI disclosure, recording, SMS) | **PLANNED** (`FND-02`, `FND-10`, `C14`, `D-14` in the register) | CL-4; founder and legal decisions |
+| **CL-6** | **Verified actions across scheduling software** | A scheduling-software adapter interface proved first by Jobber, then by a second system (Housecall Pro: no code exists); each booking verified by an independent read-back; a path to a marketplace listing only if the founder chooses (its requirements are **UNVERIFIED**; none researched). Maps to `DRF-02`, `DRF-04` | **PLANNED** | CL-5; founder decisions |
+
+**The Cleaning gate:** Cleaning is finished when CL-0 to CL-5 are DONE (CL-6 is the integration milestone and may follow or run next at the founder's choice). After the gate the founder may, in writing, approve **research** into adjacent cleaning services (carpet, window, pressure washing); that is a research task, not a build commitment, and nothing in this roadmap schedules it. Towing, plumbing and HVAC are retired from the plan (historical).
+
+**Mapping to the older plan.** The four-agent plan (sections 3, 3a, 4, 5e) and milestone M1 `Reliable Intake` (`docs/ROADMAP_BACKLOG.md` section 2) are **historical**: M1 was accepted for progression on 2026-10-29/30 (5a-32) and is replaced by CL-1. `DRF-01` -> CL-4; `DRF-02` and `DRF-04` -> CL-6 (the verified-booking figures also CL-3); `DRF-05` (ongoing call-quality review) runs through CL-1 to CL-2 as the review of each live call; `DRF-06` (owner text alerts) -> CL-2; `DRF-03` and `DRF-07` to `DRF-09` stay inactive; `DRF-10` is in use.
+
+**Phases.** Phase 1 = CL-0 to CL-2; Phase 2 = CL-3 to CL-5; Phase 3 = CL-6 and the goals in 0.1a (`DRF-03` to `DRF-06`). The phases group the milestones; they add none.
+
+### 0.4 Founder approvals: what exists, and what is still needed
+- **Approved and recorded:** one residential-cleaning AI agent; the four-agent direction retired; the live Drew test **paused** pending Twilio SMS approval, **SMS OFF**; the Jack greeting and the AI-honesty behavior; $199 for two bedrooms and two bathrooms; the Jobber Developer Test Account and the standing test approval in the configuration; the texts and consent wording submitted to Twilio; the owner's consent step (reported recorded); the public privacy and SMS pages; commits C1, C2 and C3 and their push; the backup direction (encrypted cloud copy and a USB copy; OneDrive Personal only **proposed**).
+- **Still needed, each as its own explicit approval:** lifting the pause and each live call; switching Jobber writes on; any restart or replacement of the old server; applying or changing any private configuration; any Twilio change or text; the backup decisions (`PRIVATE_BACKUP_AND_RESTORE.md` section 8); the disposition of `public-site/` and the Pages repository's unpushed edits; each milestone task (an approved milestone does not approve its tasks); every commit and every push.
+- **One-time approval rule:** an approval names one action and ends when it is done. It never carries over to the next action, even the one that obviously follows.
+
+### 0.5 The working rules (these replace the older standing rules where they differ)
+1. **Approval before each task** (section 1b stands). **Explicit approval before any commit, any push and any live action** (a call, a restart, applying configuration, a Twilio or Jobber change or write, a text, a deployment, publishing, running a backup or opening private data, any spend or install). **This supersedes the older standing rule that completed, tested work is committed and pushed automatically** (`PRODUCT_CONTINUITY.md` rule 8).
+2. **Plain-English five-part report for every task** (replaces the six-area report of `PRODUCT_CONTINUITY.md` rule 10 and the paragraph in section 1b):
+   1. **What was done**, in plain words, in a few sentences.
+   2. **The evidence,** each claim labelled BUILT / TESTED OFFLINE / VERIFIED LIVE / UNVERIFIED and naming its source (file, commit, CI run or log).
+   3. **What is still not proven or is blocking.**
+   4. **What is needed from the founder:** each decision or approval as one explicit question.
+   5. **The next single step, and what will not happen without approval.**
+   Facts and recommendations are kept apart. No secret, number, host or private value appears in a report.
+3. **No repeat audits.** An audit is recorded once (date, scope, the commit it covered). It is repeated only when the founder asks, or when the audited code or risk has materially changed since; otherwise the record is cited and updated. The 2026-11-02 takeover audit, the commit-boundary audit, the docs review and the backup review are recorded (5a-52 and the backup document) and are not repeated.
+4. **Reconcile, don't duplicate.** One place for each thing: this section for milestones, done, approvals and reporting; the roadmap's 5a records for evidence; `ROADMAP_BACKLOG.md` for the DRF requirements; `PRODUCT_CONTINUITY.md` for the dashboard rule; `PRIVATE_BACKUP_AND_RESTORE.md` for backups. A change that would restate another document's content points to it instead.
+5. **The existing code and the dashboard are preserved.** Nothing is deleted, replaced or rebuilt without the founder's written instruction naming it.
+
+
 ## 1. The product in one paragraph
+
+**HISTORICAL as of 2026-11-02.** The title of this file and the paragraph below describe the retired four-agent platform. The current product and vision are in section 0.1 (one AI-native residential cleaning operations platform, one agent); the paragraph is kept as the record of the earlier direction.
 
 A B2B platform for service businesses, built from four cooperating agents, each judged by evidence the previous one did not write: **1 Intake** (take the customer's request, today by phone; mask personal data; classify and extract; confirm by read-back; produce a validated work item), **2 Processing** (run a fixed plan of allow-listed tools; human-approved tools pause for a named approver), **3 Quality Control** (judge the result from evidence Processing did not write: pass, rework or escalate), **4 Reporting** (verify the chain, keep an append-only history, produce per-tenant reports). The owner's window onto all four is the dashboard. Standing rules for every step below: synthetic or invented data in tests, no live or paid calls and no public endpoints without the founder's say-so, no commits or pushes except under the founder's standing rule in section 7, secrets never displayed, safety limits and gates preserved.
 
@@ -28,6 +127,8 @@ What this means in practice for the order in section 3:
 
 **Reporting (founder, 2026-10-29).** **Standing communication rule (founder, 2026-10-29): every task report states our position across six areas: Intake, backend / current-call state, dashboard, Processing / booking, QC and Reporting.** For each area it says, separately and without merging them, what is **built** (code exists), what is **tested offline** (automated tests pass against stand-ins), what is **verified live** (seen on a real call or service, with the evidence), and what is **still missing**. It also names the **active task** and the **next authorized step** (or says that none is authorized). Section 5c-1 below holds the dated baseline that reports update; a report that has nothing new for an area says "unchanged". The rule changes how work is reported, not what is authorized: it starts no task, and the rules against using the API key, restarting, changing configuration or Twilio, calling and any live or paid action stand.
 
+**[SUPERSEDED 2026-11-02 by section 0.5: the six-area report is replaced by the plain-English five-part report. Section 1b rules 1 to 8 (approval first, one task at a time, no commit, push or live action without its own request) stand.]**
+
 **Status: required.** It applies to every step in section 3, every track in section 4, every mode switch in section 3a, and every small piece of work inside them. It adds to, and does not weaken, section 1a (the dashboard) and the standing rules in section 1.
 
 1. **Approval first.** No development task begins until the founder has explicitly approved *that task*. The approval names the task (what it will change and what it will not). An earlier approval, a roadmap entry, a dependency order, or "the next step" is not approval.
@@ -46,6 +147,7 @@ What this means in practice for the order in section 3:
 ## 2. Delivery strategy
 
 - **Cleaning first.** The first business type taken end to end is a cleaning service. It was chosen because a request is simple (rooms, date, time window), the harm of a mistake is low, and it exercises every stage (price, approval, availability, booking) without an emergency dimension.
+- **[RETIRED 2026-11-02; HISTORICAL. Replaced by section 0.1: residential cleaning is the sole active product; carpet, window and pressure washing are research candidates only; towing, plumbing and HVAC are not planned. The bullets below are kept only as the record of the earlier reasoning.]**
 - **Industry order is fixed by the founder: Cleaning → Towing → Plumbing → HVAC, one at a time.** Each later business is a new skill configuration plus whatever its own policy needs. None is started while the one before it is unfinished, and none is built in parallel with cleaning: the shared stages (contact, pricing, approval, availability, booking, QC) must be proven on one business type first. Starting each one is its own founder-approved task (section 1b); finishing one does not authorise the next.
   - **Towing** (second) is the hardest of the three: the caller is often roadside and stressed, location is the key field (and the most sensitive), time to arrival matters more than a date, and a wrong promise has an immediate cost. Its location and time-to-arrival handling must be designed and approved before its task begins; it stays in SIMULATION until then.
   - **Plumbing** (third) has an existing sample skill and the earlier live test used it. It adds emergency triage (a burst pipe is not a quote request) and a safety line the assistant must not cross.
@@ -71,7 +173,11 @@ What this means in practice for the order in section 3:
 
 This is recorded as a requirement, not a built feature. It applies to every business in the order of section 2, cleaning first, and it does not change the preserved dashboard (section 1a).
 
+**[2026-11-02: it applies to the residential cleaning agent; "the order of section 2" is historical.]**
+
 ## 3. Dependency order (cleaning-first critical path)
+
+**HISTORICAL (four-agent plan).** Superseded for milestones and order by section 0. Kept as the record of how the earlier plan was reasoned.
 
 Each step needs the one before it. Do not start a step on the assumption that an earlier one will "probably" work. Being next in this table does not authorise a step: each task still needs the founder's explicit approval first (section 1b).
 
@@ -111,6 +217,8 @@ Rules that apply to both modes (they are tested in simulation so they are known 
 
 Cleaning development in SIMULATION proves these rules; towing, plumbing and HVAC (in that order, section 2) each repeat the same switch to LIVE only after their own rates and availability exist. Towing in particular should not leave SIMULATION until its location and time-to-arrival handling are designed.
 
+**[HISTORICAL 2026-11-02: towing, plumbing and HVAC are retired. The simulation-then-live rule applies to the residential cleaning agent: nothing goes live without the founder's written decision.]**
+
 ## 3b. Founder requirement: the two-minute owner dashboard (PROPOSED; not yet implemented or validated)
 
 **Status: a requirement recorded from the founder, not a design, not built, and not tested with an owner.** It is delivered only as incremental additions to the existing dashboard under section 1a (preserve it, evolve it, never replace or redesign it from scratch); it restates no part of that decision and weakens none of it. It is built only after the dependencies below, one separately approved task at a time (section 1b), and it follows `docs/PRODUCT_CONTINUITY.md` (which governs the dashboard) on the owner view's strict allow-list.
@@ -142,6 +250,8 @@ Cleaning development in SIMULATION proves these rules; towing, plumbing and HVAC
 **Constraints that stay in force.** Every addition keeps the strict owner-view allow-list, its tests, the routes `/`, `/data.js` and `/api/owner`, and old records displaying. Adding a field to the allow-list is a contract change that needs its tests and the founder's say-so. The current rule that nothing on the dashboard says or implies a booking stays until a verified booking exists; relaxing it is its own approved contract change, and simulated bookings stay labelled. The dashboard has no login today, so nothing personal may be added before authentication exists.
 
 ## 4. Tracks that run beside the critical path
+
+**HISTORICAL (four-agent plan).** Superseded by section 0; read only for the reasoning.
 
 These are real work, but they do not block (and must not be allowed to quietly change) the order above. Each needs its own decision before it starts.
 
@@ -1082,6 +1192,8 @@ This file was reconciled with `docs/PRODUCT_CONTINUITY.md` (which governs the da
 (The dashboard constraint in section 1a and the one-task-at-a-time rule in section 1b are **not** open decisions.)
 
 ## 7. Rules for whoever continues this
+
+**[2026-11-02: any rule below that lets tested work be committed and pushed automatically is superseded by section 0.5 rule 1: every commit, push and live action needs its own explicit approval.]**
 
 - Read `docs/PRODUCT_CONTINUITY.md` first, then section 1a above. The dashboard rule is permanent and founder-locked.
 - Keep the order in section 3. If a step is skipped, say so in the register.

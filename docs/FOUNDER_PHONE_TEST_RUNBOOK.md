@@ -134,6 +134,8 @@ So an 8-minute call (the cap) is about 8 x ($0.0085 + $0.07) = **$0.63 before an
 
 Development order and approval: the industry order is Cleaning → Towing → Plumbing → HVAC, one at a time, and the founder approves each task before it begins (implementation → automated tests → live validation where applicable → founder review; finishing one task never authorises the next). See `docs/DEVELOPMENT_ROADMAP.md` sections 1b and 2. The prototype dashboard is preserved and evolved, never replaced (`docs/PRODUCT_CONTINUITY.md` governs).
 
+*(2026-11-02: the industry order above is RETIRED; the product is one residential-cleaning AI agent. See `docs/DEVELOPMENT_ROADMAP.md` section 0.1. The approval cycle stands; every commit, push and live action needs its own explicit approval.)*
+
 ## Approvals and payments the founder must make (nothing below can start without them)
 
 **Decisions**

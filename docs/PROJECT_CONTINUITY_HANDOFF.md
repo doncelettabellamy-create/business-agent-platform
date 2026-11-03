@@ -12,6 +12,8 @@
 
 **Backups.** No verified backup of the private files (the Jobber private folder, the contact key, the databases, the configs, the logs); the DPAPI-protected ones cannot be restored on another machine or user.
 
+**The authoritative milestones, Definition of Done, approvals and reporting format are in `docs/DEVELOPMENT_ROADMAP.md` section 0 (2026-11-02).** Only Cleaning is active (CL-0 partial; CL-1 built and tested offline, paused; CL-2 blocked on Twilio approval). Drew is one AI agent for cleaning-business operations; residential cleaning is the only active product and test; carpet, window and pressure washing are research candidates only (no build commitment); towing, plumbing and HVAC and the four-agent expansion are retired and historical. Every commit, push and live action needs its own explicit approval, and every task report is the plain-English five-part report. **Vision (finalized 2026-11-02): an AI-native operations platform for residential cleaning companies, one agent, not merely a receptionist. The current test capabilities and the Phase 3 goals (authorized actions, verified outcomes, owner controls, revenue recovery, operational reporting) are kept apart in roadmap section 0.1a; the Phase 3 items are goals only, not scheduled or built.**
+
 ## Resume here (reconciled 2026-10-29; documentation only; read this first)
 
 **A new session reads these records, in this order, before proposing anything, and changes nothing until the founder approves a named task.**
@@ -113,6 +115,8 @@ Written 2026-10-25. Purpose: let a new person or session continue without the ch
 - **The dashboard is kept.** Do not discard, replace or rebuild `prototype/intake-work-items/` (the existing test dashboard, which is to evolve into the production customer dashboard after testing and founder approval) without the founder's explicit written authorization. Read `docs/PRODUCT_CONTINUITY.md` first.
 
 **Development order and approval: the industry order is Cleaning → Towing → Plumbing → HVAC, one at a time, and the founder approves each task before it begins (implementation → automated tests → live validation where applicable → founder review; finishing one task never authorises the next).** See `docs/DEVELOPMENT_ROADMAP.md` sections 1b and 2. The prototype dashboard is preserved and evolved, never replaced (`docs/PRODUCT_CONTINUITY.md` governs).
+
+*(2026-11-02: the industry order in the paragraph above is RETIRED; see `docs/DEVELOPMENT_ROADMAP.md` section 0.1. The approval cycle it describes stands, with the explicit-approval rules of section 0.5.)*
 
 ## 2. Architecture
 
