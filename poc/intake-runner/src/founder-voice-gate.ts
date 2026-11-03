@@ -23,9 +23,44 @@ import { fixtureDigest } from './reviewed-fixtures.ts';
 import { speakerSettingsProblems } from './speaker-adapter.ts';
 import type { SpeakerSettings } from './speaker-adapter.ts';
 import { consentNoticeFor } from './opening.ts';
+import { availabilityProblems } from './fast-availability.ts';
+import type { AvailabilityConfig } from './fast-availability.ts';
+import type { FastSettings } from './fast-call-handler.ts';
 
 /** Who SPEAKS. The default (this section absent) is OpenAI. Present, the fixed lines are spoken by ElevenLabs (src/speaker-adapter.ts, src/elevenlabs-speech-source.ts) while OpenAI still listens. Only the approved candidate values are accepted. */
 export interface SpeakerConfig { provider: 'elevenlabs'; voice_id: string; model_id: string; speed: number }
+
+/**
+ * The CONTROLLED fast test call (fast-call-handler.ts). Absent (the default): nothing changes. Present, the call is the short, deterministic test flow, and it is part of the approval digest, so adding or editing it needs a new approval.
+ * It holds business facts the founder supplies (no default is invented): the Jobber test account's exact name and time zone, the open hours of the TEST and how long one cleaning takes, the one size and price that is booked, and the
+ * founder's standing approval of test bookings. It holds NO number, key or token: the approved test numbers live in the private protected folder, and the gate below checks that they are there.
+ */
+export interface FastTestConfig {
+  jobber_account_name: string; timezone: string; hours: Record<string, Array<[string, string]>>; duration_minutes: number;
+  price_dollars: number; bedrooms: number; bathrooms: number; service_label: string; standing_approval: boolean;
+  state?: string; lead_minutes?: number; step_minutes?: number; buffer_minutes?: number; horizon_days?: number;
+}
+const FAST_KEYS = 'bathrooms,bedrooms,duration_minutes,hours,jobber_account_name,price_dollars,service_label,standing_approval,timezone'.split(',');
+const FAST_OPTIONAL = ['state', 'lead_minutes', 'step_minutes', 'buffer_minutes', 'horizon_days'];
+export function fastTestProblems(x: unknown): string[] {
+  if (!isRecord(x)) return ['fast_test must be an object'];
+  const p: string[] = []; const k = Object.keys(x);
+  if (!FAST_KEYS.every((n) => k.includes(n)) || !k.every((n) => FAST_KEYS.includes(n) || FAST_OPTIONAL.includes(n))) p.push('fast_test must have the expected keys and no others');
+  if (typeof x.jobber_account_name !== 'string' || x.jobber_account_name.trim() === '' || x.jobber_account_name.length > 80 || /[\u0000-\u001f<>]/.test(x.jobber_account_name)) p.push('fast_test.jobber_account_name must be the exact Jobber test account name');
+  if (!Number.isInteger(x.price_dollars) || (x.price_dollars as number) < 1 || (x.price_dollars as number) > 5000) p.push('fast_test.price_dollars must be a whole number of dollars, 1 to 5000');
+  if (!Number.isInteger(x.bedrooms) || (x.bedrooms as number) < 0 || (x.bedrooms as number) > 12 || !Number.isInteger(x.bathrooms) || (x.bathrooms as number) < 1 || (x.bathrooms as number) > 12) p.push('fast_test.bedrooms and bathrooms must be whole numbers');
+  if (typeof x.service_label !== 'string' || !/^[A-Za-z0-9 .,'&()-]{3,60}$/.test(x.service_label)) p.push('fast_test.service_label must be plain text');
+  if (typeof x.standing_approval !== 'boolean') p.push('fast_test.standing_approval must be true or false (true is the standing approval of test bookings)');
+  if ('state' in x && !(typeof x.state === 'string' && /^[A-Za-z]{2}$/.test(x.state))) p.push('fast_test.state must be two letters');
+  if (availabilityProblems({ timezone: x.timezone, hours: x.hours, durationMinutes: x.duration_minutes, stepMinutes: x.step_minutes, leadMinutes: x.lead_minutes, bufferMinutes: x.buffer_minutes, horizonDays: x.horizon_days }).length > 0) p.push('fast_test needs a valid time zone, open hours (weekday 0 to 6, "HH:MM" pairs) and a cleaning duration of 30 to 480 minutes');
+  return p;
+}
+/** The settings the fast handler runs with, from a VALID voice config. */
+export function fastSettingsOf(voice: FounderVoiceConfig, businessName: string): FastSettings | undefined {
+  const f = voice.fast_test; if (f === undefined) return undefined;
+  const availability: AvailabilityConfig = { timezone: f.timezone, hours: f.hours, durationMinutes: f.duration_minutes, ...(f.step_minutes === undefined ? {} : { stepMinutes: f.step_minutes }), ...(f.lead_minutes === undefined ? {} : { leadMinutes: f.lead_minutes }), ...(f.buffer_minutes === undefined ? {} : { bufferMinutes: f.buffer_minutes }), ...(f.horizon_days === undefined ? {} : { horizonDays: f.horizon_days }) };
+  return { businessName, serviceLabel: f.service_label, availability, bedrooms: f.bedrooms, bathrooms: f.bathrooms, priceDollars: f.price_dollars, standingApproval: f.standing_approval, ...(f.state === undefined ? {} : { state: f.state.toUpperCase() }) };
+}
 
 export interface FounderVoiceConfig {
   approval_id: string;
@@ -52,9 +87,11 @@ export interface FounderVoiceConfig {
   conversation?: 'scripted' | 'native';
   /** Optional. Absent (the default): OpenAI speaks, exactly as before. Present: ElevenLabs speaks. Part of the approval digest, so adding it needs a new approval; it also needs the ElevenLabs key and a consent notice that names ElevenLabs. */
   speaker?: SpeakerConfig;
+  /** Optional. Absent (the default): the long cleaning flow, exactly as before. Present: the controlled fast test call (see FastTestConfig). Part of the approval digest. */
+  fast_test?: FastTestConfig;
 }
 const KEYS = 'approval_id,max_openai_calls,openai_model,persona,realtime_model,transcription_model,voice'.split(',');
-const OPTIONAL = ['safety_identifier', 'realtime_reasoning', 'text_reasoning', 'transcription', 'conversation', 'speaker'];
+const OPTIONAL = ['safety_identifier', 'realtime_reasoning', 'text_reasoning', 'transcription', 'conversation', 'speaker', 'fast_test'];
 const SPEAKER_KEYS = 'model_id,provider,speed,voice_id';
 const asSettings = (s: Record<string, unknown>): unknown => ({ provider: s.provider, voiceId: s.voice_id, modelId: s.model_id, speed: s.speed, outputFormat: 'ulaw_8000' });
 /** The speaker settings the config selects, or undefined (the default: OpenAI speaks). The voice config must be valid. */
@@ -89,6 +126,10 @@ export function founderVoiceConfigProblems(cfg: unknown): string[] {
     if (!isRecord(s) || Object.keys(s).sort().join(',') !== SPEAKER_KEYS || speakerSettingsProblems(asSettings(s as Record<string, unknown>)).length > 0) p.push('speaker must be { provider elevenlabs, voice_id, model_id, speed } with the approved candidate values');
     else if (c.conversation === 'native') p.push('the speaker works with scripted conversation only');
   }
+  if ('fast_test' in c) {
+    for (const m of fastTestProblems(c.fast_test)) p.push(m);
+    if (c.conversation === 'native') p.push('the fast test works with scripted conversation only');
+  }
   if ('transcription' in c) {
     for (const m of transcriptionHintProblems(c.transcription)) p.push(m);
     if (typeof c.transcription_model === 'string' && !HINT_TRANSCRIBERS.includes(c.transcription_model)) p.push('transcription hints are documented only for gpt-transcribe and gpt-live-transcribe');
@@ -116,6 +157,8 @@ export interface VoiceGateInput {
   voiceConfig: unknown;
   /** What the entry read from the environment: presence and equality only, never a secret's value. */
   env: { allowLive: string | undefined; callApprovedDigest: string | undefined; voiceApprovedDigest: string | undefined; twilioTokenPresent: boolean; openaiKeyPresent: boolean; /** Only asked when the voice config selects the ElevenLabs speaker. */ elevenlabsKeyPresent?: boolean };
+  /** Only asked when the voice config has a `fast_test` section: whether the private pieces it needs are in place (presence only). */
+  fastTest?: { numbersPresent: boolean; /** FAST_TEXTS=on. Off (the default) is the no-texts test mode: no text can be sent and no owner consent is needed. */ textsOn: boolean; ownerConsent: boolean; jobberConnected: boolean; jobberWritesOn: boolean };
   nowIso: string;
 }
 /** Empty means a live voice call may start. */
@@ -130,7 +173,16 @@ export function founderVoiceGateProblems(input: VoiceGateInput): string[] {
     if (input.env.elevenlabsKeyPresent !== true) p.push('the ElevenLabs key is not set');
     let notice = '';
     try { if (founderConfigProblems(input.callConfig).length === 0) notice = consentNoticeFor((input.callConfig as FounderCallConfig).opening); } catch { notice = ''; }
-    if (!/eleven\s?labs/i.test(notice)) p.push('the consent notice does not name ElevenLabs as a speech provider');
+    // The long notice must name the speech provider. The CONTROLLED fast test (founder's request) may use a short test notice instead, because that flow only proceeds for an approved test caller, with invented details.
+    if (!/eleven\s?labs/i.test(notice) && (input.voiceConfig as FounderVoiceConfig).fast_test === undefined) p.push('the consent notice does not name ElevenLabs as a speech provider');
+  }
+  // A greeting opening has no request to say yes: only the controlled fast test (which asks its first question in the greeting and takes no yes) may use it.
+  if ((input.callConfig as FounderCallConfig).opening?.greeting !== undefined && (input.voiceConfig as FounderVoiceConfig).fast_test === undefined) p.push('the opening greeting is only for the controlled fast test (the voice config has no fast_test section)');
+  if ((input.voiceConfig as FounderVoiceConfig).fast_test !== undefined) {
+    if (input.env.fastTest?.numbersPresent !== true) p.push('the approved test numbers are not saved (run the private number setup)');
+    if (input.env.fastTest?.textsOn === true && input.env.fastTest?.ownerConsent !== true) p.push('the owner text consent is not recorded (run the private owner-consent step)');
+    if (input.env.fastTest?.jobberConnected !== true) p.push('Jobber is not connected (authorize the connector first)');
+    if (input.env.fastTest?.jobberWritesOn !== true) p.push('JOBBER_ALLOW_WRITES is not set to test-account (the test booking would be refused)');
   }
   return p;
 }

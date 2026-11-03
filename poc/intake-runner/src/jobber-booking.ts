@@ -1,0 +1,203 @@
+// Test-account-only booking adapter for the standalone Jobber connector (proof of concept). NOT wired to the voice server, the call logic or the simulated booking checkpoint (simulated-booking.ts is untouched and does not
+// import this); nothing imports this file except its tests. It is used ONLY against the founder's Jobber DEVELOPER TEST ACCOUNT, and only when writes are switched on in the connector context (they are off by default).
+//
+// One booking = one test client with one property (clientCreate), one job with one scheduled visit (jobCreate), then an INDEPENDENT read-back (a separate query path that reads the job by id and compares every field that
+// matters). The field names and input types below were read from the live schema on 2026-11-01 (read-only introspection); what the schema cannot say is marked UNVERIFIED and is covered by the read-back, so a wrong guess
+// ends as `uncertain`, never as a claimed booking.
+//
+// Gates (all must hold, and each is checked again here): writes switched on for exactly the expected test account (name and pinned id, re-checked before every write); `gate` has all three literal `true`s (a record that
+// passed eligibleForProcessing, a person approved this booking, the caller agreed to this price and time); the request is valid (strict patterns); the booking key has not been used (duplicate prevention below).
+//
+// Duplicate prevention: (1) a ledger of this key's progress in the private folder (protected like the tokens, ids only, no personal detail) written BEFORE each write; (2) a marker in the job's title and instructions,
+// searched in Jobber before any new job is created; (3) a lock per key so two callers cannot book at once. A retry after a finished booking changes nothing and only re-verifies it; a retry after a half-finished one
+// reuses the client and property already created; a key left "pending" with no job to be found in Jobber is NOT retried (`uncertain`: a person decides).
+//
+// Privacy: the caller's name, phone and address are used only inside the request to Jobber. They are never logged, never put in an error, never in the ledger and never in a result. Diagnostics are fixed codes and counts.
+
+import { createHash } from 'node:crypto';
+import { JobberError, mutate, query, verifyExpectedAccount } from './jobber-connector.ts';
+import type { Credentials, Ctx } from './jobber-connector.ts';
+
+export interface BookingGate {
+  /** The saved record passed eligibleForProcessing (the caller confirmed the read-back and the address). */ eligibleRecord: true;
+  /** A person approved this booking step. */ approvedByPerson: true;
+  /** The caller agreed to this price and this time. */ callerAgreed: true;
+}
+export interface BookingRequest {
+  /** An opaque id for this booking (for example from the call reference); the same key can never book twice. */ key: string;
+  gate: BookingGate;
+  client: { firstName: string; lastName: string; /** A 10-digit US number, with or without punctuation. */ phone: string };
+  address: { street1: string; city: string; postalCode: string; province?: string };
+  /** The visit, in the Jobber account's local time: a date, two clock times, and the account's UTC offset (used to compare the read-back as instants). */
+  when: { date: string; startTime: string; endTime: string; utcOffset: string };
+  title: string; service: string; priceDollars: number;
+}
+export type BookingStatus = 'booked_verified' | 'not_booked' | 'uncertain' | 'refused';
+export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED';
+export interface BookingResult {
+  status: BookingStatus; reason?: BookingReason;
+  /** True when this key had already been booked and nothing new was written. */ duplicate?: boolean;
+  jobId?: string; jobNumber?: number;
+  /** Only the NAMES of the fields that did not match the read-back. */ mismatches?: string[];
+  /** How many mutations this call sent. */ writes: number;
+}
+
+const KEY = /^[A-Za-z0-9_-]{16,64}$/;
+const NAME = /^[\p{L}][\p{L} '.-]{0,59}$/u;
+const STREET = /^[\p{L}\p{N} .,'#/-]{3,80}$/u;
+const CITY = /^[\p{L} .'-]{2,60}$/u;
+const TEXT = /^[A-Za-z0-9 .,'&()-]{3,80}$/;
+const DATE = /^\d{4}-\d{2}-\d{2}$/; const CLOCK = /^([01]\d|2[0-3]):[0-5]\d$/; const OFFSET = /^[+-](0\d|1[0-4]):[0-5]\d$/;
+const JOB_ID = /^[A-Za-z0-9_=+/.-]{4,200}$/;
+
+const digitsOf = (s: string): string => s.replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+export const markerFor = (key: string): string => `DREWTEST-${createHash('sha256').update(`drew-booking:${key}`).digest('hex').slice(0, 12).toUpperCase()}`;
+const instant = (date: string, clock: string, offset: string): number => Date.parse(`${date}T${clock}:00${offset}`);
+
+/** What is wrong with a request, as field names only (never a value). */
+export function requestProblems(r: unknown, now: number): string[] {
+  const p: string[] = []; const x = r as BookingRequest;
+  if (typeof x !== 'object' || x === null) return ['request'];
+  if (typeof x.key !== 'string' || !KEY.test(x.key)) p.push('key');
+  if (!(x.gate?.eligibleRecord === true && x.gate?.approvedByPerson === true && x.gate?.callerAgreed === true)) p.push('gate');
+  if (!NAME.test(String(x.client?.firstName ?? ''))) p.push('client.firstName');
+  if (!NAME.test(String(x.client?.lastName ?? ''))) p.push('client.lastName');
+  if (!/^[\d\s().+-]{10,20}$/.test(String(x.client?.phone ?? '')) || !/^\d{10}$/.test(digitsOf(String(x.client?.phone ?? '')))) p.push('client.phone');
+  if (!STREET.test(String(x.address?.street1 ?? ''))) p.push('address.street1');
+  if (!CITY.test(String(x.address?.city ?? ''))) p.push('address.city');
+  if (!/^\d{5}$/.test(String(x.address?.postalCode ?? ''))) p.push('address.postalCode');
+  if (x.address?.province !== undefined && !/^[A-Za-z]{2}$/.test(String(x.address.province))) p.push('address.province');
+  const w = x.when;
+  if (!DATE.test(String(w?.date ?? '')) || !CLOCK.test(String(w?.startTime ?? '')) || !CLOCK.test(String(w?.endTime ?? '')) || !OFFSET.test(String(w?.utcOffset ?? ''))) p.push('when');
+  else {
+    const s = instant(w.date, w.startTime, w.utcOffset); const e = instant(w.date, w.endTime, w.utcOffset);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s || e - s > 8 * 3_600_000 || s <= now) p.push('when');
+  }
+  if (!TEXT.test(String(x.title ?? ''))) p.push('title');
+  if (!TEXT.test(String(x.service ?? ''))) p.push('service');
+  if (typeof x.priceDollars !== 'number' || !Number.isFinite(x.priceDollars) || x.priceDollars < 1 || x.priceDollars > 100_000 || Math.abs(x.priceDollars * 100 - Math.round(x.priceDollars * 100)) > 1e-6) p.push('priceDollars');
+  return p;
+}
+
+// ---------------------------------------------------------------- the ledger (ids only; protected; written before each write)
+interface Entry { state: 'pending' | 'client_created' | 'created'; clientId?: string; propertyId?: string; jobId?: string }
+const LEDGER = 'jobber-booking-ledger';
+async function loadLedger(ctx: Ctx): Promise<Record<string, Entry>> {
+  const t = await ctx.vault.loadBlob(LEDGER); if (t === undefined) return {};
+  try { const j = JSON.parse(t) as { entries?: Record<string, Entry> }; return typeof j.entries === 'object' && j.entries !== null ? j.entries : {}; } catch { return {}; }
+}
+const saveLedger = (ctx: Ctx, entries: Record<string, Entry>): Promise<void> => ctx.vault.saveBlob(LEDGER, JSON.stringify({ version: 1, entries }));
+
+// ---------------------------------------------------------------- the documents (names and types from the live schema, 2026-11-01)
+const CREATE_CLIENT = 'mutation CreateTestClient($input: ClientCreateInput!) { clientCreate(input: $input) { client { id clientProperties(first: 5) { nodes { id } } } userErrors { message path } } }';
+const CREATE_JOB = 'mutation CreateTestJob($input: JobCreateAttributes!) { jobCreate(input: $input) { job { id jobNumber } userErrors { message path } } }';
+const FIND_JOBS = 'query FindTestJobs($term: String!) { jobs(first: 10, searchTerm: $term) { nodes { id title } } }';
+const READ_BACK = 'query ReadBackJob($id: EncodedId!) { job(id: $id) { id jobNumber title instructions jobStatus total client { firstName lastName phones { number } } property { address { street1 city postalCode } } visits(first: 5) { nodes { startAt endAt } } } }';
+
+const rec = (x: unknown): Record<string, unknown> => (typeof x === 'object' && x !== null ? x as Record<string, unknown> : {});
+const list = (x: unknown): unknown[] => (Array.isArray(x) ? x : []);
+const norm = (s: unknown): string => String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+export function clientInput(r: BookingRequest): Record<string, unknown> {
+  return {
+    firstName: r.client.firstName, lastName: r.client.lastName,
+    // Jobber must not message the test client by itself: all reminders and follow-ups are off and the number is not SMS-enabled (the texts of this project are sent by Twilio, later, on their own gate).
+    receivesReminders: false, receivesFollowUps: false, receivesQuoteFollowUps: false, receivesInvoiceFollowUps: false, receivesReviewRequests: false,
+    phones: [{ number: digitsOf(r.client.phone), description: 'MOBILE', smsAllowed: false, primary: true }],
+    properties: [{ address: { street1: r.address.street1, city: r.address.city, postalCode: r.address.postalCode, ...(r.address.province === undefined ? {} : { province: r.address.province.toUpperCase() }) } }],
+  };
+}
+export function jobInput(r: BookingRequest, propertyId: string, marker: string): Record<string, unknown> {
+  return {
+    propertyId, title: `${r.title} [${marker}]`, instructions: `${r.service} ${marker}`, allowReviewRequest: false,
+    invoicing: { invoicingType: 'FIXED_PRICE', invoicingSchedule: 'ON_COMPLETION' },
+    // `startTime` and `endTime` are ISO 8601 clock times of the visit and `timeframe.startAt` the date (descriptions read from the schema); that they are read in the account's own time zone is UNVERIFIED until the first approved test write, and the read-back compares instants, so a different reading cannot pass as a booking.
+    timeframe: { startAt: r.when.date, durationUnits: 'DAYS', durationValue: 1 },
+    scheduling: { createVisits: true, notifyTeam: false, startTime: `${r.when.startTime}:00`, endTime: `${r.when.endTime}:00` },
+    lineItems: [{ name: r.service, unitPrice: r.priceDollars, quantity: 1, saveToProductsAndServices: false }],
+  };
+}
+
+/** The independent read-back: a separate query path (a read by job id) that compares what Jobber now holds with what was confirmed. Returns the NAMES of the fields that differ (none = verified). */
+export async function readBackJob(ctx: Ctx, creds: Credentials, jobId: string, r: BookingRequest, marker: string): Promise<{ found: boolean; mismatches: string[]; jobNumber?: number }> {
+  if (!JOB_ID.test(jobId)) return { found: false, mismatches: ['jobId'] };
+  const j = rec((await query(ctx, creds, READ_BACK, { id: jobId })).data.job);
+  if (typeof j.id !== 'string') return { found: false, mismatches: [] };
+  const bad: string[] = [];
+  if (j.id !== jobId) bad.push('jobId');
+  if (!String(j.title ?? '').includes(marker) || !String(j.instructions ?? '').includes(marker)) bad.push('marker');
+  if (String(j.title ?? '') !== `${r.title} [${marker}]`) bad.push('title');
+  const c = rec(j.client);
+  if (norm(c.firstName) !== norm(r.client.firstName) || norm(c.lastName) !== norm(r.client.lastName)) bad.push('client_name');
+  if (!list(c.phones).some((p) => digitsOf(String(rec(p).number ?? '')) === digitsOf(r.client.phone))) bad.push('client_phone');
+  const a = rec(rec(j.property).address);
+  if (norm(a.street1) !== norm(r.address.street1) || norm(a.city) !== norm(r.address.city) || String(a.postalCode ?? '').trim().slice(0, 5) !== r.address.postalCode) bad.push('address');
+  const visits = list(rec(j.visits).nodes).map(rec);
+  if (visits.length !== 1) bad.push('visit_count');
+  else if (Date.parse(String(visits[0].startAt)) !== instant(r.when.date, r.when.startTime, r.when.utcOffset) || Date.parse(String(visits[0].endAt)) !== instant(r.when.date, r.when.endTime, r.when.utcOffset)) bad.push('visit_time');
+  if (Math.abs(Number(j.total) - r.priceDollars) > 0.005) bad.push('price');
+  if (/archiv|cancel|closed/i.test(String(j.jobStatus ?? ''))) bad.push('job_status');
+  return { found: true, mismatches: bad, ...(typeof j.jobNumber === 'number' ? { jobNumber: j.jobNumber } : {}) };
+}
+
+async function findByMarker(ctx: Ctx, creds: Credentials, marker: string): Promise<string[]> {
+  const nodes = list(rec((await query(ctx, creds, FIND_JOBS, { term: marker })).data.jobs).nodes).map(rec);
+  return nodes.filter((n) => String(n.title ?? '').includes(marker) && typeof n.id === 'string').map((n) => n.id as string);
+}
+const userErrorCount = (x: unknown): number => list(x).length;
+
+/** Books one TEST visit in the Jobber Developer Test Account, then verifies it independently. Never throws for an expected failure: the status says what happened. */
+export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRequest): Promise<BookingResult> {
+  let writes = 0;
+  const done = (status: BookingStatus, extra: Partial<BookingResult> = {}): BookingResult => ({ status, writes, ...extra });
+  const problems = requestProblems(req, ctx.now());
+  if (problems.length > 0) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: problems.includes('gate') ? 'NOT_AUTHORIZED' : 'INVALID_REQUEST', fields: problems.join(',') }); return done('refused', { reason: problems.includes('gate') ? 'NOT_AUTHORIZED' : 'INVALID_REQUEST' }); }
+  if (ctx.allowWrites === undefined) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'WRITES_OFF' }); return done('refused', { reason: 'WRITES_OFF' }); }
+  const marker = markerFor(req.key);
+  try {
+    const tokens = await ctx.vault.loadTokens(); if (tokens === undefined) throw new JobberError('NOT_CONNECTED');
+    await verifyExpectedAccount(ctx, creds, ctx.allowWrites.expectedAccountName, tokens.account_id);   // the test account, before anything else
+    return await ctx.vault.withLock(`booking-${marker.toLowerCase()}`, async () => {
+      const ledger = await loadLedger(ctx); const prior = ledger[marker];
+      const verify = async (jobId: string, duplicate: boolean): Promise<BookingResult> => {
+        const rb = await readBackJob(ctx, creds, jobId, req, marker);
+        if (!rb.found) return done('uncertain', { reason: 'NOT_FOUND', jobId, ...(duplicate ? { duplicate } : {}) });
+        if (rb.mismatches.length > 0) { ctx.diag('JOBBER_READBACK_MISMATCH', { fields: rb.mismatches.join(',') }); return done('uncertain', { reason: 'READBACK_MISMATCH', jobId, mismatches: rb.mismatches, ...(duplicate ? { duplicate } : {}) }); }
+        return done('booked_verified', { jobId, ...(rb.jobNumber === undefined ? {} : { jobNumber: rb.jobNumber }), ...(duplicate ? { duplicate } : {}) });
+      };
+      // 1. a finished booking is never repeated: it is only verified again
+      if (prior?.state === 'created' && prior.jobId !== undefined) return verify(prior.jobId, true);
+      // 2. Jobber itself is asked whether this key already has a job (a lost ledger, or a crash after the job was created)
+      const existing = await findByMarker(ctx, creds, marker);
+      if (existing.length > 1) return done('uncertain', { reason: 'DUPLICATE_MARKERS' });
+      if (existing.length === 1) { ledger[marker] = { ...(prior ?? { state: 'created' }), state: 'created', jobId: existing[0] }; await saveLedger(ctx, ledger); return verify(existing[0], true); }
+      // 3. a key left pending with no job in Jobber is not retried blindly
+      if (prior?.state === 'pending') return done('uncertain', { reason: 'PENDING_UNRESOLVED' });
+      let clientId = prior?.clientId; let propertyId = prior?.propertyId;
+      if (prior?.state !== 'client_created' || propertyId === undefined) {
+        ledger[marker] = { state: 'pending' }; await saveLedger(ctx, ledger);   // written BEFORE the write
+        writes++;
+        const c = rec(rec((await mutate(ctx, creds, CREATE_CLIENT, { input: clientInput(req) })).data.clientCreate));
+        const props = list(rec(rec(c.client).clientProperties).nodes).map(rec);
+        if (userErrorCount(c.userErrors) > 0 || typeof rec(c.client).id !== 'string' || props.length !== 1 || typeof props[0].id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(c.userErrors) }); delete ledger[marker]; await saveLedger(ctx, ledger); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+        clientId = rec(c.client).id as string; propertyId = props[0].id as string;
+        ledger[marker] = { state: 'client_created', clientId, propertyId }; await saveLedger(ctx, ledger);
+      }
+      writes++;
+      ledger[marker] = { state: 'pending', clientId, propertyId }; await saveLedger(ctx, ledger);   // written BEFORE the job is created
+      // An unknown outcome (an error after the request was sent) leaves the key "pending": the next call asks Jobber before doing anything.
+      const jc = rec(rec((await mutate(ctx, creds, CREATE_JOB, { input: jobInput(req, propertyId as string, marker) })).data.jobCreate));
+      if (userErrorCount(jc.userErrors) > 0 || typeof rec(jc.job).id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(jc.userErrors) }); ledger[marker] = { state: 'client_created', clientId, propertyId }; await saveLedger(ctx, ledger); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+      const jobId = rec(jc.job).id as string;
+      ledger[marker] = { state: 'created', clientId, propertyId, jobId }; await saveLedger(ctx, ledger);
+      ctx.diag('JOBBER_BOOKING_CREATED', { writes });
+      return verify(jobId, false);
+    });
+  } catch (e) {
+    const code = e instanceof JobberError ? e.code : 'API_ERROR';
+    const reason: BookingReason = code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : 'API_ERROR';
+    ctx.diag('JOBBER_BOOKING_FAILED', { reason });
+    // Before any write an error is simply "not booked"; after a write was sent its outcome is unknown, so the status says so.
+    return done(writes > 0 ? 'uncertain' : 'not_booked', { reason });
+  }
+}

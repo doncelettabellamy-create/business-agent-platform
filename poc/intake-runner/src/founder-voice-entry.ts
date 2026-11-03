@@ -12,6 +12,8 @@
 // modules; it is never printed, logged or stored. What this file never does: expose an endpoint (the founder's tunnel does that, deliberately), change Twilio, place or buy anything, or log speech.
 
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mintExecutionContext } from './execution-context.ts';
 import { createIntakeRecordStore } from './intake-record-store.ts';
@@ -28,6 +30,9 @@ import { createFounderVoiceService } from './founder-voice-service.ts';
 import { withSelectedSpeaker } from './founder-voice-speaker.ts';
 import { streamTwimlFor } from './stream-twiml.ts';
 import { fileDiagSink } from './call-diag.ts';
+import { consentNoticeFor } from './opening.ts';
+import { windowsProtector } from './jobber-dpapi.ts';
+import { buildFastDeps, fastStatus } from './founder-voice-fast.ts';
 
 const nowIso = (): string => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
@@ -56,6 +61,17 @@ console.log(`Call config: ${configPath}   tenant: ${config.tenant}   numbers: ${
 console.log(`Voice config: ${voicePath}   text model: ${voice.openai_model}   voice model: ${voice.realtime_model}   transcription model: ${voice.transcription_model}   voice: ${voice.voice}`);
 console.log(speaker === undefined ? 'Speaker: OpenAI speaks (the default; the ElevenLabs speaker is OFF)' : `Speaker: ElevenLabs ON (voice ${speaker.voiceId}, model ${speaker.modelId}, speed ${speaker.speed}); the TEXT of every spoken line, read-backs included, goes to ElevenLabs; OpenAI still hears the caller`);
 const eff = effectiveVoiceSettings(voice);
+// The CONTROLLED fast test call (voice config `fast_test`; off when the section is absent). Only presence and the founder's own business facts are printed: no number, key or token.
+const fastCfg = voice.fast_test;
+const fastDir = process.env.JOBBER_STORE_DIR ?? join(homedir(), '.drew-jobber');
+const fastEnv = fastCfg === undefined ? undefined : await fastStatus({ vaultDir: fastDir, protector: windowsProtector(), env: process.env });
+if (fastCfg === undefined) console.log('Fast test call: OFF (the long cleaning flow runs, exactly as before)');
+else {
+  const days = Object.entries(fastCfg.hours).filter(([, v]) => v.length > 0).map(([d]) => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][Number(d)]).join(' ');
+  console.log(`Fast test call: ON (controlled test: only the approved test caller gets past the opening)   Jobber test account: "${fastCfg.jobber_account_name}"   size ${fastCfg.bedrooms} bed / ${fastCfg.bathrooms} bath at $${fastCfg.price_dollars}   cleaning ${fastCfg.duration_minutes} min   open ${days} (${fastCfg.timezone})   standing test approval: ${fastCfg.standing_approval}`);
+  console.log(`  private pieces: approved test numbers saved: ${fastEnv?.numbersPresent}   TEXTS: ${fastEnv?.textsOn === true ? `ON (owner text consent recorded: ${fastEnv?.ownerConsent})` : 'OFF (no real text can be sent; the call skips texts and says so)'}   Jobber connected: ${fastEnv?.jobberConnected}   Jobber writes switched on (JOBBER_ALLOW_WRITES=test-account): ${fastEnv?.jobberWritesOn}`);
+  console.log(`  opening the caller hears (exactly): ${consentNoticeFor(config.opening)}`);
+}
 console.log(`Settings (defaults filled in): voice reasoning ${eff.realtimeReasoning}; text reasoning ${eff.textReasoning}; transcription hints: ${eff.transcription === undefined ? 'none' : `${eff.transcription.languages?.length ?? 0} language(s), ${eff.transcription.keywords?.length ?? 0} keyword(s)`}. UNVERIFIED until a live call: whether each model accepts these values.`);
 console.log(`Bounds: at most ${bounds.calls} calls of ${bounds.minutesPerCall} minutes (${bounds.maxVoiceMinutes} voice minutes in all), ${config.max_turns} caller turns each, ${bounds.maxOpenaiCalls} OpenAI text calls for the whole run. No dollar ceiling is computed: OpenAI prices for these models are not on file and the voice cost per minute is unverified.`);
 if (!serve) {
@@ -69,6 +85,7 @@ const gate = founderVoiceGateProblems({
     allowLive: process.env.INTAKE_ALLOW_LIVE_CALLS, callApprovedDigest: process.env.FOUNDER_CALL_APPROVED_DIGEST, voiceApprovedDigest: process.env.FOUNDER_VOICE_APPROVED_DIGEST,
     twilioTokenPresent: typeof twilioToken === 'string' && twilioToken.length >= 8, openaiKeyPresent: typeof process.env.OPENAI_API_KEY === 'string' && process.env.OPENAI_API_KEY.length >= 8,
     elevenlabsKeyPresent: typeof process.env.ELEVENLABS_API_KEY === 'string' && process.env.ELEVENLABS_API_KEY.length >= 8,
+    ...(fastEnv === undefined ? {} : { fastTest: fastEnv }),
   },
 });
 console.log('\nGate (every line must be [ok] to serve):');
@@ -101,8 +118,14 @@ catch { console.error('serve refused: the contact vault could not be opened (wro
 console.log(`Contact capture (name, callback number, service address; encrypted, 30-day retention): ${contacts === undefined ? 'OFF (no FOUNDER_CONTACT_KEY)' : 'ON'}`);
 
 const store = createIntakeRecordStore({ path: config.db_path });
+// The fast test call's pieces (Jobber, Twilio, the approved numbers) are built only here, only after the gate passed. Its outcomes are logged as fixed codes.
+const fast = fastCfg === undefined ? undefined : await buildFastDeps({
+  config, voice, vaultDir: fastDir, protector: windowsProtector(), env: process.env, fetch: globalThis.fetch, now: () => Date.now(), log: (code, detail) => sink(code, detail),
+  onOutcome: (o) => sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length }),
+});
 const service = createFounderVoiceService({
   config, voice, textClient,
+  ...(fast === undefined ? {} : { fast }),
   diag: sink,
   // OpenAI speaks unless the voice config selects the ElevenLabs speaker (the opener is then returned unchanged). The ElevenLabs key is read here, at the moment a line starts, and nowhere else.
   openVoice: withSelectedSpeaker((d) => createOpenAiVoiceSocket({ model: voice.realtime_model, getKey, ...(voice.safety_identifier === undefined ? {} : { safetyIdentifier: voice.safety_identifier }), diag: (code, detail) => d(code as never, detail) }), speaker, { getKey: () => process.env.ELEVENLABS_API_KEY, fetch: globalThis.fetch }),

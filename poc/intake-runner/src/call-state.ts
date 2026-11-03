@@ -171,6 +171,8 @@ export interface ContactState {
   addressPart(): 'street name' | 'house number' | 'street address' | 'city' | 'ZIP code' | undefined;
   /** The held address as it is SPOKEN back (the ZIP code digit by digit), for the read-back to the caller over the phone only. RAW personal data. Undefined until the address is whole. */
   spokenAddress(): string | undefined;
+  /** City-and-ZIP mode, once the address is whole: its three parts kept apart (a street address, a city, a five-digit ZIP code), for a system that needs them separately. RAW personal data. Undefined until the address is whole, or when the mode is off. */
+  addressParts(): { street: string; city: string; zip: string } | undefined;
   status(): ContactStatus;
   dispose(): void;
 }
@@ -401,6 +403,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       return aCity === '' ? 'city' : 'ZIP code';
     },
     spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aZip.split('').join(' ')}` : values.address; },
+    addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' ? undefined : { street: aStreet, city: aCity, zip: aZip }; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);

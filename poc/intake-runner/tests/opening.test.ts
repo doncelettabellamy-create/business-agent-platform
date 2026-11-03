@@ -124,3 +124,13 @@ test('twiml: the greeting carries the notice, escaped, with no way to break out 
   assert.ok(value !== null && value[1].includes('&quot;Clean&quot;') && !value[1].includes('"'), 'the whole notice sits inside the attribute with no raw quote');
   assert.match(t, /welcomeGreetingInterruptible="none" \/>/);
 });
+
+test('greeting: the controlled test may replace the whole spoken opening; it is spoken exactly, validated, and never goes into TwiML', () => {
+  const G = "Thanks for calling Drew Cleaning. I'm Jack. What's your name?";
+  assert.equal(consentNoticeFor({ business_name: 'Drew Cleaning', greeting: G }), G, 'exactly the greeting: nothing added before or after it');
+  assert.deepEqual(openingProblems({ business_name: 'Drew Cleaning', greeting: G }), []);
+  assert.ok(openingProblems({ business_name: 'Drew Cleaning', greeting: 'short' }).length > 0, 'too short');
+  assert.ok(openingProblems({ business_name: 'Drew Cleaning', greeting: 'x'.repeat(201) }).length > 0, 'too long');
+  assert.ok(openingProblems({ business_name: 'Drew Cleaning', greeting: 'Line one.\nLine two is here.' }).length > 0, 'single line only');
+  assert.throws(() => twimlFor('wss://calls.example.test/relay/abcdefghijklmnopqrstuvwxyz012345', { business_name: 'Drew Cleaning', greeting: G }), RangeError);
+});

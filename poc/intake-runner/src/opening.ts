@@ -15,15 +15,19 @@
 // Because the block is part of the config, it is part of the approval digest: changing a name, the disclosure or the special changes the digest, so the
 // founder must approve it again. The wording needs a legal check by the business. The model never sees or produces any of this.
 
-export interface Opening { business_name: string; agent_name?: string; disclosure?: string; special?: string }
+/**
+ * `greeting`: the CONTROLLED FAST TEST only (fast-call-handler.ts). When present, the opening is exactly this text, with no introduction, no disclosure, no special and NO request to say yes: the greeting itself asks the first
+ * question. The voice gate refuses a call config with a greeting unless the voice config has the fast test section, and the ConversationRelay TwiML refuses it outright, because the long call logic waits for a yes.
+ */
+export interface Opening { business_name: string; agent_name?: string; disclosure?: string; special?: string; greeting?: string }
 
 /** The original notice, unchanged: used whenever the config has no `opening` block. */
 export const DEFAULT_CONSENT_NOTICE = 'Hello. This is an automated A I assistant, part of a test of a business phone line. We do not record the audio. Our phone provider turns your speech into text, and personal details are masked before an A I model reads it. Please say yes to continue, or hang up now.';
 /** The disclosure used with an `opening` block that gives none of its own. */
 export const DEFAULT_DISCLOSURE = 'We do not record the audio. Our phone provider turns your speech into text, and personal details are masked before an A I model reads it.';
 
-const KEYS = ['agent_name', 'business_name', 'disclosure', 'special'];
-const LIMITS: Record<string, [number, number]> = { business_name: [2, 80], agent_name: [2, 40], disclosure: [10, 400], special: [3, 200] };
+const KEYS = ['agent_name', 'business_name', 'disclosure', 'greeting', 'special'];
+const LIMITS: Record<string, [number, number]> = { business_name: [2, 80], agent_name: [2, 40], disclosure: [10, 400], greeting: [10, 200], special: [3, 200] };
 /** One line of plain speech: no control characters, no angle or square or curly brackets (a placeholder look-alike or markup cannot be smuggled in). */
 const LINE = /^[^\u0000-\u001f\u007f<>[\]{}\\]+$/;
 
@@ -54,6 +58,7 @@ const endSentence = (s: string): string => (/[.!?]$/.test(s) ? s : `${s}.`);
 export function consentNoticeFor(opening?: Opening): string {
   if (opening === undefined) return DEFAULT_CONSENT_NOTICE;
   if (openingProblems(opening).length > 0) throw new RangeError('the opening block is not valid');
+  if (opening.greeting !== undefined) return opening.greeting;   // the controlled fast test: exactly this text
   const who = opening.agent_name === undefined ? 'the' : `${opening.agent_name}, the`;
   const intro = `Hello. This is ${who} automated A I assistant for ${opening.business_name}.`;
   const special = opening.special === undefined ? '' : ` ${endSentence(opening.special)}`;
@@ -65,5 +70,6 @@ const xml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;'
 
 /** The TwiML to paste into a Twilio TwiML Bin (so the phone provider hosts it and this machine exposes no HTTP endpoint for it). */
 export function twimlFor(publicWssUrl: string, opening?: Opening): string {
+  if (opening?.greeting !== undefined) throw new RangeError('the greeting opening is for the controlled fast test only');   // the long call logic waits for a yes, so it must never open with a greeting that does not ask for one
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Connect>\n    <ConversationRelay url="${xml(publicWssUrl)}" language="en-US" welcomeGreeting="${xml(consentNoticeFor(opening))}" welcomeGreetingInterruptible="none" />\n  </Connect>\n</Response>\n`;
 }

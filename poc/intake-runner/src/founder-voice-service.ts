@@ -16,6 +16,8 @@ import { createOpenAIProvider } from './openai-provider.ts';
 import { createOpenAIDialogueModel } from './openai-dialogue-model.ts';
 import type { OpenAITextClient } from './openai-dialogue-model.ts';
 import { createRelayHandler } from './relay-handler.ts';
+import { createFastCallHandler } from './fast-call-handler.ts';
+import type { FastDeps, FastHandler } from './fast-call-handler.ts';
 import type { RelayHandler } from './relay-handler.ts';
 import { consentNoticeFor } from './opening.ts';
 import { requiredFieldsOf } from './cleaning-state.ts';
@@ -44,6 +46,8 @@ export interface VoiceServiceDeps {
   contacts?: ContactVault;
   /** Mints the Intake context for a call (the composition root mints it; this file never does). */
   intakeContext(tenant: string, callRef: string): Promise<unknown>;
+  /** The controlled fast test call (voice config `fast_test`; fast-call-handler.ts). Supplied by the composition root only when that section is present and the whole gate passed. Absent: the long flow, exactly as before. */
+  fast?: FastDeps;
   now(): number;
   nowIso(): string;
   killed(): boolean;
@@ -54,6 +58,8 @@ export interface VoiceServiceDeps {
 }
 export interface VoiceService {
   handler: RelayHandler;
+  /** The fast test call handler, when the controlled fast test is on (it then answers every call; `handler` is unused). */
+  fast?: FastHandler;
   /** Runs one call over a Twilio Media Streams connection. */
   handleStream(conn: RelayConnection): void;
   /** The consent notice that is spoken first on every call, word for word. */
@@ -127,13 +133,14 @@ export function createFounderVoiceService(deps: VoiceServiceDeps): VoiceService 
     log: deps.log,
   });
   const sink = deps.diag ?? noDiag;
+  const fast = deps.fast === undefined ? undefined : createFastCallHandler(deps.fast);
   let calls = 0;
   return {
-    handler, notice,
+    handler, notice, ...(fast === undefined ? {} : { fast }),
     handleStream(conn: RelayConnection): void {
       const d = scopedDiag(sink, ++calls);
       d('CALL_STREAM_ACCEPTED', { noticeChars: notice.length, setupWaitMs: setupTimeoutMs });
-      startRealtimeCall(conn, deps.openVoice(d as never), (t) => handler.serve(t), {
+      startRealtimeCall(conn, deps.openVoice(d as never), (t) => (fast === undefined ? handler.serve(t) : fast.serve(t)), {
         notice, transcriptionModel: voice.transcription_model, voice: voice.voice, persona, reasoningEffort: settings.realtimeReasoning, diag: d,
         ...(settings.transcription === undefined ? {} : { transcription: settings.transcription }),
         // Native conversation (voice config `conversation: "native"`): the voice converses in its own words and may call the server's contact tools, and only those.
