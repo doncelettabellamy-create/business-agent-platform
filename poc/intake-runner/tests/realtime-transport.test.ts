@@ -18,7 +18,7 @@ import { fallbackText } from '../src/dialogue-model.ts';
 import type { DialogueModel, Directive } from '../src/dialogue-model.ts';
 import type { DialogueTurn } from '../src/call-session.ts';
 import type { ModelProvider, ModelRequest } from '../src/model-gateway.ts';
-import { createRealtimeTransport, sameSpeech, SAY_PREFIX, SPEAK_ONLY, wholeAcknowledged, wordsOf } from '../src/realtime-transport.ts';
+import { closingStart, createRealtimeTransport, sameSpeech, SAY_PREFIX, SPEAK_ONLY, tailHeard, TAIL_MAX_MS, wholeAcknowledged, wordsOf } from '../src/realtime-transport.ts';
 import type { TransportEvent } from '../src/call-transport.ts';
 import { createRealtimeSim } from './helpers/realtime-sim.ts';
 import type { Behaviour, RealtimeSim } from './helpers/realtime-sim.ts';
@@ -669,4 +669,45 @@ test('wholeAcknowledged: the measured verdict is milliseconds only: the live cal
   for (const bad of [[undefined, 5], [5, undefined], ['5', 5], [NaN, 5], [5, Infinity], [-1, 0], [null, null]]) assert.equal(wholeAcknowledged(bad[0], bad[1]), undefined, JSON.stringify(bad));
   // The speed of speech is irrelevant: the same milliseconds give the same verdict whatever the text length.
   for (const chars of [10, 92, 387]) for (const msPerChar of [40, 70, 84, 120]) { const sent = chars * msPerChar; assert.equal(wholeAcknowledged(sent, sent), true); assert.equal(wholeAcknowledged(sent, sent - 1), false); }
+});
+
+// ================================================================ the tail of a confirmation line
+const TAIL_OFFER = 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Wednesday, November fourth, 2026 at 9 A M. Does that work?';
+const TAIL_READBACK = 'To confirm: Standard cleaning for Testa on Wednesday, November fourth, 2026 at 9 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is one hundred ninety-nine dollars. Shall I book it? Say yes or no.';
+test('closing question: only the trailing question sentences count, and never one that holds a digit or a dollar sign', () => {
+  assert.equal(TAIL_OFFER.slice(closingStart(TAIL_OFFER)), 'Does that work?');
+  assert.equal(TAIL_READBACK.slice(closingStart(TAIL_READBACK)), 'Shall I book it? Say yes or no.');
+  assert.equal('The booking is made. Please say yes or no.'.slice(closingStart('The booking is made. Please say yes or no.')), 'Please say yes or no.');
+  assert.equal(closingStart('Is it 5 P M?'), undefined, 'a question that is the whole line is not a closing'); assert.equal(closingStart('We have 5 P M. Is that $199?'), undefined, 'a digit or a dollar sign keeps a sentence out of the closing');
+  assert.equal(closingStart('We have the time. That is all.'), undefined); assert.equal(closingStart('Does that work?'), undefined); assert.equal(closingStart(''), undefined);
+  assert.equal(closingStart('Your price is one hundred ninety-nine dollars. We have the time'), undefined, 'no question, no closing');
+});
+test('tail tolerance (pure): a line counts as heard only when what is left is inside its closing question and short; an answer during the facts never does', () => {
+  assert.equal(tailHeard(TAIL_OFFER, 11563.5, 11336.1), true, 'the live call: 0.2 s of 11.6 s left');
+  assert.equal(tailHeard(TAIL_OFFER, 11563.5, 544.7), false, 'cut 0.5 s in'); assert.equal(tailHeard(TAIL_OFFER, 11563.5, 0), false);
+  assert.equal(tailHeard(TAIL_OFFER, 11563.5, 11563.5), false, 'a whole line is judged elsewhere, not here');
+  const closingMs = 11563.5 * ('Does that work?'.length / TAIL_OFFER.length);
+  assert.equal(tailHeard(TAIL_OFFER, 11563.5, 11563.5 - 0.5 * closingMs), true, 'half of the closing left'); assert.equal(tailHeard(TAIL_OFFER, 11563.5, 11563.5 - 0.9 * closingMs), false, 'almost all of the closing left: the facts may not be finished');
+  assert.equal(tailHeard(TAIL_OFFER, 11563.5, 11563.5 - closingMs - 300), false, 'the answer began before the closing question');
+  assert.equal(tailHeard(TAIL_READBACK, 20000, 20000 - 0.5 * (20000 * 'Shall I book it? Say yes or no.'.length / TAIL_READBACK.length)), true);
+  assert.equal(tailHeard(TAIL_READBACK, 20000, 20000 - 3000), false, 'inside the price sentence');
+  assert.equal(tailHeard('We have Tuesday at 10.', 5000, 4900), false, 'no closing question');
+  for (const bad of [[undefined, 1], [100, undefined], [NaN, 1], [100, NaN], [0, 0], [-5, 1], [100, -1], ['100', '99']] as Array<[unknown, unknown]>) assert.equal(tailHeard(TAIL_OFFER, bad[0], bad[1]), false, JSON.stringify(bad));
+  assert.ok(TAIL_MAX_MS <= 2000, 'the unplayed audio is bounded');
+  assert.equal(tailHeard(`${'Fact one is stated here. '.repeat(3)}${'Is that right? '.repeat(40)}`, 60000, 60000 - 2500), false, 'never more than TAIL_MAX_MS left, however long the closing');
+});
+test('tail tolerance (through the transport): a caller who starts answering inside the closing question gets a played line; one who talks over the facts gets a cut line', async () => {
+  const text = 'The total is one hundred ninety-nine dollars. We have Tuesday at nine. Does that work?'; const per = 25; const sentMs = text.length * per;
+  const run = async (leftMs: number, diagSeen: string[]): Promise<'played' | 'cut' | 'timeout'> => {
+    const sim = createRealtimeSim({ msPerChar: per });
+    const t = createRealtimeTransport(sim.link, { notice: NOTICE, transcriptionModel: 'x', voice: 'y', msPerChar: per, diag: (code, detail) => { if (code === 'ADAPTER_REPLY_DONE' && (detail as { tail?: boolean } | undefined)?.tail === true) diagSeen.push('tail'); } });
+    t.onEvent = () => undefined; sim.start({ to: N1, callSid: SID(1) }); await sim.heard(1, 20_000);
+    const began = Date.now(); assert.equal(t.speak(text, true), true); await sim.waitFor(() => sim.playing());
+    await sim.waitFor(() => Date.now() - began >= sentMs - leftMs); sim.say('yes');
+    const verdict = await t.playbackDone!(3000); await sim.idle(); return verdict;
+  };
+  const seen: string[] = [];
+  assert.equal(await run(150, seen), 'played', 'about 0.15 s of "Does that work?" left'); assert.deepEqual(seen, ['tail'], 'the audit trail says why');
+  const none: string[] = [];
+  assert.equal(await run(1000, none), 'cut', 'inside the date sentence, before the closing question'); assert.equal(await run(sentMs - 300, none), 'cut', 'during the price'); assert.deepEqual(none, []);
 });

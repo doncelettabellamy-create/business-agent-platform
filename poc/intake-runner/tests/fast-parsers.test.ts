@@ -1,7 +1,7 @@
 // The deterministic answer parsers of the fast Drew test call. Synthetic phrases only.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
+import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
 
 const TZ = 'America/Chicago';
 const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 2 November 2026, 9:00 in Chicago (standard time, UTC-6; summer time ended on 1 November)
@@ -77,4 +77,13 @@ test('isAiQuestion: a caller asking whether this is a person, a robot or an A I 
     assert.equal(isAiQuestion(q), true, q);
   for (const n of ['my name is Bot Johnson', 'Robin Lee', 'Al Machine', 'Testa Invented', 'yes', 'Tuesday at ten', '123 Invented Lane', 'are you open on Tuesday', 'is this the price'])
     assert.equal(isAiQuestion(n), false, n);
+});
+
+test('the price in words: the voice is never asked to read a dollar sign and digits', () => {
+  const cases: Array<[number, string]> = [[199, 'one hundred ninety-nine dollars'], [1, 'one dollar'], [0, 'zero dollars'], [100, 'one hundred dollars'], [205, 'two hundred five dollars'], [250, 'two hundred fifty dollars'],
+    [11, 'eleven dollars'], [20, 'twenty dollars'], [21, 'twenty-one dollars'], [999, 'nine hundred ninety-nine dollars'], [1000, 'one thousand dollars'], [1250, 'one thousand two hundred fifty dollars'],
+    [199.5, 'one hundred ninety-nine dollars and fifty cents'], [0.01, 'zero dollars and one cent'], [12.25, 'twelve dollars and twenty-five cents']];
+  for (const [n, words] of cases) assert.equal(sayDollars(n), words, String(n));
+  for (const bad of [NaN, -1, 1_000_000, Infinity]) assert.ok(!/[\$]/.test(sayDollars(bad)) && sayDollars(bad).endsWith(' dollars'), String(bad));
+  for (let n = 1; n <= 999; n++) assert.ok(/^[a-z -]+ dollars?$/.test(sayDollars(n)), `${n} has only words`);
 });

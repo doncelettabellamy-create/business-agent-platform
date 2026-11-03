@@ -42,12 +42,12 @@ const noPersonalDetail = (logs: Array<[string, unknown]>, extra: string[] = []):
 test('the whole call: name, address with city and ZIP, day and time, size, $199 with a time the calendar supports, agreement, verified caller ID as the callback number, text permission, read-back, the Jobber test booking, both texts, delivery checked', async () => {
   const t = build();
   t.h.serve(t.c.transport); await toOffer(t.c);
-  const offer = await t.c.hears(/is \$199/, 'yes');
-  assert.equal(offer, 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
+  const offer = await t.c.hears(/is one hundred ninety-nine dollars/, 'yes');
+  assert.equal(offer, 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
   assert.equal(await t.c.hears(/calling from a number ending in/, 'yes'), 'I see you are calling from a number ending in 0 0 0 2. Is that the best number to reach you?');
   await t.c.hears(/May we send you one automated/, 'yes');
   const readback = await t.c.hears(/To confirm/, 'yes');
-  assert.equal(readback, 'To confirm: Standard cleaning for Testa on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is $199. Shall I book it? Say yes or no.');
+  assert.equal(readback, 'To confirm: Standard cleaning for Testa on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is one hundred ninety-nine dollars. Shall I book it? Say yes or no.');
   await finish(t.c);
   assert.equal(t.booked.length, 1);
   const r = t.booked[0];
@@ -72,7 +72,7 @@ test('answers are kept: an address said in pieces asks only for what is missing,
   await t.c.hears(/What day and time/, 'Tuesday');
   await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms');
   await t.c.hears(/And how many bathrooms/, 'two');
-  const offer = await t.c.hears(/is \$199/, 'no');
+  const offer = await t.c.hears(/is one hundred ninety-nine dollars/, 'no');
   assert.match(offer, /We have Tuesday, November third, 2026 at 9 A M\./, 'only a day was asked for: the earliest time that day');
   const count = (re: RegExp): number => t.c.lines.filter((l) => re.test(l)).length;
   assert.deepEqual([count(/the street address/), count(/^What is the city\?$/), count(/^And the ZIP code\?$/), count(/What day and time/), count(/How many bedrooms and bathrooms/)], [1, 1, 1, 1, 1]);
@@ -88,7 +88,7 @@ test('a name said in one word asks only for the last name; the first and last ar
 
 test('measured confirmation: a yes before the line has finished playing is HELD and confirms nothing; the line is spoken again after the approved instruction and only a fresh yes after the whole line counts', async () => {
   const t = build(); t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes', { early: true });
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes', { early: true });
   assert.ok(t.logs.some(([c]) => c === 'CONFIRM_HELD'));
   const again = await t.c.hears(/Please wait until I have finished, then answer\. A standard cleaning/, 'yes');
   assert.match(again, /We have Tuesday, November third, 2026 at 10 A M\. Does that work\?$/);
@@ -102,7 +102,7 @@ test('measured confirmation: a yes before the line has finished playing is HELD 
 
 test('a read-back that was cut or never reported is replayed; after two replays the call ends unconfirmed and nothing is booked', async () => {
   const t = build(); t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes');
   await t.c.hears(/^To confirm/, undefined, { verdict: 'cut' });
   await t.c.hears(/Please wait until I have finished, then answer\. To confirm/, undefined, { verdict: 'timeout' });
   await t.c.hears(/Please wait until I have finished, then answer\. Please wait|Please wait until I have finished, then answer\. To confirm/, undefined, { verdict: 'cut' });
@@ -144,7 +144,7 @@ test('HONESTY: asked whether this is a person, a robot or an A I - at ANY step, 
   await b.c.hears(/^What is the city\?$/, 'Testville'); await b.c.hears(/ZIP code\?$/, '90210'); await b.c.hears(/What day and time/, undefined);
   // at a confirmation unit, over the line while it is still playing: the answer is given, the unit is spoken again after the approved instruction, and the question confirms or denies nothing
   const c = build(); c.h.serve(c.c.transport); await toOffer(c.c);
-  await c.c.hears(/is \$199/, 'am I talking to a human?', { early: true });   // the helper lets everything pending finish, the answer included
+  await c.c.hears(/is one hundred ninety-nine dollars/, 'am I talking to a human?', { early: true });   // the helper lets everything pending finish, the answer included
   await c.c.until(() => c.c.lines.includes(ANSWER), 'the truthful answer');
   assert.match(await c.c.hears(/Please wait until I have finished, then answer\. A standard cleaning/, 'yes'), /Does that work\?$/);
   assert.equal(c.booked.length, 0); await c.c.hears(/calling from/, 'are you an A I?'); await c.c.hears(/^Yes, I'm an A I assistant/, undefined);
@@ -166,23 +166,23 @@ test('only the one priced size is booked: any other size ends politely before th
 test('no time is invented: an unreadable or incomplete calendar, missing hours, or no opening each end with "a person will call" and no offer, no price promise on a time and no booking', async () => {
   for (const [label, o, reason] of [['incomplete', { busy: { busy: [], complete: false } }, 'CALENDAR_UNREADABLE'], ['no hours', { settings: { availability: { ...SETTINGS.availability, hours: {} } } }, 'NO_OPENING'], ['all busy', { busy: { busy: [{ start: NOW, end: NOW + 40 * 86_400_000 }], complete: true } }, 'NO_OPENING']] as const) {
     const t = build(o as never); t.h.serve(t.c.transport); await toOffer(t.c); await finish(t.c);
-    assert.equal(t.last().reason, reason, label); assert.equal(t.booked.length, 0, label); assert.ok(!t.c.lines.some((l) => /is \$199/.test(l)), `${label}: no offer was spoken`);
+    assert.equal(t.last().reason, reason, label); assert.equal(t.booked.length, 0, label); assert.ok(!t.c.lines.some((l) => /is one hundred ninety-nine dollars/.test(l)), `${label}: no offer was spoken`);
   }
   const t = build({ busy: { busy: [{ start: instantOf('2026-11-03', '09:00', TZ), end: instantOf('2026-11-03', '12:00', TZ) }], complete: true } }); t.h.serve(t.c.transport); await toOffer(t.c);
-  assert.match(await t.c.hears(/is \$199/, 'no'), /Tuesday, November third, 2026 at 12 P M/, 'the calendar\'s busy time moved the offer');
+  assert.match(await t.c.hears(/is one hundred ninety-nine dollars/, 'no'), /Tuesday, November third, 2026 at 12 P M/, 'the calendar\'s busy time moved the offer');
 });
 
 test('the caller can decline the time: a different one is offered and the same time is never offered twice; two refusals end the call with nothing booked', async () => {
   const t = build(); t.h.serve(t.c.transport); await toOffer(t.c);
-  const first = await t.c.hears(/is \$199/, 'no'); assert.match(first, /10 A M/);
+  const first = await t.c.hears(/is one hundred ninety-nine dollars/, 'no'); assert.match(first, /10 A M/);
   await t.c.hears(/What other day and time/, 'Tuesday at ten again');
-  const second = await t.c.hears(/is \$199/, 'no'); assert.ok(!/at 10 A M/.test(second), 'the refused 10 A M is not offered again');
+  const second = await t.c.hears(/is one hundred ninety-nine dollars/, 'no'); assert.ok(!/at 10 A M/.test(second), 'the refused 10 A M is not offered again');
   await finish(t.c); assert.equal(t.last().reason, 'OFFER_DECLINED'); assert.equal(t.booked.length, 0);
 });
 
 test('callback number: the caller ID is the candidate; a no asks for a number, said in pieces, read back and confirmed; a text goes only to an approved customer number, the owner is texted either way', async () => {
   const t = build({ customers: [CUSTOMER] }); t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from a number ending in/, 'no');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'no');
   await t.c.hears(/What is the best number/, 'five five five zero one');
   await t.c.hears(/remaining 5 digits/, 'zero zero zero nine nine');
   assert.equal(await t.c.hears(/I heard/, 'yes'), 'I heard 5 5 5 0 1 0 0 0 9 9. Is that right?');
@@ -194,22 +194,22 @@ test('callback number: the caller ID is the candidate; a no asks for a number, s
 
 test('text permission: a no books without a customer text and the owner is still texted; a final no books nothing; no standing approval books nothing', async () => {
   const a = build(); a.h.serve(a.c.transport); await toOffer(a.c);
-  await a.c.hears(/is \$199/, 'yes'); await a.c.hears(/calling from/, 'yes'); await a.c.hears(/May we send you one automated/, 'no'); await a.c.hears(/To confirm/, 'yes'); await finish(a.c);
+  await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from/, 'yes'); await a.c.hears(/May we send you one automated/, 'no'); await a.c.hears(/To confirm/, 'yes'); await finish(a.c);
   assert.deepEqual(a.texts.map((x) => x.to), [OWNER]); assert.equal(a.booked.length, 1); assert.doesNotMatch(a.c.lines.at(-1)!, /text/i);
   const b = build(); b.h.serve(b.c.transport); await toOffer(b.c);
-  await b.c.hears(/is \$199/, 'yes'); await b.c.hears(/calling from/, 'yes'); await b.c.hears(/May we send you one automated/, 'yes'); await b.c.hears(/To confirm/, 'no'); await finish(b.c);
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from/, 'yes'); await b.c.hears(/May we send you one automated/, 'yes'); await b.c.hears(/To confirm/, 'no'); await finish(b.c);
   assert.equal(b.booked.length, 0); assert.equal(b.texts.length, 0); assert.equal(b.last().reason, 'DECLINED_AT_READBACK');
   const c = build({ settings: { standingApproval: false } }); c.h.serve(c.c.transport); await toOffer(c.c);
-  await c.c.hears(/is \$199/, 'yes'); await c.c.hears(/calling from/, 'yes'); await c.c.hears(/May we send you one automated/, 'yes'); await c.c.hears(/To confirm/, 'yes'); await finish(c.c);
+  await c.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.c.hears(/calling from/, 'yes'); await c.c.hears(/May we send you one automated/, 'yes'); await c.c.hears(/To confirm/, 'yes'); await finish(c.c);
   assert.equal(c.booked.length, 0); assert.equal(c.last().reason, 'NO_STANDING_APPROVAL'); assert.equal(c.texts.length, 0);
 });
 
 test('honesty: a booking that is not verified sends no text and says a person will follow up; a refused customer text is not claimed; an undelivered or unconfirmed text is reported, not assumed', async () => {
   const a = build({ book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', mismatches: ['visit_time'], writes: 2 }) }); a.h.serve(a.c.transport); await toOffer(a.c);
-  await a.c.hears(/is \$199/, 'yes'); await a.c.hears(/calling from/, 'yes'); await a.c.hears(/May we send you one automated/, 'yes'); await a.c.hears(/To confirm/, 'yes'); await finish(a.c);
+  await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from/, 'yes'); await a.c.hears(/May we send you one automated/, 'yes'); await a.c.hears(/To confirm/, 'yes'); await finish(a.c);
   assert.equal(a.texts.length, 0); assert.equal(a.last().reason, 'BOOKING_NOT_VERIFIED'); assert.equal(a.last().booked, false); assert.match(a.c.lines.at(-1)!, /could not confirm the booking, so a person will follow up/);
   const b = build({ send: (to) => (to === CUSTOMER ? { ok: false, error: 'REFUSED', twilioCode: 21608 } : { ok: true, sid: `SM${'2'.repeat(32)}` }), delivery: 'unconfirmed' }); b.h.serve(b.c.transport); await toOffer(b.c);
-  await b.c.hears(/is \$199/, 'yes'); await b.c.hears(/calling from/, 'yes'); await b.c.hears(/May we send you one automated/, 'yes'); await b.c.hears(/To confirm/, 'yes');
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from/, 'yes'); await b.c.hears(/May we send you one automated/, 'yes'); await b.c.hears(/To confirm/, 'yes');
   await b.c.drain(() => b.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'), 'delivery to be checked');
   assert.doesNotMatch(b.c.lines.at(-1)!, /on its way/); assert.match(b.c.lines.at(-1)!, /could not send the text/);
   assert.deepEqual([b.last().customerText, b.last().ownerText], ['not_sent', 'unconfirmed']);
@@ -235,7 +235,7 @@ test('the line limits: a carrier that cannot measure playback is refused; one ca
 
 test('privacy: a whole call writes no name, address, number, caller word or text to any diagnostic; the outcome holds fixed codes only', async () => {
   const t = build(); t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
   await t.c.drain(() => t.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'));
   noPersonalDetail(t.logs, ['Lane', 'Tue Nov', 'booked for']);
   assert.ok(t.last().steps.every((s) => /^[A-Z_]+$/.test(s)), 'steps are fixed codes'); assert.ok(!JSON.stringify(t.outcomes).includes('Testa'));
@@ -244,7 +244,7 @@ test('privacy: a whole call writes no name, address, number, caller word or text
 const CONSENT_LINE = "This is Donceletta Bellamy's developer test using the fictional Drew Cleaning business. May we send you one automated booking-details text per completed test booking? Message and data rates may apply. Reply STOP to unsubscribe or HELP for help. Texting is optional. Our privacy policy and SMS terms are available on our developer test website and will be provided before you consent. Do you agree?";
 async function through(t: ReturnType<typeof build>, consentAnswer: string): Promise<string> {
   t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from/, 'yes'); const line = await t.c.hears(/May we send you one automated/, consentAnswer); await t.c.hears(/To confirm/, 'yes'); await finish(t.c); return line;
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from/, 'yes'); const line = await t.c.hears(/May we send you one automated/, consentAnswer); await t.c.hears(/To confirm/, 'yes'); await finish(t.c); return line;
 }
 
 test('SUBMITTED consent script: the caller is asked, word for word, as one measured unit; a yes is recorded as minimal evidence and a no is recorded too', async () => {
@@ -254,7 +254,7 @@ test('SUBMITTED consent script: the caller is asked, word for word, as one measu
   const n = build(); await through(n, 'no'); assert.deepEqual(n.consents.map((c) => c.result), ['no']);
   assert.deepEqual(n.texts.map((x) => x.to), [OWNER], 'no customer text after a no; the booking is not conditional on it'); assert.equal(n.booked.length, 1);
   // an early yes during the long line is held, like every unit, and the line is asked again after the approved instruction
-  const e = build(); e.h.serve(e.c.transport); await toOffer(e.c); await e.c.hears(/is \$199/, 'yes'); await e.c.hears(/calling from/, 'yes');
+  const e = build(); e.h.serve(e.c.transport); await toOffer(e.c); await e.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await e.c.hears(/calling from/, 'yes');
   await e.c.hears(/May we send you one automated/, 'yes', { early: true }); assert.equal(e.consents.length, 0, 'a yes before the line finished is not consent');
   assert.match(await e.c.hears(/Please wait until I have finished, then answer\. This is Donceletta/, 'yes'), /Do you agree\?$/); assert.deepEqual(e.consents.map((c) => c.result), ['yes']);
 });
@@ -276,7 +276,7 @@ test('a text longer than the limit is never cut or sent; the booking stands and 
 
 test('TEXTS OFF: no text question is asked, no consent is recorded, nothing is sent, the booking is unchanged, and both texts are reported as skipped (never delivered) while the goodbye says so', async () => {
   const t = build({ textsEnabled: false, ownerConsent: false }); t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from/, 'yes');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from/, 'yes');
   assert.match(await t.c.hears(/To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa/, 'the read-back follows the callback number directly'); await finish(t.c);
   assert.equal(t.booked.length, 1); assert.equal(t.texts.length, 0); assert.equal(t.consents.length, 0);
   assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.');
@@ -284,7 +284,7 @@ test('TEXTS OFF: no text question is asked, no consent is recorded, nothing is s
   assert.deepEqual([t.last().reason, t.last().booked, t.last().customerText, t.last().ownerText], ['BOOKED', true, 'skipped', 'skipped']);
   assert.ok(t.logs.some(([c]) => c === 'FAST_TEXTS_SKIPPED') && !t.logs.some(([c]) => /TEXTS_SENT|TEXTS_VERIFIED/.test(c)));
   // a different number still goes through its own confirmation, then straight to the read-back
-  const n = build({ textsEnabled: false }); n.h.serve(n.c.transport); await toOffer(n.c); await n.c.hears(/is \$199/, 'yes'); await n.c.hears(/calling from/, 'no');
+  const n = build({ textsEnabled: false }); n.h.serve(n.c.transport); await toOffer(n.c); await n.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await n.c.hears(/calling from/, 'no');
   await n.c.hears(/best number/, 'five five five zero one zero zero zero zero two'); await n.c.hears(/I heard/, 'yes'); await n.c.hears(/To confirm/, 'yes'); await finish(n.c);
   assert.equal(n.booked.length, 1); assert.equal(n.texts.length, 0); assert.equal(n.last().customerText, 'skipped');
 });
@@ -324,7 +324,7 @@ test('dates: one already passed, or beyond the days the calendar is read for, is
   await t.c.hears(/^That date has already passed\. Which day would you like\?$/, 'December fifteenth at ten');
   await t.c.hears(/^Sorry, I can only book within the next two weeks, up to Monday, November sixteenth\. Which day would you like\?$/, 'Tuesday at ten');
   await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
-  const offer = await t.c.hears(/is \$199/, 'no');
+  const offer = await t.c.hears(/is one hundred ninety-nine dollars/, 'no');
   assert.match(offer, /We have Tuesday, November third, 2026 at 10 A M\. Does that work\?$/, 'the year is spoken with the day and the time');
   assert.equal(t.booked.length, 0);
 });
@@ -341,13 +341,13 @@ test('dates: after three dates that cannot be used the call ends with a person t
 test('availability is read again right before the write: a time that was taken in between, or a calendar that cannot be read now, ends the call with nothing booked', async () => {
   const taken = build({ busyLater: { busy: [{ start: instantOf('2026-11-03', '09:00', TZ), end: instantOf('2026-11-03', '17:00', TZ) }], complete: true } });
   taken.h.serve(taken.c.transport); await toOffer(taken.c);
-  await taken.c.hears(/is \$199/, 'yes'); await taken.c.hears(/calling from/, 'yes'); await taken.c.hears(/May we send you one automated/, 'yes'); await taken.c.hears(/To confirm/, 'yes');
+  await taken.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await taken.c.hears(/calling from/, 'yes'); await taken.c.hears(/May we send you one automated/, 'yes'); await taken.c.hears(/To confirm/, 'yes');
   await finish(taken.c);
   assert.equal(taken.booked.length, 0, 'no write was sent'); assert.equal(taken.last().reason, 'NO_LONGER_AVAILABLE'); assert.match(taken.c.lines.at(-1)!, /no longer available/);
   assert.ok(taken.logs.some(([c]) => c === 'FAST_SLOT_RECHECK_FAILED'));
   const unreadable = build({ busyLater: { busy: [], complete: false } });
   unreadable.h.serve(unreadable.c.transport); await toOffer(unreadable.c);
-  await unreadable.c.hears(/is \$199/, 'yes'); await unreadable.c.hears(/calling from/, 'yes'); await unreadable.c.hears(/May we send you one automated/, 'yes'); await unreadable.c.hears(/To confirm/, 'yes');
+  await unreadable.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await unreadable.c.hears(/calling from/, 'yes'); await unreadable.c.hears(/May we send you one automated/, 'yes'); await unreadable.c.hears(/To confirm/, 'yes');
   await finish(unreadable.c);
   assert.equal(unreadable.booked.length, 0); assert.equal(unreadable.last().reason, 'CALENDAR_UNREADABLE');
 });
@@ -355,7 +355,7 @@ test('availability is read again right before the write: a time that was taken i
 /** A whole call to a verified booking with texts OFF (no text question): the usual answers. */
 async function toBooked(t: ReturnType<typeof build>): Promise<void> {
   t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
 }
 const MAIL_LINES = ['Name: Testa Invented', 'Service: Standard cleaning, 2 bedrooms / 2 bathrooms', 'When: Tuesday, November 3, 2026, 10:00 AM - 12:00 PM Central', 'Where: 123 Invented Lane, Testville, CA 90210', 'Price: $199', 'Booking reference: Jobber job #1001'];
 
@@ -372,7 +372,7 @@ test('test emails (on, texts off): after Jobber returns booked_verified, one fix
 
 test('test emails (on, texts on): the goodbye names the text and the email, and the last outcome carries both email verdicts after delivery is checked', async () => {
   const t = build({ emails: 'accept' }); t.h.serve(t.c.transport); await toOffer(t.c);
-  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
   assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. A confirmation text is on its way. A confirmation email is on its way. Goodbye.');
   assert.deepEqual([t.last().reason, t.last().customerEmail, t.last().ownerEmail, t.last().customerText], ['TEXTS_VERIFIED', 'accepted', 'accepted', 'delivered']);
   assert.equal(t.mails.length, 2);
@@ -382,7 +382,7 @@ test('test emails: nothing is emailed unless the booking is verified (an unverif
   const unverified = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }) }); await toBooked(unverified);
   assert.equal(unverified.mails.length, 0); assert.equal(unverified.last().reason, 'BOOKING_NOT_VERIFIED'); assert.equal(unverified.last().customerEmail, undefined);
   const declined = build({ textsEnabled: false, emails: 'accept' }); declined.h.serve(declined.c.transport); await toOffer(declined.c);
-  await declined.c.hears(/is \$199/, 'yes'); await declined.c.hears(/calling from a number ending in/, 'yes'); await declined.c.hears(/To confirm/, 'no'); await finish(declined.c);
+  await declined.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await declined.c.hears(/calling from a number ending in/, 'yes'); await declined.c.hears(/To confirm/, 'no'); await finish(declined.c);
   assert.equal(declined.mails.length, 0); assert.equal(declined.last().reason, 'DECLINED_AT_READBACK');
   const stranger = build({ textsEnabled: false, emails: 'accept', caller: STRANGER }); stranger.h.serve(stranger.c.transport); stranger.c.setup(DREW, undefined, 'Testa Invented'); await finish(stranger.c);
   assert.equal(stranger.mails.length, 0); assert.equal(stranger.booked.length, 0);
@@ -400,4 +400,13 @@ test('test emails: off by default: no email is built or sent, the goodbye and th
   const t = build({ textsEnabled: false }); await toBooked(t);
   assert.equal(t.mails.length, 0); assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.');
   assert.ok(!('customerEmail' in t.last()) && !('ownerEmail' in t.last())); assert.ok(!t.logs.some(([c]) => c === 'FAST_EMAILS_SENT'));
+});
+
+test('the price is spoken in words everywhere it is spoken: no dollar sign reaches the voice, while the texts and the Jobber amount keep 199', async () => {
+  const t = build({ emails: 'accept' }); t.h.serve(t.c.transport); await toOffer(t.c);
+  const offer = await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); const readback = await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+  assert.match(offer, /bathrooms is one hundred ninety-nine dollars\. We have Tuesday, November third, 2026 at 10 A M\. Does that work\?$/); assert.match(readback, /The price is one hundred ninety-nine dollars\. Shall I book it\? Say yes or no\.$/);
+  assert.ok(t.c.lines.every((l) => !l.includes('$')), 'no spoken line holds a dollar sign'); assert.ok(t.c.lines.every((l) => !/\b199\b/.test(l)), 'no spoken line holds the digits 199');
+  assert.equal(t.booked.length, 1); assert.equal(t.booked[0].priceDollars, 199, 'the Jobber amount is unchanged');
+  assert.ok(t.texts.every((x) => x.body.includes('$199')), 'the texts keep $199'); assert.ok(t.mails.every((m) => m.text.includes('Price: $199')), 'the emails keep $199');
 });

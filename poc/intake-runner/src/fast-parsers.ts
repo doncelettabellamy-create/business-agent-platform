@@ -161,5 +161,21 @@ const cap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
 export function sayDay(date: string): string { const [, m, d] = date.split('-').map(Number); return `${cap(DAYS[weekdayOf(date)])}, ${cap(MONTHS[m - 1])} ${ORDINALS[d]}`; }
 /** A date as it is spoken in an offer or a read-back, with the year: "Tuesday, November tenth, 2026". */
 export function sayDayYear(date: string): string { return `${sayDay(date)}, ${date.slice(0, 4)}`; }
+const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const TENS_W = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+function wordsUnder1000(n: number): string {
+  const h = Math.floor(n / 100); const r = n % 100; const out: string[] = [];
+  if (h > 0) out.push(`${ONES[h]} hundred`);
+  if (r > 0) out.push(r < 20 ? ONES[r] : `${TENS_W[Math.floor(r / 10)]}${r % 10 === 0 ? '' : `-${ONES[r % 10]}`}`);
+  return out.join(' ');
+}
+/** An amount of dollars as it is spoken, in words, so the voice never has to read a dollar sign and digits: 199 -> "one hundred ninety-nine dollars"; 1 -> "one dollar"; 199.5 -> "one hundred ninety-nine dollars and fifty cents". Whole amounts below one million; anything else is returned as plain digits followed by "dollars". */
+export function sayDollars(amount: number): string {
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0 || amount >= 1_000_000) return `${String(amount)} dollars`;
+  const cents = Math.round(amount * 100) % 100; const whole = Math.floor(Math.round(amount * 100) / 100);
+  const thousands = Math.floor(whole / 1000); const rest = whole % 1000;
+  const words = whole === 0 ? 'zero' : [thousands > 0 ? `${wordsUnder1000(thousands)} thousand` : '', rest > 0 ? wordsUnder1000(rest) : ''].filter((s) => s !== '').join(' ');
+  return `${words} ${whole === 1 ? 'dollar' : 'dollars'}${cents > 0 ? ` and ${wordsUnder1000(cents)} ${cents === 1 ? 'cent' : 'cents'}` : ''}`;
+}
 /** A clock time as it is spoken: "10 A M", "2 30 P M". */
 export function sayTime(hm: string): string { const [h, mi] = hm.split(':').map(Number); const ap = h >= 12 ? 'P M' : 'A M'; const h12 = h % 12 === 0 ? 12 : h % 12; return mi === 0 ? `${h12} ${ap}` : `${h12} ${pad2(mi)} ${ap}`; }

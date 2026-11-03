@@ -22,7 +22,7 @@ import type { ContactState } from './call-state.ts';
 import { spokenDigits } from './contact-capture.ts';
 import { chooseOffer, lastBookableDate } from './fast-availability.ts';
 import type { AvailabilityConfig, Busy, Offer } from './fast-availability.ts';
-import { countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
+import { countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
 import type { When } from './fast-parsers.ts';
 import type { BookingRequest, BookingResult } from './jobber-booking.ts';
 import type { CallTransport, TransportEvent } from './call-transport.ts';
@@ -223,7 +223,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const o = chooseOffer(pref, S.availability, cal.busy, deps.now(), refused);
       if (o === undefined) return end('NO_OPENING', 'Sorry, I do not have an opening in the next two weeks, so a person will call you. Goodbye.');
       offer = o;
-      const line = `A standard cleaning for ${num(S.bedrooms)} bedrooms and ${num(S.bathrooms)} bathrooms is $${S.priceDollars}. We have ${sayDayYear(o.date)} at ${sayTime(o.time)}. Does that work?`;
+      const line = `A standard cleaning for ${num(S.bedrooms)} bedrooms and ${num(S.bathrooms)} bathrooms is ${sayDollars(S.priceDollars)}. We have ${sayDayYear(o.date)} at ${sayTime(o.time)}. Does that work?`;
       ask('OFFER', line, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return askCallback();
@@ -274,7 +274,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const o = offer!; const p = contact.addressParts();
       if (p === undefined) return void giveUp('ADDRESS_MISSING');
       const spokenZip = p.zip.split('').join(' ');
-      ask('READBACK', `To confirm: ${S.serviceLabel} for ${firstName} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is $${S.priceDollars}. Shall I book it? Say yes or no.`, async (heard) => {
+      ask('READBACK', `To confirm: ${S.serviceLabel} for ${firstName} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return book();
         if (y === 'no') return end('DECLINED_AT_READBACK', 'No problem. Nothing was booked. Goodbye.');

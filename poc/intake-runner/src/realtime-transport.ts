@@ -81,6 +81,30 @@ export function wholeAcknowledged(sentMs: unknown, ackedMs: unknown): boolean | 
   if (typeof sentMs !== 'number' || typeof ackedMs !== 'number' || !Number.isFinite(sentMs) || !Number.isFinite(ackedMs) || sentMs < 0 || ackedMs < 0) return undefined;
   return sentMs > 0 && ackedMs >= sentMs;
 }
+/**
+ * Where the CLOSING QUESTION of a spoken line starts (an index into `text`), or undefined when the line has none. The closing is the trailing run of sentences that ask ("...?") or say "Say yes or no.". A sentence that
+ * holds a digit or a dollar sign is never part of it, so the facts being confirmed (price, date, time, address) always come BEFORE it. Pure.
+ */
+export function closingStart(text: string): number | undefined {
+  const parts: Array<{ at: number; s: string }> = []; const re = /[^.?!]+[.?!]+(?:\s+|$)|[^.?!]+$/g; let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) parts.push({ at: m.index, s: m[0].trim() });
+  let start: number | undefined;
+  for (let i = parts.length - 1; i >= 0; i--) { const s = parts[i].s; if (/[\d$]/.test(s) || !(/\?$/.test(s) || /^(?:please )?say yes or no\.?$/i.test(s))) break; start = parts[i].at; }
+  return start === undefined || start === 0 ? undefined : start;
+}
+/** The most audio, in milliseconds, that may be left unplayed for a line to still count as heard. */
+export const TAIL_MAX_MS = 2000;
+/**
+ * True when a confirmation line was cut by the caller starting to speak only inside its CLOSING question: at least a quarter of the closing was already played (so everything before it, the facts, was heard in full), and
+ * what is left is at most TAIL_MAX_MS. A caller who answers early, during the price, the date or the address, is NOT accepted: the line is still treated as cut. `sentMs` and `ackedMs` are the bridge's measured audio sent
+ * and audio the phone acknowledged. Pure.
+ */
+export function tailHeard(text: string, sentMs: unknown, ackedMs: unknown): boolean {
+  if (typeof text !== 'string' || typeof sentMs !== 'number' || typeof ackedMs !== 'number' || !Number.isFinite(sentMs) || !Number.isFinite(ackedMs) || sentMs <= 0 || ackedMs < 0 || ackedMs >= sentMs) return false;
+  const at = closingStart(text); if (at === undefined) return false;
+  const closingMs = sentMs * ((text.length - at) / text.length);
+  return sentMs - ackedMs <= Math.min(TAIL_MAX_MS, 0.75 * closingMs);
+}
 export const SAY_PREFIX = 'Say exactly the following words, and nothing else: ';
 /** The words a speech request asks for: everything after the first SAY_PREFIX (a request that has none is returned whole). Pure. */
 export function wordsOf(instructions: string): string {
@@ -354,8 +378,10 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         const played = r.status === 'completed' && wholeAcked && typeof done.transcript === 'string' && sameSpeech(done.transcript, done.text);
         const status = typeof r.status === 'string' && /^[a-z_]{1,32}$/.test(r.status) ? r.status : 'other';
         const why = r.status !== 'completed' ? `status_${status}` : typeof done.transcript !== 'string' ? 'no_transcript' : !sameSpeech(done.transcript, done.text) ? 'transcript_differs' : 'not_all_acknowledged';
-        lastPlayback = played && done.interrupted !== true ? 'played' : 'cut';
-        diag('ADAPTER_REPLY_DONE', { kind: done.kind, status, played, interrupted: done.interrupted === true, requestedChars: done.text.length, transcriptChars: typeof done.transcript === 'string' ? done.transcript.length : 0 });
+        // A caller who starts answering only inside the closing question ("Does that work?") has heard the facts: that line counts as played. Anything earlier is still cut.
+        const tail = done.interrupted === true && done.kind === 'reply' && tailHeard(done.text, m.x_sent_ms, m.x_acked_ms);
+        lastPlayback = (played && done.interrupted !== true) || tail ? 'played' : 'cut';
+        diag('ADAPTER_REPLY_DONE', { kind: done.kind, status, played, interrupted: done.interrupted === true, requestedChars: done.text.length, transcriptChars: typeof done.transcript === 'string' ? done.transcript.length : 0, ...(tail ? { tail: true } : {}) });
         if (done.interrupted) { /* the caller took the floor: nothing failed */ }
         else if (!played) { if (done.kind === 'notice') { noticeFailed(why); return; } diag('ADAPTER_REPLY_FAILED', { reason: why }); emit({ kind: 'reply_failed' }); }
         else if (done.kind === 'notice') { phase = 'live'; diag('ADAPTER_NOTICE_PLAYED'); diag('ADAPTER_SETUP_EMITTED'); emit({ kind: 'setup', to: start?.to, callSid: start?.callSid }); }
