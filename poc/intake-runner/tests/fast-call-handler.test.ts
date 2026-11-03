@@ -14,19 +14,20 @@ const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15
 const SETTINGS: FastSettings = { businessName: 'Drew Cleaning', serviceLabel: 'Standard cleaning', bedrooms: 2, bathrooms: 2, priceDollars: 199, standingApproval: true, state: 'CA',
   availability: { timezone: TZ, hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, durationMinutes: 120, stepMinutes: 30, leadMinutes: 60 } };
 
-function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; maxCalls?: number } = {}) {
-  const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const booked: BookingRequest[] = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
+function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw'; maxCalls?: number } = {}) {
+  const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: BookingRequest[] = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
   const deps: FastDeps = {
     settings: { ...SETTINGS, ...o.settings }, numbers: new Set([DREW]), approvedCallers: new Set([CUSTOMER]), approvedCustomerNumbers: new Set(o.customers ?? [CUSTOMER]), ownerNumber: OWNER, maxCalls: o.maxCalls ?? 5,
-    now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; return o.busy ?? { busy: [], complete: true }; },
+    now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; return (busyCalls > 1 && o.busyLater !== undefined ? o.busyLater : o.busy) ?? { busy: [], complete: true }; },
     book: async (r) => { booked.push(r); return (o.book ?? (() => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2 })))(r); },
     sendText: async (to, body) => { texts.push({ to, body }); return (o.send ?? (() => ({ ok: true, sid: `SM${'1'.repeat(32)}` })))(to, body); },
     textsEnabled: o.textsEnabled ?? true, ownerConsent: o.ownerConsent ?? true, recordConsent: async (e) => { consents.push(e); return o.consentOk ?? true; },
     verifyText: async () => o.delivery ?? 'delivered', log: (c, d) => { logs.push([c, d]); }, onOutcome: (x) => { outcomes.push(x); },
-    answerWaitMs: o.answerWaitMs ?? 5000, settleMs: 15, playbackMaxMs: 5000, afterSpeechMs: 5,
+    emailsEnabled: o.emails !== undefined, ...(o.emails === undefined ? {} : { sendEmail: async (role: 'customer' | 'owner', subject: string, text: string) => { mails.push({ role, subject, text }); if (o.emails === 'throw') throw new Error('mail down'); return { ok: o.emails === 'accept' }; } }),
+    answerWaitMs: o.answerWaitMs ?? 5000, settleMs: o.settleMs === null ? undefined : o.settleMs ?? 15, playbackMaxMs: 5000, afterSpeechMs: 5,
   };
   const h = createFastCallHandler(deps); const c = fakeCarrier();
-  return { h, c, logs, outcomes, booked, texts, consents, busyCalls: () => busyCalls, last: () => outcomes[outcomes.length - 1] };
+  return { h, c, logs, outcomes, mails, booked, texts, consents, busyCalls: () => busyCalls, last: () => outcomes[outcomes.length - 1] };
 }
 /** The caller's side of a complete call up to the offer, with the usual answers. */
 async function toOffer(c: ReturnType<typeof fakeCarrier>, when = 'Tuesday at ten'): Promise<void> {
@@ -42,11 +43,11 @@ test('the whole call: name, address with city and ZIP, day and time, size, $199 
   const t = build();
   t.h.serve(t.c.transport); await toOffer(t.c);
   const offer = await t.c.hears(/is \$199/, 'yes');
-  assert.equal(offer, 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third at 10 A M. Does that work?');
+  assert.equal(offer, 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
   assert.equal(await t.c.hears(/calling from a number ending in/, 'yes'), 'I see you are calling from a number ending in 0 0 0 2. Is that the best number to reach you?');
   await t.c.hears(/May we send you one automated/, 'yes');
   const readback = await t.c.hears(/To confirm/, 'yes');
-  assert.equal(readback, 'To confirm: Standard cleaning for Testa on Tuesday, November third at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is $199. Shall I book it? Say yes or no.');
+  assert.equal(readback, 'To confirm: Standard cleaning for Testa on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is $199. Shall I book it? Say yes or no.');
   await finish(t.c);
   assert.equal(t.booked.length, 1);
   const r = t.booked[0];
@@ -56,7 +57,7 @@ test('the whole call: name, address with city and ZIP, day and time, size, $199 
   assert.equal(t.texts[0].body, 'Donceletta Bellamy - Developer Testing: Drew Cleaning DEMO booking confirmed for Tue Nov 3, 10:00 AM-12:00 PM Central, at 123 Invented Lane, Testville, CA 90210. Standard cleaning, 2 bedrooms/2 bathrooms, $199. Test only; no cleaning service will occur. Reply STOP to opt out or HELP for help.');
   assert.equal(t.texts[1].body, 'Donceletta Bellamy - Developer Testing: New Drew Cleaning DEMO booking for Testa Invented, Tue Nov 3, 10:00 AM-12:00 PM Central, at 123 Invented Lane, Testville, CA 90210. Standard cleaning, 2 bedrooms/2 bathrooms, $199. Test only; no cleaning service will occur. Reply STOP to opt out or HELP for help.');
   assert.deepEqual(t.consents.map((c) => [c.result, c.script]), [['yes', 'fast-consent-v1-customer']]); assert.match(t.consents[0].ref, /^[0-9a-f]{24}$/);
-  assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third at 10 A M. A confirmation text is on its way. Goodbye.');
+  assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. A confirmation text is on its way. Goodbye.');
   assert.deepEqual([t.last().reason, t.last().booked, t.last().customerText, t.last().ownerText], ['TEXTS_VERIFIED', true, 'delivered', 'delivered']);
   const asks = t.c.lines.filter((l) => /\?|Say yes or no/.test(l)); assert.equal(new Set(asks).size, asks.length, 'no question was asked twice');
   noPersonalDetail(t.logs);
@@ -72,7 +73,7 @@ test('answers are kept: an address said in pieces asks only for what is missing,
   await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms');
   await t.c.hears(/And how many bathrooms/, 'two');
   const offer = await t.c.hears(/is \$199/, 'no');
-  assert.match(offer, /We have Tuesday, November third at 9 A M\./, 'only a day was asked for: the earliest time that day');
+  assert.match(offer, /We have Tuesday, November third, 2026 at 9 A M\./, 'only a day was asked for: the earliest time that day');
   const count = (re: RegExp): number => t.c.lines.filter((l) => re.test(l)).length;
   assert.deepEqual([count(/the street address/), count(/^What is the city\?$/), count(/^And the ZIP code\?$/), count(/What day and time/), count(/How many bedrooms and bathrooms/)], [1, 1, 1, 1, 1]);
   assert.equal(count(/first and last name/), 0, 'the greeting asked the name; the call never asks it again');
@@ -90,7 +91,7 @@ test('measured confirmation: a yes before the line has finished playing is HELD 
   await t.c.hears(/is \$199/, 'yes', { early: true });
   assert.ok(t.logs.some(([c]) => c === 'CONFIRM_HELD'));
   const again = await t.c.hears(/Please wait until I have finished, then answer\. A standard cleaning/, 'yes');
-  assert.match(again, /We have Tuesday, November third at 10 A M\. Does that work\?$/);
+  assert.match(again, /We have Tuesday, November third, 2026 at 10 A M\. Does that work\?$/);
   await t.c.hears(/calling from a number ending in/, 'yes');
   await t.c.hears(/May we send you one automated/, 'yes');
   await t.c.hears(/To confirm/, 'yes', { early: true });   // an early yes to the read-back
@@ -168,7 +169,7 @@ test('no time is invented: an unreadable or incomplete calendar, missing hours, 
     assert.equal(t.last().reason, reason, label); assert.equal(t.booked.length, 0, label); assert.ok(!t.c.lines.some((l) => /is \$199/.test(l)), `${label}: no offer was spoken`);
   }
   const t = build({ busy: { busy: [{ start: instantOf('2026-11-03', '09:00', TZ), end: instantOf('2026-11-03', '12:00', TZ) }], complete: true } }); t.h.serve(t.c.transport); await toOffer(t.c);
-  assert.match(await t.c.hears(/is \$199/, 'no'), /Tuesday, November third at 12 P M/, 'the calendar\'s busy time moved the offer');
+  assert.match(await t.c.hears(/is \$199/, 'no'), /Tuesday, November third, 2026 at 12 P M/, 'the calendar\'s busy time moved the offer');
 });
 
 test('the caller can decline the time: a different one is offered and the same time is never offered twice; two refusals end the call with nothing booked', async () => {
@@ -278,7 +279,7 @@ test('TEXTS OFF: no text question is asked, no consent is recorded, nothing is s
   await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from/, 'yes');
   assert.match(await t.c.hears(/To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa/, 'the read-back follows the callback number directly'); await finish(t.c);
   assert.equal(t.booked.length, 1); assert.equal(t.texts.length, 0); assert.equal(t.consents.length, 0);
-  assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third at 10 A M. This test line does not send text messages. Goodbye.');
+  assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.');
   assert.ok(!t.c.lines.some((l) => /May we send you|automated booking-details|on its way/.test(l)));
   assert.deepEqual([t.last().reason, t.last().booked, t.last().customerText, t.last().ownerText], ['BOOKED', true, 'skipped', 'skipped']);
   assert.ok(t.logs.some(([c]) => c === 'FAST_TEXTS_SKIPPED') && !t.logs.some(([c]) => /TEXTS_SENT|TEXTS_VERIFIED/.test(c)));
@@ -286,4 +287,117 @@ test('TEXTS OFF: no text question is asked, no consent is recorded, nothing is s
   const n = build({ textsEnabled: false }); n.h.serve(n.c.transport); await toOffer(n.c); await n.c.hears(/is \$199/, 'yes'); await n.c.hears(/calling from/, 'no');
   await n.c.hears(/best number/, 'five five five zero one zero zero zero zero two'); await n.c.hears(/I heard/, 'yes'); await n.c.hears(/To confirm/, 'yes'); await finish(n.c);
   assert.equal(n.booked.length, 1); assert.equal(n.texts.length, 0); assert.equal(n.last().customerText, 'skipped');
+});
+
+test('settle wait: an address said in pieces is not asked for again while the caller is still speaking; the missing part is asked only after they stop and the quiet wait has passed', async () => {
+  const t = build({ settleMs: 80 }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane');   // street only: the city and ZIP are still to come
+  t.c.emit({ kind: 'speech', active: true });               // the caller starts the next piece before the quiet wait is over
+  await new Promise((r) => setTimeout(r, 250));              // more than three times the wait: it would have asked by now
+  assert.equal(t.c.lines.filter((l) => /^What is the city\?$|^And the ZIP code\?$/.test(l)).length, 0, 'nothing is asked while the caller speaks');
+  t.c.emit({ kind: 'speech', active: false });
+  await t.c.hears(/What is the city/, 'Testville');
+  assert.equal(t.c.lines.filter((l) => /^What is the city\?$/.test(l)).length, 1);
+});
+
+test('settle wait: more speech that arrives as an answer cancels the pending question, so the part the caller just said is never asked for', async () => {
+  const t = build({ settleMs: 80 }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane');
+  t.c.emit({ kind: 'speech', active: true }); t.c.emit({ kind: 'speech', active: false });
+  t.c.emit({ kind: 'utterance', text: 'Testville, 90210' });   // the rest arrives inside the wait
+  await t.c.hears(/What day and time/, 'Tuesday');
+  assert.equal(t.c.lines.filter((l) => /^What is the city\?$|^And the ZIP code\?$/.test(l)).length, 0, 'the city and ZIP were said, so they are not asked');
+});
+
+test('settle wait: the default quiet wait is longer than 1.2 seconds, so a pause between the street and the city is not mistaken for the end of the answer', async () => {
+  const t = build({ settleMs: null }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane');
+  await new Promise((r) => setTimeout(r, 1600));
+  assert.equal(t.c.lines.filter((l) => /^What is the city\?$|^And the ZIP code\?$/.test(l)).length, 0, 'nothing was asked 1.6 seconds after the street');
+  await t.c.hears(/What is the city/, 'Testville');
+});
+
+test('dates: one already passed, or beyond the days the calendar is read for, is never taken as asked; the caller is told why and asked again, and nothing is offered or booked from it', async () => {
+  const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/What day and time/, 'October fourth at ten');
+  await t.c.hears(/^That date has already passed\. Which day would you like\?$/, 'December fifteenth at ten');
+  await t.c.hears(/^Sorry, I can only book within the next two weeks, up to Monday, November sixteenth\. Which day would you like\?$/, 'Tuesday at ten');
+  await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  const offer = await t.c.hears(/is \$199/, 'no');
+  assert.match(offer, /We have Tuesday, November third, 2026 at 10 A M\. Does that work\?$/, 'the year is spoken with the day and the time');
+  assert.equal(t.booked.length, 0);
+});
+
+test('dates: after three dates that cannot be used the call ends with a person to follow up, and nothing is booked', async () => {
+  const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/What day and time/, 'October fourth');
+  await t.c.hears(/already passed/, 'October fifth');
+  await t.c.hears(/already passed/, 'October sixth');
+  await finish(t.c); assert.equal(t.last().reason, 'WHEN_UNCLEAR'); assert.equal(t.booked.length, 0);
+});
+
+test('availability is read again right before the write: a time that was taken in between, or a calendar that cannot be read now, ends the call with nothing booked', async () => {
+  const taken = build({ busyLater: { busy: [{ start: instantOf('2026-11-03', '09:00', TZ), end: instantOf('2026-11-03', '17:00', TZ) }], complete: true } });
+  taken.h.serve(taken.c.transport); await toOffer(taken.c);
+  await taken.c.hears(/is \$199/, 'yes'); await taken.c.hears(/calling from/, 'yes'); await taken.c.hears(/May we send you one automated/, 'yes'); await taken.c.hears(/To confirm/, 'yes');
+  await finish(taken.c);
+  assert.equal(taken.booked.length, 0, 'no write was sent'); assert.equal(taken.last().reason, 'NO_LONGER_AVAILABLE'); assert.match(taken.c.lines.at(-1)!, /no longer available/);
+  assert.ok(taken.logs.some(([c]) => c === 'FAST_SLOT_RECHECK_FAILED'));
+  const unreadable = build({ busyLater: { busy: [], complete: false } });
+  unreadable.h.serve(unreadable.c.transport); await toOffer(unreadable.c);
+  await unreadable.c.hears(/is \$199/, 'yes'); await unreadable.c.hears(/calling from/, 'yes'); await unreadable.c.hears(/May we send you one automated/, 'yes'); await unreadable.c.hears(/To confirm/, 'yes');
+  await finish(unreadable.c);
+  assert.equal(unreadable.booked.length, 0); assert.equal(unreadable.last().reason, 'CALENDAR_UNREADABLE');
+});
+
+/** A whole call to a verified booking with texts OFF (no text question): the usual answers. */
+async function toBooked(t: ReturnType<typeof build>): Promise<void> {
+  t.h.serve(t.c.transport); await toOffer(t.c);
+  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+}
+const MAIL_LINES = ['Name: Testa Invented', 'Service: Standard cleaning, 2 bedrooms / 2 bathrooms', 'When: Tuesday, November 3, 2026, 10:00 AM - 12:00 PM Central', 'Where: 123 Invented Lane, Testville, CA 90210', 'Price: $199', 'Booking reference: Jobber job #1001'];
+
+test('test emails (on, texts off): after Jobber returns booked_verified, one fixed email goes to the customer role and one to the owner role with the verified details, the goodbye says so only because both were accepted, and the outcome records them', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept' }); await toBooked(t);
+  assert.equal(t.booked.length, 1); assert.deepEqual(t.mails.map((m) => m.role).sort(), ['customer', 'owner']);
+  for (const m of t.mails) for (const line of MAIL_LINES) assert.ok(m.text.split('\n').includes(line), `${m.role}: ${line}`);
+  assert.equal(t.mails.find((m) => m.role === 'customer')!.subject, 'Drew Cleaning DEMO booking confirmed: Tuesday, November 3, 2026');
+  assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. A confirmation email is on its way. This test line does not send text messages. Goodbye.');
+  assert.deepEqual([t.last().reason, t.last().booked, t.last().customerEmail, t.last().ownerEmail, t.last().customerText], ['BOOKED', true, 'accepted', 'accepted', 'skipped']);
+  assert.deepEqual(t.logs.find(([c]) => c === 'FAST_EMAILS_SENT')?.[1], { customer: 'accepted', owner: 'accepted' });
+  assert.equal(t.texts.length, 0, 'texts stay off'); noPersonalDetail(t.logs);
+});
+
+test('test emails (on, texts on): the goodbye names the text and the email, and the last outcome carries both email verdicts after delivery is checked', async () => {
+  const t = build({ emails: 'accept' }); t.h.serve(t.c.transport); await toOffer(t.c);
+  await t.c.hears(/is \$199/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+  assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. A confirmation text is on its way. A confirmation email is on its way. Goodbye.');
+  assert.deepEqual([t.last().reason, t.last().customerEmail, t.last().ownerEmail, t.last().customerText], ['TEXTS_VERIFIED', 'accepted', 'accepted', 'delivered']);
+  assert.equal(t.mails.length, 2);
+});
+
+test('test emails: nothing is emailed unless the booking is verified (an unverified booking, a declined read-back, a taken time, a refused caller)', async () => {
+  const unverified = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }) }); await toBooked(unverified);
+  assert.equal(unverified.mails.length, 0); assert.equal(unverified.last().reason, 'BOOKING_NOT_VERIFIED'); assert.equal(unverified.last().customerEmail, undefined);
+  const declined = build({ textsEnabled: false, emails: 'accept' }); declined.h.serve(declined.c.transport); await toOffer(declined.c);
+  await declined.c.hears(/is \$199/, 'yes'); await declined.c.hears(/calling from a number ending in/, 'yes'); await declined.c.hears(/To confirm/, 'no'); await finish(declined.c);
+  assert.equal(declined.mails.length, 0); assert.equal(declined.last().reason, 'DECLINED_AT_READBACK');
+  const stranger = build({ textsEnabled: false, emails: 'accept', caller: STRANGER }); stranger.h.serve(stranger.c.transport); stranger.c.setup(DREW, undefined, 'Testa Invented'); await finish(stranger.c);
+  assert.equal(stranger.mails.length, 0); assert.equal(stranger.booked.length, 0);
+});
+
+test('test emails: a refused or failing mail server changes nothing about the booking, and the caller is not told an email is coming', async () => {
+  for (const mode of ['refuse', 'throw'] as const) {
+    const t = build({ textsEnabled: false, emails: mode }); await toBooked(t);
+    assert.equal(t.booked.length, 1); assert.equal(t.last().reason, 'BOOKED'); assert.equal(t.last().booked, true); assert.deepEqual([t.last().customerEmail, t.last().ownerEmail], ['refused', 'refused']);
+    assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.', mode);
+  }
+});
+
+test('test emails: off by default: no email is built or sent, the goodbye and the outcome are exactly as before, and no email field appears', async () => {
+  const t = build({ textsEnabled: false }); await toBooked(t);
+  assert.equal(t.mails.length, 0); assert.equal(t.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.');
+  assert.ok(!('customerEmail' in t.last()) && !('ownerEmail' in t.last())); assert.ok(!t.logs.some(([c]) => c === 'FAST_EMAILS_SENT'));
 });

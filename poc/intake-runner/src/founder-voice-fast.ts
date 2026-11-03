@@ -12,6 +12,8 @@ import { callerOf, E164, sendSms, SID, verifyDelivery } from './twilio-messaging
 import type { HttpFetch, TwilioCtx } from './twilio-messaging.ts';
 import type { FastDeps } from './fast-call-handler.ts';
 import { appendConsent, ownerConsentOn } from './fast-consent.ts';
+import { createEmailSender, EMAIL_BLOB, isTestEmails } from './fast-email.ts';
+import type { MailTransport, TestEmails } from './fast-email.ts';
 import { fastSettingsOf } from './founder-voice-gate.ts';
 import type { FounderVoiceConfig } from './founder-voice-gate.ts';
 import type { FounderCallConfig } from './founder-call-gate.ts';
@@ -33,12 +35,23 @@ export interface FastComposition {
   /** Test hooks: other addresses for the two services. */
   jobberEndpoints?: typeof JOBBER_ENDPOINTS; twilioOrigin?: string;
   textFrom?: string;
+  /** TEST ONLY: a stand-in mail transport, or a local fake SMTP port, in place of Gmail. */
+  emailTransport?: MailTransport; emailTestPort?: number;
 }
 
 export async function loadTestNumbers(vault: ReturnType<typeof createVault>): Promise<TestNumbers | undefined> {
   const t = await vault.loadBlob(NUMBERS_BLOB); if (t === undefined) return undefined;
   try { const j = JSON.parse(t) as unknown; return isTestNumbers(j) ? j : undefined; } catch { return undefined; }
 }
+export async function loadTestEmails(vault: ReturnType<typeof createVault>): Promise<TestEmails | undefined> {
+  const t = await vault.loadBlob(EMAIL_BLOB); if (t === undefined) return undefined;
+  try { const j = JSON.parse(t) as unknown; return isTestEmails(j) ? j : undefined; } catch { return undefined; }
+}
+/** Presence only: are the test email addresses saved, and is the switch on? Emails are OFF unless FAST_EMAILS is exactly "on". */
+export async function emailStatus(c: Pick<FastComposition, 'vaultDir' | 'protector' | 'env'>): Promise<{ emailsSaved: boolean; emailsOn: boolean }> {
+  return { emailsSaved: (await loadTestEmails(createVault(c.vaultDir, c.protector))) !== undefined, emailsOn: c.env.FAST_EMAILS === 'on' };
+}
+
 /** Presence only, for the gate and the dry run: are the private pieces in place? Nothing is printed and nothing leaves the machine. */
 export async function fastStatus(c: Pick<FastComposition, 'vaultDir' | 'protector' | 'env'>): Promise<{ numbersPresent: boolean; textsOn: boolean; ownerConsent: boolean; jobberConnected: boolean; jobberWritesOn: boolean }> {
   const vault = createVault(c.vaultDir, c.protector); const nums = await loadTestNumbers(vault);
@@ -54,6 +67,9 @@ export async function buildFastDeps(c: FastComposition): Promise<FastDeps> {
   const numbers = await loadTestNumbers(vault); const creds = await vault.loadCredentials();
   if (numbers === undefined || creds === undefined || (await vault.loadTokens()) === undefined) throw new RangeError('the approved test numbers or the Jobber connection are missing');
   const from = c.textFrom ?? c.config.numbers[0]; const textsEnabled = c.env.FAST_TEXTS === 'on';
+  // Test emails: OFF unless FAST_EMAILS is exactly "on". Switched on without the approved addresses saved, nothing starts (it never falls back to anything else).
+  const emailsOn = c.env.FAST_EMAILS === 'on'; const emails = emailsOn ? await loadTestEmails(vault) : undefined;
+  if (emailsOn && emails === undefined) throw new RangeError('FAST_EMAILS is on but the approved test email addresses are not saved');
   const jobber: JobberCtx = { vault, endpoints: c.jobberEndpoints ?? JOBBER_ENDPOINTS, fetch: c.fetch as unknown as FetchLike, now: c.now, diag: (code, detail) => c.log(code, detail), version: c.env.JOBBER_GRAPHQL_VERSION ?? GRAPHQL_VERSION,
     ...(c.env.JOBBER_ALLOW_WRITES === 'test-account' ? { allowWrites: { expectedAccountName: f.jobber_account_name } } : {}) };
   const twilio: TwilioCtx = { accountSid: numbers.account_sid, authToken: () => c.env.TWILIO_AUTH_TOKEN, fetch: c.fetch as unknown as HttpFetch, diag: (code, detail) => c.log(code, detail), approved: new Set([numbers.customer, numbers.owner]), ...(c.twilioOrigin === undefined ? {} : { origin: c.twilioOrigin }) };
@@ -69,5 +85,7 @@ export async function buildFastDeps(c: FastComposition): Promise<FastDeps> {
     ownerConsent: textsEnabled && (await ownerConsentOn(vault, numbers.owner)),
     recordConsent: !textsEnabled ? async () => false : (e) => appendConsent(vault, { v: 1, role: 'customer', at: new Date(c.now()).toISOString(), method: 'call_verbal', script: e.script, result: e.result, ref: e.ref }),
     verifyText: (sid) => verifyDelivery(twilio, sid),
+    emailsEnabled: emails !== undefined,
+    ...(emails === undefined ? {} : { sendEmail: createEmailSender({ settings: emails, log: c.log, ...(c.emailTransport === undefined ? {} : { transport: c.emailTransport }), ...(c.emailTestPort === undefined ? {} : { testOnlyLocalPort: c.emailTestPort }) }) }),
   };
 }

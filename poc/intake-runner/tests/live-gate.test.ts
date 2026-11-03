@@ -2,7 +2,7 @@
 // Nothing here calls any API. Run: npm test
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { DEFAULT_LIVE_MODEL, isAllowedInputPath, liveGateProblems, parseLiveArgs, syntheticProblems } from '../src/live-gate.ts';
 import type { LiveArgs } from '../src/live-gate.ts';
 import { PRICES_PER_MILLION, approxTokens, costFromUsage, estimateCall, estimateRun, formatUsd } from '../src/cost-estimate.ts';
@@ -175,8 +175,11 @@ test('package manifest: no npm script can trigger a live call; the only dependen
     devDependencies?: unknown; optionalDependencies?: unknown; peerDependencies?: unknown;
   };
   for (const [name, cmd] of Object.entries(pkg.scripts)) assert.ok(!cmd.includes('--live'), `script ${name} must not contain --live`);
-  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk'], 'exactly one dependency');
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk', 'nodemailer'], 'exactly the two approved dependencies: the official SDK and the test-only email sender');
   assert.match(pkg.dependencies!['@anthropic-ai/sdk'], /^\d+\.\d+\.\d+$/, 'exact version: no range operators');
+  assert.match(pkg.dependencies!.nodemailer, /^\d+\.\d+\.\d+$/, 'exact version: no range operators');
+  assert.equal(JSON.parse(read('package-lock.json')).packages['node_modules/nodemailer'].version, pkg.dependencies!.nodemailer, 'the locked mail library version equals the pinned one');
+  assert.deepEqual(readdirSync(new URL('../src/', import.meta.url)).filter((f) => f.endsWith('.ts') && /from\s+'nodemailer'|import\s*\(\s*'nodemailer'/.test(readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'))), ['fast-email.ts'], 'only the email sender imports the mail library');
   assert.ok(!('devDependencies' in pkg) && !('optionalDependencies' in pkg) && !('peerDependencies' in pkg));
 
   const lock = JSON.parse(read('package-lock.json')) as { lockfileVersion: number; packages: Record<string, { version?: string; resolved?: string; integrity?: string; hasInstallScript?: boolean; dependencies?: Record<string, string> }> };

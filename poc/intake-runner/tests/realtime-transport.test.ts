@@ -400,7 +400,8 @@ test('interruption: a question queued behind a reply that the caller talks over 
   await sim.waitFor(() => sim.playing());
   sim.say('stop', { playedMs: 8 * 10 });
   await sim.idle();
-  assert.deepEqual(events.map((e) => e.kind), ['setup', 'interrupt', 'utterance']);
+  assert.deepEqual(events.map((e) => e.kind), ['setup', 'speech', 'interrupt', 'speech', 'utterance']);   // the caller's speech start and stop are reported around the interruption
+  assert.deepEqual(events.filter((e) => e.kind === 'speech').map((e) => (e as { active: boolean }).active), [true, false]);
   assert.equal(sim.spoken.length, 1, 'neither the first reply nor the queued one was heard');
   assert.equal(SAYS(sim).length, 2, 'the second was never requested');
 });

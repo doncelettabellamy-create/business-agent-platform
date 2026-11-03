@@ -52,14 +52,18 @@ export function candidatesOn(date: string, c: AvailabilityConfig, busy: readonly
   return out;
 }
 
+/** The last date an offer may fall on: the end of the window the calendar is read for (today plus the horizon). */
+export function lastBookableDate(nowMs: number, c: AvailabilityConfig): string { const t = zonedParts(nowMs, c.timezone); return addDays(isoDate(t.y, t.m, t.d), c.horizonDays ?? 14); }
+
 /** The one time to offer for what the caller asked, or undefined when nothing is supported. `skip` lists offers already refused (the same time is never offered twice). */
 export function chooseOffer(pref: When, c: AvailabilityConfig, busy: readonly Busy[], nowMs: number, skip: readonly Offer[] = []): Offer | undefined {
   if (availabilityProblems(c).length > 0) return undefined;
   const today = zonedParts(nowMs, c.timezone); const todayIso = isoDate(today.y, today.m, today.d);
-  const first = pref.date !== undefined && pref.date >= todayIso ? pref.date : todayIso; const horizon = c.horizonDays ?? 14;
+  const first = pref.date !== undefined && pref.date >= todayIso ? pref.date : todayIso; const horizon = c.horizonDays ?? 14; const last = lastBookableDate(nowMs, c);
+  if (pref.date !== undefined && pref.date > last) return undefined;   // a date the calendar was never read for is never offered
   const refused = (o: Offer): boolean => skip.some((s) => s.date === o.date && s.time === o.time);
   for (let i = 0; i <= horizon; i++) {
-    const date = addDays(first, i); const day = candidatesOn(date, c, busy, nowMs).filter((o) => !refused(o));
+    const date = addDays(first, i); if (date > last) break; const day = candidatesOn(date, c, busy, nowMs).filter((o) => !refused(o));
     if (day.length === 0) continue;
     const sameDay = date === first && pref.date !== undefined;
     const inPart = pref.part === undefined ? day : day.filter((o) => partOf(o.time) === pref.part);

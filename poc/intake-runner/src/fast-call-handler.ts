@@ -20,14 +20,15 @@ import { createHash } from 'node:crypto';
 import { createContactState } from './call-state.ts';
 import type { ContactState } from './call-state.ts';
 import { spokenDigits } from './contact-capture.ts';
-import { chooseOffer } from './fast-availability.ts';
+import { chooseOffer, lastBookableDate } from './fast-availability.ts';
 import type { AvailabilityConfig, Busy, Offer } from './fast-availability.ts';
-import { countFrom, instantOf, isAiQuestion, sayDay, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
+import { countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
 import type { When } from './fast-parsers.ts';
 import type { BookingRequest, BookingResult } from './jobber-booking.ts';
 import type { CallTransport, TransportEvent } from './call-transport.ts';
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
+import { customerEmail, ownerEmail } from './fast-email-copy.ts';
 import { CUSTOMER_SCRIPT_ID, MAX_TEXT_CHARS, customerConsentLine, customerText, ownerText, zoneLabelOf } from './fast-sms-copy.ts';
 
 export interface FastSettings {
@@ -40,7 +41,8 @@ export interface FastSettings {
   /** Two letters, sent with the address to Jobber when given. */
   state?: string;
 }
-export interface FastOutcome { reason: string; booked: boolean; customerText: Delivery | 'not_sent' | 'skipped'; ownerText: Delivery | 'not_sent' | 'skipped'; steps: string[] }
+export type EmailVerdict = 'accepted' | 'refused' | 'not_sent';
+export interface FastOutcome { reason: string; booked: boolean; customerText: Delivery | 'not_sent' | 'skipped'; ownerText: Delivery | 'not_sent' | 'skipped'; /** Present only when test emails are on: whether the mail server ACCEPTED each (not that it reached an inbox). */ customerEmail?: EmailVerdict; ownerEmail?: EmailVerdict; steps: string[] }
 export interface FastDeps {
   settings: FastSettings;
   /** The dialed numbers the test line answers on (E.164). */
@@ -62,6 +64,10 @@ export interface FastDeps {
   /** Writes the caller's spoken answer to the text-consent question as minimal protected evidence; true only if it was written. A yes that could not be recorded sends no text. */
   recordConsent(e: { result: 'yes' | 'no'; script: string; ref: string }): Promise<boolean>;
   verifyText(sid: string): Promise<Delivery>;
+  /** TEST EMAILS ON (default off). After a VERIFIED booking one fixed test email goes to the founder-approved customer address and one to the owner address. A failure never changes the booking. */
+  emailsEnabled?: boolean;
+  /** Sends one fixed test email to a ROLE's approved address. The addresses live only behind this function: the call logic never holds or chooses one. */
+  sendEmail?(role: 'customer' | 'owner', subject: string, text: string): Promise<{ ok: boolean }>;
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number | boolean>): void;
   onOutcome?(o: FastOutcome): void;
@@ -83,7 +89,7 @@ interface Awaiting { id: string; text: string; unit: boolean; playing: boolean; 
 export function createFastCallHandler(deps: FastDeps): FastHandler {
   if (typeof deps !== 'object' || deps === null || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1 || typeof deps.settings !== 'object' || !(deps.numbers instanceof Set) || !(deps.approvedCallers instanceof Set) || !(deps.approvedCustomerNumbers instanceof Set) || !/^\+[1-9]\d{9,14}$/.test(String(deps.ownerNumber))
     || ['callerOf', 'busy', 'book', 'sendText', 'verifyText', 'now', 'log'].some((k) => typeof (deps as unknown as Record<string, unknown>)[k] !== 'function')) throw new RangeError('the fast call handler needs its dependencies');
-  const answerWaitMs = deps.answerWaitMs ?? 12_000; const settleMs = deps.settleMs ?? 1200; const playbackMaxMs = deps.playbackMaxMs ?? 60_000; const afterSpeechMs = deps.afterSpeechMs ?? 400;
+  const answerWaitMs = deps.answerWaitMs ?? 12_000; const settleMs = deps.settleMs ?? 3000; const playbackMaxMs = deps.playbackMaxMs ?? 60_000; const afterSpeechMs = deps.afterSpeechMs ?? 400;
   const S = deps.settings; let active = 0; let accepted = 0; const work = new Set<Promise<unknown>>();
 
   function serve(t: CallTransport): void {
@@ -93,10 +99,19 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     const contact: ContactState = createContactState({ cityZip: true });
     const steps: string[] = []; let done = false; let queue: Promise<void> = Promise.resolve();
     let awaiting: Awaiting | undefined; let answerTimer: ReturnType<typeof setTimeout> | undefined; let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    let settleFn: (() => Promise<void>) | undefined; let speakingSince: number | undefined;   // the pending "ask only what is missing", and when the caller last started speaking
     let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
     const note = (s: string): void => { if (steps.length < 40) steps.push(s); };
-    const clearTimers = (): void => { if (answerTimer !== undefined) clearTimeout(answerTimer); if (settleTimer !== undefined) clearTimeout(settleTimer); answerTimer = undefined; settleTimer = undefined; };
+    const clearTimers = (): void => { if (answerTimer !== undefined) clearTimeout(answerTimer); if (settleTimer !== undefined) clearTimeout(settleTimer); answerTimer = undefined; settleTimer = undefined; settleFn = undefined; };
+    /** True while the voice detection says the caller is speaking. A start that never gets its stop stops counting after ten seconds, so a lost event cannot silence the call for good. */
+    const callerSpeaking = (): boolean => speakingSince !== undefined && deps.now() - speakingSince < 10_000;
+    const fireSettle = (): void => {
+      settleTimer = undefined; const f = settleFn; if (f === undefined || callerSpeaking()) return;   // while the caller speaks it stays pending; the end of their speech starts the wait again
+      settleFn = undefined; enqueue(async () => { if (callerSpeaking()) { settleFn = f; return; } await f(); });
+    };
+    /** Waits `settleMs` of quiet, then runs `fn` (ask only for what is missing). More speech, or any new answer, cancels or postpones it. */
+    const armSettle = (fn: () => Promise<void>): void => { if (settleTimer !== undefined) clearTimeout(settleTimer); settleFn = fn; settleTimer = callerSpeaking() ? undefined : setTimeout(fireSettle, settleMs); };
     const enqueue = (fn: () => Promise<void>): void => { const p = (queue = queue.then(async () => { if (!done) await fn(); }).catch(() => { deps.log('FAST_ERROR'); void end('ERROR', 'Sorry, something went wrong, so I will end the call. Goodbye.'); })); const w = p.then(() => undefined); work.add(w); void w.finally(() => work.delete(w)); };
 
     // ---------------------------------------------------------------- speaking, with the measured playback verdict
@@ -116,7 +131,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     /** Waits for an answer to something the carrier already said (the opening): nothing is spoken now; silence reprompts once with `text`. */
     function listen(id: string, text: string, onAnswer: Awaiting['onAnswer']): void { clearTimers(); const a: Awaiting = { id, text, unit: false, playing: false, heldEarly: false, replays: 0, reprompts: 0, onAnswer }; awaiting = a; note(id); armAnswerTimer(a); }
     function ask(id: string, text: string, onAnswer: Awaiting['onAnswer'], unit = false): void { clearTimers(); const a: Awaiting = { id, text, unit, playing: true, heldEarly: false, replays: 0, reprompts: 0, onAnswer }; awaiting = a; note(id); play(a, text); }
-    function armAnswerTimer(a: Awaiting): void { if (answerTimer !== undefined) clearTimeout(answerTimer); answerTimer = setTimeout(() => enqueue(async () => { if (awaiting !== a || a.playing) return; a.reprompts++; deps.log('FAST_SILENCE', { id: a.id, n: a.reprompts }); if (a.reprompts >= 2) return end('NO_ANSWER', 'I am not hearing a reply, so I will end the call. Goodbye.'); play(a, `Sorry, I did not catch that. ${a.text}`); }), answerWaitMs); }
+    function armAnswerTimer(a: Awaiting): void { if (answerTimer !== undefined) clearTimeout(answerTimer); answerTimer = setTimeout(() => enqueue(async () => { if (awaiting !== a || a.playing) return; if (callerSpeaking()) return armAnswerTimer(a); a.reprompts++; deps.log('FAST_SILENCE', { id: a.id, n: a.reprompts }); if (a.reprompts >= 2) return end('NO_ANSWER', 'I am not hearing a reply, so I will end the call. Goodbye.'); play(a, `Sorry, I did not catch that. ${a.text}`); }), answerWaitMs); }
     /** A line that needs no answer, played to its end (its measured verdict is not needed). */
     async function say(text: string): Promise<void> { if (done) return; if (!t.speak(text, true)) return; deps.log('FAST_SAY', { id: 'info', unit: false }); await t.playbackDone!(playbackMaxMs); }
     async function end(reason: string, line?: string, booked = false, extra: Partial<FastOutcome> = {}): Promise<void> {
@@ -162,16 +177,18 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         if (r.outcome === 'captured') { tries = 0; return askWhen(); }
         if ((r.outcome === 'unclear' || r.reason === 'SAME') && ++tries >= 4) return giveUp('ADDRESS_UNCLEAR');
         // Pieces are kept; wait a moment in case the rest follows, then ask ONLY for what is missing.
-        if (settleTimer !== undefined) clearTimeout(settleTimer);
-        settleTimer = setTimeout(() => enqueue(async () => {
+        armSettle(async () => {
           const part = contact.addressPart();
           askAddress(part === 'city' ? 'What is the city?' : part === 'ZIP code' ? 'And the ZIP code?' : part === 'street name' ? 'What is the street name?' : part === 'house number' ? 'What is the house number?' : 'Sorry, what is the street address?');
-        }), settleMs);
+        });
       });
     }
     function askWhen(lead?: string): void {
       ask('WHEN', lead ?? 'What day and time would you like?', async (heard) => {
-        const w = whenFrom(heard, deps.now(), S.availability.timezone);
+        const w = whenFrom(heard, deps.now(), S.availability.timezone); const last = lastBookableDate(deps.now(), S.availability);
+        // A date that has passed, or lies beyond the days the calendar is read for, is never taken as asked: the caller is told why and asked again.
+        if (w.past === true && w.date === undefined) { if (++tries >= 3) return giveUp('WHEN_UNCLEAR'); return askWhen('That date has already passed. Which day would you like?'); }
+        if (w.date !== undefined && w.date > last) { if (++tries >= 3) return giveUp('WHEN_UNCLEAR'); return askWhen(`Sorry, I can only book within the next two weeks, up to ${sayDay(last)}. Which day would you like?`); }
         pref = { ...pref, ...w };
         if (pref.date === undefined && pref.time === undefined && pref.part === undefined && pref.flexible !== true) { if (++tries >= 3) return giveUp('WHEN_UNCLEAR'); return askWhen('Sorry, which day would you like?'); }
         if (pref.date === undefined) return askWhen('Which day?');
@@ -194,9 +211,11 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         return checkAndOffer();
       });
     }
+    /** The days the calendar is read for (today through the last bookable date, with a day to spare); nothing is offered or booked outside it. */
+    const calendarWindow = (): { from: string; to: string } => ({ from: new Date(deps.now()).toISOString(), to: new Date(deps.now() + (S.availability.horizonDays ?? 14) * 86_400_000 + 86_400_000).toISOString() });
     async function checkAndOffer(): Promise<void> {
       clearTimers(); awaiting = undefined;
-      const from = new Date(deps.now()).toISOString(); const to = new Date(deps.now() + (S.availability.horizonDays ?? 14) * 86_400_000 + 86_400_000).toISOString();
+      const { from, to } = calendarWindow();
       void say('One moment.');   // spoken while the calendar is read; nothing waits on it
       let cal: { busy: Busy[]; complete: boolean };
       try { cal = await deps.busy(from, to); } catch { cal = { busy: [], complete: false }; }
@@ -204,7 +223,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const o = chooseOffer(pref, S.availability, cal.busy, deps.now(), refused);
       if (o === undefined) return end('NO_OPENING', 'Sorry, I do not have an opening in the next two weeks, so a person will call you. Goodbye.');
       offer = o;
-      const line = `A standard cleaning for ${num(S.bedrooms)} bedrooms and ${num(S.bathrooms)} bathrooms is $${S.priceDollars}. We have ${sayDay(o.date)} at ${sayTime(o.time)}. Does that work?`;
+      const line = `A standard cleaning for ${num(S.bedrooms)} bedrooms and ${num(S.bathrooms)} bathrooms is $${S.priceDollars}. We have ${sayDayYear(o.date)} at ${sayTime(o.time)}. Does that work?`;
       ask('OFFER', line, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return askCallback();
@@ -227,9 +246,8 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         const r = contact.collect('phone', heard);
         if (r.outcome === 'captured') { const d = contact.value('phone') ?? ''; return confirmNumber(d.length === 10 ? `+1${d}` : d.length === 11 && d.startsWith('1') ? `+${d}` : ''); }
         if (r.outcome === 'unclear' && ++tries >= 4) return giveUp('NUMBER_UNCLEAR');
-        if (settleTimer !== undefined) clearTimeout(settleTimer);
         const need = contact.phoneNeed();
-        settleTimer = setTimeout(() => enqueue(async () => askNumber(typeof need === 'number' ? `What are the remaining ${need} digits?` : need === 'restate' ? 'Could you say the whole number again, from the start?' : 'Sorry, what is the best number to reach you?')), settleMs);
+        armSettle(async () => askNumber(typeof need === 'number' ? `What are the remaining ${need} digits?` : need === 'restate' ? 'Could you say the whole number again, from the start?' : 'Sorry, what is the best number to reach you?'));
       });
     }
     function confirmNumber(e164: string): void {
@@ -256,7 +274,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const o = offer!; const p = contact.addressParts();
       if (p === undefined) return void giveUp('ADDRESS_MISSING');
       const spokenZip = p.zip.split('').join(' ');
-      ask('READBACK', `To confirm: ${S.serviceLabel} for ${firstName} on ${sayDay(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is $${S.priceDollars}. Shall I book it? Say yes or no.`, async (heard) => {
+      ask('READBACK', `To confirm: ${S.serviceLabel} for ${firstName} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is $${S.priceDollars}. Shall I book it? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return book();
         if (y === 'no') return end('DECLINED_AT_READBACK', 'No problem. Nothing was booked. Goodbye.');
@@ -269,6 +287,13 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       clearTimers(); awaiting = undefined;
       const o = offer!; const p = contact.addressParts();
       if (p === undefined || !S.standingApproval) return end(S.standingApproval ? 'ADDRESS_MISSING' : 'NO_STANDING_APPROVAL', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
+      // Availability is checked once more, from the calendar, right before anything is written: the time must lie inside the window that was read and still be free.
+      { const { from, to } = calendarWindow(); let cal: { busy: Busy[]; complete: boolean }; try { cal = await deps.busy(from, to); } catch { cal = { busy: [], complete: false }; }
+        const still = cal.complete ? chooseOffer({ date: o.date, time: o.time }, S.availability, cal.busy, deps.now(), []) : undefined;
+        if (!cal.complete || still === undefined || still.date !== o.date || still.time !== o.time) {
+          deps.log('FAST_SLOT_RECHECK_FAILED', { calendar: cal.complete ? 'read' : 'unreadable' });
+          return end(cal.complete ? 'NO_LONGER_AVAILABLE' : 'CALENDAR_UNREADABLE', cal.complete ? 'Sorry, that time is no longer available, so nothing was booked and a person will call you. Goodbye.' : 'Sorry, I cannot check the schedule right now, so nothing was booked and a person will call you. Goodbye.');
+        } }
       void say('Booking that now.');
       const digits = callback.replace(/^\+1/, '');
       const req: BookingRequest = {
@@ -282,9 +307,21 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       try { res = await deps.book(req); } catch { res = { status: 'uncertain', reason: 'API_ERROR', writes: 0 }; }
       note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }) });
       if (res.status !== 'booked_verified') return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');
+      // Test emails (default OFF): only now that Jobber's read-back verified the booking, only to the two approved addresses (held behind `sendEmail`), and a failure changes nothing about the booking.
+      const mail: { customer: EmailVerdict; owner: EmailVerdict } = { customer: 'not_sent', owner: 'not_sent' };
+      if (deps.emailsEnabled === true && deps.sendEmail !== undefined) {
+        const tzE = S.availability.timezone;
+        const ef = { businessName: S.businessName, serviceLabel: S.serviceLabel, bedrooms: S.bedrooms, bathrooms: S.bathrooms, priceDollars: S.priceDollars, date: o.date, startText: textTime(o.time), endText: textTime(o.endTime), zoneLabel: zoneLabelOf(tzE, instantOf(o.date, o.time, tzE)),
+          address: `${p.street}, ${p.city}${S.state === undefined ? '' : `, ${S.state}`} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim(), ...(res.jobNumber === undefined ? {} : { jobNumber: res.jobNumber }) };
+        const one = async (role: 'customer' | 'owner', m: { subject: string; text: string }): Promise<EmailVerdict> => { try { return (await deps.sendEmail!(role, m.subject, m.text)).ok ? 'accepted' : 'refused'; } catch { return 'refused'; } };
+        [mail.customer, mail.owner] = await Promise.all([one('customer', customerEmail(ef)), one('owner', ownerEmail(ef))]);
+        deps.log('FAST_EMAILS_SENT', { customer: mail.customer, owner: mail.owner }); note('EMAILS_SENT');
+      }
+      const mailOutcome: Partial<FastOutcome> = deps.emailsEnabled === true ? { customerEmail: mail.customer, ownerEmail: mail.owner } : {};
+      const emailLine = mail.customer === 'accepted' ? ' A confirmation email is on its way.' : '';   // said only when the mail server took it
       if (!deps.textsEnabled) {
         deps.log('FAST_TEXTS_SKIPPED'); note('TEXTS_SKIPPED');
-        return end('BOOKED', `You are booked for ${sayDay(o.date)} at ${sayTime(o.time)}. This test line does not send text messages. Goodbye.`, true, { customerText: 'skipped', ownerText: 'skipped' });
+        return end('BOOKED', `You are booked for ${sayDayYear(o.date)} at ${sayTime(o.time)}.${emailLine} This test line does not send text messages. Goodbye.`, true, { customerText: 'skipped', ownerText: 'skipped', ...mailOutcome });
       }
       // Texts: the details match the verified booking exactly. Each is sent only to an approved number, the customer's only with permission.
       // The words are the SUBMITTED campaign samples (fast-sms-copy.ts). The customer's text needs the caller's recorded yes; the owner's needs the owner's recorded setup consent. A body over the limit is never cut: it is not sent.
@@ -296,12 +333,12 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const ownerSend = deps.ownerConsent && ownerBody.length <= MAX_TEXT_CHARS ? await deps.sendText(deps.ownerNumber, ownerBody) : undefined;
       const customerAccepted = customerSend !== undefined && customerSend.ok; const ownerAccepted = ownerSend !== undefined && ownerSend.ok;
       deps.log('FAST_TEXTS_SENT', { customer: customerSend === undefined ? 'not_sent' : customerSend.ok ? 'accepted' : 'refused', owner: ownerSend === undefined ? 'not_sent' : ownerSend.ok ? 'accepted' : 'refused' });
-      const bye = `You are booked for ${sayDay(o.date)} at ${sayTime(o.time)}.${customerAccepted ? ' A confirmation text is on its way.' : wantsText ? ' I could not send the text on this test line.' : ''} Goodbye.`;
+      const bye = `You are booked for ${sayDayYear(o.date)} at ${sayTime(o.time)}.${customerAccepted ? ' A confirmation text is on its way.' : wantsText ? ' I could not send the text on this test line.' : ''}${emailLine} Goodbye.`;
       // Delivery is checked while the goodbye plays and after it; the result goes to the log and the outcome, never to the caller.
       const verifying = Promise.all([customerSend !== undefined && customerSend.ok ? deps.verifyText(customerSend.sid) : Promise.resolve<Delivery | 'not_sent'>('not_sent'), ownerSend !== undefined && ownerSend.ok ? deps.verifyText(ownerSend.sid) : Promise.resolve<Delivery | 'not_sent'>('not_sent')]);
-      await end('BOOKED', bye, true);
+      await end('BOOKED', bye, true, mailOutcome);
       const [c, w] = await verifying; deps.log('FAST_TEXTS_VERIFIED', { customer: c, owner: w });
-      deps.onOutcome?.({ reason: 'TEXTS_VERIFIED', booked: true, customerText: c, ownerText: w, steps });
+      deps.onOutcome?.({ reason: 'TEXTS_VERIFIED', booked: true, customerText: c, ownerText: w, ...mailOutcome, steps });
     }
 
     // ---------------------------------------------------------------- events
@@ -323,12 +360,17 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       if (ev.kind === 'utterance') {
         const heard = ev.text;
         // A new utterance cancels a pending "ask the missing part": more of the answer may be following.
-        if (settleTimer !== undefined) { clearTimeout(settleTimer); settleTimer = undefined; }
+        if (settleTimer !== undefined) { clearTimeout(settleTimer); settleTimer = undefined; } settleFn = undefined;
         if (isAiQuestion(heard)) { if (answerTimer !== undefined) { clearTimeout(answerTimer); answerTimer = undefined; } enqueue(async () => answerAi()); return; }   // answered truthfully before anything else, even over a line that is still playing
         const a = awaiting;
         if (a !== undefined && a.unit && a.playing) { a.heldEarly = true; deps.log('CONFIRM_HELD', { id: a.id }); return; }   // a yes before the whole line was played confirms nothing
         if (answerTimer !== undefined) { clearTimeout(answerTimer); answerTimer = undefined; }
         enqueue(async () => { const cur = awaiting; if (cur === undefined || cur.playing && cur.unit) return; cur.reprompts = 0; await cur.onAnswer(heard); });
+        return;
+      }
+      if (ev.kind === 'speech') {   // the caller is talking: hold back any "ask only what is missing" until they have stopped and the quiet wait has passed
+        if (ev.active) { speakingSince = deps.now(); if (settleTimer !== undefined) clearTimeout(settleTimer); settleTimer = settleFn === undefined ? undefined : setTimeout(fireSettle, 10_000 + settleMs); }   // the long timer only matters if the matching stop never arrives
+        else { speakingSince = undefined; if (settleFn !== undefined) { if (settleTimer !== undefined) clearTimeout(settleTimer); settleTimer = setTimeout(fireSettle, settleMs); } }
         return;
       }
       if (ev.kind === 'reply_failed') { const a = awaiting; if (a !== undefined) enqueue(async () => { if (awaiting !== a) return; if (++a.replays > 2) return end('REPLY_FAILED', undefined); play(a, a.text); }); return; }

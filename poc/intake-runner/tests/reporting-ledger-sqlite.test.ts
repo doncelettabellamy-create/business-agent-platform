@@ -415,6 +415,6 @@ test('inventory: only the two SQLite modules import node:sqlite, nothing but tes
   assert.deepEqual(imports, ['./contracts.ts', './handoff-seal.ts', './reporting-ledger.ts', './reporting-ledger.ts', 'node:sqlite']);
   assert.ok(!/\b(fetch|process\.env|readFile|writeFile|child_process|mintExecutionContext|Math\.random|Date\.now|new Date|setTimeout|loadExtension|randomUUID)\b/.test(code_));
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { dependencies?: Record<string, string> };
-  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk'], 'still exactly one dependency: SQLite adds none');
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk', 'nodemailer'], 'still exactly the two approved dependencies (the SDK and the test-only email sender): SQLite adds none');
   assert.equal(GENESIS_DIGEST.length, 64);
 });

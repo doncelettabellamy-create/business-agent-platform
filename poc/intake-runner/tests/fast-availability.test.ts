@@ -1,7 +1,7 @@
 // Availability for the fast Drew test call: only times inside the founder's stated hours that fit the whole cleaning and overlap nothing Jobber returned. The hours below are a SYNTHETIC test fixture, not the founder's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { availabilityProblems, candidatesOn, chooseOffer } from '../src/fast-availability.ts';
+import { availabilityProblems, candidatesOn, chooseOffer, lastBookableDate } from '../src/fast-availability.ts';
 import type { AvailabilityConfig } from '../src/fast-availability.ts';
 import { instantOf } from '../src/fast-parsers.ts';
 
@@ -50,4 +50,13 @@ test('the offer: the exact time when it is free, else the nearest free time that
   assert.deepEqual(chooseOffer({}, CFG, [], NOW)?.date, '2026-11-02', 'no day asked: the earliest open time from now');
   assert.equal(chooseOffer({ date: '2026-11-03' }, { ...CFG, horizonDays: 0 }, [busyOn('2026-11-03', '00:00', '23:59')], NOW), undefined, 'nothing within the horizon: no offer');
   assert.equal(chooseOffer({ date: '2026-10-20' }, CFG, [], NOW)?.date, '2026-11-02', 'a day in the past is not offered');
+});
+
+test('the window: a date beyond the days the calendar is read for is never offered, and the search never runs past the last bookable date', () => {
+  assert.equal(lastBookableDate(NOW, CFG), '2026-11-16', 'today (Nov 2) plus the 14-day horizon');
+  assert.equal(chooseOffer({ date: '2027-10-04', time: '09:00' }, CFG, [], NOW), undefined, 'a date eleven months away, with no calendar data, is not "free"');
+  assert.equal(chooseOffer({ date: '2026-11-17' }, CFG, [], NOW), undefined, 'one day past the window');
+  assert.equal(chooseOffer({ date: '2026-11-16', time: '09:00' }, CFG, [], NOW)?.date, '2026-11-16', 'the last day itself is inside');
+  const allBusy = [{ start: instantOf('2026-11-16', '00:00', TZ), end: instantOf('2026-11-18', '00:00', TZ) }];
+  assert.equal(chooseOffer({ date: '2026-11-16' }, CFG, allBusy, NOW), undefined, 'a busy last day does not push the offer past the window');
 });

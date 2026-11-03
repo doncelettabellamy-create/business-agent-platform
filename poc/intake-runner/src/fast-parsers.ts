@@ -84,7 +84,7 @@ export const weekdayOf = (date: string): number => new Date(`${date}T12:00:00Z`)
 export function instantOf(date: string, hm: string, tz: string): number { return Date.parse(`${date}T${hm}:00${utcOffsetFor(Date.parse(`${date}T12:00:00Z`), tz)}`); }
 
 // ---------------------------------------------------------------- day and time
-export interface When { date?: string; time?: string; part?: 'morning' | 'afternoon' | 'evening'; flexible?: boolean }
+export interface When { date?: string; time?: string; part?: 'morning' | 'afternoon' | 'evening'; flexible?: boolean; /** A month and day that has already passed this year was named: no date is chosen, the caller is asked. */ past?: true }
 const DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 const DAY_ABBR: Record<string, number> = { sun: 0, mon: 1, tue: 2, tues: 2, wed: 3, weds: 3, thu: 4, thur: 4, thurs: 4, fri: 5, sat: 6 };
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
@@ -101,6 +101,12 @@ export function whenFrom(raw: unknown, nowMs: number, tz: string): When {
   let t = raw.toLowerCase().replace(/[’]/g, "'").replace(/\./g, '').replace(/[^a-z0-9:/' -]+/g, ' ').replace(/\s+/g, ' ').trim();
   const today = zonedParts(nowMs, tz); const todayIso = isoDate(today.y, today.m, today.d); const out: When = {};
   const takeOut = (m: RegExpExecArray): void => { t = `${t.slice(0, m.index)} ${t.slice(m.index + m[0].length)}`.replace(/\s+/g, ' ').trim(); };
+  // A month and day is read in THIS year, or in the four-digit year the caller said. One that has already passed is never moved to next year: it is flagged, and the caller is asked which day they mean.
+  const yearSaid = /\b(20\d\d)\b/.exec(t); const yr = yearSaid === null ? undefined : Number(yearSaid[1]);
+  const place = (mo: number, dayNo: number): void => {
+    const d = isoDate(yr ?? today.y, mo, dayNo); if (new Date(`${d}T12:00:00Z`).getUTCMonth() + 1 !== mo) return;   // no such day (for example February 30)
+    if (d < todayIso) out.past = true; else out.date = d;
+  };
   // ---- the day
   let m: RegExpExecArray | null;
   if ((m = /\bday after tomorrow\b/.exec(t)) !== null) { out.date = addDays(todayIso, 2); takeOut(m); }
@@ -108,19 +114,19 @@ export function whenFrom(raw: unknown, nowMs: number, tz: string): When {
   else if ((m = /\b(?:today|tonight|this evening)\b/.exec(t)) !== null) { out.date = todayIso; if (/tonight|evening/.test(m[0])) out.part = 'evening'; takeOut(m); }
   else if ((m = new RegExp(`\\b(${MONTH_RE})\\s+(?:the\\s+)?(\\d{1,2})(?:st|nd|rd|th)?\\b`).exec(t)) !== null || (m = new RegExp(`\\b(?:the\\s+)?(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?(${MONTH_RE})\\b`).exec(t)) !== null) {
     const monthWord = MONTH_RE.length > 0 && isNaN(Number(m[1])) ? m[1] : m[2]; const dayNo = Number(isNaN(Number(m[1])) ? m[2] : m[1]);
-    const mo = monthNo(monthWord); if (mo !== undefined && dayNo >= 1 && dayNo <= 31) { let y = today.y; let d = isoDate(y, mo, dayNo); if (d < todayIso) d = isoDate(++y, mo, dayNo); out.date = d; takeOut(m); }
+    const mo = monthNo(monthWord); if (mo !== undefined && dayNo >= 1 && dayNo <= 31) { place(mo, dayNo); takeOut(m); }
   } else if ((m = new RegExp(`\\b(${MONTH_RE})\\s+(?:the\\s+)?(${ORD_RE})\\b`).exec(t)) !== null) {
-    const mo = monthNo(m[1]); const dayNo = ORD[m[2]]; let y = today.y; let d = isoDate(y, mo, dayNo); if (d < todayIso) d = isoDate(++y, mo, dayNo); out.date = d; takeOut(m);
+    const mo = monthNo(m[1]); const dayNo = ORD[m[2]]; place(mo, dayNo); takeOut(m);
   } else if ((m = new RegExp(`\\b(?:the\\s+)?(${ORD_RE})\\s+of\\s+(${MONTH_RE})\\b`).exec(t)) !== null) {
-    const mo = monthNo(m[2]); const dayNo = ORD[m[1]]; let y = today.y; let d = isoDate(y, mo, dayNo); if (d < todayIso) d = isoDate(++y, mo, dayNo); out.date = d; takeOut(m);
+    const mo = monthNo(m[2]); const dayNo = ORD[m[1]]; place(mo, dayNo); takeOut(m);
   } else if ((m = /\b(\d{1,2})\/(\d{1,2})\b/.exec(t)) !== null) {
     const mo = Number(m[1]); const dayNo = Number(m[2]);
-    if (mo >= 1 && mo <= 12 && dayNo >= 1 && dayNo <= 31) { let y = today.y; let d = isoDate(y, mo, dayNo); if (d < todayIso) d = isoDate(++y, mo, dayNo); out.date = d; takeOut(m); }
+    if (mo >= 1 && mo <= 12 && dayNo >= 1 && dayNo <= 31) { place(mo, dayNo); takeOut(m); }
   } else if ((m = new RegExp(`\\b(?:this |next |on )?(${DAYS.join('|')}|${Object.keys(DAY_ABBR).join('|')})\\b`).exec(t)) !== null) {
     const wd = DAYS.indexOf(m[1]) >= 0 ? DAYS.indexOf(m[1]) : DAY_ABBR[m[1]]; let n = (wd - today.weekday + 7) % 7; if (n === 0) n = 7;
     out.date = addDays(todayIso, n); takeOut(m);
   } else if ((m = new RegExp(`\\b(?:the\\s+)?(${ORD_RE}|\\d{1,2}(?:st|nd|rd|th))\\b`).exec(t)) !== null) {
-    const dayNo = ORD[m[1]] ?? Number(m[1].replace(/\D+/g, '')); if (dayNo >= 1 && dayNo <= 31) { let y = today.y; let mo = today.m; let d = isoDate(y, mo, dayNo); if (d < todayIso) { mo++; if (mo > 12) { mo = 1; y++; } d = isoDate(y, mo, dayNo); } out.date = d; takeOut(m); }
+    const dayNo = ORD[m[1]] ?? Number(m[1].replace(/\D+/g, '')); if (dayNo >= 1 && dayNo <= 31) { place(today.m, dayNo); takeOut(m); }
   }
   // ---- the time
   if ((m = /\bnoon\b/.exec(t)) !== null) { out.time = '12:00'; takeOut(m); }
@@ -153,5 +159,7 @@ const ORDINALS = ['', 'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 's
 const cap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
 /** A date as it is spoken: "Tuesday, November tenth". */
 export function sayDay(date: string): string { const [, m, d] = date.split('-').map(Number); return `${cap(DAYS[weekdayOf(date)])}, ${cap(MONTHS[m - 1])} ${ORDINALS[d]}`; }
+/** A date as it is spoken in an offer or a read-back, with the year: "Tuesday, November tenth, 2026". */
+export function sayDayYear(date: string): string { return `${sayDay(date)}, ${date.slice(0, 4)}`; }
 /** A clock time as it is spoken: "10 A M", "2 30 P M". */
 export function sayTime(hm: string): string { const [h, mi] = hm.split(':').map(Number); const ap = h >= 12 ? 'P M' : 'A M'; const h12 = h % 12 === 0 ? 12 : h % 12; return mi === 0 ? `${h12} ${ap}` : `${h12} ${pad2(mi)} ${ap}`; }

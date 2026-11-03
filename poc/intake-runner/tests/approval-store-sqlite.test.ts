@@ -393,5 +393,5 @@ test('sqlite: only this store imports node:sqlite, nothing imports the store, an
   assert.ok(!/from\s+'\.\/(processing-entry|qc-entry|reporting-entry|pipeline|intake-entry|mock-tools|live-run)\.ts'/.test(code_));
   assert.ok(!/\b(fetch|process\.env|readFile|writeFile|child_process|mintExecutionContext|mintApproverContext|Math\.random|Date\.now|setTimeout|loadExtension)\b/.test(code_));
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { dependencies?: Record<string, string> };
-  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk'], 'still exactly one dependency: SQLite adds none');
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), ['@anthropic-ai/sdk', 'nodemailer'], 'still exactly the two approved dependencies (the SDK and the test-only email sender): SQLite adds none');
 });

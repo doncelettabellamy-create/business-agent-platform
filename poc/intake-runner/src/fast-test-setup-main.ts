@@ -2,6 +2,7 @@
 //
 //   node src/fast-test-setup-main.ts save-numbers      reads {"account_sid": "AC...", "customer": "+1...", "owner": "+1..."} from STANDARD INPUT (use fast-test-enter-numbers.ps1, which prompts privately) and stores it
 //                                                      protected for this Windows user in the private folder (outside the repository). Prints no number.
+//   node src/fast-test-setup-main.ts save-emails      reads {"sender": "x@gmail.com", "app_password": "...", "customer": "...", "owner": "..."} from STANDARD INPUT (use fast-test-enter-emails.ps1, which prompts privately) and stores it protected. Prints nothing private.
 //   node src/fast-test-setup-main.ts status            yes/no only: are the approved numbers saved, is Jobber connected, are Jobber writes switched on.
 //   node src/fast-test-setup-main.ts sms-check --sid AC... [--number +1...] [--config founder-voice-call.config.json]
 //                                                      READ-ONLY questions to Twilio (needs TWILIO_AUTH_TOKEN in the environment): can the Drew number send texts, and what has been registered for US business
@@ -14,7 +15,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createVault } from './jobber-connector.ts';
 import { windowsProtector } from './jobber-dpapi.ts';
-import { fastStatus, isTestNumbers, loadTestNumbers, NUMBERS_BLOB } from './founder-voice-fast.ts';
+import { emailStatus, fastStatus, isTestNumbers, loadTestNumbers, NUMBERS_BLOB } from './founder-voice-fast.ts';
+import { EMAIL_BLOB, emailProblems, isTestEmails, normalizeTestEmails } from './fast-email.ts';
 import { appendConsent, ownerRef } from './fast-consent.ts';
 import { OWNER_SCRIPT_ID, ownerConsentText } from './fast-sms-copy.ts';
 import { E164, messagingSetup, SID, smsCapability } from './twilio-messaging.ts';
@@ -35,6 +37,14 @@ async function main(): Promise<number> {
     await createVault(dir, protector).saveBlob(NUMBERS_BLOB, JSON.stringify({ account_sid, customer, owner }));
     say('saved: the approved test numbers and the Twilio account id are stored protected for this Windows user (nothing was printed)'); return 0;
   }
+  if (cmd === 'save-emails') {
+    let j: unknown; try { j = normalizeTestEmails(JSON.parse(await readStdin())); } catch { say('refused: the input was not the expected JSON'); return 2; }
+    const problems = emailProblems(j);
+    if (problems.length > 0) { say(`refused: nothing was saved; not acceptable: ${problems.join(', ')} (a sender address at yahoo.com or gmail.com, its 16-character app password, and two DIFFERENT plain recipient addresses)`); return 2; }
+    if (!isTestEmails(j)) return 2;
+    await createVault(dir, protector).saveBlob(EMAIL_BLOB, JSON.stringify({ sender: j.sender, app_password: j.app_password, customer: j.customer, owner: j.owner }));
+    say('saved: the test email sender and the two approved recipient addresses are stored protected for this Windows user (nothing was printed; emails stay OFF until FAST_EMAILS=on)'); return 0;
+  }
   if (cmd === 'owner-consent-text' || cmd === 'record-owner-consent') {
     let business = 'Drew Cleaning'; try { const c = JSON.parse(readFileSync(opt('config') ?? 'founder-voice-call.config.json', 'utf8')) as { opening?: { business_name?: unknown } }; if (typeof c.opening?.business_name === 'string') business = c.opening.business_name; } catch { /* the demo name stays */ }
     if (cmd === 'owner-consent-text') { say(ownerConsentText(business)); return 0; }
@@ -46,7 +56,7 @@ async function main(): Promise<number> {
     if (!ok) { say('failed: the consent record could not be written'); return 1; }
     say(answer === 'yes' ? 'recorded: owner text consent GIVEN (protected evidence: time, script, answer; no number or name)' : 'recorded: owner text consent DECLINED (no owner text will be sent)'); return 0;
   }
-  if (cmd === 'status') { const s = await fastStatus({ vaultDir: dir, protector, env: process.env }); say(`approved test numbers saved: ${s.numbersPresent}`); say(`texts enabled (FAST_TEXTS=on): ${s.textsOn}   (off is the default: no real text can be sent)`); say(`owner text consent recorded: ${s.ownerConsent}`); say(`Jobber connected: ${s.jobberConnected}`); say(`Jobber writes switched on (JOBBER_ALLOW_WRITES=test-account): ${s.jobberWritesOn}`); return 0; }
+  if (cmd === 'status') { const s = await fastStatus({ vaultDir: dir, protector, env: process.env }); say(`approved test numbers saved: ${s.numbersPresent}`); say(`texts enabled (FAST_TEXTS=on): ${s.textsOn}   (off is the default: no real text can be sent)`); say(`owner text consent recorded: ${s.ownerConsent}`); say(`Jobber connected: ${s.jobberConnected}`); say(`Jobber writes switched on (JOBBER_ALLOW_WRITES=test-account): ${s.jobberWritesOn}`); const em = await emailStatus({ vaultDir: dir, protector, env: process.env }); say(`approved test emails saved: ${em.emailsSaved}`); say(`emails enabled (FAST_EMAILS=on): ${em.emailsOn}   (off is the default: no email can be sent)`); return 0; }
   if (cmd === 'sms-check') {
     const sid = opt('sid'); if (sid === undefined || !SID.test(sid)) { say('refused: --sid AC... is required'); return 2; }
     let number = opt('number');

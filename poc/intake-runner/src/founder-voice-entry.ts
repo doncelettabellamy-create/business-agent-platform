@@ -32,7 +32,7 @@ import { streamTwimlFor } from './stream-twiml.ts';
 import { fileDiagSink } from './call-diag.ts';
 import { consentNoticeFor } from './opening.ts';
 import { windowsProtector } from './jobber-dpapi.ts';
-import { buildFastDeps, fastStatus } from './founder-voice-fast.ts';
+import { buildFastDeps, emailStatus, fastStatus } from './founder-voice-fast.ts';
 
 const nowIso = (): string => new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 
@@ -70,6 +70,8 @@ else {
   const days = Object.entries(fastCfg.hours).filter(([, v]) => v.length > 0).map(([d]) => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][Number(d)]).join(' ');
   console.log(`Fast test call: ON (controlled test: only the approved test caller gets past the opening)   Jobber test account: "${fastCfg.jobber_account_name}"   size ${fastCfg.bedrooms} bed / ${fastCfg.bathrooms} bath at $${fastCfg.price_dollars}   cleaning ${fastCfg.duration_minutes} min   open ${days} (${fastCfg.timezone})   standing test approval: ${fastCfg.standing_approval}`);
   console.log(`  private pieces: approved test numbers saved: ${fastEnv?.numbersPresent}   TEXTS: ${fastEnv?.textsOn === true ? `ON (owner text consent recorded: ${fastEnv?.ownerConsent})` : 'OFF (no real text can be sent; the call skips texts and says so)'}   Jobber connected: ${fastEnv?.jobberConnected}   Jobber writes switched on (JOBBER_ALLOW_WRITES=test-account): ${fastEnv?.jobberWritesOn}`);
+  const emailEnv = await emailStatus({ vaultDir: fastDir, protector: windowsProtector(), env: process.env });
+  console.log(`  test emails: approved addresses saved: ${emailEnv.emailsSaved}   EMAILS: ${emailEnv.emailsOn ? 'ON (one fixed test email to each approved address after a verified booking)' : 'OFF (no email can be sent)'}`);
   console.log(`  opening the caller hears (exactly): ${consentNoticeFor(config.opening)}`);
 }
 console.log(`Settings (defaults filled in): voice reasoning ${eff.realtimeReasoning}; text reasoning ${eff.textReasoning}; transcription hints: ${eff.transcription === undefined ? 'none' : `${eff.transcription.languages?.length ?? 0} language(s), ${eff.transcription.keywords?.length ?? 0} keyword(s)`}. UNVERIFIED until a live call: whether each model accepts these values.`);

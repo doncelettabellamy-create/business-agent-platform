@@ -1,7 +1,7 @@
 // The deterministic answer parsers of the fast Drew test call. Synthetic phrases only.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
+import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
 
 const TZ = 'America/Chicago';
 const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 2 November 2026, 9:00 in Chicago (standard time, UTC-6; summer time ended on 1 November)
@@ -50,8 +50,13 @@ test('day and time: weekdays, relative days, dates and times in the ways they ar
   assert.deepEqual(w('the tenth of november at 9:30 am'), { date: '2026-11-10', time: '09:30' });
   assert.deepEqual(w('11/12 at noon'), { date: '2026-11-12', time: '12:00' });
   assert.deepEqual(w('the 15th'), { date: '2026-11-15' });
-  assert.deepEqual(w('the first'), { date: '2026-12-01' }, 'a day of the month already past means next month');
-  assert.deepEqual(w('january fifth'), { date: '2027-01-05' });
+  assert.deepEqual(w('the first'), { past: true }, 'a day of the month already past is flagged, never moved to next month');
+  assert.deepEqual(w('january fifth'), { past: true }, 'a month and day already past is flagged, never moved to next year');
+  assert.deepEqual(w('october 4th'), { past: true }); assert.deepEqual(w('10/4'), { past: true }, 'the 4 October reading of the founder call is no longer silently read as 2027');
+  assert.deepEqual(w('january fifth 2027'), { date: '2027-01-05' }, 'a four-digit year said by the caller is used as said');
+  assert.deepEqual(w('february thirtieth'), {}, 'a day that does not exist is not a date');
+  assert.deepEqual(w('november third'), { date: '2026-11-03' }); assert.deepEqual(w('tuesday'), { date: '2026-11-03' });
+  assert.equal(sayDayYear('2026-11-03'), 'Tuesday, November third, 2026');
   assert.deepEqual(w('wednesday at 8'), { date: '2026-11-04', time: '08:00' });
   assert.deepEqual(w('thursday at four'), { date: '2026-11-05', time: '16:00' });
   assert.deepEqual(w('saturday at 14:00'), { date: '2026-11-07', time: '14:00' });

@@ -71,7 +71,7 @@ export function requestProblems(r: unknown, now: number): string[] {
   if (!DATE.test(String(w?.date ?? '')) || !CLOCK.test(String(w?.startTime ?? '')) || !CLOCK.test(String(w?.endTime ?? '')) || !OFFSET.test(String(w?.utcOffset ?? ''))) p.push('when');
   else {
     const s = instant(w.date, w.startTime, w.utcOffset); const e = instant(w.date, w.endTime, w.utcOffset);
-    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s || e - s > 8 * 3_600_000 || s <= now) p.push('when');
+    if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s || e - s > 8 * 3_600_000 || s <= now || s > now + 30 * 86_400_000) p.push('when');   // not in the past, and not more than 30 days ahead
   }
   if (!TEXT.test(String(x.title ?? ''))) p.push('title');
   if (!TEXT.test(String(x.service ?? ''))) p.push('service');

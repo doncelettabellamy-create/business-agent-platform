@@ -105,7 +105,7 @@ export function sameSpeech(a: string, b: string): boolean {
   return typeof a === 'string' && typeof b === 'string' && spokenForm(a).length > 0 && spokenForm(a) === spokenForm(b);
 }
 
-const BENIGN: ReadonlySet<string> = new Set(['session.created', 'session.updated', 'input_audio_buffer.speech_stopped', 'input_audio_buffer.committed', 'conversation.item.created', 'conversation.item.added', 'conversation.item.done',
+const BENIGN: ReadonlySet<string> = new Set(['session.created', 'session.updated', 'input_audio_buffer.committed', 'conversation.item.created', 'conversation.item.added', 'conversation.item.done',
   'conversation.item.deleted', 'rate_limits.updated', 'response.output_item.added', 'response.output_item.done', 'response.content_part.added', 'response.content_part.done', 'response.output_audio.delta', 'response.output_audio.done',
   'response.function_call_arguments.delta', 'output_audio_buffer.started', 'output_audio_buffer.stopped', 'output_audio_buffer.cleared']);
 interface Out {
@@ -363,6 +363,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         return;
       }
       case 'input_audio_buffer.speech_started': {
+        if (phase === 'live') emit({ kind: 'speech', active: true });
         const o = current;
         if (phase !== 'live' || o === undefined || (o.kind !== 'reply' && o.kind !== 'converse') || !o.interruptible || o.interrupted) return;
         o.interrupted = true;
@@ -377,6 +378,9 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
         emit({ kind: 'interrupt', spoken });
         return;
       }
+      case 'input_audio_buffer.speech_stopped':
+        if (phase === 'live') emit({ kind: 'speech', active: false });
+        return;
       case 'conversation.item.input_audio_transcription.completed': {
         if (native === undefined && typeof m.item_id === 'string') ask('delete', { type: 'conversation.item.delete', item_id: m.item_id });   // the voice service keeps no copy of what was said (native conversation keeps the call's turns, see RealtimeOptions.native)
         if (phase !== 'live') return;   // nothing said before the notice has played, or after the call has ended, is taken

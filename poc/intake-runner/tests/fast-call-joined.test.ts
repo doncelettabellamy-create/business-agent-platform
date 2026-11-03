@@ -104,11 +104,11 @@ test('JOINED: the short opening, a yes, name, address with city and ZIP, day and
   await r.hears(/street address/, '123 Invented Lane, Testville, 90210');
   await r.hears(/What day and time/, 'Tuesday at ten');
   await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
-  assert.equal(await r.hears(/is \$199/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third at 10 A M. Does that work?');
+  assert.equal(await r.hears(/is \$199/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
   await r.hears(/calling from a number ending in 0 0 0 2/, 'yes');
   await r.hears(/May we send you one automated/, 'yes');
-  assert.equal(await r.hears(/^To confirm/, 'yes'), 'To confirm: Standard cleaning for Testa on Tuesday, November third at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is $199. Shall I book it? Say yes or no.');
-  const bye = await r.hears(/You are booked/); assert.equal(bye, 'You are booked for Tuesday, November third at 10 A M. A confirmation text is on its way. Goodbye.');
+  assert.equal(await r.hears(/^To confirm/, 'yes'), 'To confirm: Standard cleaning for Testa on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is $199. Shall I book it? Say yes or no.');
+  const bye = await r.hears(/You are booked/); assert.equal(bye, 'You are booked for Tuesday, November third, 2026 at 10 A M. A confirmation text is on its way. Goodbye.');
   await until(() => r.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'), 'the delivery check');
   // Jobber: one client, one job, the read-back matched
   assert.equal(r.jobber.clientCount(), 1); assert.equal(r.jobber.jobs.size, 1);
@@ -154,7 +154,7 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   const b = await rig(); b.jobber.opts.scheduled = [{ startAt: new Date(instantOf('2026-11-03', '09:00', 'America/Chicago')).toISOString(), endAt: new Date(instantOf('2026-11-03', '12:00', 'America/Chicago')).toISOString() }];
   const sb = await b.connect(); b.start(sb); await until(() => b.voices.length === 1 && b.voices[0].spoken.length >= 1, 'the opening');
   await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/street address/, '123 Invented Lane, Testville, 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
-  const offer = await b.hears(/is \$199/); assert.match(offer, /Tuesday, November third at 12 P M/); sb.end(); await pause(30);
+  const offer = await b.hears(/is \$199/); assert.match(offer, /Tuesday, November third, 2026 at 12 P M/); sb.end(); await pause(30);
   assert.equal(b.jobber.jobs.size, 0);
   // 3. Jobber says more items exist than were returned: the calendar is treated as unreadable, nothing is offered
   const c = await rig(); c.jobber.opts.hasMoreScheduled = true;
@@ -173,11 +173,11 @@ test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call 
   await r.hears(/street address/, '123 Invented Lane, Testville, 90210');
   await r.hears(/What day and time/, 'Tuesday at ten');
   await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
-  assert.equal(await r.hears(/is \$199/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third at 10 A M. Does that work?');
+  assert.equal(await r.hears(/is \$199/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is $199. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
   // the verified caller ID is still the callback candidate; with texts off the very next question is the read-back
   assert.equal(await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'), 'I see you are calling from a number ending in 0 0 0 2. Is that the best number to reach you?');
-  assert.match(await r.hears(/^To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa on Tuesday, November third at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0\. The price is \$199\./);
-  assert.equal(await r.hears(/You are booked/), 'You are booked for Tuesday, November third at 10 A M. This test line does not send text messages. Goodbye.');
+  assert.match(await r.hears(/^To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0\. The price is \$199\./);
+  assert.equal(await r.hears(/You are booked/), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.');
   await until(() => r.outcomes.some((o) => o.reason === 'BOOKED'), 'the outcome');
   const spoken = r.voices[0].spoken.join(' | '); assert.ok(!/May we send you|automated booking-details|confirmation text is on its way/.test(spoken), 'no text question, no promise of a text');
   // the real Jobber booking is unchanged: calendar read first, one client, one job, independent read-back by id, $199

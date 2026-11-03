@@ -109,6 +109,7 @@ test('the write path re-checks the account itself (not only the booking code): a
 
 test('request gate: the three literal approvals, strict patterns and a future, same-day, at-most-eight-hour visit; only field NAMES are reported', () => {
   assert.deepEqual(requestProblems(REQ, NOW), []);
+  const far = { ...REQ.when, date: '2027-10-04' }; assert.ok(requestProblems({ ...REQ, when: far }, NOW).includes('when'), 'a visit more than 30 days ahead is refused before any write');
   const bad = (o: Partial<BookingRequest> | Record<string, unknown>) => requestProblems({ ...REQ, ...o }, NOW);
   assert.ok(bad({ gate: { ...REQ.gate, approvedByPerson: false } }).includes('gate'));
   assert.ok(bad({ gate: {} }).includes('gate')); assert.ok(bad({ gate: undefined }).includes('gate'));
