@@ -34,3 +34,7 @@ founder-voice-call.config.json
 *.backup
 founder-call-backups/
 preserved-work/
+
+# Timestamped backups the private-config helpers make beside the private configs are never committed.
+*.bak.json
+*.config.json.before-*
