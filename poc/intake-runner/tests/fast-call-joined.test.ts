@@ -135,7 +135,7 @@ test('JOINED: a caller who is not on the approved list hears one short line afte
   const r = await rig(); r.twilio.opts.callerFrom = '+15550100099';
   const sim = await r.connect(); r.start(sim);
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
-  await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented');
+  await r.hears(/Thanks for calling Drew Cleaning/);   // no answer is sent: the refusal follows the greeting by itself, and an answer could cut it off
   await r.hears(/private test line/);
   await sim.closed; await until(() => r.outcomes.length > 0, 'the outcome');
   assert.equal(r.outcomes[0].reason, 'NOT_APPROVED'); assert.deepEqual(r.voices[0].spoken.length, 2);
