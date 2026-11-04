@@ -3,17 +3,17 @@ import type { CallTransport, TransportEvent } from '../../src/call-transport.ts'
 
 export type Verdict = 'played' | 'cut' | 'timeout';
 export function fakeCarrier(opts: { measures?: boolean } = {}) {
-  const spoken: string[] = []; const waiting: Array<(v: Verdict) => void> = []; let ended = 0; let closed = 0; let cursor = 0;
+  const spoken: string[] = []; const speakOpts: Array<{ interruptible?: boolean } | undefined> = []; const waiting: Array<(v: Verdict) => void> = []; let ended = 0; let closed = 0; let cursor = 0;
   const transport: CallTransport = {
     onEvent: () => undefined, onClose: () => undefined,
-    speak(token: string): boolean { spoken.push(token); return true; },
+    speak(token: string, _last?: boolean, options?: { interruptible?: boolean }): boolean { spoken.push(token); speakOpts.push(options); return true; },
     ...(opts.measures === false ? {} : { playbackDone: (_max: number): Promise<Verdict> => new Promise((res) => { waiting.push(res); }) }),
     endCall(): boolean { ended++; return true; },
     close(): void { closed++; transport.onClose(); },
   };
   const until = async (cond: () => boolean, label = 'condition', ms = 3000): Promise<void> => { const t0 = Date.now(); while (!cond()) { if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${label}; spoken so far: ${spoken.length}; playbacks pending: ${waiting.length}; last lines: ${JSON.stringify(spoken.slice(-3).map((l) => l.slice(0, 60)))}`); await new Promise((r) => setTimeout(r, 2)); } };
   const api = {
-    transport, spoken, get ended() { return ended; }, get closed() { return closed; }, pending: (): number => waiting.length,
+    transport, spoken, /** The options each spoken line was handed over with, in the same order as `spoken`. */ speakOpts, get ended() { return ended; }, get closed() { return closed; }, pending: (): number => waiting.length,
     emit(ev: TransportEvent): void { transport.onEvent(ev); },
     /** Every line handed over so far has now finished playing with this verdict. */
     finish(v: Verdict = 'played'): void { for (const r of waiting.splice(0)) r(v); },

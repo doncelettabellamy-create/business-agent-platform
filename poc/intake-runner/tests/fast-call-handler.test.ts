@@ -544,3 +544,24 @@ test('FAST_ADDRESS: one line per address answer with the outcome, reason, which 
   // the whole call: the address, its parts and its digits appear in no log line at all
   noPersonalDetail(t.logs, ['Lane', '123', 'Invented Lane']); noPersonalDetail(u.logs, ['Lane', '123', 'Invented Lane']);
 });
+
+test('interruption: every question that is not a confirmation unit, and the info lines, are spoken non-interruptible; OFFER, CALLBACK, texts consent and READBACK (and their replays) stay interruptible; the call still books as before', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept' }); await toBooked(t);
+  assert.equal(t.booked.length, 1, 'booking behaviour is unchanged');
+  const rows = t.c.lines.map((l, i) => ({ l, i, flag: t.c.speakOpts[i]?.interruptible }));
+  const units = rows.filter((r) => /^(A standard cleaning|I see you are calling|To confirm|Please wait until)/.test(r.l));
+  const short = rows.filter((r) => /street address|What day and time|bedrooms and bathrooms|^One moment|^Booking that now/.test(r.l));
+  assert.ok(units.length >= 3 && short.length >= 5, 'the lines were found: ' + units.length + ' units, ' + short.length + ' short lines');
+  for (const r of units) assert.notEqual(r.flag, false, 'a confirmation unit stays interruptible: ' + r.l.slice(0, 30));
+  for (const r of short) assert.equal(r.flag, false, 'a short line cannot be cleared by the caller: ' + r.l.slice(0, 30));
+  // the questions that ask only for what is missing are short lines too
+  const p = build(); p.h.serve(p.c.transport); p.c.setup(DREW, undefined, 'Testa Invented');
+  await p.c.hears(/street address/, '123 Invented Lane'); await p.c.hears(/What is the city/, 'Testville'); await p.c.hears(/^And the ZIP code/, '90210'); await p.c.hears(/What day and time/, undefined);
+  for (const re of [/street address/, /^What is the city/, /^And the ZIP code/, /What day and time/]) { const i = p.c.lines.findIndex((l) => re.test(l)); assert.equal(p.c.speakOpts[i]?.interruptible, false, String(re)); }
+  // an answer given before the question finished is still taken, and nothing is asked twice
+  const e = build(); e.h.serve(e.c.transport); e.c.setup(DREW, undefined, 'Testa Invented');
+  await e.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await e.c.hears(/What day and time/, 'Tuesday at ten', { early: true });
+  await e.c.until(() => e.c.lines.some((l) => /bedrooms and bathrooms/.test(l)), 'the size question');
+  assert.equal(e.c.lines.filter((l) => /What day and time/.test(l)).length, 1); assert.equal(e.c.lines.filter((l) => /bedrooms and bathrooms/.test(l)).length, 1);
+});

@@ -137,7 +137,8 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     }
     /** Speaks the question and watches its measured playback. */
     function speakIt(a: Awaiting, text: string): void {
-      if (!t.speak(text, true)) { void end('SPEAK_FAILED'); return; }
+      // A short question is not worth interrupting: the voice service's own interruption is switched off for it, so a noise or an early word cannot cut it after its first words (Live Test #4). The caller's words are still heard and taken as the answer. A confirmation unit stays interruptible: a cut one is replayed.
+      if (!t.speak(text, true, a.unit ? undefined : { interruptible: false })) { void end('SPEAK_FAILED'); return; }
       deps.log('FAST_SAY', { id: a.id, unit: a.unit });
       void t.playbackDone!(playbackMaxMs).then((v) => enqueue(async () => { if (awaiting !== a || a.deferred === true) return; a.playing = false;
         if (a.unit && (v !== 'played' || a.heldEarly)) {
@@ -153,7 +154,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     function ask(id: string, text: string, onAnswer: Awaiting['onAnswer'], unit = false): void { clearTimers(); const a: Awaiting = { id, text, unit, playing: true, heldEarly: false, replays: 0, reprompts: 0, onAnswer }; awaiting = a; note(id); play(a, text); }
     function armAnswerTimer(a: Awaiting): void { if (answerTimer !== undefined) clearTimeout(answerTimer); answerTimer = setTimeout(() => enqueue(async () => { if (awaiting !== a || a.playing) return; if (callerSpeaking()) return armAnswerTimer(a); a.reprompts++; deps.log('FAST_SILENCE', { id: a.id, n: a.reprompts }); if (a.reprompts >= 2) return end('NO_ANSWER', 'I am not hearing a reply, so I will end the call. Goodbye.'); play(a, `Sorry, I did not catch that. ${a.text}`); }), answerWaitMs); }
     /** A line that needs no answer, played to its end (its measured verdict is not needed). */
-    async function say(text: string): Promise<void> { if (done) return; if (!t.speak(text, true)) return; deps.log('FAST_SAY', { id: 'info', unit: false }); await t.playbackDone!(playbackMaxMs); }
+    async function say(text: string): Promise<void> { if (done) return; if (!t.speak(text, true, { interruptible: false })) return; deps.log('FAST_SAY', { id: 'info', unit: false }); await t.playbackDone!(playbackMaxMs); }
     async function end(reason: string, line?: string, booked = false, extra: Partial<FastOutcome> = {}): Promise<void> {
       if (done) return; done = true; clearTimers(); awaiting = undefined;
       try { if (line !== undefined) { if (t.speak(line, true)) await t.playbackDone!(playbackMaxMs); } } catch { /* the call is going anyway */ }

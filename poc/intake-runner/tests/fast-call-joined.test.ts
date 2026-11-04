@@ -51,7 +51,7 @@ function wsOver(v: WireVoice): WebSocketLike {
 }
 const HOURS = { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] } as Record<string, Array<[string, string]>>;
 
-async function rig(o: { jobberWrites?: boolean; ownerConsent?: boolean; texts?: boolean; word?: string } = {}) {
+async function rig(o: { jobberWrites?: boolean; ownerConsent?: boolean; texts?: boolean; word?: string; msPerChar?: number } = {}) {
   const dir = mkdtempSync(join(root, 'r-')); const jobber = await mockJobber(); const twilio = await mockTwilio(); closers.push(() => jobber.close(), () => twilio.close());
   const callConfig: FounderCallConfig = { approval_id: 'fast-test', tenant: T, numbers: [DREW], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'], kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
     opening: { business_name: 'Drew Cleaning', greeting: "Thanks for calling Drew Cleaning. I'm Jack. What's your name?" } };
@@ -74,7 +74,7 @@ async function rig(o: { jobberWrites?: boolean; ownerConsent?: boolean; texts?: 
   const service = createFounderVoiceService({
     diag: (code, detail) => { diagLines.push({ code, ...detail }); }, config: callConfig, voice: voiceConfig, fast,
     textClient: createOpenAIHttpClient({ getKey: () => FAKE_KEY, fetch: (async () => new Response('{}', { status: 500 })) as unknown as typeof globalThis.fetch }),
-    openVoice: (d) => createOpenAiVoiceSocket({ model: voiceConfig.realtime_model, getKey: () => FAKE_KEY, connectTimeoutMs: 3000, diag: (code, detail) => { d(code as never, detail); }, factory: () => { const v = createWireVoice({ msPerChar: 1, autoOpen: false }); voices.push(v); return wsOver(v); } }),
+    openVoice: (d) => createOpenAiVoiceSocket({ model: voiceConfig.realtime_model, getKey: () => FAKE_KEY, connectTimeoutMs: 3000, diag: (code, detail) => { d(code as never, detail); }, factory: () => { const v = createWireVoice({ msPerChar: o.msPerChar ?? 1, autoOpen: false }); voices.push(v); return wsOver(v); } }),
     store, async intakeContext(tenant, ref) { const r = await mintExecutionContext({ credential: 'test', agent: 'intake' }, { verify: () => ({ kind: 'system', id: 'fast-joined-test' }), selectTenant: () => tenant, grants: () => ['intake:run'], newCorrelationId: () => `corr-${ref}` }); if (!r.ok) throw new Error('context'); return r.context; },
     now: () => Date.now(), nowIso: () => '2026-11-02T15:00:00Z', killed: () => false, log: (code, detail) => { logs.push({ code, detail }); },
   });
@@ -227,4 +227,32 @@ test('JOINED: an UNASSIGNED visit in Jobber (how Drew\'s own bookings are stored
   assert.match(await b.hears(/no longer available/), /nothing was booked/); await sb.closed;
   assert.equal(b.jobber.jobs.size, 0); assert.equal(b.jobber.clientCount(), 0); assert.ok(!b.jobber.ops.some((x) => x.field === 'clientCreate' || x.field === 'jobCreate'), 'no Jobber write was sent');
   assert.equal(b.outcomes[b.outcomes.length - 1].reason, 'NO_LONGER_AVAILABLE'); assert.equal(b.twilio.messages.length, 0);
+});
+
+test('JOINED: a caller who talks over a short question is not interrupted (no ADAPTER_INTERRUPT), the early answer is taken, nothing is asked twice and the booking completes; talking over the OFFER still clears it and the OFFER is replayed', async () => {
+  const r = await rig({ msPerChar: 30 });   // slow enough to be spoken over
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
+  const asked = (re: RegExp): number => (r.voices[0].spoken).filter((l) => re.test(l)).length;
+  const said = (id: string): number => r.logs.filter((l) => l.code === 'FAST_SAY' && l.detail?.id === id).length;
+  // the line is being spoken (not just handed over: the OFFER waits behind "One moment."), and the caller starts to talk
+  const talkOver = async (id: string, text: string, after?: RegExp): Promise<void> => { await until(() => said(id) > 0 && (after === undefined || r.voices[0].spoken.some((l) => after.test(l))) && r.voices[0].playing(), 'the ' + id + ' line to be playing'); r.voices[0].hear(text); };
+  await r.hears(/Thanks for calling/, 'Testa Invented'); await r.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  // 1. the WHEN question is being spoken: the caller answers over it
+  await talkOver('WHEN', 'Tuesday at ten');
+  await r.hears(/What day and time/); await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  assert.equal(asked(/What day and time/), 1, 'the question was spoken once, to its end'); assert.equal(asked(/bedrooms and bathrooms/), 1);
+  const cuts = (): number => r.diagLines.filter((d) => d.code === 'ADAPTER_INTERRUPT').length;   // the transport's own record that the caller took the floor from a line
+  assert.equal(cuts(), 0, 'the short question was not interrupted');
+  // 2. the OFFER is a unit: talking over it clears it, and it is spoken again
+  await talkOver('OFFER', 'yes', /^One moment/);
+  await until(() => r.logs.some((l) => l.code === 'CONFIRM_REPLAY' && l.detail?.id === 'OFFER'), 'the OFFER to be replayed');
+  assert.equal(cuts(), 1, 'the unit was interrupted');
+  // 3. the call goes on to the booking as before
+  await r.hears(/Please wait until I have finished, then answer\. A standard cleaning/, 'yes');
+  await r.hears(/calling from a number ending in/, 'yes'); await r.hears(/May we send you one automated/, 'yes');
+  await r.hears(/^To confirm/, 'yes'); await r.hears(/You are booked/);
+  await until(() => r.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'), 'the delivery check');
+  assert.equal(r.jobber.clientCount(), 1); assert.equal(r.jobber.jobs.size, 1);
+  await sim.closed; noPersonal(r.logs); noPersonal(r.diagLines);
 });
