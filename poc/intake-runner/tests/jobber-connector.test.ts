@@ -8,7 +8,7 @@ import type { Server } from 'node:http';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { accessToken, callbackUrlFor, createVault, isReadOnlyDocument, JobberError, pkcePair, query, readSchedule, startAuthorization, verifyExpectedAccount } from '../src/jobber-connector.ts';
+import { accessToken, callbackUrlFor, createVault, isReadOnlyDocument, JobberError, pkcePair, query, readBusyIntervals, readSchedule, startAuthorization, verifyExpectedAccount } from '../src/jobber-connector.ts';
 import type { Credentials, Ctx, FetchLike, Protector } from '../src/jobber-connector.ts';
 import { windowsProtector } from '../src/jobber-dpapi.ts';
 
@@ -269,4 +269,17 @@ test('standalone: nothing in the voice server, call logic, booking checkpoint or
   assert.ok(!/child_process|from 'node:https'|WebSocket/.test(text), 'no child process, no https client library, no WebSocket (the one node:http use is the local callback listener)');
   assert.ok(!/mutation\s+\w+\s*\{/i.test(text), 'no mutation document');
   assert.ok(createHmac !== undefined);
+});
+
+test('busy time: the schedule query asks for UNASSIGNED visits too (Drew\'s own bookings have no assignee), sends the window, reads only start and end, and returns them as busy', async () => {
+  const r = await rig();
+  try {
+    await connected(r); r.mock.opts.nodes = [{ __typename: 'Visit', startAt: '2026-11-04T15:00:00Z', endAt: '2026-11-04T17:00:00Z' }];
+    const from = '2026-11-03T20:00:00.000Z'; const to = '2026-11-18T20:00:00.000Z';
+    const b = await readBusyIntervals(r.ctx, CREDS, from, to);
+    assert.deepEqual(b, { busy: [{ start: Date.parse('2026-11-04T15:00:00Z'), end: Date.parse('2026-11-04T17:00:00Z') }], complete: true });
+    const sent = JSON.parse(r.mock.seen.graphql.at(-1)!.body) as { query: string; variables: { first: number; filter: Record<string, unknown> } };
+    assert.deepEqual(sent.variables.filter, { occursWithin: { startAt: from, endAt: to }, includeUnassigned: true }, 'the window, and unassigned visits included');
+    assert.ok(!/title|client|address|property/i.test(sent.query), 'no title, client or address is requested');
+  } finally { await r.done(); }
 });

@@ -210,3 +210,21 @@ test('texts off, defense in depth: even if something asked, the wired send is re
 test('any word other than exactly on leaves the composed dependencies in texts-off mode', async () => {
   for (const word of ['yes', 'ON', 'true', '1', 'off', '']) { const r = await rig({ texts: false, word }); assert.equal(r.fast.textsEnabled, false, word || '(empty)'); assert.equal(r.status.textsOn, false, word || '(empty)'); }
 });
+
+test('JOINED: an UNASSIGNED visit in Jobber (how Drew\'s own bookings are stored) blocks the offer and blocks the booking right before the write', async () => {
+  const busyAt = (from: string, to: string) => ({ startAt: new Date(instantOf('2026-11-03', from, 'America/Chicago')).toISOString(), endAt: new Date(instantOf('2026-11-03', to, 'America/Chicago')).toISOString(), unassigned: true });
+  // 1. an unassigned visit at 9 to 12: the 10 A M asked for is not offered, and the query said it wants unassigned items
+  const a = await rig(); a.jobber.opts.scheduled = [busyAt('09:00', '12:00')];
+  const sa = await a.connect(); a.start(sa); await until(() => a.voices.length === 1 && a.voices[0].spoken.length >= 1, 'the opening');
+  await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/street address/, '123 Invented Lane, Testville, 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
+  const offer = await a.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /Tuesday, November third, 2026 at 12 P M/, 'the unassigned visit was seen, so a later time is offered'); sa.end(); await pause(30);
+  const read = a.jobber.ops.find((x) => x.field === 'scheduledItems')!; assert.equal((read.variables.filter as { includeUnassigned?: unknown }).includeUnassigned, true); assert.equal(a.jobber.jobs.size, 0);
+  // 2. the slot is free at the offer, then an unassigned visit appears before the caller's final yes: the second read stops the booking and nothing is written
+  const b = await rig(); const sb = await b.connect(); b.start(sb); await until(() => b.voices.length === 1 && b.voices[0].spoken.length >= 1, 'the opening');
+  await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/street address/, '123 Invented Lane, Testville, 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
+  assert.match(await b.hears(/is one hundred ninety-nine dollars/, 'yes'), /at 10 A M/); await b.hears(/calling from/, 'yes'); await b.hears(/May we send you one automated/, 'yes');
+  await b.hears(/^To confirm/); b.jobber.opts.scheduled = [busyAt('10:00', '12:00')]; b.voices[0].hear('yes');   // someone else took the time (an unassigned visit) while the read-back was being said
+  assert.match(await b.hears(/no longer available/), /nothing was booked/); await sb.closed;
+  assert.equal(b.jobber.jobs.size, 0); assert.equal(b.jobber.clientCount(), 0); assert.ok(!b.jobber.ops.some((x) => x.field === 'clientCreate' || x.field === 'jobCreate'), 'no Jobber write was sent');
+  assert.equal(b.outcomes[b.outcomes.length - 1].reason, 'NO_LONGER_AVAILABLE'); assert.equal(b.twilio.messages.length, 0);
+});

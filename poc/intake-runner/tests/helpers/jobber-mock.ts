@@ -3,7 +3,7 @@
 import { createServer } from 'node:http';
 
 export const ACCOUNT = { id: 'ACCT-TEST-1', name: 'Test Cleaning Developer Account' };
-export interface JobberMockOptions { account: { id: string; name: string }; scheduled: Array<{ startAt: string; endAt: string; allDay?: boolean }>; hasMoreScheduled: boolean; shiftVisitMs: number; jobUserErrors: boolean; searchBlind: boolean }
+export interface JobberMockOptions { account: { id: string; name: string }; scheduled: Array<{ startAt: string; endAt: string; allDay?: boolean; /** Not assigned to anyone: Jobber returns it only when the query sets includeUnassigned, like the real service. */ unassigned?: boolean }>; hasMoreScheduled: boolean; shiftVisitMs: number; jobUserErrors: boolean; searchBlind: boolean }
 export interface JobberMock { endpoints: { authorize: string; token: string; graphql: string }; ops: Array<{ field: string; variables: Record<string, unknown> }>; opts: JobberMockOptions; jobs: Map<string, Record<string, unknown>>; clientCount(): number; close(): Promise<void> }
 
 export async function mockJobber(): Promise<JobberMock> {
@@ -17,7 +17,7 @@ export async function mockJobber(): Promise<JobberMock> {
       if (!/^Bearer tok-valid/.test(String(req.headers.authorization ?? ''))) return send(401, {});
       const b = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { query: string; variables?: Record<string, unknown> }; const v = b.variables ?? {};
       const data = (d: unknown) => send(200, { data: d, extensions: { versioning: { version: '2026-09-25' } } });
-      if (/query Busy/.test(b.query)) { ops.push({ field: 'scheduledItems', variables: v }); return data({ scheduledItems: { nodes: opts.scheduled, pageInfo: { hasNextPage: opts.hasMoreScheduled } } }); }
+      if (/query Busy/.test(b.query)) { ops.push({ field: 'scheduledItems', variables: v }); const asked = (v.filter as { includeUnassigned?: unknown } | undefined)?.includeUnassigned === true; return data({ scheduledItems: { nodes: opts.scheduled.filter((s) => s.unassigned !== true || asked).map(({ unassigned: _u, ...node }) => node), pageInfo: { hasNextPage: opts.hasMoreScheduled } } }); }
       if (/query GetAccount/.test(b.query)) { ops.push({ field: 'account', variables: v }); return data({ account: opts.account }); }
       if (/clientCreate/.test(b.query)) {
         ops.push({ field: 'clientCreate', variables: v });
