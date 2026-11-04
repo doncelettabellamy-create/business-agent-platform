@@ -7,6 +7,7 @@ import type { FastDeps, FastOutcome, FastSettings } from '../src/fast-call-handl
 import { instantOf } from '../src/fast-parsers.ts';
 import type { BookingRequest, BookingResult } from '../src/jobber-booking.ts';
 import type { Delivery, SendResult } from '../src/twilio-messaging.ts';
+import { cleanDetail } from '../src/call-diag.ts';
 import { fakeCarrier } from './helpers/fake-carrier.ts';
 
 const TZ = 'America/Chicago'; const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 9:00 in Chicago
@@ -523,28 +524,6 @@ test('full-name read-back: the read-back says the first AND last name exactly as
   noPersonalDetail(b.logs, ['Done', 'Bill']);
 });
 
-test('FAST_ADDRESS: one line per address answer with the outcome, reason, which parts are held and a digit-run count; no address text or digit is ever logged, and the questions asked are unchanged', async () => {
-  const t = build();
-  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
-  await t.c.hears(/street address/, '123 Invented Lane');
-  await t.c.hears(/What is the city/, 'Testville');
-  await t.c.hears(/^And the ZIP code/, '90210');
-  await t.c.hears(/What day and time/);
-  const lines = t.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
-  assert.deepEqual(lines, [
-    { outcome: 'partial', reason: 'NEED_CITY', held: { street: true, city: false, zip: false }, digitRuns: 1 },
-    { outcome: 'partial', reason: 'NEED_ZIP', held: { street: true, city: true, zip: false }, digitRuns: 0 },
-    { outcome: 'captured', reason: 'JOINED', held: { street: true, city: true, zip: true }, digitRuns: 1 },
-  ]);
-  // a ZIP followed by extra words is dropped by the parser (unchanged behaviour); the line says so without saying what was heard
-  const u = build(); u.h.serve(u.c.transport); u.c.setup(DREW, undefined, 'Testa Invented');
-  await u.c.hears(/street address/, '123 Invented Lane, Testville, 90210, that is it');
-  await u.c.hears(/What is the city/);
-  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', held: { street: true, city: false, zip: false }, digitRuns: 2 }]);   // the house number and the ZIP are two runs
-  // the whole call: the address, its parts and its digits appear in no log line at all
-  noPersonalDetail(t.logs, ['Lane', '123', 'Invented Lane']); noPersonalDetail(u.logs, ['Lane', '123', 'Invented Lane']);
-});
-
 test('interruption: every question that is not a confirmation unit, and the info lines, are spoken non-interruptible; OFFER, CALLBACK, texts consent and READBACK (and their replays) stay interruptible; the call still books as before', async () => {
   const t = build({ textsEnabled: false, emails: 'accept' }); await toBooked(t);
   assert.equal(t.booked.length, 1, 'booking behaviour is unchanged');
@@ -564,4 +543,58 @@ test('interruption: every question that is not a confirmation unit, and the info
   await e.c.hears(/What day and time/, 'Tuesday at ten', { early: true });
   await e.c.until(() => e.c.lines.some((l) => /bedrooms and bathrooms/.test(l)), 'the size question');
   assert.equal(e.c.lines.filter((l) => /What day and time/.test(l)).length, 1); assert.equal(e.c.lines.filter((l) => /bedrooms and bathrooms/.test(l)).length, 1);
+});
+
+test('FAST_ADDRESS: one line per address answer with the outcome, reason, three flat booleans for street, city and ZIP, and counts; every field survives the log sink, no address text or digit is logged, and the questions asked are unchanged', async () => {
+  const sizes = (s: string) => ({ digitRuns: (s.match(/\d+/g) ?? []).length, words: s.trim().split(/\s+/).length, chars: s.trim().length });
+  const t = build();
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane');
+  await t.c.hears(/What is the city/, 'Testville');
+  await t.c.hears(/^And the ZIP code/, '90210');
+  await t.c.hears(/What day and time/, undefined);
+  const lines = t.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
+  assert.deepEqual(lines, [
+    { outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, ...sizes('123 Invented Lane') },
+    { outcome: 'partial', reason: 'NEED_ZIP', street: true, city: true, zip: false, digitRuns: 0, words: 1, chars: 9 },
+    { outcome: 'captured', reason: 'JOINED', street: true, city: true, zip: true, ...sizes('90210') },
+  ]);
+  // a ZIP followed by extra words is dropped by the parser (unchanged behaviour); the line says so without saying what was heard
+  const said = '123 Invented Lane, Testville, 90210, that is it';
+  const u = build(); u.h.serve(u.c.transport); u.c.setup(DREW, undefined, 'Testa Invented');
+  await u.c.hears(/street address/, said);
+  await u.c.hears(/What is the city/, undefined);
+  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, ...sizes(said) }]);
+  // every field is a flat boolean, number or short token, so the real log sink keeps all of them (it drops anything else)
+  for (const l of [...t.logs, ...u.logs]) if (l[0] === 'FAST_ADDRESS') assert.deepEqual(cleanDetail(l[1]), l[1], 'the sink keeps every field');
+  // the whole call: the address, its parts and its digits appear in no log line at all
+  noPersonalDetail(t.logs, ['Lane', '123', 'Invented Lane']); noPersonalDetail(u.logs, ['Lane', '123', 'Invented Lane']);
+});
+
+test('FAST_SIZE: one line per size answer says what the parser found (booleans and counts only); three unreadable answers still end the call as before; the words said are never logged', async () => {
+  const flat = (logs: Array<[string, unknown]>) => logs.filter(([k]) => k === 'FAST_SIZE').map(([, v]) => v as Record<string, unknown>);
+  // 1. nothing readable, then a lone number-less answer, then both: the retry wording and the count of tries are unchanged
+  const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await t.c.hears(/What day and time/, 'Tuesday at ten');
+  await t.c.hears(/bedrooms and bathrooms/, 'banana smoothie please');
+  await t.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'two bedrooms');
+  await t.c.hears(/^And how many bathrooms/, 'two');
+  await t.c.hears(/is one hundred ninety-nine dollars/, undefined);
+  assert.deepEqual(flat(t.logs), [
+    { parsedBeds: false, parsedBaths: false, bareCount: false, hadBeds: false, hadBaths: false, haveBeds: false, haveBaths: false, numberTokens: 0, words: 3, chars: 22, tries: 0, verdict: 'NONE' },
+    { parsedBeds: true, parsedBaths: false, bareCount: true, hadBeds: false, hadBaths: false, haveBeds: true, haveBaths: false, numberTokens: 1, words: 2, chars: 12, tries: 1, verdict: 'BEDS_ONLY' },
+    { parsedBeds: false, parsedBaths: false, bareCount: true, hadBeds: true, hadBaths: false, haveBeds: true, haveBaths: true, numberTokens: 1, words: 1, chars: 3, tries: 1, verdict: 'BOTH' },   // tries is not reset by a partial answer (unchanged behaviour)
+  ]);
+  // 2. three answers with no size in them: the third ends the call exactly as before (SIZE_UNCLEAR), and the tries read 0, 1, 2
+  const g = build(); g.h.serve(g.c.transport); g.c.setup(DREW, undefined, 'Testa Invented');
+  await g.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await g.c.hears(/What day and time/, 'Tuesday at ten');
+  await g.c.hears(/bedrooms and bathrooms/, 'hmm');
+  await g.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'okay then');
+  await g.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'thank you');
+  await finish(g.c);
+  assert.equal(g.last().reason, 'SIZE_UNCLEAR'); assert.equal(g.booked.length, 0);
+  assert.deepEqual(flat(g.logs).map((l) => [l.tries, l.verdict]), [[0, 'NONE'], [1, 'NONE'], [2, 'NONE']]);
+  // 3. every field is a flat boolean, number or short token, so the real log sink keeps all of them; nothing said is in any line
+  for (const l of [...t.logs, ...g.logs]) if (l[0] === 'FAST_SIZE') assert.deepEqual(cleanDetail(l[1]), l[1], 'the sink keeps every field');
+  noPersonalDetail(t.logs, ['banana', 'smoothie']); noPersonalDetail(g.logs, ['okay', 'thank you', 'hmm']);
 });

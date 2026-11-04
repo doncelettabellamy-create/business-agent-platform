@@ -410,13 +410,17 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
       case 'conversation.item.input_audio_transcription.completed': {
         if (native === undefined && typeof m.item_id === 'string') ask('delete', { type: 'conversation.item.delete', item_id: m.item_id });   // the voice service keeps no copy of what was said (native conversation keeps the call's turns, see RealtimeOptions.native)
         if (phase !== 'live') return;   // nothing said before the notice has played, or after the call has ended, is taken
+        const said = typeof m.transcript === 'string' ? m.transcript.trim() : '';
+        diag('ADAPTER_TRANSCRIPT', { status: said.length === 0 ? 'EMPTY' : 'TEXT', chars: said.length, words: said.length === 0 ? 0 : said.split(/\s+/).length });   // a status and two counts: never the words
         if (typeof m.transcript !== 'string' || m.transcript.trim().length === 0) emit({ kind: 'partial' });
         else emit({ kind: 'utterance', text: m.transcript });
         return;
       }
       case 'conversation.item.input_audio_transcription.delta':
-      case 'conversation.item.input_audio_transcription.failed':
         if (phase === 'live') emit({ kind: 'partial' });
+        return;
+      case 'conversation.item.input_audio_transcription.failed':
+        if (phase === 'live') { diag('ADAPTER_TRANSCRIPT', { status: 'FAILED', chars: 0, words: 0 }); emit({ kind: 'partial' }); }
         return;
       case 'error': {
         // An error that answers one of our own cancel or delete requests (the reply had just finished; the item was already gone) is not a fault of the call.

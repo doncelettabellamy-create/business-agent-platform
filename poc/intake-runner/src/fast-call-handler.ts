@@ -106,6 +106,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
     const note = (s: string): void => { if (steps.length < 40) steps.push(s); };
+    const wordsIn = (s: string): number => (s.trim() === '' ? 0 : s.trim().split(/\s+/).length);   // diagnostics only: how many words, never which
     const clearTimers = (): void => { if (answerTimer !== undefined) clearTimeout(answerTimer); if (settleTimer !== undefined) clearTimeout(settleTimer); answerTimer = undefined; settleTimer = undefined; settleFn = undefined; if (holdTimer !== undefined) clearTimeout(holdTimer); holdTimer = undefined; };
     /** True while the voice detection says the caller is speaking. A start that never gets its stop stops counting after ten seconds, so a lost event cannot silence the call for good. */
     const callerSpeaking = (): boolean => speakingSince !== undefined && deps.now() - speakingSince < 10_000;
@@ -195,7 +196,8 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const text = lead ?? 'What is the street address, with the city and ZIP code?';
       ask('ADDRESS', text, async (heard) => {
         const r = contact.collect('address', heard);
-        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, held: contact.addressHeld(), digitRuns: digitRuns(heard).length });   // codes, booleans and a count only: never the address, a part of it or a digit
+        const held = contact.addressHeld();
+        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, digitRuns: digitRuns(heard).length, words: wordsIn(heard), chars: heard.trim().length });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit
         if (r.outcome === 'captured') { tries = 0; return askWhen(); }
         if ((r.outcome === 'unclear' || r.reason === 'SAME') && ++tries >= 4) return giveUp('ADDRESS_UNCLEAR');
         // Pieces are kept; wait a moment in case the rest follows, then ask ONLY for what is missing.
@@ -219,12 +221,15 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     }
     function askSize(lead?: string): void {
       ask('SIZE', lead ?? 'How many bedrooms and bathrooms?', async (heard) => {
+        const heldBefore = { beds: size.beds !== undefined, baths: size.baths !== undefined };
         const s = sizeFrom(heard);
         if (s.beds !== undefined) size.beds = s.beds; if (s.baths !== undefined) size.baths = s.baths;
         if (s.beds === undefined && s.baths === undefined) {   // a bare "two" answers whichever one was just asked about
           const one = countFrom(heard);
           if (one !== undefined && size.beds !== undefined && size.baths === undefined) size.baths = one; else if (one !== undefined && size.baths !== undefined && size.beds === undefined) size.beds = one;
         }
+        // What the size parser did with this answer: booleans and counts only, never the words or the numbers said.
+        deps.log('FAST_SIZE', { parsedBeds: s.beds !== undefined, parsedBaths: s.baths !== undefined, bareCount: countFrom(heard) !== undefined, hadBeds: heldBefore.beds, hadBaths: heldBefore.baths, haveBeds: size.beds !== undefined, haveBaths: size.baths !== undefined, numberTokens: digitRuns(heard).length, words: wordsIn(heard), chars: heard.trim().length, tries, verdict: size.beds !== undefined && size.baths !== undefined ? 'BOTH' : size.beds !== undefined ? 'BEDS_ONLY' : size.baths !== undefined ? 'BATHS_ONLY' : 'NONE' });
         if (size.beds === undefined && size.baths === undefined) { if (++tries >= 3) return giveUp('SIZE_UNCLEAR'); return armSettle(async () => askSize('Sorry, how many bedrooms and bathrooms?')); }
         if (size.beds === undefined) return armSettle(async () => askSize('And how many bedrooms?'));
         if (size.baths === undefined) return armSettle(async () => askSize('And how many bathrooms?'));

@@ -711,3 +711,20 @@ test('tail tolerance (through the transport): a caller who starts answering insi
   const none: string[] = [];
   assert.equal(await run(1000, none), 'cut', 'inside the date sentence, before the closing question'); assert.equal(await run(sentMs - 300, none), 'cut', 'during the price'); assert.deepEqual(none, []);
 });
+
+test('transcript status: every recognised transcript logs its status (TEXT, EMPTY or FAILED) and its size in chars and words, never the words; what the call logic receives is unchanged', async () => {
+  const sim = createRealtimeSim({ msPerChar: 5 });
+  const lines: Array<{ code: string; detail?: Record<string, unknown> }> = []; const events: TransportEvent[] = [];
+  const t = createRealtimeTransport(sim.link, { notice: NOTICE, transcriptionModel: 'x', voice: 'y', msPerChar: 5, diag: (code, detail) => { lines.push({ code, detail }); } });
+  t.onEvent = (e) => { events.push(e); };
+  sim.start({ to: N1, callSid: SID(1) }); await sim.heard(1);
+  sim.say('banana smoothie please'); await sim.idle();
+  sim.mumble(); await sim.idle();
+  (sim.link as unknown as { onMessage(m: unknown): void }).onMessage({ type: 'conversation.item.input_audio_transcription.failed', item_id: 'item_x' }); await sim.idle();
+  assert.deepEqual(lines.filter((l) => l.code === 'ADAPTER_TRANSCRIPT').map((l) => l.detail), [
+    { status: 'TEXT', chars: 22, words: 3 }, { status: 'EMPTY', chars: 0, words: 0 }, { status: 'FAILED', chars: 0, words: 0 },
+  ]);
+  assert.ok(!JSON.stringify(lines).includes('banana'), 'the words are never logged');
+  assert.deepEqual(events.filter((e) => e.kind === 'utterance' || e.kind === 'partial').map((e) => e.kind), ['utterance', 'partial', 'partial']);   // as before: a sentence, then two non-answers
+  assert.equal((events.find((e) => e.kind === 'utterance') as { text: string }).text, 'banana smoothie please');
+});
