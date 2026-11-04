@@ -68,7 +68,7 @@ async function rig(o: { jobberWrites?: boolean; ownerConsent?: boolean; texts?: 
   const status = await fastStatus({ vaultDir: dir, protector: fakeProtector, env });
   const logs: Array<{ code: string; detail?: Record<string, unknown> }> = []; const diagLines: Array<{ code: string; [k: string]: unknown }> = []; const outcomes: FastOutcome[] = [];
   const fast = await buildFastDeps({ config: callConfig, voice: voiceConfig, vaultDir: dir, protector: fakeProtector, env, fetch: globalThis.fetch, now: () => NOW, log: (code, detail) => { logs.push({ code, detail }); }, onOutcome: (x) => { outcomes.push(x); }, jobberEndpoints: jobber.endpoints, twilioOrigin: twilio.origin, textFrom: DREW });
-  fast.answerWaitMs = 20_000; fast.settleMs = 30;
+  fast.answerWaitMs = 20_000; fast.settleMs = 30; fast.holdGraceMs = 30; fast.holdMaxMs = 300;
   const store = createIntakeRecordStore({ path: join(dir, 'calls.sqlite') }); closers.push(() => store.close());
   const voices: WireVoice[] = [];
   const service = createFounderVoiceService({
@@ -177,7 +177,7 @@ test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call 
   // the verified caller ID is still the callback candidate; with texts off the very next question is the read-back
   assert.equal(await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'), 'I see you are calling from a number ending in 0 0 0 2. Is that the best number to reach you?');
   assert.match(await r.hears(/^To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0\. The price is one hundred ninety-nine dollars\./);
-  assert.equal(await r.hears(/You are booked/), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.');
+  assert.equal(await r.hears(/You are booked/), 'You are booked for Tuesday, November third, 2026 at 10 A M. Goodbye.');
   await until(() => r.outcomes.some((o) => o.reason === 'BOOKED'), 'the outcome');
   const spoken = r.voices[0].spoken.join(' | '); assert.ok(!/May we send you|automated booking-details|confirmation text is on its way/.test(spoken), 'no text question, no promise of a text');
   // the real Jobber booking is unchanged: calendar read first, one client, one job, independent read-back by id, $199
