@@ -294,7 +294,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const o = offer!; const p = contact.addressParts();
       if (p === undefined) return void giveUp('ADDRESS_MISSING');
       const spokenZip = p.zip.split('').join(' ');
-      ask('READBACK', `To confirm: ${S.serviceLabel} for ${firstName} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
+      ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return book();
         if (y === 'no') return end('DECLINED_AT_READBACK', 'No problem. Nothing was booked. Goodbye.');
