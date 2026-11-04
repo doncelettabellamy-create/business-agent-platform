@@ -173,6 +173,8 @@ export interface ContactState {
   spokenAddress(): string | undefined;
   /** City-and-ZIP mode, once the address is whole: its three parts kept apart (a street address, a city, a five-digit ZIP code), for a system that needs them separately. RAW personal data. Undefined until the address is whole, or when the mode is off. */
   addressParts(): { street: string; city: string; zip: string } | undefined;
+  /** City-and-ZIP mode: which of the three address parts are held, as booleans only (never a part itself), for a log line. */
+  addressHeld(): { street: boolean; city: boolean; zip: boolean };
   status(): ContactStatus;
   dispose(): void;
 }
@@ -404,6 +406,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
     },
     spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aZip.split('').join(' ')}` : values.address; },
     addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' ? undefined : { street: aStreet, city: aCity, zip: aZip }; },
+    addressHeld() { return disposed ? { street: false, city: false, zip: false } : { street: aStreet !== '', city: aCity !== '', zip: aZip !== '' }; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);

@@ -17,7 +17,7 @@
 // Every outside thing is handed in (the clock, Twilio, Jobber, the booking adapter), so this file is tested with stand-ins and never reaches the network itself.
 
 import { createHash } from 'node:crypto';
-import { createContactState } from './call-state.ts';
+import { createContactState, digitRuns } from './call-state.ts';
 import type { ContactState } from './call-state.ts';
 import { spokenDigits } from './contact-capture.ts';
 import { chooseOffer, lastBookableDate } from './fast-availability.ts';
@@ -194,6 +194,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const text = lead ?? 'What is the street address, with the city and ZIP code?';
       ask('ADDRESS', text, async (heard) => {
         const r = contact.collect('address', heard);
+        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, held: contact.addressHeld(), digitRuns: digitRuns(heard).length });   // codes, booleans and a count only: never the address, a part of it or a digit
         if (r.outcome === 'captured') { tries = 0; return askWhen(); }
         if ((r.outcome === 'unclear' || r.reason === 'SAME') && ++tries >= 4) return giveUp('ADDRESS_UNCLEAR');
         // Pieces are kept; wait a moment in case the rest follows, then ask ONLY for what is missing.

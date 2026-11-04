@@ -522,3 +522,25 @@ test('full-name read-back: the read-back says the first AND last name exactly as
   const c = build({ textsEnabled: false, emails: 'accept' }); await toBooked(c); assert.deepEqual([c.booked[0].client.firstName, c.booked[0].client.lastName], ['Testa', 'Invented']);
   noPersonalDetail(b.logs, ['Done', 'Bill']);
 });
+
+test('FAST_ADDRESS: one line per address answer with the outcome, reason, which parts are held and a digit-run count; no address text or digit is ever logged, and the questions asked are unchanged', async () => {
+  const t = build();
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane');
+  await t.c.hears(/What is the city/, 'Testville');
+  await t.c.hears(/^And the ZIP code/, '90210');
+  await t.c.hears(/What day and time/);
+  const lines = t.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
+  assert.deepEqual(lines, [
+    { outcome: 'partial', reason: 'NEED_CITY', held: { street: true, city: false, zip: false }, digitRuns: 1 },
+    { outcome: 'partial', reason: 'NEED_ZIP', held: { street: true, city: true, zip: false }, digitRuns: 0 },
+    { outcome: 'captured', reason: 'JOINED', held: { street: true, city: true, zip: true }, digitRuns: 1 },
+  ]);
+  // a ZIP followed by extra words is dropped by the parser (unchanged behaviour); the line says so without saying what was heard
+  const u = build(); u.h.serve(u.c.transport); u.c.setup(DREW, undefined, 'Testa Invented');
+  await u.c.hears(/street address/, '123 Invented Lane, Testville, 90210, that is it');
+  await u.c.hears(/What is the city/);
+  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', held: { street: true, city: false, zip: false }, digitRuns: 2 }]);   // the house number and the ZIP are two runs
+  // the whole call: the address, its parts and its digits appear in no log line at all
+  noPersonalDetail(t.logs, ['Lane', '123', 'Invented Lane']); noPersonalDetail(u.logs, ['Lane', '123', 'Invented Lane']);
+});
