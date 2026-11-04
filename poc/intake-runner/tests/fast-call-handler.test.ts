@@ -410,3 +410,26 @@ test('the price is spoken in words everywhere it is spoken: no dollar sign reach
   assert.equal(t.booked.length, 1); assert.equal(t.booked[0].priceDollars, 199, 'the Jobber amount is unchanged');
   assert.ok(t.texts.every((x) => x.body.includes('$199')), 'the texts keep $199'); assert.ok(t.mails.every((m) => m.text.includes('Price: $199')), 'the emails keep $199');
 });
+
+test('callback number in the OWNER\'s email: the confirmed number (the verified caller ID, or the one the caller gave and confirmed) is in the owner email only; no log line holds it', async () => {
+  const a = build({ textsEnabled: false, emails: 'accept' }); await toBooked(a);
+  const ao = a.mails.find((m) => m.role === 'owner')!; const ac = a.mails.find((m) => m.role === 'customer')!;
+  assert.ok(ao.text.split('\n').includes('Callback number: (555) 010-0002'), 'the caller ID the caller confirmed'); assert.ok(!/callback|5550100002|\(555\)/i.test(ac.text + ac.subject + ao.subject), 'not in the customer email or any subject');
+  noPersonalDetail(a.logs);
+  const b = build({ textsEnabled: false, emails: 'accept' }); b.h.serve(b.c.transport); await toOffer(b.c);
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from a number ending in/, 'no'); await b.c.hears(/What is the best number/, 'five five five zero one');
+  await b.c.hears(/remaining 5 digits/, 'zero zero zero nine nine'); await b.c.hears(/I heard/, 'yes'); await b.c.hears(/To confirm/, 'yes'); await finish(b.c);
+  assert.ok(b.mails.find((m) => m.role === 'owner')!.text.split('\n').includes('Callback number: (555) 010-0099'), 'the number the caller gave and confirmed'); assert.ok(!b.mails.find((m) => m.role === 'customer')!.text.includes('010-0099'));
+  noPersonalDetail(b.logs, ['5550100099', '0100099']);
+});
+
+test('duplicate-email guard: a booking Jobber reports as already made, and a booking key already emailed in this process, send no second email', async () => {
+  const dup = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 0, duplicate: true }) }); await toBooked(dup);
+  assert.equal(dup.mails.length, 0); assert.deepEqual(dup.logs.find(([c]) => c === 'FAST_EMAILS_SKIPPED')?.[1], { reason: 'DUPLICATE' });
+  assert.equal(dup.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. This test line does not send text messages. Goodbye.', 'no email is promised'); assert.deepEqual([dup.last().customerEmail, dup.last().ownerEmail, dup.last().booked], ['not_sent', 'not_sent', true]);
+  const t = build({ textsEnabled: false, emails: 'accept' }); await toBooked(t); assert.equal(t.mails.length, 2);
+  const again = fakeCarrier(); t.h.serve(again.transport); again.setup(DREW, undefined, 'Testa Invented');   // the same call id: the same booking key
+  await again.hears(/street address/, '123 Invented Lane, Testville, 90210'); await again.hears(/What day and time/, 'Tuesday at ten'); await again.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await again.hears(/is one hundred ninety-nine dollars/, 'yes'); await again.hears(/calling from a number ending in/, 'yes'); await again.hears(/To confirm/, 'yes'); await finish(again);
+  assert.equal(t.mails.length, 2, 'the same booking is never emailed twice'); assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_EMAILS_SKIPPED').map(([, d]) => d), [{ reason: 'ALREADY_SENT' }]); assert.equal(t.booked.length, 2);
+});

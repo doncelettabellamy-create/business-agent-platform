@@ -8,6 +8,7 @@
 // Failure text is fixed: a server's reply (which can echo an address or a login) is never logged, returned or thrown on.
 
 import nodemailer from 'nodemailer';
+import { sampleEmail } from './fast-email-copy.ts';
 
 export const EMAIL_BLOB = 'test-emails';
 /** The private, protected record: the sender (a Yahoo or Gmail account), its app password, and the two approved recipients. The sender may also be one of the two recipients. */
@@ -89,4 +90,17 @@ export function createEmailSender(o: EmailSenderOptions): (role: EmailRole, subj
       log('FAST_EMAIL_FAILED', { role, reason }); return { ok: false, reason };   // the error's own text is never used
     } finally { if (timer !== undefined) clearTimeout(timer); try { transport.close?.(); } catch { /* closed */ } }
   };
+}
+
+/**
+ * The setup's EMAIL CHECK. Without `send` it sends nothing and opens no connection: it only says whether the saved settings are in place. With `send` it sends ONE sample email (invented details, clearly marked) to the OWNER address
+ * only, through the same allowlisted sender, and prints status words: never an address, a login or a server's text. "Accepted" means the mail server took it, not that it reached an inbox.
+ */
+export async function emailCheck(o: { settings: TestEmails | undefined; send: boolean; senderOptions?: Partial<EmailSenderOptions> }): Promise<{ ok: boolean; lines: string[] }> {
+  if (o.settings === undefined) return { ok: false, lines: ['not ready: the test email sender and addresses are not saved; run fast-test-enter-emails.ps1 first. Nothing was sent.'] };
+  if (!o.send) return { ok: true, lines: ['ready: the settings are saved. This would send ONE sample email to the OWNER address only, with invented details. Add --send to send it. Nothing was sent.'] };
+  const m = sampleEmail(); const r = await createEmailSender({ ...(o.senderOptions ?? {}), settings: o.settings })('owner', m.subject, m.text);
+  if (r.ok) return { ok: true, lines: ['accepted: the mail server took ONE sample email for the OWNER address. That is not delivery: look in the inbox AND the spam folder.'] };
+  const hint: Record<string, string> = { AUTH: 'the mail server refused the sender login: create a new app password and run fast-test-enter-emails.ps1 again', TIMEOUT: 'the mail server did not answer in time', REFUSED: 'the mail server did not accept the message', INVALID: 'the message was not acceptable', NOT_ALLOWED: 'the recipient is not allowed', ERROR: 'the connection or the server failed' };
+  return { ok: false, lines: [`failed (${r.reason ?? 'ERROR'}): ${hint[r.reason ?? 'ERROR'] ?? hint.ERROR}. Nothing else was sent.`] };
 }

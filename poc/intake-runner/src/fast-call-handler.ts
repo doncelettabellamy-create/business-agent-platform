@@ -90,7 +90,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
   if (typeof deps !== 'object' || deps === null || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1 || typeof deps.settings !== 'object' || !(deps.numbers instanceof Set) || !(deps.approvedCallers instanceof Set) || !(deps.approvedCustomerNumbers instanceof Set) || !/^\+[1-9]\d{9,14}$/.test(String(deps.ownerNumber))
     || ['callerOf', 'busy', 'book', 'sendText', 'verifyText', 'now', 'log'].some((k) => typeof (deps as unknown as Record<string, unknown>)[k] !== 'function')) throw new RangeError('the fast call handler needs its dependencies');
   const answerWaitMs = deps.answerWaitMs ?? 12_000; const settleMs = deps.settleMs ?? 3000; const playbackMaxMs = deps.playbackMaxMs ?? 60_000; const afterSpeechMs = deps.afterSpeechMs ?? 400;
-  const S = deps.settings; let active = 0; let accepted = 0; const work = new Set<Promise<unknown>>();
+  const S = deps.settings; const emailedKeys = new Set<string>(); let active = 0; let accepted = 0; const work = new Set<Promise<unknown>>();
 
   function serve(t: CallTransport): void {
     if (typeof t.playbackDone !== 'function') { deps.log('FAST_REFUSED', { reason: 'NO_PLAYBACK_MEASURE' }); t.close(1011); return; }   // a carrier that cannot measure playback cannot confirm anything
@@ -309,10 +309,13 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       if (res.status !== 'booked_verified') return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');
       // Test emails (default OFF): only now that Jobber's read-back verified the booking, only to the two approved addresses (held behind `sendEmail`), and a failure changes nothing about the booking.
       const mail: { customer: EmailVerdict; owner: EmailVerdict } = { customer: 'not_sent', owner: 'not_sent' };
-      if (deps.emailsEnabled === true && deps.sendEmail !== undefined) {
+      if (deps.emailsEnabled === true && deps.sendEmail !== undefined && (res.duplicate === true || emailedKeys.has(req.key))) {
+        deps.log('FAST_EMAILS_SKIPPED', { reason: res.duplicate === true ? 'DUPLICATE' : 'ALREADY_SENT' }); note('EMAILS_SKIPPED');   // one booking is never emailed twice
+      } else if (deps.emailsEnabled === true && deps.sendEmail !== undefined) {
+        emailedKeys.add(req.key);
         const tzE = S.availability.timezone;
         const ef = { businessName: S.businessName, serviceLabel: S.serviceLabel, bedrooms: S.bedrooms, bathrooms: S.bathrooms, priceDollars: S.priceDollars, date: o.date, startText: textTime(o.time), endText: textTime(o.endTime), zoneLabel: zoneLabelOf(tzE, instantOf(o.date, o.time, tzE)),
-          address: `${p.street}, ${p.city}${S.state === undefined ? '' : `, ${S.state}`} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim(), ...(res.jobNumber === undefined ? {} : { jobNumber: res.jobNumber }) };
+          address: `${p.street}, ${p.city}${S.state === undefined ? '' : `, ${S.state}`} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim(), callbackNumber: callback, ...(res.jobNumber === undefined ? {} : { jobNumber: res.jobNumber }) };
         const one = async (role: 'customer' | 'owner', m: { subject: string; text: string }): Promise<EmailVerdict> => { try { return (await deps.sendEmail!(role, m.subject, m.text)).ok ? 'accepted' : 'refused'; } catch { return 'refused'; } };
         [mail.customer, mail.owner] = await Promise.all([one('customer', customerEmail(ef)), one('owner', ownerEmail(ef))]);
         deps.log('FAST_EMAILS_SENT', { customer: mail.customer, owner: mail.owner }); note('EMAILS_SENT');

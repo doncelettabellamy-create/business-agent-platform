@@ -3,6 +3,7 @@
 //   node src/fast-test-setup-main.ts save-numbers      reads {"account_sid": "AC...", "customer": "+1...", "owner": "+1..."} from STANDARD INPUT (use fast-test-enter-numbers.ps1, which prompts privately) and stores it
 //                                                      protected for this Windows user in the private folder (outside the repository). Prints no number.
 //   node src/fast-test-setup-main.ts save-emails      reads {"sender": "x@gmail.com", "app_password": "...", "customer": "...", "owner": "..."} from STANDARD INPUT (use fast-test-enter-emails.ps1, which prompts privately) and stores it protected. Prints nothing private.
+//   node src/fast-test-setup-main.ts email-check [--send]   without --send: only says whether the email settings are saved (no connection, nothing sent). With --send: sends ONE sample email (invented details) to the OWNER address only and prints a status word.
 //   node src/fast-test-setup-main.ts status            yes/no only: are the approved numbers saved, is Jobber connected, are Jobber writes switched on.
 //   node src/fast-test-setup-main.ts sms-check --sid AC... [--number +1...] [--config founder-voice-call.config.json]
 //                                                      READ-ONLY questions to Twilio (needs TWILIO_AUTH_TOKEN in the environment): can the Drew number send texts, and what has been registered for US business
@@ -15,8 +16,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createVault } from './jobber-connector.ts';
 import { windowsProtector } from './jobber-dpapi.ts';
-import { emailStatus, fastStatus, isTestNumbers, loadTestNumbers, NUMBERS_BLOB } from './founder-voice-fast.ts';
-import { EMAIL_BLOB, emailProblems, isTestEmails, normalizeTestEmails } from './fast-email.ts';
+import { emailStatus, fastStatus, isTestNumbers, loadTestEmails, loadTestNumbers, NUMBERS_BLOB } from './founder-voice-fast.ts';
+import { EMAIL_BLOB, emailCheck, emailProblems, isTestEmails, normalizeTestEmails } from './fast-email.ts';
 import { appendConsent, ownerRef } from './fast-consent.ts';
 import { OWNER_SCRIPT_ID, ownerConsentText } from './fast-sms-copy.ts';
 import { E164, messagingSetup, SID, smsCapability } from './twilio-messaging.ts';
@@ -45,6 +46,7 @@ async function main(): Promise<number> {
     await createVault(dir, protector).saveBlob(EMAIL_BLOB, JSON.stringify({ sender: j.sender, app_password: j.app_password, customer: j.customer, owner: j.owner }));
     say('saved: the test email sender and the two approved recipient addresses are stored protected for this Windows user (nothing was printed; emails stay OFF until FAST_EMAILS=on)'); return 0;
   }
+  if (cmd === 'email-check') { const r = await emailCheck({ settings: await loadTestEmails(createVault(dir, protector)), send: argv.includes('--send') }); for (const l of r.lines) say(l); return r.ok ? 0 : 1; }
   if (cmd === 'owner-consent-text' || cmd === 'record-owner-consent') {
     let business = 'Drew Cleaning'; try { const c = JSON.parse(readFileSync(opt('config') ?? 'founder-voice-call.config.json', 'utf8')) as { opening?: { business_name?: unknown } }; if (typeof c.opening?.business_name === 'string') business = c.opening.business_name; } catch { /* the demo name stays */ }
     if (cmd === 'owner-consent-text') { say(ownerConsentText(business)); return 0; }

@@ -6,11 +6,11 @@ import net from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createEmailSender, EMAIL_BLOB, emailProblems, isTestEmails, normalizeTestEmails, PROVIDERS } from '../src/fast-email.ts';
+import { createEmailSender, EMAIL_BLOB, emailCheck, emailProblems, isTestEmails, normalizeTestEmails, PROVIDERS } from '../src/fast-email.ts';
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import type { TestEmails } from '../src/fast-email.ts';
-import { customerEmail, emailDay, ownerEmail } from '../src/fast-email-copy.ts';
+import { customerEmail, emailDay, ownerEmail, sampleEmail } from '../src/fast-email-copy.ts';
 import type { EmailFacts } from '../src/fast-email-copy.ts';
 import { createVault } from '../src/jobber-connector.ts';
 import type { Protector } from '../src/jobber-connector.ts';
@@ -190,4 +190,43 @@ test('the setup program: a refused save names the field, never echoes a value, a
   assert.ok(!existsSync(join(dir, `${EMAIL_BLOB}.enc`)), 'nothing was written');
   const provider = run({ ...OK, sender: 'x@outlook.com' }); assert.match(provider.stdout, /not acceptable: sender provider \(must be yahoo\.com or gmail\.com\)/);
   const notJson = spawnSync('node', ['src/fast-test-setup-main.ts', 'save-emails'], { input: 'not json', encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir }, cwd: new URL('..', import.meta.url) }); assert.match(notJson.stdout, /^refused: the input was not the expected JSON/);
+});
+
+test('the callback number the caller confirmed is in the OWNER\'s email only, formatted, and only when it is a plain US number', () => {
+  const o = ownerEmail({ ...FACTS, callbackNumber: '+15550100002' }); const c = customerEmail({ ...FACTS, callbackNumber: '+15550100002' });
+  assert.ok(o.text.split('\n').includes('Callback number: (555) 010-0002')); assert.ok(!/callback|\(555\)|5550100002/i.test(c.text + c.subject), 'the customer\'s email never carries it'); assert.ok(!/5550100002|\(555\)/.test(o.subject), 'not in a subject');
+  for (const bad of [undefined, '', '+1555', '5550100002', '+442071838750', '+15550100002x', '+15550100002\r\nBcc: x@y.com', '(555) 010-0002']) assert.ok(!/Callback number/.test(ownerEmail({ ...FACTS, callbackNumber: bad }).text), JSON.stringify(bad));
+  assert.ok(!/Callback number/.test(ownerEmail(FACTS).text), 'no number given, no line');
+});
+
+test('the sample email is clearly a sample: invented details, no booking claim, no real value', () => {
+  const m = sampleEmail();
+  assert.match(m.subject, /DEMO SAMPLE: email check \(no booking exists\)/); assert.match(m.text, /This is a SAMPLE email from the Drew test setup check\./); assert.match(m.text, /Every detail below is invented\./);
+  assert.match(m.text, /This sample has no booking behind it: nothing was created in Jobber/); assert.ok(!/The booking was created in a developer test account/.test(m.text));
+  assert.match(m.text, /Callback number: \(555\) 010-0100/); assert.match(m.text, /Name: Sample Customer/); assert.ok(m.text.split('\n').includes('When: Wednesday, January 6, 2027, 10:00 AM - 12:00 PM Central'));
+  noSecrets([m.subject, m.text]); assert.ok(!/[\r]/.test(m.subject + m.text) && !/[\n]/.test(m.subject));
+});
+
+test('email check: without --send nothing is sent and no connection opens; with --send exactly ONE sample goes to the OWNER address only; a refused login or a silent server ends as a fixed status', async () => {
+  assert.deepEqual(await emailCheck({ settings: undefined, send: true }), { ok: false, lines: ['not ready: the test email sender and addresses are not saved; run fast-test-enter-emails.ps1 first. Nothing was sent.'] });
+  const smtp = await fakeSmtp(); servers.push(smtp);
+  const dry = await emailCheck({ settings: OK, send: false, senderOptions: { testOnlyLocalPort: smtp.port } });
+  assert.equal(dry.ok, true); assert.match(dry.lines[0], /^ready: the settings are saved\. This would send ONE sample email to the OWNER address only.*Add --send to send it\. Nothing was sent\.$/); assert.equal(smtp.connections(), 0, 'no connection at all'); noSecrets(dry);
+  const sent = await emailCheck({ settings: OK, send: true, senderOptions: { testOnlyLocalPort: smtp.port } });
+  assert.equal(sent.ok, true); assert.match(sent.lines[0], /^accepted: the mail server took ONE sample email for the OWNER address\. That is not delivery: look in the inbox AND the spam folder\.$/); noSecrets(sent);
+  assert.equal(smtp.messages.length, 1); assert.deepEqual(smtp.messages[0].to, [OK.owner], 'only the owner address'); assert.ok(smtp.messages[0].data.includes('DEMO SAMPLE: email check (no booking exists)')); assert.ok(!smtp.messages[0].to.includes(OK.customer));
+  const bad = await fakeSmtp({ rejectAuth: true }); servers.push(bad);
+  const refused = await emailCheck({ settings: OK, send: true, senderOptions: { testOnlyLocalPort: bad.port } });
+  assert.equal(refused.ok, false); assert.match(refused.lines[0], /^failed \(AUTH\): the mail server refused the sender login: create a new app password and run fast-test-enter-emails\.ps1 again\. Nothing else was sent\.$/); assert.equal(bad.messages.length, 0); noSecrets(refused);
+  const quiet = await fakeSmtp({ silent: true }); servers.push(quiet);
+  const slow = await emailCheck({ settings: OK, send: true, senderOptions: { testOnlyLocalPort: quiet.port, timeoutMs: 300 } });
+  assert.equal(slow.ok, false); assert.match(slow.lines[0], /^failed \(TIMEOUT\): the mail server did not answer in time\./); noSecrets(slow);
+});
+
+test('email check (the real command, no saved settings): it says so, exits non-zero, and sends nothing with or without --send', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fast-email-check-')); dirs.push(dir);
+  for (const extra of [[], ['--send']]) {
+    const r = spawnSync('node', ['src/fast-test-setup-main.ts', 'email-check', ...extra], { encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir }, cwd: new URL('..', import.meta.url) });
+    assert.equal(r.status, 1, JSON.stringify(extra)); assert.match(r.stdout, /^not ready: the test email sender and addresses are not saved/); noSecrets([r.stdout, r.stderr]);
+  }
 });
