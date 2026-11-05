@@ -154,7 +154,7 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   const b = await rig(); b.jobber.opts.scheduled = [{ startAt: new Date(instantOf('2026-11-03', '09:00', 'America/Chicago')).toISOString(), endAt: new Date(instantOf('2026-11-03', '12:00', 'America/Chicago')).toISOString() }];
   const sb = await b.connect(); b.start(sb); await until(() => b.voices.length === 1 && b.voices[0].spoken.length >= 1, 'the opening');
   await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/Is that right\? Say yes or no/, 'yes'); await b.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
-  const offer = await b.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /Tuesday, November third, 2026 at 12 P M/); sb.end(); await pause(30);
+  const offer = await b.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /I do not have 10 A M on Tuesday, November third, 2026. The nearest time I have that day is 12 P M./); sb.end(); await pause(30);
   assert.equal(b.jobber.jobs.size, 0);
   // 3. Jobber says more items exist than were returned: the calendar is treated as unreadable, nothing is offered
   const c = await rig(); c.jobber.opts.hasMoreScheduled = true;
@@ -217,7 +217,7 @@ test('JOINED: an UNASSIGNED visit in Jobber (how Drew\'s own bookings are stored
   const a = await rig(); a.jobber.opts.scheduled = [busyAt('09:00', '12:00')];
   const sa = await a.connect(); a.start(sa); await until(() => a.voices.length === 1 && a.voices[0].spoken.length >= 1, 'the opening');
   await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/Is that right\? Say yes or no/, 'yes'); await a.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
-  const offer = await a.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /Tuesday, November third, 2026 at 12 P M/, 'the unassigned visit was seen, so a later time is offered'); sa.end(); await pause(30);
+  const offer = await a.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /I do not have 10 A M on Tuesday, November third, 2026. The nearest time I have that day is 12 P M./, 'the unassigned visit was seen, so a later time is offered'); sa.end(); await pause(30);
   const read = a.jobber.ops.find((x) => x.field === 'scheduledItems')!; assert.equal((read.variables.filter as { includeUnassigned?: unknown }).includeUnassigned, true); assert.equal(a.jobber.jobs.size, 0);
   // 2. the slot is free at the offer, then an unassigned visit appears before the caller's final yes: the second read stops the booking and nothing is written
   const b = await rig(); const sb = await b.connect(); b.start(sb); await until(() => b.voices.length === 1 && b.voices[0].spoken.length >= 1, 'the opening');

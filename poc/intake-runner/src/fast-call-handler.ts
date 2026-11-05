@@ -89,6 +89,28 @@ const first = (s: string): string => s.trim().split(/\s+/)[0] ?? '';
 export const AI_ANSWER = "Yes, I'm an A I assistant for Drew Cleaning, not a person. This is a test call.";
 interface Awaiting { id: string; text: string; unit: boolean; playing: boolean; heldEarly: boolean; replays: number; reprompts: number; /** The caller asked if this is an A I: the question is repeated only after that answer has played. */ deferred?: boolean; /** The question is waiting for the caller to stop speaking; nothing has been said yet. */ holding?: boolean; ignored?: number; onAnswer: (heard: string) => Promise<void> }
 
+/**
+ * A name spoken letter by letter, so a near-identical word can be told apart by ear (Live Test #7: "Done" was heard as "Don" and confirmed): "Done" gives "D O N E"; the words of a longer name are set apart ("De La Cruz" gives "D E, L A, C R U Z");
+ * an apostrophe and a hyphen are said as words. The letters are the ones that were kept: nothing is added or guessed.
+ */
+export function spellOut(name: string): string {
+  return name.split(' ').filter((w) => w !== '').map((w) => w.replace(/\p{L}/gu, (c) => `${c.toUpperCase()} `).replace(/'/g, 'apostrophe ').replace(/-/g, 'dash ').trim()).join(', ');
+}
+/** What the caller confirmed in the read-back, held until the booking is built: the booking must carry exactly these facts. */
+export interface ConfirmedFacts { first: string; last: string; date: string; start: string; end: string; street: string; city: string; zip: string; state: string; price: number }
+/** The NAMES of the facts in the booking request that differ from what the caller confirmed (none = the same). Nothing is booked, and nothing is sent, when any differs or when nothing was confirmed. */
+export function confirmedMismatches(c: ConfirmedFacts | undefined, req: BookingRequest): string[] {
+  if (c === undefined) return ['confirmation'];
+  const bad: string[] = [];
+  if (c.first !== req.client.firstName) bad.push('first_name'); if (c.last !== req.client.lastName) bad.push('last_name');
+  if (c.date !== req.when.date) bad.push('date'); if (c.start !== req.when.startTime) bad.push('start_time'); if (c.end !== req.when.endTime) bad.push('end_time');
+  if (c.street !== req.address.street1) bad.push('street'); if (c.city !== req.address.city) bad.push('city'); if (c.zip !== req.address.postalCode) bad.push('zip'); if (c.state !== req.address.province) bad.push('state');
+  if (c.price !== req.priceDollars) bad.push('price');
+  return bad;
+}
+/** A clock time "HH:MM" as minutes since midnight, for the diagnostics (a number, never text). */
+const minutesOf = (hm: string): number => { const [h, m] = hm.split(':').map(Number); return h * 60 + m; };
+
 export function createFastCallHandler(deps: FastDeps): FastHandler {
   if (typeof deps !== 'object' || deps === null || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1 || typeof deps.settings !== 'object' || !(deps.numbers instanceof Set) || !(deps.approvedCallers instanceof Set) || !(deps.approvedCustomerNumbers instanceof Set) || !/^\+[1-9]\d{9,14}$/.test(String(deps.ownerNumber))
     || ['callerOf', 'busy', 'book', 'sendText', 'verifyText', 'now', 'log'].some((k) => typeof (deps as unknown as Record<string, unknown>)[k] !== 'function')) throw new RangeError('the fast call handler needs its dependencies');
@@ -106,6 +128,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     let settleFn: (() => Promise<void>) | undefined; let speakingSince: number | undefined;   // the pending "ask only what is missing", and when the caller last started speaking
     let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
+    let confirmed: ConfirmedFacts | undefined;   // set when the read-back is spoken; the booking must carry exactly these facts
     let nameOk = false; let nameNo = 0; let spellBuf = ''; let spellBad = 0;   // the caller's own yes to the name (nothing is booked without it); how many times they said it was wrong; the letters of a spelling heard so far, and the spellings that gave nothing
     const note = (s: string): void => { if (steps.length < 40) steps.push(s); };
     const wordsIn = (s: string): number => (s.trim() === '' ? 0 : s.trim().split(/\s+/).length);   // diagnostics only: how many words, never which
@@ -201,9 +224,10 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
      */
     function confirmName(): void {
       tries = 0;
-      ask('NAME_CONFIRM', `I have ${firstName} ${lastName}. Is that right? Say yes or no.`, async (heard) => {
+      // The name is said AND spelled letter by letter ("I have Done, D O N E, Bellamy, B E L L A M Y."): a word that sounds like another ("Done" for "Don", Live Test #7) cannot pass as the right one by ear.
+      ask('NAME_CONFIRM', `I have ${firstName}, ${spellOut(firstName)}, ${lastName}, ${spellOut(lastName)}. Is that right? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
-        deps.log('FAST_NAME', { path: 'CONFIRM', answer: y, no: nameNo });   // a short token and a count: never the name
+        deps.log('FAST_NAME', { path: 'CONFIRM', answer: y, no: nameNo, spelled: true, letters: firstName.length + lastName.length });   // a short token, flags and counts: never the name or a letter
         if (y === 'yes') { nameOk = true; note('NAME_CONFIRMED'); return askAddress(); }
         if (y === 'no') { nameNo++; if (nameNo >= 3) return giveUp('NAME_NOT_CONFIRMED'); if (nameNo === 1) return askName(true, 'Sorry. Please say your first and last name again.'); spellBuf = ''; spellBad = 0; return askSpelling('first'); }
         return replayUnclear();
@@ -257,19 +281,31 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     function askWhen(lead?: string): void {
       ask('WHEN', lead ?? 'What day and time would you like?', async (heard) => {
         const w = whenFrom(heard, deps.now(), S.availability.timezone); const last = lastBookableDate(deps.now(), S.availability);
+        deps.log('FAST_WHEN', { path: 'ANSWER', hasDay: w.date !== undefined, hasTime: w.time !== undefined, hasPart: w.part !== undefined, flexible: w.flexible === true, past: w.past === true, heldDay: pref.date !== undefined, heldTime: pref.time !== undefined, words: wordsIn(heard), chars: heard.trim().length, tries });   // flags and counts only: never a day, a time or a word
         // A date that has passed, or lies beyond the days the calendar is read for, is never taken as asked: the caller is told why and asked again.
         if (w.past === true && w.date === undefined) { if (++tries >= 3) return giveUp('WHEN_UNCLEAR'); return askWhen('That date has already passed. Which day would you like?'); }
         if (w.date !== undefined && w.date > last) { if (++tries >= 3) return giveUp('WHEN_UNCLEAR'); return askWhen(`Sorry, I can only book within the next two weeks, up to ${sayDay(last)}. Which day would you like?`); }
         pref = { ...pref, ...w };
         if (pref.date === undefined && pref.time === undefined && pref.part === undefined && pref.flexible !== true) { if (++tries >= 3) return giveUp('WHEN_UNCLEAR'); return armSettle(async () => askWhen('Sorry, which day would you like?')); }
         if (pref.date === undefined) return armSettle(async () => askWhen('Which day?'));
-        tries = 0; return size.beds !== undefined && size.baths !== undefined ? checkAndOffer() : askSize();
+        tries = 0;
+        const proceed = async (): Promise<void> => (size.beds !== undefined && size.baths !== undefined ? checkAndOffer() : askSize());
+        // A day with no time may be the first half of "Friday ... at nine": the next question waits for the quiet period, so a time that follows joins this answer instead of being heard as an answer to the next question (Live Test #7).
+        if (pref.time === undefined && pref.part === undefined && pref.flexible !== true) return armSettle(proceed);
+        return proceed();
       });
     }
     function askSize(lead?: string): void {
       ask('SIZE', lead ?? 'How many bedrooms and bathrooms?', async (heard) => {
         const heldBefore = { beds: size.beds !== undefined, baths: size.baths !== undefined };
         const s = sizeFrom(heard);
+        // A clock time that arrives while the size is being asked, with no size in it, is the rest of the day-and-time answer (Live Test #7: "at 9 a.m." came after the day): it is kept for the offer, and the size question simply stays open.
+        const late = whenFrom(heard, deps.now(), S.availability.timezone);
+        if (pref.time === undefined && pref.part === undefined && late.time !== undefined && late.date === undefined && s.beds === undefined && s.baths === undefined) {
+          pref = { ...pref, time: late.time };
+          deps.log('FAST_WHEN', { path: 'LATE_TIME', hasDay: false, hasTime: true, hasPart: false, flexible: false, past: false, heldDay: pref.date !== undefined, heldTime: true, words: wordsIn(heard), chars: heard.trim().length, tries });
+          return;
+        }
         if (s.beds !== undefined) size.beds = s.beds; if (s.baths !== undefined) size.baths = s.baths;
         if (s.beds === undefined && s.baths === undefined) {   // a bare "two" answers whichever one was just asked about
           const one = countFrom(heard);
@@ -297,7 +333,15 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const o = chooseOffer(pref, S.availability, cal.busy, deps.now(), refused);
       if (o === undefined) return end('NO_OPENING', 'Sorry, I do not have an opening in the next two weeks, so a person will call you. Goodbye.');
       offer = o;
-      const line = `A standard cleaning for ${num(S.bedrooms)} bedrooms and ${num(S.bathrooms)} bathrooms is ${sayDollars(S.priceDollars)}. We have ${sayDayYear(o.date)} at ${sayTime(o.time)}. Does that work?`;
+      // When the time (or part of the day, or day) that was asked for is not what is offered, the offer SAYS so (Live Test #7: 9 A M was asked for and 11 A M was offered in the same words as an exact match, and was accepted twice).
+      let said: 'PLAIN' | 'TIME_SUBSTITUTED' | 'PART_SUBSTITUTED' | 'DAY_SUBSTITUTED' = 'PLAIN';
+      let when = `We have ${sayDayYear(o.date)} at ${sayTime(o.time)}.`;
+      if (o.kind === 'same_day' && pref.time !== undefined && pref.time !== o.time) { said = 'TIME_SUBSTITUTED'; when = `I do not have ${sayTime(pref.time)} on ${sayDayYear(o.date)}. The nearest time I have that day is ${sayTime(o.time)}.`; }
+      else if (o.kind === 'same_day' && pref.time === undefined && pref.part !== undefined) { said = 'PART_SUBSTITUTED'; when = `I do not have ${pref.part === 'evening' ? 'an' : 'a'} ${pref.part} time on ${sayDayYear(o.date)}. The nearest time I have that day is ${sayTime(o.time)}.`; }
+      else if (o.kind === 'other_day' && pref.date !== undefined && pref.date !== o.date) { said = 'DAY_SUBSTITUTED'; when = `I do not have an opening on ${sayDayYear(pref.date)}. The next opening I have is ${sayDayYear(o.date)} at ${sayTime(o.time)}.`; }
+      const todayIso = new Date(deps.now()).toLocaleDateString('en-CA', { timeZone: S.availability.timezone });
+      deps.log('FAST_OFFER', { kind: o.kind, said, askedDay: pref.date !== undefined, askedTime: pref.time !== undefined, askedPart: pref.part !== undefined, sameDay: pref.date === undefined || pref.date === o.date, sameTime: pref.time === undefined || pref.time === o.time, dayOffset: Math.round((Date.parse(`${o.date}T12:00:00Z`) - Date.parse(`${todayIso}T12:00:00Z`)) / 86_400_000), startMin: minutesOf(o.time), askedMin: pref.time === undefined ? -1 : minutesOf(pref.time), refused: refused.length });   // flags and numbers only: no date, no clock text
+      const line = `A standard cleaning for ${num(S.bedrooms)} bedrooms and ${num(S.bathrooms)} bathrooms is ${sayDollars(S.priceDollars)}. ${when} Does that work?`;
       ask('OFFER', line, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return askCallback();
@@ -349,6 +393,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       if (p === undefined) return void giveUp('ADDRESS_MISSING');
       if (!nameOk) return void giveUp('NAME_UNCONFIRMED');   // never read back, or booked, without the caller's own yes to the name
       if (p.state === undefined) return void giveUp('STATE_MISSING');   // never read back, or booked, without the caller's state
+      confirmed = { first: firstName, last: lastName, date: o.date, start: o.time, end: o.endTime, street: p.street, city: p.city, zip: p.zip, state: p.state, price: S.priceDollars };   // exactly what the caller is about to be asked to confirm
       const spokenZip = p.zip.split('').join(' ');
       ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${stateName(p.state)}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
@@ -370,7 +415,6 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
           deps.log('FAST_SLOT_RECHECK_FAILED', { calendar: cal.complete ? 'read' : 'unreadable' });
           return end(cal.complete ? 'NO_LONGER_AVAILABLE' : 'CALENDAR_UNREADABLE', cal.complete ? 'Sorry, that time is no longer available, so nothing was booked and a person will call you. Goodbye.' : 'Sorry, I cannot check the schedule right now, so nothing was booked and a person will call you. Goodbye.');
         } }
-      void say('Booking that now.');
       const digits = callback.replace(/^\+1/, '');
       const req: BookingRequest = {
         key: `fast-${createHash('sha256').update(`drew-fast:${String(callSid)}`).digest('hex').slice(0, 24)}`,
@@ -379,10 +423,17 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         when: { date: o.date, startTime: o.time, endTime: o.endTime, utcOffset: utcOffsetFor(instantOf(o.date, o.time, S.availability.timezone), S.availability.timezone) },
         title: S.serviceLabel, service: `${S.serviceLabel} ${S.bedrooms} bed ${S.bathrooms} bath`, priceDollars: S.priceDollars,
       };
+      // Fail closed: the request about to be sent must carry exactly what the caller confirmed in the read-back. Any difference (or no confirmation) ends the call with nothing sent to Jobber, no email and no text.
+      const drift = confirmedMismatches(confirmed, req);
+      if (drift.length > 0) { deps.log('FAST_BOOKING_GUARD', { ok: false, count: drift.length, field: drift[0] }); return end('BOOKING_CHANGED', 'I could not confirm the booking, so a person will follow up. Goodbye.'); }   // the field NAME only, never its value
+      deps.log('FAST_BOOKING_GUARD', { ok: true, count: 0, startMin: minutesOf(req.when.startTime), sameAsOffer: req.when.date === o.date && req.when.startTime === o.time && req.when.endTime === o.endTime });
+      void say('Booking that now.');
       let res: BookingResult;
       try { res = await deps.book(req); } catch { res = { status: 'uncertain', reason: 'API_ERROR', writes: 0 }; }
-      note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }) });
-      if (res.status !== 'booked_verified') return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');
+      const readBackDiffs = res.mismatches?.length ?? 0;
+      note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }), ...(readBackDiffs === 0 ? {} : { readBackDiffs }) });
+      // Jobber's own read-back must have matched in every field: a "verified" result that still names a differing field is not a booking, and nothing is emailed or texted for it.
+      if (res.status !== 'booked_verified' || readBackDiffs > 0) return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');
       // Test emails (default OFF): only now that Jobber's read-back verified the booking, only to the two approved addresses (held behind `sendEmail`), and a failure changes nothing about the booking.
       const mail: { customer: EmailVerdict; owner: EmailVerdict } = { customer: 'not_sent', owner: 'not_sent' };
       if (deps.emailsEnabled === true && deps.sendEmail !== undefined && (res.duplicate === true || emailedKeys.has(req.key))) {

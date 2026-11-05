@@ -2,7 +2,7 @@
 // address is invented. The hours in SETTINGS are a SYNTHETIC test fixture, not the founder's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AI_ANSWER, createFastCallHandler } from '../src/fast-call-handler.ts';
+import { AI_ANSWER, confirmedMismatches, createFastCallHandler, spellOut } from '../src/fast-call-handler.ts';
 import type { FastDeps, FastOutcome, FastSettings } from '../src/fast-call-handler.ts';
 import { instantOf } from '../src/fast-parsers.ts';
 import type { BookingRequest, BookingResult } from '../src/jobber-booking.ts';
@@ -122,7 +122,7 @@ test('controlled test: a caller who is not on the approved list, or whose caller
 
 test('no yes prompt: the greeting from the carrier asks for the name, so nothing is spoken first and the first thing the caller says is the answer; a yes or an off-topic line is not a name and the name is asked for again; silence is reprompted once and ends the call', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
-  await t.c.hears(/Is that right\? Say yes or no/, 'yes'); await t.c.hears(/street address/, undefined); assert.match(t.c.lines[0], /^I have Testa Invented\. Is that right\?/, 'the first thing the call says is the name confirmation: the greeting already asked the name'); assert.match(t.c.lines[1], /street address/, 'then the address question');
+  await t.c.hears(/Is that right\? Say yes or no/, 'yes'); await t.c.hears(/street address/, undefined); assert.match(t.c.lines[0], /^I have Testa, T E S T A, Invented, I N V E N T E D\. Is that right\?/, 'the first thing the call says is the name confirmation: the greeting already asked the name'); assert.match(t.c.lines[1], /street address/, 'then the address question');
   assert.ok(!t.logs.some(([c]) => /CONSENT/.test(c)) && !t.c.lines.some((l) => /say yes to continue/i.test(l)), 'no yes is asked for anywhere');
   const y = build(); y.h.serve(y.c.transport); y.c.setup(DREW, undefined, 'yes');
   await y.c.hears(/^Sorry, what is your first and last name\?$/, 'Testa Invented'); await y.c.hears(/Is that right\? Say yes or no/, 'yes'); await y.c.hears(/street address/, undefined);
@@ -170,7 +170,7 @@ test('no time is invented: an unreadable or incomplete calendar, missing hours, 
     assert.equal(t.last().reason, reason, label); assert.equal(t.booked.length, 0, label); assert.ok(!t.c.lines.some((l) => /is one hundred ninety-nine dollars/.test(l)), `${label}: no offer was spoken`);
   }
   const t = build({ busy: { busy: [{ start: instantOf('2026-11-03', '09:00', TZ), end: instantOf('2026-11-03', '12:00', TZ) }], complete: true } }); t.h.serve(t.c.transport); await toOffer(t.c);
-  assert.match(await t.c.hears(/is one hundred ninety-nine dollars/, 'no'), /Tuesday, November third, 2026 at 12 P M/, 'the calendar\'s busy time moved the offer');
+  assert.match(await t.c.hears(/is one hundred ninety-nine dollars/, 'no'), /I do not have 10 A M on Tuesday, November third, 2026. The nearest time I have that day is 12 P M./, 'the calendar\'s busy time moved the offer');
 });
 
 test('the caller can decline the time: a different one is offered and the same time is never offered twice; two refusals end the call with nothing booked', async () => {
@@ -736,31 +736,31 @@ async function afterName(t: ReturnType<typeof build>): Promise<string> {
 
 test('NAME: the name is confirmed on its own before the address is asked; a no lets the caller say it again, and the corrected name (Done becomes Don) is what the read-back, Jobber and both emails carry', async () => {
   const t = build({ emails: 'accept', textsEnabled: false, settleMs: 80 }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Done Bellamy');   // what the voice service wrote in Live Test #6
-  assert.equal(await t.c.hears(/^I have Done Bellamy\./, 'no'), 'I have Done Bellamy. Is that right? Say yes or no.');
+  assert.equal(await t.c.hears(/^I have Done, D O N E, Bellamy, B E L L A M Y\./, 'no'), 'I have Done, D O N E, Bellamy, B E L L A M Y. Is that right? Say yes or no.');
   assert.equal(t.c.lines.filter((l) => /street address/.test(l)).length, 0, 'nothing else is asked while the name is wrong');
   await t.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Don Bellamy');
-  await t.c.hears(/^I have Don Bellamy\. Is that right\?/, 'yes');
+  await t.c.hears(/^I have Don, D O N, Bellamy, B E L L A M Y\. Is that right\?/, 'yes');
   assert.match(await afterName(t), /for Don Bellamy on/, 'the read-back says the corrected name'); await finish(t.c);
   assert.deepEqual(t.booked.map((r) => r.client), [{ firstName: 'Don', lastName: 'Bellamy', phone: '5550100002' }]);
   assert.equal(t.mails.length, 2); for (const m of t.mails) { assert.match(m.text, /Don Bellamy/); assert.ok(!/\bDone\b/.test(m.text), 'the wrong name is nowhere in the email'); }
-  assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_NAME').map(([, v]) => v), [{ path: 'CONFIRM', answer: 'no', no: 0 }, { path: 'CONFIRM', answer: 'yes', no: 1 }], 'a token and a count: never the name');
+  assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_NAME').map(([, v]) => v), [{ path: 'CONFIRM', answer: 'no', no: 0, spelled: true, letters: 11 }, { path: 'CONFIRM', answer: 'yes', no: 1, spelled: true, letters: 10 }], 'a token and a count: never the name');
   const asks = t.c.lines.filter((l) => /\?|Say yes or no/.test(l)); assert.equal(new Set(asks).size, asks.length, 'no question was asked twice');
   noPersonalDetail(t.logs, ['Done', 'Bellamy']);
 });
 
 test('NAME: a name said in one word asks only for the last name, and the whole name is then confirmed once; a yes goes straight on and nothing is asked twice', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Don');
-  await t.c.hears(/last name/, 'Bellamy'); await t.c.hears(/^I have Don Bellamy\. Is that right\? Say yes or no\.$/, 'yes'); await t.c.hears(/street address/, undefined);
+  await t.c.hears(/last name/, 'Bellamy'); await t.c.hears(/^I have Don, D O N, Bellamy, B E L L A M Y\. Is that right\? Say yes or no\.$/, 'yes'); await t.c.hears(/street address/, undefined);
   assert.equal(t.c.lines.filter((l) => /first and last name|^I have /.test(l)).length, 1, 'the name was confirmed once and never asked for again');
 });
 
 test('NAME spelling: after a second no the caller spells the first and then the last name, one letter at a time and in pieces; only letters are read, and the spelled name is confirmed and then booked exactly', async () => {
   const t = build({ emails: 'accept', textsEnabled: false, settleMs: 80 }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Done Bellamy');
-  await t.c.hears(/^I have Done Bellamy\./, 'no'); await t.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy');   // still wrong
-  await t.c.hears(/^I have Dawn Bellamy\./, 'no');
+  await t.c.hears(/^I have Done, D O N E, Bellamy, B E L L A M Y\./, 'no'); await t.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy');   // still wrong
+  await t.c.hears(/^I have Dawn, D A W N, Bellamy, B E L L A M Y\./, 'no');
   await t.c.hears(/^Please spell your first name, one letter at a time\.$/, 'D O'); await sleep(30); t.c.emit({ kind: 'utterance', text: 'N' });   // in two pieces
   await t.c.hears(/^Please spell your last name, one letter at a time\.$/, 'B E double L'); await sleep(30); t.c.emit({ kind: 'utterance', text: 'A as in Alpha, M, Y' });
-  await t.c.hears(/^I have Don Bellamy\. Is that right\?/, 'yes');
+  await t.c.hears(/^I have Don, D O N, Bellamy, B E L L A M Y\. Is that right\?/, 'yes');
   assert.match(await afterName(t), /for Don Bellamy on/); await finish(t.c);
   assert.deepEqual(t.booked.map((r) => [r.client.firstName, r.client.lastName]), [['Don', 'Bellamy']]); assert.ok(t.mails.every((m) => /Don Bellamy/.test(m.text) && !/Dawn|Done/.test(m.text)));
   assert.equal(t.c.lines.filter((l) => /spell your (?:first|last) name/.test(l)).length, 2, 'each part was asked once: the pieces were joined, not re-asked');
@@ -773,24 +773,96 @@ test('NAME spelling: after a second no the caller spells the first and then the 
 test('NAME failure: a third no, a spelling that gives nothing twice, or three unclear answers to the confirmation each end the call with a person to follow up; nothing is asked after it, booked or emailed', async () => {
   // a third no (after the name was said again and then spelled)
   const a = build({ emails: 'accept', settleMs: 80 }); a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Done Bellamy');
-  await a.c.hears(/^I have Done Bellamy\./, 'no'); await a.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy'); await a.c.hears(/^I have Dawn Bellamy\./, 'no');
-  await a.c.hears(/^Please spell your first name/, 'D A W N'); await a.c.hears(/^Please spell your last name/, 'B E L L A M Y'); await a.c.hears(/^I have Dawn Bellamy\./, 'no'); await finish(a.c);
+  await a.c.hears(/^I have Done, D O N E, Bellamy, B E L L A M Y\./, 'no'); await a.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy'); await a.c.hears(/^I have Dawn, D A W N, Bellamy, B E L L A M Y\./, 'no');
+  await a.c.hears(/^Please spell your first name/, 'D A W N'); await a.c.hears(/^Please spell your last name/, 'B E L L A M Y'); await a.c.hears(/^I have Dawn, D A W N, Bellamy, B E L L A M Y\./, 'no'); await finish(a.c);
   assert.deepEqual([a.last().reason, a.last().booked], ['NAME_NOT_CONFIRMED', false]); assert.equal(a.booked.length, 0); assert.equal(a.mails.length, 0); assert.equal(a.texts.length, 0);
   assert.equal(a.c.lines.filter((l) => /street address|To confirm/.test(l)).length, 0, 'the address was never asked and nothing was read back');
   // a spelling that is not letters, twice: nothing is guessed
   const b = build({ settleMs: 80 }); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Done Bellamy');
-  await b.c.hears(/^I have Done Bellamy\./, 'no'); await b.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy'); await b.c.hears(/^I have Dawn Bellamy\./, 'no');
+  await b.c.hears(/^I have Done, D O N E, Bellamy, B E L L A M Y\./, 'no'); await b.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy'); await b.c.hears(/^I have Dawn, D A W N, Bellamy, B E L L A M Y\./, 'no');
   await b.c.hears(/^Please spell your first name/, 'banana'); await b.c.hears(/^Sorry, please spell your first name again/, 'dee oh en'); await finish(b.c);
   assert.deepEqual([b.last().reason, b.last().booked], ['NAME_UNCLEAR', false]); assert.equal(b.booked.length, 0); assert.equal(b.c.lines.filter((l) => /street address/.test(l)).length, 0);
   // three answers that are neither yes nor no
   const c = build({ settleMs: 80 }); c.h.serve(c.c.transport); c.c.setup(DREW, undefined, 'Done Bellamy');
-  await c.c.hears(/^I have Done Bellamy\./, 'maybe'); await c.c.hears(/^Please say yes or no\. I have Done Bellamy/, 'maybe'); await c.c.hears(/^Please say yes or no\. I have Done Bellamy/, 'maybe'); await finish(c.c);
+  await c.c.hears(/^I have Done, D O N E, Bellamy, B E L L A M Y\./, 'maybe'); await c.c.hears(/^Please say yes or no\. I have Done, D O N E, Bellamy, B E L L A M Y/, 'maybe'); await c.c.hears(/^Please say yes or no\. I have Done, D O N E, Bellamy, B E L L A M Y/, 'maybe'); await finish(c.c);
   assert.deepEqual([c.last().reason, c.last().booked], ['UNCONFIRMED', false]); assert.equal(c.booked.length, 0); assert.equal(c.c.lines.filter((l) => /street address/.test(l)).length, 0);
   noPersonalDetail([...a.logs, ...b.logs, ...c.logs], ['Done', 'Dawn', 'Bellamy', 'banana']);
 });
 
 test('NAME: letters said one at a time are never kept as a name ("D O N" is not the names "D" and "O N"); the name is asked for again', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'D O N B E L L A M Y');
-  await t.c.hears(/^Sorry, what is your first and last name\?$/, 'Don Bellamy'); await t.c.hears(/^I have Don Bellamy\. Is that right\?/, 'yes'); await t.c.hears(/street address/, undefined);
+  await t.c.hears(/^Sorry, what is your first and last name\?$/, 'Don Bellamy'); await t.c.hears(/^I have Don, D O N, Bellamy, B E L L A M Y\. Is that right\?/, 'yes'); await t.c.hears(/street address/, undefined);
   assert.equal(t.c.lines.filter((l) => /^I have /.test(l)).length, 1);
+});
+
+// ---------------------------------------------------------------- Live Test #7: the name spelled aloud, an alternate time said plainly, a time said in a second piece kept, decisions logged, and a booking that fails closed
+
+test('name spelling: the confirmation says the name AND spells it letter by letter, so "Done" cannot pass for "Don" by ear; the letters are exactly the kept name and never reach a log', async () => {
+  assert.equal(spellOut('Done'), 'D O N E'); assert.equal(spellOut('Bellamy'), 'B E L L A M Y'); assert.equal(spellOut("O'Brien"), 'O apostrophe B R I E N'); assert.equal(spellOut('Ann-Marie'), 'A N N dash M A R I E'); assert.equal(spellOut('De La Cruz'), 'D E, L A, C R U Z'); assert.equal(spellOut('José'), 'J O S É');
+  const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Done Bellamy');   // what the voice service wrote in Live Test #7
+  assert.equal(await t.c.hears(/^I have /, 'no'), 'I have Done, D O N E, Bellamy, B E L L A M Y. Is that right? Say yes or no.');
+  await t.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Don Bellamy');
+  assert.equal(await t.c.hears(/^I have Don,/, 'yes'), 'I have Don, D O N, Bellamy, B E L L A M Y. Is that right? Say yes or no.', 'the corrected name is spelled too: the E is gone');
+  const all = JSON.stringify(t.logs); for (const s of ['D O N', 'B E L L A M Y', 'Bellamy', 'Done']) assert.ok(!all.includes(s), `no ${s} in the diagnostics`);
+  for (const r of t.logs.filter(([c]) => c === 'FAST_NAME').map(([, v]) => v)) assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field');
+});
+
+test('alternate time: a time, a part of the day or a day that cannot be given is SAID ("I do not have 9 A M ... the nearest time I have that day is 11 A M"); an exact time is offered in the plain words; the decision is logged as flags and numbers', async () => {
+  const busy = { busy: [{ start: instantOf('2026-11-03', '09:00', TZ), end: instantOf('2026-11-03', '11:00', TZ) }], complete: true };
+  const a = build({ busy }); a.h.serve(a.c.transport); await toOffer(a.c, 'Tuesday at 9 a.m.');   // Live Test #7: 9 A M asked, the nearest free time is 11 A M
+  assert.equal(await a.c.hears(/is one hundred ninety-nine dollars/, 'no'), 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. I do not have 9 A M on Tuesday, November third, 2026. The nearest time I have that day is 11 A M. Does that work?');
+  const row = a.logs.find(([k]) => k === 'FAST_OFFER')![1] as Record<string, unknown>;
+  assert.deepEqual(row, { kind: 'same_day', said: 'TIME_SUBSTITUTED', askedDay: true, askedTime: true, askedPart: false, sameDay: true, sameTime: false, dayOffset: 1, startMin: 660, askedMin: 540, refused: 0 });
+  const b = build(); b.h.serve(b.c.transport); await toOffer(b.c, 'Tuesday at 9 a.m.');   // free: the plain words, unchanged
+  assert.equal(await b.c.hears(/is one hundred ninety-nine dollars/, 'no'), 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Tuesday, November third, 2026 at 9 A M. Does that work?');
+  assert.deepEqual([b.logs.find(([k]) => k === 'FAST_OFFER')![1]].map((r) => [(r as Record<string, unknown>).kind, (r as Record<string, unknown>).said, (r as Record<string, unknown>).sameTime]), [['exact', 'PLAIN', true]]);
+  const c = build(); c.h.serve(c.c.transport); await toOffer(c.c, 'Tuesday evening');   // no evening time in the hours
+  assert.match(await c.c.hears(/is one hundred ninety-nine dollars/, 'no'), /I do not have an evening time on Tuesday, November third, 2026\. The nearest time I have that day is 9 A M\. Does that work\?$/);
+  const d = build(); d.h.serve(d.c.transport); await toOffer(d.c, 'Sunday');   // no hours on a Sunday
+  assert.match(await d.c.hears(/is one hundred ninety-nine dollars/, 'no'), /I do not have an opening on Sunday, November eighth, 2026\. The next opening I have is Monday, November ninth, 2026 at 9 A M\. Does that work\?$/);
+  const e = build(); e.h.serve(e.c.transport); await toOffer(e.c, 'Tuesday');   // a day with no time: the earliest time that day is the plain offer, not a substitution
+  assert.match(await e.c.hears(/is one hundred ninety-nine dollars/, 'no'), /We have Tuesday, November third, 2026 at 9 A M\. Does that work\?$/);
+  for (const t of [a, b, c, d, e]) { for (const r of t.logs.filter(([k]) => k === 'FAST_OFFER' || k === 'FAST_WHEN').map(([, v]) => v)) assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field'); noPersonalDetail(t.logs, ['Tuesday', 'Sunday', 'November', '11 A M', '9 A M']); }
+});
+
+test('a time said in a second piece is kept: "Tuesday" then "at 9 a.m." (even while the size is being asked) gives a 9 A M offer, the size question is not asked twice, and a real size answer is still read', async () => {
+  const start = async (settleMs: number) => { const t = build({ settleMs }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented'); await t.c.hears(/Is that right\? Say yes or no/, 'yes'); await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); return t; };
+  const sizeAsks = (t: ReturnType<typeof build>): number => t.c.lines.filter((l) => /bedrooms and bathrooms\?$|^And how many/.test(l)).length;
+  // (a) the time arrives inside the quiet wait after the day
+  const a = await start(80); await a.c.hears(/What day and time/, 'Tuesday'); await sleep(30); a.c.emit({ kind: 'utterance', text: 'at 9 a.m.' });
+  await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  assert.match(await a.c.hears(/is one hundred ninety-nine dollars/, undefined), /We have Tuesday, November third, 2026 at 9 A M\. Does that work\?$/); assert.equal(sizeAsks(a), 1);
+  // (b) Live Test #7: the day was answered, the size question was already asked, and the time arrives as its own piece
+  const b = await start(5); await b.c.hears(/What day and time/, 'Tuesday'); await b.c.hears(/^How many bedrooms and bathrooms\?$/, undefined);
+  b.c.emit({ kind: 'utterance', text: 'at 9 a.m.' }); await sleep(30); b.c.emit({ kind: 'utterance', text: 'two bedrooms and two bathrooms' });
+  assert.match(await b.c.hears(/is one hundred ninety-nine dollars/, undefined), /We have Tuesday, November third, 2026 at 9 A M\. Does that work\?$/);
+  assert.equal(b.c.lines.filter((l) => /^Sorry, how many/.test(l)).length, 0, 'the time was not mistaken for a failed size answer, so no "Sorry" question');
+  assert.deepEqual(b.logs.filter(([k]) => k === 'FAST_WHEN').map(([, v]) => (v as Record<string, unknown>).path), ['ANSWER', 'LATE_TIME']);
+  // (c) a real size answer, and a bare count for the bathrooms, are never taken for a time
+  const c = await start(80); await c.c.hears(/What day and time/, 'Tuesday at ten'); await c.c.hears(/bedrooms and bathrooms/, 'two bedrooms'); await sleep(30); c.c.emit({ kind: 'utterance', text: 'two' });
+  assert.match(await c.c.hears(/is one hundred ninety-nine dollars/, undefined), /We have Tuesday, November third, 2026 at 10 A M\./); assert.ok(!c.logs.some(([k, v]) => k === 'FAST_WHEN' && (v as Record<string, unknown>).path === 'LATE_TIME'));
+  // (d) a day with no time still goes on after the quiet wait, once
+  const d = await start(80); await d.c.hears(/What day and time/, 'Tuesday'); await d.c.hears(/^How many bedrooms and bathrooms\?$/, 'two bedrooms and two bathrooms');
+  assert.match(await d.c.hears(/is one hundred ninety-nine dollars/, undefined), /We have Tuesday, November third, 2026 at 9 A M\./); assert.equal(sizeAsks(d), 1);
+  const w = d.logs.filter(([k]) => k === 'FAST_WHEN').map(([, v]) => v as Record<string, unknown>); assert.deepEqual(w.map((r) => [r.path, r.hasDay, r.hasTime]), [['ANSWER', true, false]]);
+  for (const r of [...a.logs, ...b.logs, ...c.logs, ...d.logs].filter(([k]) => k === 'FAST_WHEN').map(([, v]) => v)) assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field');
+  noPersonalDetail([...a.logs, ...b.logs, ...d.logs], ['Tuesday', 'a.m.', 'November']);
+});
+
+test('fail closed: the booking carries exactly what the caller confirmed; any difference names the field and sends nothing; a "verified" result that still names a differing field is not a booking and nothing is emailed', async () => {
+  const req = (over: Partial<{ first: string; start: string; state: string }> = {}): BookingRequest => ({ key: 'fast-0123456789abcdef01234567', gate: { eligibleRecord: true, approvedByPerson: true, callerAgreed: true }, client: { firstName: over.first ?? 'Don', lastName: 'Bellamy', phone: '5550100002' }, address: { street1: '123 Invented Lane', city: 'Testville', postalCode: '90210', province: over.state ?? 'TX' }, when: { date: '2026-11-03', startTime: over.start ?? '09:00', endTime: '11:00', utcOffset: '-06:00' }, title: 'Standard cleaning', service: 'Standard cleaning 2 bed 2 bath', priceDollars: 199 });
+  const ok = { first: 'Don', last: 'Bellamy', date: '2026-11-03', start: '09:00', end: '11:00', street: '123 Invented Lane', city: 'Testville', zip: '90210', state: 'TX', price: 199 };
+  assert.deepEqual(confirmedMismatches(ok, req()), []); assert.deepEqual(confirmedMismatches(undefined, req()), ['confirmation']);
+  assert.deepEqual(confirmedMismatches(ok, req({ first: 'Done' })), ['first_name']); assert.deepEqual(confirmedMismatches(ok, req({ start: '11:00' })), ['start_time']); assert.deepEqual(confirmedMismatches(ok, req({ state: 'CA' })), ['state']);
+  assert.deepEqual(confirmedMismatches({ ...ok, zip: '90211', price: 200, date: '2026-11-04' }, req()), ['date', 'zip', 'price']);
+  // the normal path logs the guard as a flag and numbers, and the request equals the offer
+  const t = build({ emails: 'accept', textsEnabled: false }); await toBooked(t);
+  assert.deepEqual(t.logs.filter(([k]) => k === 'FAST_BOOKING_GUARD').map(([, v]) => v), [{ ok: true, count: 0, startMin: 600, sameAsOffer: true }]);
+  assert.deepEqual([t.booked[0].when.date, t.booked[0].when.startTime, t.booked[0].when.endTime], ['2026-11-03', '10:00', '12:00']);
+  // Jobber's own read-back names a differing field although the status says verified: the call ends, nothing is emailed, texted or claimed
+  const m = build({ emails: 'accept', textsEnabled: true, book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2, mismatches: ['visit_time'] }) });
+  m.h.serve(m.c.transport); await toOffer(m.c); await m.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await m.c.hears(/calling from a number ending in/, 'yes'); await m.c.hears(/May we send you one automated/, 'yes'); await m.c.hears(/To confirm/, 'yes'); await finish(m.c);
+  assert.deepEqual([m.last().reason, m.last().booked], ['BOOKING_NOT_VERIFIED', false]); assert.equal(m.mails.length, 0); assert.equal(m.texts.length, 0);
+  assert.ok(!m.c.lines.some((l) => /You are booked|confirmation (?:text|email)/.test(l)), 'no booking is claimed');
+  assert.deepEqual(m.logs.filter(([k]) => k === 'FAST_BOOKING').map(([, v]) => v), [{ status: 'booked_verified', readBackDiffs: 1 }], 'a count of differing fields, never their values');
 });
