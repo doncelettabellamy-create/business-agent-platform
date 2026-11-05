@@ -197,9 +197,26 @@ test('us-state: every state and DC round-trips between its name and its code; na
     assert.deepEqual(stateFrom(`Springfield, ${name}`), { code, rest: 'Springfield' }, name);
     if (!['OK', 'IN', 'OR', 'ME', 'HI', 'OH'].includes(code)) assert.deepEqual(stateFrom(code), { code, rest: '' }, code);
   }
-  assert.equal(stateName('ZZ'), undefined); assert.equal(stateName(undefined), undefined); assert.equal(stateName('tx'), undefined);
-  for (const bad of [undefined, null, 5, '', '   ', 'Texas Avenue', 'Texas Street, Springfield', 'x'.repeat(300), 'tx', 'banana', 'I do not know']) assert.equal(stateFrom(bad), undefined, String(bad));
+  assert.equal(stateName('ZZ'), undefined); assert.equal(stateName(undefined), undefined); assert.equal(stateName('tx'), undefined, 'a name is looked up by the stored upper-case code only');
+  for (const bad of [undefined, null, 5, '', '   ', 'Texas Avenue', 'Texas Street, Springfield', 'x'.repeat(300), 'banana', 'I do not know']) assert.equal(stateFrom(bad), undefined, String(bad));
   assert.deepEqual(stateFrom('Austin, TX'), { code: 'TX', rest: 'Austin' });
   assert.deepEqual(stateFrom('it is Texas, thanks'), { code: 'TX', rest: '' });
   assert.deepEqual(stateFrom('West Virginia'), { code: 'WV', rest: '' }, 'the longer name wins over "Virginia"');
+});
+
+test('a lower-case or mixed-case state is taken only when something anchors it: after a comma, right after the ZIP code, or as the whole answer; a word that is also a code, and a street ending that is also a code, are not states (Live Test #6 follow-up)', () => {
+  for (const [line, code] of [
+    [`${STREET}, Springfield, tx 91364`, 'TX'], [`${STREET} Springfield tx 91364`, 'TX'], [`${STREET}, Springfield, Tx 91364`, 'TX'], [`${STREET}, Springfield, t x 91364`, 'TX'], [`${STREET}, Springfield, ny 91364`, 'NY'], [`${STREET}, Springfield, pa 91364`, 'PA'],
+    [`${STREET}, Omaha, NE 91364`, 'NE'], [`${STREET}, Hartford, CT 91364`, 'CT'], [`${STREET}, Washington, DC 91364`, 'DC'],
+  ] as const) {
+    const s = state(); say(s, line);
+    assert.equal(s.addressParts()?.state, code, line); assert.ok(!/\b(?:tx|Tx|ny|pa|t x)\b/.test(s.addressParts()?.city ?? ''), `${line}: the state is not left in the city`);
+  }
+  const c = state(); say(c, `${STREET}, Springfield, tx`); assert.deepEqual(c.addressHeld(), { street: true, city: true, zip: false, state: true }, 'after a comma, with no ZIP yet');
+  for (const word of ['tx', 'ny', 'wa']) { const s = state(); say(s, STREET, 'Springfield', '91364'); s.collect('address', word); assert.equal(s.addressParts()?.state, word.toUpperCase(), `the whole answer: ${word}`); }
+  // not states: common words, short names, and street endings
+  for (const word of ['in', 'or', 'me', 'hi', 'oh', 'ok', 'al', 'de', 'id', 'la', 'ma', 'pa', 'co', 'md', 'ct', 'ne', 'Pa']) { const s = state(); say(s, STREET, 'Springfield', '91364'); s.collect('address', word); assert.equal(s.addressParts()?.state, undefined, `as the whole answer: ${word}`); }
+  for (const line of [`1427 Sample Ct 91364`, `1427 Sample Street NE 91364`, `1427 Sample Street, Springfield tx`]) { const s = state(); say(s, line); assert.equal(s.addressHeld().state, false, line); }
+  assert.deepEqual(stateFrom('Hartford, CT'), { code: 'CT', rest: 'Hartford' }); assert.equal(stateFrom('Hartford CT'), undefined, 'no comma: it may end a street'); assert.deepEqual(stateFrom('Hartford Connecticut'), { code: 'CT', rest: 'Hartford' }, 'the full name always counts');
+  assert.deepEqual(stateFrom('Springfield, tx'), { code: 'TX', rest: 'Springfield' }); assert.equal(stateFrom('Springfield tx'), undefined, 'lower case with no anchor'); assert.deepEqual(stateFrom('Springfield tx', true), { code: 'TX', rest: 'Springfield' }, 'anchored by a ZIP code just taken off');
 });

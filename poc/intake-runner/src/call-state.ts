@@ -73,6 +73,11 @@ const DIGIT_TOKEN = '(?:(?:double|triple|treble)[\\s-]+)?(?:zero|oh|one|two|thre
 /** The stretches of a line that are digits said or written ("five five five 0 1 double 0"), so only those are taught to the masker, not the words around them. */
 const DIGIT_RUNS = new RegExp(`\\b${DIGIT_TOKEN}(?:[\\s,.-]+${DIGIT_TOKEN})*\\b`, 'gi');
 export function digitRuns(raw: string): string[] { return [...raw.matchAll(DIGIT_RUNS)].map((m) => m[0]).filter((s) => s.length > 0); }
+/** How many digits a line ENDS with (zero when it does not end in digits), for the diagnostics: a count, never a digit. A ZIP code is five. */
+export function trailingDigitCount(raw: string): number {
+  const runs = digitRuns(raw); const last = runs[runs.length - 1]; if (last === undefined) return 0;
+  const at = raw.lastIndexOf(last); return raw.slice(at + last.length).replace(/[\s,.!?]+/g, '') === '' ? (digitsOf(last) ?? '').length : 0;
+}
 const CLOCK_TIME = /\b(?:\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|oh|fifteen|thirty|forty[- ]five)\s*(?:a\.?\s?m\.?|p\.?\s?m\.?)(?![a-z])/i;
 /** The digit runs of five or more digits (never a day of the month, a count or a year). */
 function longDigitRuns(raw: string): string[] { return digitRuns(raw).filter((r) => (digitsOf(r) ?? '').length >= 5); }
@@ -279,7 +284,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       }
     }
     // 1b. The state, said at the end of what is left ("Austin, Texas", "Austin TX") or on its own. It is taken out BEFORE the city is read, so it can never become part of the city; it is never filled in from anywhere else.
-    let stateCode: string | undefined; if (t !== '') { const sf = stateFrom(t); if (sf !== undefined) { stateCode = sf.code; t = sf.rest; } }
+    let stateCode: string | undefined; if (t !== '') { const sf = stateFrom(t, zip !== undefined || badZip); if (sf !== undefined) { stateCode = sf.code; t = sf.rest; } }
     // 2. The rest: a street address, a city, or both; or one part of a street (a house number, a street name).
     let street: string | undefined; let city: string | undefined; let piece: AddressPiece | undefined;
     if (t !== '') {

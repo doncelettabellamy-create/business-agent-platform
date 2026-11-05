@@ -17,13 +17,13 @@
 // Every outside thing is handed in (the clock, Twilio, Jobber, the booking adapter), so this file is tested with stand-ins and never reaches the network itself.
 
 import { createHash } from 'node:crypto';
-import { createContactState, digitRuns } from './call-state.ts';
+import { createContactState, digitRuns, trailingDigitCount } from './call-state.ts';
 import { stateName } from './us-state.ts';
 import type { ContactState } from './call-state.ts';
 import { spokenDigits } from './contact-capture.ts';
 import { chooseOffer, lastBookableDate } from './fast-availability.ts';
 import type { AvailabilityConfig, Busy, Offer } from './fast-availability.ts';
-import { countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
+import { countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
 import type { When } from './fast-parsers.ts';
 import type { BookingRequest, BookingResult } from './jobber-booking.ts';
 import type { CallTransport, TransportEvent } from './call-transport.ts';
@@ -198,8 +198,10 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       ask('ADDRESS', text, async (heard) => {
         const r = contact.collect('address', heard);
         const held = contact.addressHeld();
-        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, state: held.state, digitRuns: digitRuns(heard).length, words: wordsIn(heard), chars: heard.trim().length });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit
+        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, state: held.state, digitRuns: digitRuns(heard).length, zipDigits: trailingDigitCount(heard), words: wordsIn(heard), chars: heard.trim().length });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit
         if (r.outcome === 'captured') { tries = 0; return contact.addressParts()?.state === undefined ? askState() : askWhen(); }
+        // A caller who says an address in pieces (Live Test #6: seven segments, two of them unusable) makes progress with most of them: a segment that adds a part clears the count of unusable ones before it, so only four in a row (or the same part again) end the call.
+        if (r.outcome === 'partial' && r.reason !== 'SAME') tries = 0;
         if ((r.outcome === 'unclear' || r.reason === 'SAME') && ++tries >= 4) return giveUp('ADDRESS_UNCLEAR');
         // Pieces are kept; wait a moment in case the rest follows, then ask ONLY for what is missing.
         armSettle(async () => {
@@ -241,7 +243,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
           if (one !== undefined && size.beds !== undefined && size.baths === undefined) size.baths = one; else if (one !== undefined && size.baths !== undefined && size.beds === undefined) size.beds = one;
         }
         // What the size parser did with this answer: booleans and counts only, never the words or the numbers said.
-        deps.log('FAST_SIZE', { parsedBeds: s.beds !== undefined, parsedBaths: s.baths !== undefined, bareCount: countFrom(heard) !== undefined, hadBeds: heldBefore.beds, hadBaths: heldBefore.baths, haveBeds: size.beds !== undefined, haveBaths: size.baths !== undefined, numberTokens: digitRuns(heard).length, words: wordsIn(heard), chars: heard.trim().length, tries, verdict: size.beds !== undefined && size.baths !== undefined ? 'BOTH' : size.beds !== undefined ? 'BEDS_ONLY' : size.baths !== undefined ? 'BATHS_ONLY' : 'NONE' });
+        deps.log('FAST_SIZE', { parsedBeds: s.beds !== undefined, parsedBaths: s.baths !== undefined, bareCount: countFrom(heard) !== undefined, hadBeds: heldBefore.beds, hadBaths: heldBefore.baths, haveBeds: size.beds !== undefined, haveBaths: size.baths !== undefined, numberTokens: digitRuns(heard).length, ...sizeShape(heard), words: wordsIn(heard), chars: heard.trim().length, tries, verdict: size.beds !== undefined && size.baths !== undefined ? 'BOTH' : size.beds !== undefined ? 'BEDS_ONLY' : size.baths !== undefined ? 'BATHS_ONLY' : 'NONE' });
         if (size.beds === undefined && size.baths === undefined) { if (++tries >= 3) return giveUp('SIZE_UNCLEAR'); return armSettle(async () => askSize('Sorry, how many bedrooms and bathrooms?')); }
         if (size.beds === undefined) return armSettle(async () => askSize('And how many bedrooms?'));
         if (size.baths === undefined) return armSettle(async () => askSize('And how many bathrooms?'));

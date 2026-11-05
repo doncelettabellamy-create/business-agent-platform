@@ -37,6 +37,8 @@ export function isAiQuestion(raw: unknown): boolean {
 // ---------------------------------------------------------------- counts
 const WORDS: Record<string, number> = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, to: 2, too: 2, for: 4, tree: 3 };
 const NUMTOK = '(?:\\d+(?:\\.5)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)';
+/** The same, plus the words a voice recognizer writes for two, three and four ("to", "too", "tree", "for"). They count ONLY right before a bedroom or bathroom word, or as the whole of a one-number answer: anywhere else they are ordinary words. */
+const NUMTOK_NEAR = '(?:\\d+(?:\\.5)?|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|to|too|tree|for)';
 function num(tok: string): number | undefined { const t = tok.toLowerCase(); if (/^\d+(?:\.5)?$/.test(t)) return Number(t); return Object.hasOwn(WORDS, t) ? WORDS[t] : undefined; }
 const squash = (raw: string): string => raw.toLowerCase().replace(/[’]/g, "'").replace(/\b(\w+)\s+and\s+a\s+half\b/g, '$1.5').replace(/\b(\w+)\s+point\s+five\b/g, '$1.5').replace(/[^a-z0-9.' ]+/g, ' ').replace(/\s+/g, ' ').trim();
 const toNum = (s: string): string => s.replace(/\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\.5\b/g, (_m, w: string) => `${WORDS[w]}.5`);
@@ -45,7 +47,7 @@ export interface Size { beds?: number; baths?: number }
 export function sizeFrom(raw: unknown): Size {
   if (typeof raw !== 'string' || raw.length > 300) return {};
   const t = toNum(squash(raw)); const out: Size = {};
-  const bed = new RegExp(`\\b(${NUMTOK})\\s*(?:-\\s*)?(?:bed(?:room)?s?|br)\\b`).exec(t); const bath = new RegExp(`\\b(${NUMTOK})\\s*(?:-\\s*)?(?:bath(?:room)?s?|ba)\\b`).exec(t);
+  const bed = new RegExp(`\\b(${NUMTOK_NEAR})\\s*(?:-\\s*)?(?:bed(?:room)?s?|br)\\b`).exec(t); const bath = new RegExp(`\\b(${NUMTOK_NEAR})\\s*(?:-\\s*)?(?:bath(?:room)?s?|ba)\\b`).exec(t);
   if (bed !== null) { const v = num(bed[1]); if (v !== undefined && Number.isInteger(v) && v >= 0 && v <= 12) out.beds = v; }
   if (bath !== null) { const v = num(bath[1]); if (v !== undefined && v >= 0.5 && v <= 12) out.baths = v; }
   if (/\bstudio\b/.test(t) && out.beds === undefined) out.beds = 0;
@@ -59,7 +61,14 @@ export function sizeFrom(raw: unknown): Size {
 export function countFrom(raw: unknown): number | undefined {
   if (typeof raw !== 'string' || raw.length > 120) return undefined;
   const nums = [...toNum(squash(raw)).matchAll(new RegExp(`\\b${NUMTOK}\\b`, 'g'))].map((m) => num(m[0])).filter((v): v is number => v !== undefined);
+  if (nums.length === 0) { const lone = /^(?:(?:um+|uh+|just|only|maybe|about)\s+)*(to|too|tree|for)\.?$/.exec(squash(raw)); if (lone !== null) return WORDS[lone[1]]; }   // the whole answer is the recognizer's "to", "too" or "for": two, two, four
   return nums.length === 1 && nums[0] >= 0 && nums[0] <= 12 ? nums[0] : undefined;
+}
+/** What an answer to the size question looks like, as flags and a count only (never a word or a number): for the diagnostics, so a failed size answer can be told apart from a missing one. */
+export function sizeShape(raw: unknown): { bedWord: boolean; bathWord: boolean; numberWords: number; homophone: boolean } {
+  if (typeof raw !== 'string' || raw.length > 300) return { bedWord: false, bathWord: false, numberWords: 0, homophone: false };
+  const t = toNum(squash(raw));
+  return { bedWord: /\b(?:bed(?:room)?s?|br)\b/.test(t), bathWord: /\b(?:bath(?:room)?s?|ba)\b/.test(t), numberWords: [...t.matchAll(new RegExp(`\\b${NUMTOK}\\b`, 'g'))].length, homophone: /\b(?:to|too|tree|for)\b/.test(t) };
 }
 
 // ---------------------------------------------------------------- time zones

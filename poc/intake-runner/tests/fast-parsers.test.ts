@@ -1,7 +1,7 @@
 // The deterministic answer parsers of the fast Drew test call. Synthetic phrases only.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
+import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
 
 const TZ = 'America/Chicago';
 const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 2 November 2026, 9:00 in Chicago (standard time, UTC-6; summer time ended on 1 November)
@@ -86,4 +86,23 @@ test('the price in words: the voice is never asked to read a dollar sign and dig
   for (const [n, words] of cases) assert.equal(sayDollars(n), words, String(n));
   for (const bad of [NaN, -1, 1_000_000, Infinity]) assert.ok(!/[\$]/.test(sayDollars(bad)) && sayDollars(bad).endsWith(' dollars'), String(bad));
   for (let n = 1; n <= 999; n++) assert.ok(/^[a-z -]+ dollars?$/.test(sayDollars(n)), `${n} has only words`);
+});
+
+test('size: the recognizer\'s "to", "too", "tree" and "for" are numbers only right before a bedroom or bathroom word, or as the whole of a one-number answer; elsewhere they are ordinary words (Live Test #6: an 8-character bathroom answer parsed to nothing)', () => {
+  assert.deepEqual(sizeFrom('to bedrooms and to bathrooms'), { beds: 2, baths: 2 });
+  assert.deepEqual(sizeFrom('tree bedrooms for baths'), { beds: 3, baths: 4 });
+  assert.deepEqual(sizeFrom('two bedrooms, too baths'), { beds: 2, baths: 2 });
+  assert.deepEqual(sizeFrom('to bath'), { baths: 2 });
+  for (const s of ['to', 'too', 'for', 'tree', 'to the left', 'I need to clean for a week', 'for sure', 'to and for']) assert.deepEqual(sizeFrom(s), {}, s);
+  assert.equal(countFrom('to'), 2); assert.equal(countFrom('Too.'), 2); assert.equal(countFrom('for'), 4); assert.equal(countFrom('tree'), 3); assert.equal(countFrom('um, to'), 2); assert.equal(countFrom('just for'), 4);
+  for (const s of ['to the', 'for sure', 'I need to', 'to and for', 'a couple', 'couple', 'a few', 'several', 'both', '', 'to bedrooms']) assert.equal(countFrom(s), undefined, `${s}: never guessed`);
+});
+
+test('size shape: flags and a count that say what an answer looked like, and never a word or a number; anything that is not a short string gives all-false', () => {
+  assert.deepEqual(sizeShape('to baths'), { bedWord: false, bathWord: true, numberWords: 0, homophone: true });
+  assert.deepEqual(sizeShape('two bedrooms'), { bedWord: true, bathWord: false, numberWords: 1, homophone: false });
+  assert.deepEqual(sizeShape('a couple of bedrooms and baths'), { bedWord: true, bathWord: true, numberWords: 0, homophone: false });
+  assert.deepEqual(sizeShape('banana smoothie please'), { bedWord: false, bathWord: false, numberWords: 0, homophone: false });
+  for (const bad of [undefined, null, 5, 'x'.repeat(400)]) assert.deepEqual(sizeShape(bad), { bedWord: false, bathWord: false, numberWords: 0, homophone: false });
+  for (const v of Object.values(sizeShape('two bedrooms and two baths'))) assert.ok(typeof v === 'boolean' || typeof v === 'number');
 });

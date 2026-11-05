@@ -555,16 +555,16 @@ test('FAST_ADDRESS: one line per address answer with the outcome, reason, four f
   await t.c.hears(/What day and time/, undefined);
   const lines = t.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
   assert.deepEqual(lines, [
-    { outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, state: false, ...sizes('123 Invented Lane') },
-    { outcome: 'partial', reason: 'NEED_ZIP', street: true, city: true, zip: false, state: false, digitRuns: 0, words: 1, chars: 9 },
-    { outcome: 'captured', reason: 'JOINED', street: true, city: true, zip: true, state: true, ...sizes('CA 90210') },
+    { outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, state: false, zipDigits: 0, ...sizes('123 Invented Lane') },
+    { outcome: 'partial', reason: 'NEED_ZIP', street: true, city: true, zip: false, state: false, zipDigits: 0, digitRuns: 0, words: 1, chars: 9 },
+    { outcome: 'captured', reason: 'JOINED', street: true, city: true, zip: true, state: true, zipDigits: 5, ...sizes('CA 90210') },
   ]);
   // a ZIP followed by extra words is dropped by the parser (unchanged behaviour); the line says so without saying what was heard
   const said = '123 Invented Lane, Testville, CA 90210, that is it';
   const u = build(); u.h.serve(u.c.transport); u.c.setup(DREW, undefined, 'Testa Invented');
   await u.c.hears(/street address/, said);
   await u.c.hears(/What is the city/, undefined);
-  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, state: false, ...sizes(said) }]);
+  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, state: false, zipDigits: 0, ...sizes(said) }]);
   // every field is a flat boolean, number or short token, so the real log sink keeps all of them (it drops anything else)
   for (const l of [...t.logs, ...u.logs]) if (l[0] === 'FAST_ADDRESS') assert.deepEqual(cleanDetail(l[1]), l[1], 'the sink keeps every field');
   // the whole call: the address, its parts and its digits appear in no log line at all
@@ -581,9 +581,9 @@ test('FAST_SIZE: one line per size answer says what the parser found (booleans a
   await t.c.hears(/^And how many bathrooms/, 'two');
   await t.c.hears(/is one hundred ninety-nine dollars/, undefined);
   assert.deepEqual(flat(t.logs), [
-    { parsedBeds: false, parsedBaths: false, bareCount: false, hadBeds: false, hadBaths: false, haveBeds: false, haveBaths: false, numberTokens: 0, words: 3, chars: 22, tries: 0, verdict: 'NONE' },
-    { parsedBeds: true, parsedBaths: false, bareCount: true, hadBeds: false, hadBaths: false, haveBeds: true, haveBaths: false, numberTokens: 1, words: 2, chars: 12, tries: 1, verdict: 'BEDS_ONLY' },
-    { parsedBeds: false, parsedBaths: false, bareCount: true, hadBeds: true, hadBaths: false, haveBeds: true, haveBaths: true, numberTokens: 1, words: 1, chars: 3, tries: 1, verdict: 'BOTH' },   // tries is not reset by a partial answer (unchanged behaviour)
+    { parsedBeds: false, parsedBaths: false, bareCount: false, hadBeds: false, hadBaths: false, haveBeds: false, haveBaths: false, numberTokens: 0, bedWord: false, bathWord: false, numberWords: 0, homophone: false, words: 3, chars: 22, tries: 0, verdict: 'NONE' },
+    { parsedBeds: true, parsedBaths: false, bareCount: true, hadBeds: false, hadBaths: false, haveBeds: true, haveBaths: false, numberTokens: 1, bedWord: true, bathWord: false, numberWords: 1, homophone: false, words: 2, chars: 12, tries: 1, verdict: 'BEDS_ONLY' },
+    { parsedBeds: false, parsedBaths: false, bareCount: true, hadBeds: true, hadBaths: false, haveBeds: true, haveBaths: true, numberTokens: 1, bedWord: false, bathWord: false, numberWords: 1, homophone: false, words: 1, chars: 3, tries: 1, verdict: 'BOTH' },   // tries is not reset by a partial answer (unchanged behaviour)
   ]);
   // 2. three answers with no size in them: the third ends the call exactly as before (SIZE_UNCLEAR), and the tries read 0, 1, 2
   const g = build(); g.h.serve(g.c.transport); g.c.setup(DREW, undefined, 'Testa Invented');
@@ -665,4 +665,63 @@ test('no state, no booking: two answers that are not a state end the call with a
   assert.equal(t.c.lines.at(-1), 'Sorry, I am having trouble with that, so a person will follow up. Goodbye.');
   assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_STATE').map(([, v]) => (v as { state: boolean }).state), [false, false]);
   noPersonalDetail(t.logs, ['banana', 'Invented Lane']);
+});
+
+// ---------------------------------------------------------------- reliability batch after Live Test #6: lower-case state, number homophones, an address said in many pieces
+
+test('lower-case state: "tx" before the ZIP is the state and nothing is asked; a bare "ny" answers the state question once; the booking carries the caller\'s state and nothing is asked twice', async () => {
+  const a = build({ settleMs: 80 }); a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
+  await a.c.hears(/street address/, '123 Invented Lane, Testville, tx 90210'); await a.c.hears(/What day and time/, undefined);
+  assert.equal(a.c.lines.filter((l) => /What state/.test(l)).length, 0);
+  assert.deepEqual(a.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => [(v as Record<string, unknown>).outcome, (v as Record<string, unknown>).state, (v as Record<string, unknown>).zipDigits]), [['captured', true, 5]], 'the ZIP has five digits and the state is held');
+  const b = build({ emails: 'accept', textsEnabled: false }); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
+  await b.c.hears(/street address/, '123 Invented Lane, Testville 90210'); await b.c.hears(/^What state is that in\?$/, 'ny');
+  await b.c.hears(/What day and time/, 'Tuesday at ten'); await b.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from a number ending in/, 'yes');
+  assert.match(await b.c.hears(/To confirm/, 'yes'), /Testville, New York, 9 0 2 1 0\./); await finish(b.c);
+  assert.equal(b.booked[0].address.province, 'NY'); assert.equal(b.c.lines.filter((l) => /What state/.test(l)).length, 1);
+  const asks = b.c.lines.filter((l) => /\?|Say yes or no/.test(l)); assert.equal(new Set(asks).size, asks.length, 'no question was asked twice');
+  // a lone word that is also a code is not a state: the question is asked again, and only then the booking can go on
+  const c = build({ settleMs: 80 }); c.h.serve(c.c.transport); c.c.setup(DREW, undefined, 'Testa Invented');
+  await c.c.hears(/street address/, '123 Invented Lane, Testville 90210'); await c.c.hears(/^What state is that in\?$/, 'in'); await c.c.hears(/^Sorry, which state is that in\?$/, 'tx'); await c.c.hears(/What day and time/, undefined);
+  assert.equal(c.c.lines.filter((l) => /state is that in/.test(l)).length, 2);
+});
+
+test('size: "to bathrooms" said as a second piece, a lone "too", and "to bedrooms and to bathrooms" are read (Live Test #6); "a couple" is never guessed; nothing already answered is asked again', async () => {
+  const start = async (...pieces: string[]) => {
+    const t = build({ settleMs: 80 }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+    await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await t.c.hears(/What day and time/, 'tomorrow at ten'); await t.c.hears(/bedrooms and bathrooms/, pieces[0]);
+    for (const p of pieces.slice(1)) { await sleep(30); t.c.emit({ kind: 'utterance', text: p }); }
+    return t;
+  };
+  const asked = (t: ReturnType<typeof build>): number => t.c.lines.filter((l) => /^And how many|^Sorry, how many/.test(l)).length;
+  for (const pieces of [['two bedrooms', 'to bathrooms'], ['two bedrooms', 'too'], ['two bedrooms', 'to baths'], ['to bedrooms and to bathrooms']]) {
+    const t = await start(...pieces); await t.c.hears(/is one hundred ninety-nine dollars/, undefined);
+    assert.equal(asked(t), 0, `${pieces.join(' + ')}: no size question was asked again`);
+  }
+  // never guessed: "a couple" has no number, so the question is asked again and the shape of the answer is logged without its words
+  const d = await start('a couple of bedrooms'); await d.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'two bedrooms and two bathrooms'); await d.c.hears(/is one hundred ninety-nine dollars/, undefined);
+  const rows = d.logs.filter(([k]) => k === 'FAST_SIZE').map(([, v]) => v as Record<string, unknown>);
+  assert.deepEqual([rows[0].verdict, rows[0].bedWord, rows[0].bathWord, rows[0].numberWords, rows[0].homophone], ['NONE', true, false, 0, false]);
+  for (const l of d.logs) if (l[0] === 'FAST_SIZE') assert.deepEqual(cleanDetail(l[1]), l[1], 'the sink keeps every field');
+  noPersonalDetail(d.logs, ['couple', 'bedrooms']);
+  // a homophone that is not next to a bedroom or bathroom word is still just a word: three of those in a row still end the call, nothing booked
+  const e = build({ settleMs: 80 }); e.h.serve(e.c.transport); e.c.setup(DREW, undefined, 'Testa Invented');
+  await e.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await e.c.hears(/What day and time/, 'tomorrow at ten'); await e.c.hears(/bedrooms and bathrooms/, 'for sure'); await e.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'I need to think'); await e.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'to the left'); await finish(e.c);
+  assert.equal(e.last().reason, 'SIZE_UNCLEAR'); assert.equal(e.booked.length, 0);
+});
+
+test('an address said in many pieces (Live Test #6: seven segments, two unusable): unusable pieces between pieces that add something do not end the call; nothing is asked while the caller keeps talking; four unusable in a row still end it', async () => {
+  const a = build({ settleMs: 80 }); a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
+  await a.c.hears(/street address/, 'um');
+  for (const piece of ['123', 'okay', 'Invented Lane', 'uh', 'hmm', 'Testville', 'um', 'tx 90210']) { await sleep(20); a.c.emit({ kind: 'utterance', text: piece }); }   // four unusable pieces in all, never four in a row
+  await a.c.hears(/What day and time/, undefined);
+  assert.equal(a.c.lines.filter((l) => /street address/.test(l)).length, 1);
+  assert.equal(a.c.lines.filter((l) => /^What is the (?:city|street name|house number)|^And the ZIP code|^What state/.test(l)).length, 0, 'everything the caller said was kept, so nothing was asked for');
+  const rows = a.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
+  assert.equal(rows.length, 9); assert.deepEqual([rows.at(-1)!.outcome, rows.at(-1)!.zipDigits, rows.at(-1)!.state], ['captured', 5, true]);
+  for (const r of rows) assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field'); noPersonalDetail(a.logs, ['Invented Lane', 'okay', 'hmm']);
+  const b = build({ settleMs: 80 }); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
+  await b.c.hears(/street address/, 'um'); for (const piece of ['uh', 'hmm', 'okay']) { await sleep(20); b.c.emit({ kind: 'utterance', text: piece }); }
+  await finish(b.c); assert.equal(b.last().reason, 'ADDRESS_UNCLEAR'); assert.equal(b.booked.length, 0);
 });
