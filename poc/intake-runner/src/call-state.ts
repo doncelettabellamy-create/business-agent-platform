@@ -16,6 +16,7 @@
 // The values are RAW personal data held in memory for one call. They leave only to the caller over the phone (read-back) and to the encrypted vault after a yes.
 
 import { digitsOf, phoneDigits, CONTACT_FIELDS } from './contact-capture.ts';
+import { stateFrom, stateName } from './us-state.ts';
 
 export type ContactField = 'name' | 'phone' | 'address';
 export const CONTACT_FIELD_KEYS: readonly ContactField[] = Object.freeze(['name', 'phone', 'address'] as ContactField[]);
@@ -171,10 +172,10 @@ export interface ContactState {
   addressPart(): 'street name' | 'house number' | 'street address' | 'city' | 'ZIP code' | undefined;
   /** The held address as it is SPOKEN back (the ZIP code digit by digit), for the read-back to the caller over the phone only. RAW personal data. Undefined until the address is whole. */
   spokenAddress(): string | undefined;
-  /** City-and-ZIP mode, once the address is whole: its three parts kept apart (a street address, a city, a five-digit ZIP code), for a system that needs them separately. RAW personal data. Undefined until the address is whole, or when the mode is off. */
-  addressParts(): { street: string; city: string; zip: string } | undefined;
-  /** City-and-ZIP mode: which of the three address parts are held, as booleans only (never a part itself), for a log line. */
-  addressHeld(): { street: boolean; city: boolean; zip: boolean };
+  /** City-and-ZIP mode, once the address is whole: its parts kept apart (a street address, a city, a five-digit ZIP code, and the two-letter state when the caller said it), for a system that needs them separately. The state is never filled in from anywhere else: absent until the caller says it. RAW personal data. Undefined until the address is whole, or when the mode is off. */
+  addressParts(): { street: string; city: string; zip: string; state?: string } | undefined;
+  /** City-and-ZIP mode: which of the address parts are held (the state included), as booleans only (never a part itself), for a log line. */
+  addressHeld(): { street: boolean; city: boolean; zip: boolean; state: boolean };
   status(): ContactStatus;
   dispose(): void;
 }
@@ -201,9 +202,9 @@ const zipOk = (d: string): boolean => /^\d{5}$/.test(d) && d !== '00000';
 export function createContactState(options: ContactStateOptions = {}): ContactState {
   const cityZip = options.cityZip === true;
   let values: { name?: string; phone?: string; address?: string } = {};
-  let aStreet = ''; let aCity = ''; let aZip = '';   // city-and-ZIP mode: the three parts of the address, held until all are known
+  let aStreet = ''; let aCity = ''; let aZip = ''; let aState = '';   // city-and-ZIP mode: the parts of the address, held until all are known (the state is held apart: it is never needed for the address to be whole, and never guessed)
   const assemble = (): void => { if (aStreet !== '' && aCity !== '' && aZip !== '') values.address = `${aStreet}, ${aCity}, ${aZip}`.slice(0, 200); else delete values.address; };
-  const dropParts = (): void => { aStreet = ''; aCity = ''; aZip = ''; pendNumber = ''; pendStreet = ''; };
+  const dropParts = (): void => { aStreet = ''; aCity = ''; aZip = ''; aState = ''; pendNumber = ''; pendStreet = ''; };
   let pending = '';   // digits of a phone number heard in pieces
   let phoneAmbiguous = false;   // the pieces heard could not be fitted together and were forgotten: the caller is asked for the whole number again
   let pendNumber = ''; let pendStreet = '';   // one part of a service address heard on its own, held until the other arrives
@@ -261,7 +262,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
    * the END of a line only; a house number is never taken for one. Never a postal check and never a service-area check: the caller confirms the whole address aloud.
    */
   function collectAddressCZ(raw: string): CollectResult {
-    const hadParts = aStreet !== '' || aCity !== '' || aZip !== '' || pendNumber !== '' || pendStreet !== '';
+    const hadParts = aStreet !== '' || aCity !== '' || aZip !== '' || aState !== '' || pendNumber !== '' || pendStreet !== '';
     const t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '');
     if (t0.length < 1 || t0.length > 160 || /[@\[\]<>]/.test(t0)) return { field: 'address', outcome: 'unclear', learn: [], reason: 'NOT_AN_ADDRESS' };
     let t = t0; let zip: string | undefined; let badZip = false; const learn: string[] = [];
@@ -277,6 +278,8 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
         t = before;
       }
     }
+    // 1b. The state, said at the end of what is left ("Austin, Texas", "Austin TX") or on its own. It is taken out BEFORE the city is read, so it can never become part of the city; it is never filled in from anywhere else.
+    let stateCode: string | undefined; if (t !== '') { const sf = stateFrom(t); if (sf !== undefined) { stateCode = sf.code; t = sf.rest; } }
     // 2. The rest: a street address, a city, or both; or one part of a street (a house number, a street name).
     let street: string | undefined; let city: string | undefined; let piece: AddressPiece | undefined;
     if (t !== '') {
@@ -304,7 +307,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       }
     }
     // 3. Apply. A street said whole replaces the street; pieces join as in the street-only flow; a city or ZIP replaces its own part only.
-    let changed = false; const parsed = street !== undefined || piece !== undefined || city !== undefined || zip !== undefined;
+    let changed = false; const parsed = street !== undefined || piece !== undefined || city !== undefined || zip !== undefined || stateCode !== undefined;
     if (street !== undefined) { if (aStreet !== street) changed = true; aStreet = street; pendNumber = ''; pendStreet = ''; learn.push(street); }
     else if (piece !== undefined) {
       const number = piece.kind === 'number' ? piece.text : pendNumber;
@@ -316,6 +319,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
     }
     if (city !== undefined) { if (aCity !== city) changed = true; aCity = city; learn.push(city); }
     if (zip !== undefined) { if (aZip !== zip) changed = true; aZip = zip; }
+    if (stateCode !== undefined) { if (aState !== stateCode) changed = true; aState = stateCode; }
     assemble();
     const out = [...new Set(learn)];
     if (values.address !== undefined) return { field: 'address', outcome: 'captured', learn: out, reason: hadParts ? 'JOINED' : 'CAPTURED' };
@@ -404,9 +408,9 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       if (aStreet === '') return aCity !== '' || aZip !== '' ? 'street address' : undefined;
       return aCity === '' ? 'city' : 'ZIP code';
     },
-    spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aZip.split('').join(' ')}` : values.address; },
-    addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' ? undefined : { street: aStreet, city: aCity, zip: aZip }; },
-    addressHeld() { return disposed ? { street: false, city: false, zip: false } : { street: aStreet !== '', city: aCity !== '', zip: aZip !== '' }; },
+    spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aState === '' ? '' : `${stateName(aState)}, `}${aZip.split('').join(' ')}` : values.address; },
+    addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' ? undefined : { street: aStreet, city: aCity, zip: aZip, ...(aState === '' ? {} : { state: aState }) }; },
+    addressHeld() { return disposed ? { street: false, city: false, zip: false, state: false } : { street: aStreet !== '', city: aCity !== '', zip: aZip !== '', state: aState !== '' }; },
     status() {
       const captured: string[] = []; const missing: string[] = [];
       for (const k of CONTACT_FIELD_KEYS) (values[k] === undefined ? missing : captured).push(CONTACT_FIELDS[k]);

@@ -18,6 +18,7 @@
 
 import { createHash } from 'node:crypto';
 import { createContactState, digitRuns } from './call-state.ts';
+import { stateName } from './us-state.ts';
 import type { ContactState } from './call-state.ts';
 import { spokenDigits } from './contact-capture.ts';
 import { chooseOffer, lastBookableDate } from './fast-availability.ts';
@@ -38,7 +39,7 @@ export interface FastSettings {
   bedrooms: number; bathrooms: number; priceDollars: number;
   /** The founder's standing approval of test bookings (config-bound). Without it nothing is ever booked. */
   standingApproval: boolean;
-  /** Two letters, sent with the address to Jobber when given. */
+  /** Kept for the config's shape only. The state of a booking is the one the CALLER says (or is asked for, once); this value is never used as a stand-in for it. */
   state?: string;
 }
 export type EmailVerdict = 'accepted' | 'refused' | 'not_sent';
@@ -197,14 +198,25 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       ask('ADDRESS', text, async (heard) => {
         const r = contact.collect('address', heard);
         const held = contact.addressHeld();
-        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, digitRuns: digitRuns(heard).length, words: wordsIn(heard), chars: heard.trim().length });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit
-        if (r.outcome === 'captured') { tries = 0; return askWhen(); }
+        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, state: held.state, digitRuns: digitRuns(heard).length, words: wordsIn(heard), chars: heard.trim().length });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit
+        if (r.outcome === 'captured') { tries = 0; return contact.addressParts()?.state === undefined ? askState() : askWhen(); }
         if ((r.outcome === 'unclear' || r.reason === 'SAME') && ++tries >= 4) return giveUp('ADDRESS_UNCLEAR');
         // Pieces are kept; wait a moment in case the rest follows, then ask ONLY for what is missing.
         armSettle(async () => {
           const part = contact.addressPart();
           askAddress(part === 'city' ? 'What is the city?' : part === 'ZIP code' ? 'And the ZIP code?' : part === 'street name' ? 'What is the street name?' : part === 'house number' ? 'What is the house number?' : 'Sorry, what is the street address?');
         });
+      });
+    }
+    /** The state is the caller's: said with the address, or asked for here, ONCE (and once more only if the answer could not be understood). It is never filled in from the config, and a state already held is never asked again. */
+    function askState(lead?: string): void {
+      ask('STATE', lead ?? 'What state is that in?', async (heard) => {
+        contact.collect('address', heard);
+        const held = contact.addressHeld();
+        deps.log('FAST_STATE', { state: held.state, words: wordsIn(heard), chars: heard.trim().length, tries });   // a boolean and counts only: never the state or what was said
+        if (contact.addressParts()?.state !== undefined) { tries = 0; return askWhen(); }
+        if (++tries >= 2) return giveUp('STATE_UNCLEAR');   // no state, no booking
+        armSettle(async () => askState('Sorry, which state is that in?'));
       });
     }
     function askWhen(lead?: string): void {
@@ -300,8 +312,9 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     function finalReadback(): void {
       const o = offer!; const p = contact.addressParts();
       if (p === undefined) return void giveUp('ADDRESS_MISSING');
+      if (p.state === undefined) return void giveUp('STATE_MISSING');   // never read back, or booked, without the caller's state
       const spokenZip = p.zip.split('').join(' ');
-      ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
+      ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${stateName(p.state)}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return book();
         if (y === 'no') return end('DECLINED_AT_READBACK', 'No problem. Nothing was booked. Goodbye.');
@@ -313,7 +326,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     async function book(): Promise<void> {
       clearTimers(); awaiting = undefined;
       const o = offer!; const p = contact.addressParts();
-      if (p === undefined || !S.standingApproval) return end(S.standingApproval ? 'ADDRESS_MISSING' : 'NO_STANDING_APPROVAL', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
+      if (p === undefined || p.state === undefined || !S.standingApproval) return end(!S.standingApproval ? 'NO_STANDING_APPROVAL' : p === undefined ? 'ADDRESS_MISSING' : 'STATE_MISSING', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
       // Availability is checked once more, from the calendar, right before anything is written: the time must lie inside the window that was read and still be free.
       { const { from, to } = calendarWindow(); let cal: { busy: Busy[]; complete: boolean }; try { cal = await deps.busy(from, to); } catch { cal = { busy: [], complete: false }; }
         const still = cal.complete ? chooseOffer({ date: o.date, time: o.time }, S.availability, cal.busy, deps.now(), []) : undefined;
@@ -326,7 +339,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const req: BookingRequest = {
         key: `fast-${createHash('sha256').update(`drew-fast:${String(callSid)}`).digest('hex').slice(0, 24)}`,
         gate: { eligibleRecord: true, approvedByPerson: true, callerAgreed: true },   // read back, measured and confirmed above; the standing test approval is the founder's, from the settings
-        client: { firstName, lastName, phone: digits }, address: { street1: p.street, city: p.city, postalCode: p.zip, ...(S.state === undefined ? {} : { province: S.state }) },
+        client: { firstName, lastName, phone: digits }, address: { street1: p.street, city: p.city, postalCode: p.zip, province: p.state },
         when: { date: o.date, startTime: o.time, endTime: o.endTime, utcOffset: utcOffsetFor(instantOf(o.date, o.time, S.availability.timezone), S.availability.timezone) },
         title: S.serviceLabel, service: `${S.serviceLabel} ${S.bedrooms} bed ${S.bathrooms} bath`, priceDollars: S.priceDollars,
       };
@@ -342,7 +355,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         emailedKeys.add(req.key);
         const tzE = S.availability.timezone;
         const ef = { businessName: S.businessName, serviceLabel: S.serviceLabel, bedrooms: S.bedrooms, bathrooms: S.bathrooms, priceDollars: S.priceDollars, date: o.date, startText: textTime(o.time), endText: textTime(o.endTime), zoneLabel: zoneLabelOf(tzE, instantOf(o.date, o.time, tzE)),
-          address: `${p.street}, ${p.city}${S.state === undefined ? '' : `, ${S.state}`} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim(), callbackNumber: callback, ...(res.jobNumber === undefined ? {} : { jobNumber: res.jobNumber }) };
+          address: `${p.street}, ${p.city}, ${p.state} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim(), callbackNumber: callback, ...(res.jobNumber === undefined ? {} : { jobNumber: res.jobNumber }) };
         const one = async (role: 'customer' | 'owner', m: { subject: string; text: string }): Promise<EmailVerdict> => { try { return (await deps.sendEmail!(role, m.subject, m.text)).ok ? 'accepted' : 'refused'; } catch { return 'refused'; } };
         [mail.customer, mail.owner] = await Promise.all([one('customer', customerEmail(ef)), one('owner', ownerEmail(ef))]);
         deps.log('FAST_EMAILS_SENT', { customer: mail.customer, owner: mail.owner }); note('EMAILS_SENT');
@@ -357,7 +370,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       // The words are the SUBMITTED campaign samples (fast-sms-copy.ts). The customer's text needs the caller's recorded yes; the owner's needs the owner's recorded setup consent. A body over the limit is never cut: it is not sent.
       const tz = S.availability.timezone;
       const facts = { businessName: S.businessName, serviceLabel: S.serviceLabel, bedrooms: S.bedrooms, bathrooms: S.bathrooms, priceDollars: S.priceDollars, dateText: textDay(o.date), startText: textTime(o.time), endText: textTime(o.endTime), zoneLabel: zoneLabelOf(tz, instantOf(o.date, o.time, tz)),
-        address: `${p.street}, ${p.city}${S.state === undefined ? '' : `, ${S.state}`} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim() };
+        address: `${p.street}, ${p.city}, ${p.state} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim() };
       const customerBody = customerText(facts); const ownerBody = ownerText(facts);
       const customerSend = textsOk && customerBody.length <= MAX_TEXT_CHARS && deps.approvedCustomerNumbers.has(callback) ? await deps.sendText(callback, customerBody) : undefined;
       const ownerSend = deps.ownerConsent && ownerBody.length <= MAX_TEXT_CHARS ? await deps.sendText(deps.ownerNumber, ownerBody) : undefined;

@@ -6,6 +6,7 @@ import { cityFrom, createContactState, runContactTool } from '../src/call-state.
 import { createCallSession } from '../src/call-session.ts';
 import { SAY } from '../src/relay-handler.ts';
 import { scriptedQuestion } from '../src/scripted-questions.ts';
+import { US_STATES, stateFrom, stateName } from '../src/us-state.ts';
 
 const STREET = '1427 Sample Street';
 const state = () => createContactState({ cityZip: true });
@@ -131,4 +132,74 @@ test('wording: the opener and its retry ask for the city and ZIP code; each foll
   assert.equal(scriptedQuestion({ field: 'Service address', part: 'ZIP code' }).text, SAY.addressZip);
   assert.equal(scriptedQuestion({ field: 'Service address', part: 'street address' }).text, SAY.addressStreetAddress);
   for (const part of ['city', 'ZIP code', 'street address'] as const) assert.match(scriptedQuestion({ field: 'Service address', part }).text, /^Thank you\. What is the [A-Za-z -]+\?$/);
+});
+
+// ---------------------------------------------------------------- the state: said by the caller, kept apart from the city, never filled in
+
+test('the state said with the address is kept apart from the city: a full name or two capital letters, with or without commas, spoken letters too; the ZIP code and the street are unchanged', () => {
+  for (const [line, city, code] of [
+    [`${STREET}, Springfield, Texas 91364`, 'Springfield', 'TX'],
+    [`${STREET}, Springfield Texas 91364`, 'Springfield', 'TX'],
+    [`${STREET}, Springfield, TX 91364`, 'Springfield', 'TX'],
+    [`${STREET} Springfield TX 91364`, 'Springfield', 'TX'],
+    [`${STREET}, Springfield, T X 91364`, 'Springfield', 'TX'],
+    [`${STREET}, Kansas City, New York 91364`, 'Kansas City', 'NY'],
+    [`${STREET}, Charleston, West Virginia 91364`, 'Charleston', 'WV'],
+    [`${STREET}, Oklahoma City, Oklahoma 91364`, 'Oklahoma City', 'OK'],
+  ]) {
+    const s = state(); say(s, line);
+    assert.deepEqual(s.addressParts(), { street: STREET, city, zip: '91364', state: code }, line);
+    assert.equal(s.value('address'), `${STREET}, ${city}, 91364`, 'the whole address is still street, city and ZIP; the state is held beside it');
+  }
+});
+
+test('the state said in pieces or on its own is kept and never becomes part of the city or the street; said again, it replaces the held one', () => {
+  const s = state(); say(s, STREET, 'Springfield', '91364');
+  assert.equal(s.addressParts()?.state, undefined, 'a whole address without a state has none: nothing fills it in');
+  assert.deepEqual(s.addressHeld(), { street: true, city: true, zip: true, state: false });
+  for (const [heard, code] of [['Texas', 'TX'], ['the state is Florida', 'FL'], ["it's in New York", 'NY'], ['Oregon, please', 'OR'], ['TX', 'TX'], ['Washington', 'WA']] as const) {
+    const r = s.collect('address', heard);
+    assert.equal(r.outcome, 'captured', heard);
+    assert.deepEqual(s.addressParts(), { street: STREET, city: 'Springfield', zip: '91364', state: code }, heard);
+  }
+  // before the rest of the address: held, and joined when the rest arrives
+  const t = state(); say(t, 'Texas'); assert.deepEqual(t.addressHeld(), { street: false, city: false, zip: false, state: true });
+  assert.equal(t.value('address'), undefined, 'a state alone is never an address');
+  say(t, STREET, 'Springfield', '91364'); assert.equal(t.addressParts()?.state, 'TX');
+  // a city and a state in one answer
+  const u = state(); say(u, STREET, 'Springfield, Texas', '91364'); assert.deepEqual(u.addressParts(), { street: STREET, city: 'Springfield', zip: '91364', state: 'TX' });
+});
+
+test('a state is never guessed: a house number before a state word is a street, a bare "OK" or "in" is not Oklahoma or Indiana, a lower-case pair is not a code, and a city that ends in a state word stays a city', () => {
+  const a = state(); say(a, '123 Washington'); assert.equal(a.addressHeld().state, false, 'a house number then a state word is a street, not a state');
+  for (const word of ['OK', 'in', 'or', 'me', 'okay', 'hi']) { const s = state(); say(s, STREET, 'Springfield', '91364'); s.collect('address', word); assert.equal(s.addressParts()?.state, undefined, word); }
+  const b = state(); say(b, `${STREET}, Oklahoma City 91364`); assert.deepEqual(b.addressParts(), { street: STREET, city: 'Oklahoma City', zip: '91364' }, 'ends in "City", so no state was said');
+  const c = state(); say(c, `${STREET}, Springfield 91364`); assert.equal(c.addressParts()?.state, undefined);
+  assert.equal(c.spokenAddress(), `${STREET}, Springfield, 9 1 3 6 4`, 'with no state held the read-back line is exactly as before');
+  assert.equal(c.value('address'), `${STREET}, Springfield, 91364`);
+});
+
+test('the read-back speaks the state by its full name; clearing the address forgets the state; the log booleans say whether a state is held and never which', () => {
+  const s = state(); say(s, `${STREET}, Springfield, TX 91364`);
+  assert.equal(s.spokenAddress(), `${STREET}, Springfield, Texas, 9 1 3 6 4`);
+  assert.deepEqual(s.addressHeld(), { street: true, city: true, zip: true, state: true });
+  assert.ok(!JSON.stringify(s.addressHeld()).includes('TX'));
+  s.clear('address'); assert.deepEqual(s.addressHeld(), { street: false, city: false, zip: false, state: false });
+  const t = state(); say(t, `${STREET}, Springfield, TX 91364`); t.abandon('address'); assert.equal(t.addressHeld().state, false);
+  const u = state(); say(u, `${STREET}, Springfield, TX 91364`); u.dispose(); assert.equal(u.addressParts(), undefined); assert.equal(u.addressHeld().state, false);
+});
+
+test('us-state: every state and DC round-trips between its name and its code; names are found only at the end of the line; anything else is not a state', () => {
+  assert.equal(Object.keys(US_STATES).length, 51);
+  for (const [code, name] of Object.entries(US_STATES)) {
+    assert.equal(stateName(code), name);
+    assert.deepEqual(stateFrom(name), { code, rest: '' }, name);
+    assert.deepEqual(stateFrom(`Springfield, ${name}`), { code, rest: 'Springfield' }, name);
+    if (!['OK', 'IN', 'OR', 'ME', 'HI', 'OH'].includes(code)) assert.deepEqual(stateFrom(code), { code, rest: '' }, code);
+  }
+  assert.equal(stateName('ZZ'), undefined); assert.equal(stateName(undefined), undefined); assert.equal(stateName('tx'), undefined);
+  for (const bad of [undefined, null, 5, '', '   ', 'Texas Avenue', 'Texas Street, Springfield', 'x'.repeat(300), 'tx', 'banana', 'I do not know']) assert.equal(stateFrom(bad), undefined, String(bad));
+  assert.deepEqual(stateFrom('Austin, TX'), { code: 'TX', rest: 'Austin' });
+  assert.deepEqual(stateFrom('it is Texas, thanks'), { code: 'TX', rest: '' });
+  assert.deepEqual(stateFrom('West Virginia'), { code: 'WV', rest: '' }, 'the longer name wins over "Virginia"');
 });

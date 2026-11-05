@@ -33,7 +33,7 @@ function build(o: { settings?: Partial<FastSettings>; caller?: string | undefine
 /** The caller's side of a complete call up to the offer, with the usual answers. */
 async function toOffer(c: ReturnType<typeof fakeCarrier>, when = 'Tuesday at ten'): Promise<void> {
   c.setup(DREW, undefined, 'Testa Invented');   // the greeting asked for the name; this is the answer
-  await c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await c.hears(/What day and time/, when);
   await c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
 }
@@ -48,7 +48,7 @@ test('the whole call: name, address with city and ZIP, day and time, size, $199 
   assert.equal(await t.c.hears(/calling from a number ending in/, 'yes'), 'I see you are calling from a number ending in 0 0 0 2. Is that the best number to reach you?');
   await t.c.hears(/May we send you one automated/, 'yes');
   const readback = await t.c.hears(/To confirm/, 'yes');
-  assert.equal(readback, 'To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0. The price is one hundred ninety-nine dollars. Shall I book it? Say yes or no.');
+  assert.equal(readback, 'To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, California, 9 0 2 1 0. The price is one hundred ninety-nine dollars. Shall I book it? Say yes or no.');
   await finish(t.c);
   assert.equal(t.booked.length, 1);
   const r = t.booked[0];
@@ -69,7 +69,7 @@ test('answers are kept: an address said in pieces asks only for what is missing,
   t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
   await t.c.hears(/street address/, '123 Invented Lane');
   await t.c.hears(/What is the city/, 'Testville');
-  await t.c.hears(/ZIP code\?$/, '90210');
+  await t.c.hears(/ZIP code\?$/, 'CA 90210');
   await t.c.hears(/What day and time/, 'Tuesday');
   await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms');
   await t.c.hears(/And how many bathrooms/, 'two');
@@ -83,7 +83,7 @@ test('answers are kept: an address said in pieces asks only for what is missing,
 test('a name said in one word asks only for the last name; the first and last are used as said', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa');
   await t.c.hears(/last name/, 'Invented');
-  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   assert.equal(t.c.lines.filter((l) => /first and last name/.test(l)).length, 0);
 });
 
@@ -142,7 +142,7 @@ test('HONESTY: asked whether this is a person, a robot or an A I - at ANY step, 
   const b = build(); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
   await b.c.hears(/street address/, '123 Invented Lane'); await b.c.hears(/What is the city/, 'is this a real person?');
   assert.equal(await b.c.hears(/^Yes, I'm an A I assistant/, undefined), ANSWER);
-  await b.c.hears(/^What is the city\?$/, 'Testville'); await b.c.hears(/ZIP code\?$/, '90210'); await b.c.hears(/What day and time/, undefined);
+  await b.c.hears(/^What is the city\?$/, 'Testville'); await b.c.hears(/ZIP code\?$/, 'CA 90210'); await b.c.hears(/What day and time/, undefined);
   // at a confirmation unit, over the line while it is still playing: the answer is given, the unit is spoken again after the approved instruction, and the question confirms or denies nothing
   const c = build(); c.h.serve(c.c.transport); await toOffer(c.c);
   await c.c.hears(/is one hundred ninety-nine dollars/, 'am I talking to a human?', { early: true });   // the helper lets everything pending finish, the answer included
@@ -158,7 +158,7 @@ test('HONESTY: asked whether this is a person, a robot or an A I - at ANY step, 
 
 test('only the one priced size is booked: any other size ends politely before the calendar is read', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
-  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await t.c.hears(/What day and time/, 'Tuesday at ten');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await t.c.hears(/What day and time/, 'Tuesday at ten');
   await t.c.hears(/bedrooms and bathrooms/, 'three bedrooms and two bathrooms');
   await finish(t.c);
   assert.equal(t.last().reason, 'SIZE_NOT_OFFERED'); assert.equal(t.busyCalls(), 0); assert.equal(t.booked.length, 0); assert.match(t.c.lines.at(-1)!, /only book two bedroom, two bathroom homes/);
@@ -222,7 +222,7 @@ test('turn-taking: silence is reprompted once and then ends the call; a line the
   await s.c.drain(() => s.c.ended > 0 && s.c.closed > 0); assert.equal(s.last().reason, 'NO_ANSWER'); assert.match(s.c.lines.at(-1)!, /not hearing a reply/);
   const f = build(); f.h.serve(f.c.transport); f.c.setup(DREW, undefined, 'Testa Invented');
   await f.c.hears(/street address/, undefined); f.c.emit({ kind: 'reply_failed' });
-  await f.c.hears(/^What is the street address, with the city and ZIP code\?$/, '123 Invented Lane, Testville, 90210'); await f.c.hears(/What day and time/, undefined);
+  await f.c.hears(/^What is the street address, with the city and ZIP code\?$/, '123 Invented Lane, Testville, CA 90210'); await f.c.hears(/What day and time/, undefined);
   const h = build(); h.h.serve(h.c.transport); h.c.setup(DREW, undefined, 'Testa Invented'); await h.c.hears(/street address/, undefined); h.c.hangUp();
   assert.equal(h.last().reason, 'CALLER_HUNG_UP'); assert.equal(h.booked.length, 0); assert.equal(h.h.active(), 0);
   const d = build(); d.h.serve(d.c.transport); d.c.setup(DREW, undefined, 'Testa Invented'); await d.c.hears(/street address/, undefined); d.c.emit({ kind: 'speaker_down' }); await d.c.drain(() => d.c.ended > 0); assert.equal(d.last().reason, 'SPEAKER_DOWN');
@@ -305,7 +305,7 @@ test('settle wait: more speech that arrives as an answer cancels the pending que
   const t = build({ settleMs: 80 }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
   await t.c.hears(/street address/, '123 Invented Lane');
   t.c.emit({ kind: 'speech', active: true }); t.c.emit({ kind: 'speech', active: false });
-  t.c.emit({ kind: 'utterance', text: 'Testville, 90210' });   // the rest arrives inside the wait
+  t.c.emit({ kind: 'utterance', text: 'Testville, CA 90210' });   // the rest arrives inside the wait
   await t.c.hears(/What day and time/, 'Tuesday');
   assert.equal(t.c.lines.filter((l) => /^What is the city\?$|^And the ZIP code\?$/.test(l)).length, 0, 'the city and ZIP were said, so they are not asked');
 });
@@ -320,7 +320,7 @@ test('settle wait: the default quiet wait is longer than 1.2 seconds, so a pause
 
 test('dates: one already passed, or beyond the days the calendar is read for, is never taken as asked; the caller is told why and asked again, and nothing is offered or booked from it', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
-  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await t.c.hears(/What day and time/, 'October fourth at ten');
   await t.c.hears(/^That date has already passed\. Which day would you like\?$/, 'December fifteenth at ten');
   await t.c.hears(/^Sorry, I can only book within the next two weeks, up to Monday, November sixteenth\. Which day would you like\?$/, 'Tuesday at ten');
@@ -332,7 +332,7 @@ test('dates: one already passed, or beyond the days the calendar is read for, is
 
 test('dates: after three dates that cannot be used the call ends with a person to follow up, and nothing is booked', async () => {
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
-  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await t.c.hears(/What day and time/, 'October fourth');
   await t.c.hears(/already passed/, 'October fifth');
   await t.c.hears(/already passed/, 'October sixth');
@@ -430,7 +430,7 @@ test('duplicate-email guard: a booking Jobber reports as already made, and a boo
   assert.equal(dup.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. Goodbye.', 'no email is promised'); assert.deepEqual([dup.last().customerEmail, dup.last().ownerEmail, dup.last().booked], ['not_sent', 'not_sent', true]);
   const t = build({ textsEnabled: false, emails: 'accept' }); await toBooked(t); assert.equal(t.mails.length, 2);
   const again = fakeCarrier(); t.h.serve(again.transport); again.setup(DREW, undefined, 'Testa Invented');   // the same call id: the same booking key
-  await again.hears(/street address/, '123 Invented Lane, Testville, 90210'); await again.hears(/What day and time/, 'Tuesday at ten'); await again.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await again.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await again.hears(/What day and time/, 'Tuesday at ten'); await again.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
   await again.hears(/is one hundred ninety-nine dollars/, 'yes'); await again.hears(/calling from a number ending in/, 'yes'); await again.hears(/To confirm/, 'yes'); await finish(again);
   assert.equal(t.mails.length, 2, 'the same booking is never emailed twice'); assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_EMAILS_SKIPPED').map(([, d]) => d), [{ reason: 'ALREADY_SENT' }]); assert.equal(t.booked.length, 2);
 });
@@ -442,7 +442,7 @@ test('turn hold: a question is not spoken while the caller is speaking; it is sp
   const t = build({ holdGraceMs: 60, holdMaxMs: 800 }); t.h.serve(t.c.transport);
   t.c.emit({ kind: 'setup', to: DREW, callSid: `CA${'ab'.repeat(16)}` }); t.c.emit({ kind: 'speech', active: true }); t.c.emit({ kind: 'utterance', text: 'Testa Invented' });   // the caller is still talking when the next question is due
   await sleep(250); assert.equal(t.c.lines.filter((l) => /street address/.test(l)).length, 0, 'nothing is spoken on top of the caller');
-  t.c.emit({ kind: 'speech', active: false }); await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  t.c.emit({ kind: 'speech', active: false }); await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   const hold = t.logs.find(([c]) => c === 'FAST_HOLD')?.[1] as { waitedMs: number; ignored: number }; assert.ok(hold.waitedMs >= 100 && hold.waitedMs < 800, 'it waited, and not to the cap'); assert.equal(hold.ignored, 0);
   assert.deepEqual(Object.keys(hold).sort(), ['ignored', 'waitedMs']); noPersonalDetail(t.logs);
 });
@@ -450,7 +450,7 @@ test('turn hold: a question is not spoken while the caller is speaking; it is sp
 test('turn hold: a speech start that never stops cannot block the call: the question is spoken at the cap', async () => {
   const t = build({ holdGraceMs: 60, holdMaxMs: 150 }); t.h.serve(t.c.transport);
   t.c.emit({ kind: 'setup', to: DREW, callSid: `CA${'ab'.repeat(16)}` }); t.c.emit({ kind: 'speech', active: true }); t.c.emit({ kind: 'utterance', text: 'Testa Invented' });
-  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   const hold = t.logs.find(([c]) => c === 'FAST_HOLD')?.[1] as { waitedMs: number }; assert.ok(hold.waitedMs >= 150 && hold.waitedMs <= 300, `waited ${hold.waitedMs}`);
 });
 
@@ -473,25 +473,25 @@ test('turn hold: words said before a confirmation line was even spoken confirm n
 
 test('fragment settle (day): an answer with nothing usable, or a time without a day, waits for the rest; no follow-up is asked if it arrives, and one is asked if it does not', async () => {
   const a = build({ settleMs: 80 }); a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
-  await a.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await a.c.hears(/What day and time/, 'um'); await sleep(30); a.c.emit({ kind: 'utterance', text: 'tomorrow at ten' });
+  await a.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.c.hears(/What day and time/, 'um'); await sleep(30); a.c.emit({ kind: 'utterance', text: 'tomorrow at ten' });
   await a.c.hears(/bedrooms and bathrooms/, undefined); assert.equal(a.c.lines.filter((l) => /Sorry, which day|^Which day\?$/.test(l)).length, 0, 'the rest arrived in time: nothing was asked');
   const b = build({ settleMs: 80 }); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
-  await b.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await b.c.hears(/What day and time/, 'at ten'); await sleep(30); b.c.emit({ kind: 'utterance', text: 'tomorrow' });
+  await b.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.c.hears(/What day and time/, 'at ten'); await sleep(30); b.c.emit({ kind: 'utterance', text: 'tomorrow' });
   await b.c.hears(/bedrooms and bathrooms/, undefined); assert.equal(b.c.lines.filter((l) => /^Which day\?$/.test(l)).length, 0, 'a time, then the day: no "Which day?"');
   const c = build({ settleMs: 80 }); c.h.serve(c.c.transport); c.c.setup(DREW, undefined, 'Testa Invented');
-  await c.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await c.c.hears(/What day and time/, 'um'); await c.c.hears(/^Sorry, which day would you like\?$/, 'um'); await c.c.hears(/^Sorry, which day would you like\?$/, 'um'); await finish(c.c);
+  await c.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await c.c.hears(/What day and time/, 'um'); await c.c.hears(/^Sorry, which day would you like\?$/, 'um'); await c.c.hears(/^Sorry, which day would you like\?$/, 'um'); await finish(c.c);
   assert.equal(c.last().reason, 'WHEN_UNCLEAR'); assert.equal(c.c.lines.filter((l) => /^Sorry, which day would you like\?$/.test(l)).length, 2, 'asked after the wait each time, and the three tries still end the call');
 });
 
 test('fragment settle (size): "two bedrooms" and then "two bathrooms" in two pieces asks nothing in between; three unusable answers still end the call', async () => {
   const a = build({ settleMs: 80 }); a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
-  await a.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await a.c.hears(/What day and time/, 'tomorrow at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms'); await sleep(30); a.c.emit({ kind: 'utterance', text: 'two bathrooms' });
+  await a.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.c.hears(/What day and time/, 'tomorrow at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms'); await sleep(30); a.c.emit({ kind: 'utterance', text: 'two bathrooms' });
   await a.c.hears(/is one hundred ninety-nine dollars/, undefined); assert.equal(a.c.lines.filter((l) => /^And how many|^Sorry, how many/.test(l)).length, 0);
   const b = build({ settleMs: 80 }); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
-  await b.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await b.c.hears(/What day and time/, 'tomorrow at ten'); await b.c.hears(/bedrooms and bathrooms/, 'um'); await b.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'um'); await b.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'um'); await finish(b.c);
+  await b.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.c.hears(/What day and time/, 'tomorrow at ten'); await b.c.hears(/bedrooms and bathrooms/, 'um'); await b.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'um'); await b.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'um'); await finish(b.c);
   assert.equal(b.last().reason, 'SIZE_UNCLEAR');
   const c = build({ settleMs: 80 }); c.h.serve(c.c.transport); c.c.setup(DREW, undefined, 'Testa Invented');
-  await c.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await c.c.hears(/What day and time/, 'tomorrow at ten'); await c.c.hears(/bedrooms and bathrooms/, 'two bedrooms'); await c.c.hears(/^And how many bathrooms\?$/, 'two');
+  await c.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await c.c.hears(/What day and time/, 'tomorrow at ten'); await c.c.hears(/bedrooms and bathrooms/, 'two bedrooms'); await c.c.hears(/^And how many bathrooms\?$/, 'two');
   await c.c.hears(/is one hundred ninety-nine dollars/, undefined);
 });
 
@@ -505,18 +505,18 @@ test('turn hold: after the caller stops, the question still waits out the grace 
   const t = build({ holdGraceMs: 300, holdMaxMs: 2000 }); t.h.serve(t.c.transport);
   t.c.emit({ kind: 'setup', to: DREW, callSid: `CA${'ab'.repeat(16)}` }); t.c.emit({ kind: 'speech', active: true }); t.c.emit({ kind: 'utterance', text: 'Testa Invented' });
   await sleep(100); t.c.emit({ kind: 'speech', active: false }); await sleep(120);
-  assert.equal(t.c.lines.filter((l) => /street address/.test(l)).length, 0, 'still inside the grace: nothing is spoken'); await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  assert.equal(t.c.lines.filter((l) => /street address/.test(l)).length, 0, 'still inside the grace: nothing is spoken'); await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
 });
 
 test('full-name read-back: the read-back says the first AND last name exactly as heard (a name given in two steps too); a wrong name gets a no, and then nothing is booked, texted or emailed', async () => {
   const a = build({ textsEnabled: false, emails: 'accept' }); a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa'); await a.c.hears(/last name/, 'Invented');
-  await a.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await a.c.hears(/What day and time/, 'Tuesday at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await a.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.c.hears(/What day and time/, 'Tuesday at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
   await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from a number ending in/, 'yes');
-  assert.match(await a.c.hears(/To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, 9 0 2 1 0\. The price is one hundred ninety-nine dollars\. Shall I book it\? Say yes or no\.$/, 'a name said in two steps is read back in full'); await finish(a.c);
+  assert.match(await a.c.hears(/To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, Testville, California, 9 0 2 1 0\. The price is one hundred ninety-nine dollars\. Shall I book it\? Say yes or no\.$/, 'a name said in two steps is read back in full'); await finish(a.c);
   assert.deepEqual([a.booked[0].client.firstName, a.booked[0].client.lastName], ['Testa', 'Invented']);
   // what the recognizer returned is spoken back as it came, so the caller can catch a mishearing; a no books nothing
   const b = build({ textsEnabled: false, emails: 'accept' }); b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Done Bill');   // a misheard name, as the transcript gave it
-  await b.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await b.c.hears(/What day and time/, 'Tuesday at ten'); await b.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await b.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.c.hears(/What day and time/, 'Tuesday at ten'); await b.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
   await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from a number ending in/, 'yes');
   assert.match(await b.c.hears(/To confirm/, 'no'), /for Done Bill on /, 'the heard name is spoken back in full, unchanged'); await finish(b.c);
   assert.equal(b.last().reason, 'DECLINED_AT_READBACK'); assert.equal(b.booked.length, 0, 'nothing was written to Jobber'); assert.equal(b.mails.length, 0); assert.equal(b.texts.length, 0); assert.match(b.c.lines.at(-1)!, /Nothing was booked/);
@@ -535,36 +535,36 @@ test('interruption: every question that is not a confirmation unit, and the info
   for (const r of short) assert.equal(r.flag, false, 'a short line cannot be cleared by the caller: ' + r.l.slice(0, 30));
   // the questions that ask only for what is missing are short lines too
   const p = build(); p.h.serve(p.c.transport); p.c.setup(DREW, undefined, 'Testa Invented');
-  await p.c.hears(/street address/, '123 Invented Lane'); await p.c.hears(/What is the city/, 'Testville'); await p.c.hears(/^And the ZIP code/, '90210'); await p.c.hears(/What day and time/, undefined);
+  await p.c.hears(/street address/, '123 Invented Lane'); await p.c.hears(/What is the city/, 'Testville'); await p.c.hears(/^And the ZIP code/, 'CA 90210'); await p.c.hears(/What day and time/, undefined);
   for (const re of [/street address/, /^What is the city/, /^And the ZIP code/, /What day and time/]) { const i = p.c.lines.findIndex((l) => re.test(l)); assert.equal(p.c.speakOpts[i]?.interruptible, false, String(re)); }
   // an answer given before the question finished is still taken, and nothing is asked twice
   const e = build(); e.h.serve(e.c.transport); e.c.setup(DREW, undefined, 'Testa Invented');
-  await e.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await e.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await e.c.hears(/What day and time/, 'Tuesday at ten', { early: true });
   await e.c.until(() => e.c.lines.some((l) => /bedrooms and bathrooms/.test(l)), 'the size question');
   assert.equal(e.c.lines.filter((l) => /What day and time/.test(l)).length, 1); assert.equal(e.c.lines.filter((l) => /bedrooms and bathrooms/.test(l)).length, 1);
 });
 
-test('FAST_ADDRESS: one line per address answer with the outcome, reason, three flat booleans for street, city and ZIP, and counts; every field survives the log sink, no address text or digit is logged, and the questions asked are unchanged', async () => {
+test('FAST_ADDRESS: one line per address answer with the outcome, reason, four flat booleans for street, city, ZIP and state, and counts; every field survives the log sink, no address text or digit is logged, and the questions asked are unchanged', async () => {
   const sizes = (s: string) => ({ digitRuns: (s.match(/\d+/g) ?? []).length, words: s.trim().split(/\s+/).length, chars: s.trim().length });
   const t = build();
   t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
   await t.c.hears(/street address/, '123 Invented Lane');
   await t.c.hears(/What is the city/, 'Testville');
-  await t.c.hears(/^And the ZIP code/, '90210');
+  await t.c.hears(/^And the ZIP code/, 'CA 90210');
   await t.c.hears(/What day and time/, undefined);
   const lines = t.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
   assert.deepEqual(lines, [
-    { outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, ...sizes('123 Invented Lane') },
-    { outcome: 'partial', reason: 'NEED_ZIP', street: true, city: true, zip: false, digitRuns: 0, words: 1, chars: 9 },
-    { outcome: 'captured', reason: 'JOINED', street: true, city: true, zip: true, ...sizes('90210') },
+    { outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, state: false, ...sizes('123 Invented Lane') },
+    { outcome: 'partial', reason: 'NEED_ZIP', street: true, city: true, zip: false, state: false, digitRuns: 0, words: 1, chars: 9 },
+    { outcome: 'captured', reason: 'JOINED', street: true, city: true, zip: true, state: true, ...sizes('CA 90210') },
   ]);
   // a ZIP followed by extra words is dropped by the parser (unchanged behaviour); the line says so without saying what was heard
-  const said = '123 Invented Lane, Testville, 90210, that is it';
+  const said = '123 Invented Lane, Testville, CA 90210, that is it';
   const u = build(); u.h.serve(u.c.transport); u.c.setup(DREW, undefined, 'Testa Invented');
   await u.c.hears(/street address/, said);
   await u.c.hears(/What is the city/, undefined);
-  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, ...sizes(said) }]);
+  assert.deepEqual(u.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v), [{ outcome: 'partial', reason: 'NEED_CITY', street: true, city: false, zip: false, state: false, ...sizes(said) }]);
   // every field is a flat boolean, number or short token, so the real log sink keeps all of them (it drops anything else)
   for (const l of [...t.logs, ...u.logs]) if (l[0] === 'FAST_ADDRESS') assert.deepEqual(cleanDetail(l[1]), l[1], 'the sink keeps every field');
   // the whole call: the address, its parts and its digits appear in no log line at all
@@ -575,7 +575,7 @@ test('FAST_SIZE: one line per size answer says what the parser found (booleans a
   const flat = (logs: Array<[string, unknown]>) => logs.filter(([k]) => k === 'FAST_SIZE').map(([, v]) => v as Record<string, unknown>);
   // 1. nothing readable, then a lone number-less answer, then both: the retry wording and the count of tries are unchanged
   const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
-  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await t.c.hears(/What day and time/, 'Tuesday at ten');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await t.c.hears(/What day and time/, 'Tuesday at ten');
   await t.c.hears(/bedrooms and bathrooms/, 'banana smoothie please');
   await t.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'two bedrooms');
   await t.c.hears(/^And how many bathrooms/, 'two');
@@ -587,7 +587,7 @@ test('FAST_SIZE: one line per size answer says what the parser found (booleans a
   ]);
   // 2. three answers with no size in them: the third ends the call exactly as before (SIZE_UNCLEAR), and the tries read 0, 1, 2
   const g = build(); g.h.serve(g.c.transport); g.c.setup(DREW, undefined, 'Testa Invented');
-  await g.c.hears(/street address/, '123 Invented Lane, Testville, 90210'); await g.c.hears(/What day and time/, 'Tuesday at ten');
+  await g.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await g.c.hears(/What day and time/, 'Tuesday at ten');
   await g.c.hears(/bedrooms and bathrooms/, 'hmm');
   await g.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'okay then');
   await g.c.hears(/^Sorry, how many bedrooms and bathrooms\?$/, 'thank you');
@@ -597,4 +597,72 @@ test('FAST_SIZE: one line per size answer says what the parser found (booleans a
   // 3. every field is a flat boolean, number or short token, so the real log sink keeps all of them; nothing said is in any line
   for (const l of [...t.logs, ...g.logs]) if (l[0] === 'FAST_SIZE') assert.deepEqual(cleanDetail(l[1]), l[1], 'the sink keeps every field');
   noPersonalDetail(t.logs, ['banana', 'smoothie']); noPersonalDetail(g.logs, ['okay', 'thank you', 'hmm']);
+});
+
+// ---------------------------------------------------------------- the state: the caller's own, asked once when missing, never taken from the config
+
+test('STATE said with the address: no question is asked; the read-back speaks its name; Jobber, the emails and the log use the caller\'s state, never the configured one', async () => {
+  const t = build({ emails: 'accept', textsEnabled: false });   // the config's state is CA (SETTINGS); the caller says Texas
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, Texas 90210');
+  await t.c.hears(/What day and time/, 'Tuesday at ten');
+  await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes');
+  await t.c.hears(/calling from a number ending in/, 'yes');
+  const readback = await t.c.hears(/To confirm/, 'yes');
+  assert.match(readback, /at 123 Invented Lane, Testville, Texas, 9 0 2 1 0\. The price is/, 'the state is read back by its full name');
+  await finish(t.c);
+  assert.equal(t.c.lines.filter((l) => /What state/.test(l)).length, 0, 'a state already said is never asked for');
+  assert.deepEqual(t.booked.map((r) => r.address), [{ street1: '123 Invented Lane', city: 'Testville', postalCode: '90210', province: 'TX' }], 'the Jobber address keeps its shape; the province is the caller\'s');
+  assert.equal(t.mails.length, 2); for (const m of t.mails) { assert.match(m.text, /123 Invented Lane, Testville, TX 90210/); assert.ok(!/\bCA\b/.test(m.text), 'the configured state is not used'); }
+  assert.deepEqual([t.last().reason, t.last().booked], ['BOOKED', true]);
+  assert.ok(!t.logs.some(([c]) => c === 'FAST_STATE'), 'no state question, no state line');
+  noPersonalDetail(t.logs, ['Texas', 'Invented Lane']);
+});
+
+test('STATE missing: asked ONCE ("What state is that in?"), kept, never asked again, and never taken from the config; the answer is read back by name and booked as said', async () => {
+  const t = build({ emails: 'accept', textsEnabled: false });   // config state CA
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/^What state is that in\?$/, 'it is Florida');
+  await t.c.hears(/What day and time/, 'Tuesday at ten');
+  await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes');
+  await t.c.hears(/calling from a number ending in/, 'yes');
+  assert.match(await t.c.hears(/To confirm/, 'yes'), /Testville, Florida, 9 0 2 1 0\./);
+  await finish(t.c);
+  assert.equal(t.c.lines.filter((l) => /What state/.test(l)).length, 1, 'asked once');
+  assert.equal(t.booked.length, 1); assert.equal(t.booked[0].address.province, 'FL', 'the caller\'s state, not the configured CA');
+  assert.ok(t.mails.every((m) => /Testville, FL 90210/.test(m.text) && !/\bCA\b/.test(m.text)));
+  const asks = t.c.lines.filter((l) => /\?|Say yes or no/.test(l)); assert.equal(new Set(asks).size, asks.length, 'no question was asked twice');
+  const st = t.logs.filter(([c]) => c === 'FAST_STATE').map(([, v]) => v);
+  assert.deepEqual(st, [{ state: true, words: 3, chars: 13, tries: 0 }], 'a boolean and counts only');
+  for (const [, v] of t.logs.filter(([c]) => c === 'FAST_STATE' || c === 'FAST_ADDRESS')) assert.deepEqual(cleanDetail(v), v, 'the log sink keeps every field');
+  noPersonalDetail(t.logs, ['Florida', 'Invented Lane']);
+});
+
+test('STATE in pieces: a state said with the city, or before the ZIP, is kept and not asked for again; only what is missing is asked', async () => {
+  const t = build(); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane');
+  await t.c.hears(/What is the city/, 'Testville, Texas');
+  await t.c.hears(/^And the ZIP code/, '90210');
+  await t.c.hears(/What day and time/, undefined);
+  assert.equal(t.c.lines.filter((l) => /What state/.test(l)).length, 0);
+  const rows = t.logs.filter(([c]) => c === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
+  assert.deepEqual(rows.map((r) => [r.reason, r.state]), [['NEED_CITY', false], ['NEED_ZIP', true], ['JOINED', true]]);
+});
+
+test('no state, no booking: two answers that are not a state end the call with a person to follow up; no read-back, no booking, no email, and the question is not asked a third time', async () => {
+  const t = build({ emails: 'accept' }); t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/street address/, '123 Invented Lane, Testville, 90210');
+  await t.c.hears(/^What state is that in\?$/, 'I do not know');
+  await t.c.hears(/^Sorry, which state is that in\?$/, 'banana');
+  await finish(t.c);
+  assert.deepEqual([t.last().reason, t.last().booked], ['STATE_UNCLEAR', false]);
+  assert.equal(t.c.lines.filter((l) => /state is that in/.test(l)).length, 2, 'asked, and once more only because the answer was not understood');
+  assert.equal(t.c.lines.filter((l) => /To confirm|What day and time/.test(l)).length, 0, 'nothing after the address was asked or read back');
+  assert.equal(t.booked.length, 0); assert.equal(t.mails.length, 0); assert.equal(t.texts.length, 0);
+  assert.equal(t.c.lines.at(-1), 'Sorry, I am having trouble with that, so a person will follow up. Goodbye.');
+  assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_STATE').map(([, v]) => (v as { state: boolean }).state), [false, false]);
+  noPersonalDetail(t.logs, ['banana', 'Invented Lane']);
 });
