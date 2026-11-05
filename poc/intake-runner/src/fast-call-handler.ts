@@ -23,7 +23,7 @@ import type { ContactState } from './call-state.ts';
 import { spokenDigits } from './contact-capture.ts';
 import { chooseOffer, lastBookableDate } from './fast-availability.ts';
 import type { AvailabilityConfig, Busy, Offer } from './fast-availability.ts';
-import { countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
+import { countFrom, instantOf, isAiQuestion, lettersFrom, nameFromLetters, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
 import type { When } from './fast-parsers.ts';
 import type { BookingRequest, BookingResult } from './jobber-booking.ts';
 import type { CallTransport, TransportEvent } from './call-transport.ts';
@@ -106,6 +106,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     let settleFn: (() => Promise<void>) | undefined; let speakingSince: number | undefined;   // the pending "ask only what is missing", and when the caller last started speaking
     let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
+    let nameOk = false; let nameNo = 0; let spellBuf = ''; let spellBad = 0;   // the caller's own yes to the name (nothing is booked without it); how many times they said it was wrong; the letters of a spelling heard so far, and the spellings that gave nothing
     const note = (s: string): void => { if (steps.length < 40) steps.push(s); };
     const wordsIn = (s: string): number => (s.trim() === '' ? 0 : s.trim().split(/\s+/).length);   // diagnostics only: how many words, never which
     const clearTimers = (): void => { if (answerTimer !== undefined) clearTimeout(answerTimer); if (settleTimer !== undefined) clearTimeout(settleTimer); answerTimer = undefined; settleTimer = undefined; settleFn = undefined; if (holdTimer !== undefined) clearTimeout(holdTimer); holdTimer = undefined; };
@@ -169,12 +170,13 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
 
     // ---------------------------------------------------------------- the questions
     const nameAnswer = async (heard: string): Promise<void> => {
-      const r = contact.collect('name', heard, true);
-      if (r.outcome !== 'captured') { if (++tries >= 3) return giveUp('NAME_UNCLEAR'); return askName(true); }
+      // Letters said one at a time are not a name: the spelling step reads them, so "D O N" is never kept as the names "D" and "O N".
+      const ok = lettersFrom(heard) === undefined && contact.collect('name', heard, true).outcome === 'captured';
+      if (!ok) { if (++tries >= 3) return giveUp('NAME_UNCLEAR'); return askName(true); }
       const words = (contact.value('name') ?? '').split(' '); firstName = words[0]; lastName = words.slice(1).join(' '); tries = 0;
-      if (lastName === '') return askLast(); return askAddress();
+      if (lastName === '') return askLast(); return confirmName();
     };
-    function askName(retry = false): void { ask('NAME', retry ? 'Sorry, what is your first and last name?' : 'What is your first and last name?', nameAnswer); }
+    function askName(retry = false, lead?: string): void { ask('NAME', lead ?? (retry ? 'Sorry, what is your first and last name?' : 'What is your first and last name?'), nameAnswer); }
     /** The greeting the carrier spoke first already asked for the name: nothing is spoken now, and the first thing the caller says is the answer. */
     function listenName(): void { listen('NAME', 'What is your first and last name?', nameAnswer); }
     /** The truthful answer to "are you a person?", at any step; then the question in progress is asked again (a unit after the approved instruction). */
@@ -188,9 +190,40 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     }
     function askLast(): void {
       ask('LAST_NAME', 'And your last name?', async (heard) => {
-        const r = contact.collect('name', heard, true); const w = (contact.value('name') ?? '').split(' ');
-        if (r.outcome !== 'captured' || w.length === 0) { if (++tries >= 3) return giveUp('NAME_UNCLEAR'); return askLast(); }
-        lastName = w[w.length - 1]; tries = 0; if (w.length >= 2) firstName = w[0]; return askAddress();
+        const ok = lettersFrom(heard) === undefined && contact.collect('name', heard, true).outcome === 'captured'; const w = (contact.value('name') ?? '').split(' ');
+        if (!ok || w.length === 0) { if (++tries >= 3) return giveUp('NAME_UNCLEAR'); return askLast(); }
+        lastName = w[w.length - 1]; tries = 0; if (w.length >= 2) firstName = w[0]; return confirmName();
+      });
+    }
+    /**
+     * The name is confirmed on its own, once, before anything else is asked: the caller hears exactly what was kept ("I have Don Bellamy. Is that right?"). A yes goes on. A no lets the caller correct it: first they say it again, then they SPELL it, first name and
+     * last name, one letter at a time (pieces are put together; only letters are read, so a spelling is never guessed); a third no, or a spelling that gives nothing twice, ends the call with a person to follow up. Nothing is booked, read back or emailed without this yes.
+     */
+    function confirmName(): void {
+      tries = 0;
+      ask('NAME_CONFIRM', `I have ${firstName} ${lastName}. Is that right? Say yes or no.`, async (heard) => {
+        const y = yesNo(heard);
+        deps.log('FAST_NAME', { path: 'CONFIRM', answer: y, no: nameNo });   // a short token and a count: never the name
+        if (y === 'yes') { nameOk = true; note('NAME_CONFIRMED'); return askAddress(); }
+        if (y === 'no') { nameNo++; if (nameNo >= 3) return giveUp('NAME_NOT_CONFIRMED'); if (nameNo === 1) return askName(true, 'Sorry. Please say your first and last name again.'); spellBuf = ''; spellBad = 0; return askSpelling('first'); }
+        return replayUnclear();
+      }, true);
+    }
+    function askSpelling(part: 'first' | 'last', retry = false): void {
+      const id = part === 'first' ? 'SPELL_FIRST' : 'SPELL_LAST';
+      ask(id, retry ? `Sorry, please spell your ${part} name again, one letter at a time.` : `Please spell your ${part} name, one letter at a time.`, async (heard) => {
+        const l = lettersFrom(heard);
+        deps.log('FAST_NAME', { path: id, letters: l === undefined ? 0 : l.length, held: spellBuf.length, words: wordsIn(heard), chars: heard.trim().length });   // counts only: never a letter
+        if (l !== undefined) spellBuf += l;
+        // The letters may come in pieces ("D O", then "N"): the name is taken only after the caller has been quiet for the settle wait, and only from what was heard as letters.
+        armSettle(async () => {
+          if (spellBuf.length >= 2) {
+            const nm = nameFromLetters(spellBuf); spellBuf = ''; spellBad = 0;
+            if (part === 'first') { firstName = nm; return askSpelling('last'); }
+            lastName = nm; return confirmName();
+          }
+          spellBuf = ''; if (++spellBad >= 2) return giveUp('NAME_UNCLEAR'); return askSpelling(part, true);
+        });
       });
     }
     function askAddress(lead?: string): void {
@@ -314,6 +347,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     function finalReadback(): void {
       const o = offer!; const p = contact.addressParts();
       if (p === undefined) return void giveUp('ADDRESS_MISSING');
+      if (!nameOk) return void giveUp('NAME_UNCONFIRMED');   // never read back, or booked, without the caller's own yes to the name
       if (p.state === undefined) return void giveUp('STATE_MISSING');   // never read back, or booked, without the caller's state
       const spokenZip = p.zip.split('').join(' ');
       ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, ${p.city}, ${stateName(p.state)}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
@@ -328,7 +362,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     async function book(): Promise<void> {
       clearTimers(); awaiting = undefined;
       const o = offer!; const p = contact.addressParts();
-      if (p === undefined || p.state === undefined || !S.standingApproval) return end(!S.standingApproval ? 'NO_STANDING_APPROVAL' : p === undefined ? 'ADDRESS_MISSING' : 'STATE_MISSING', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
+      if (p === undefined || p.state === undefined || !nameOk || !S.standingApproval) return end(!S.standingApproval ? 'NO_STANDING_APPROVAL' : !nameOk ? 'NAME_UNCONFIRMED' : p === undefined ? 'ADDRESS_MISSING' : 'STATE_MISSING', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
       // Availability is checked once more, from the calendar, right before anything is written: the time must lie inside the window that was read and still be free.
       { const { from, to } = calendarWindow(); let cal: { busy: Busy[]; complete: boolean }; try { cal = await deps.busy(from, to); } catch { cal = { busy: [], complete: false }; }
         const still = cal.complete ? chooseOffer({ date: o.date, time: o.time }, S.availability, cal.busy, deps.now(), []) : undefined;

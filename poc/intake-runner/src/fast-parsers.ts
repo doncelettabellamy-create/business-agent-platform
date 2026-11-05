@@ -64,6 +64,27 @@ export function countFrom(raw: unknown): number | undefined {
   if (nums.length === 0) { const lone = /^(?:(?:um+|uh+|just|only|maybe|about)\s+)*(to|too|tree|for)\.?$/.exec(squash(raw)); if (lone !== null) return WORDS[lone[1]]; }   // the whole answer is the recognizer's "to", "too" or "for": two, two, four
   return nums.length === 1 && nums[0] >= 0 && nums[0] <= 12 ? nums[0] : undefined;
 }
+// ---------------------------------------------------------------- spelling
+/**
+ * Letters said or written one at a time: "D O N", "d-o-n", "D as in David, O, N", "B E double L A M Y", "O apostrophe B R I E N". The letters joined, in capitals (an apostrophe or hyphen stays, and a hyphen can be said as "dash" or "hyphen").
+ * Undefined unless EVERY word of the answer is a single letter, a "double" letter, or the helper word of an "as in" pair: any other word, or letter names written out ("dee oh en"), is not read, so a spelling is never guessed. One letter alone is returned, so a spelling that
+ * arrives in pieces can be put together by the caller of this function.
+ */
+export function lettersFrom(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || raw.length > 200) return undefined;
+  let t = raw.toLowerCase().replace(/[’]/g, "'").replace(/\b([a-z])\s+(?:as in|as|for|like)\s+[a-z]+\b/g, '$1');
+  t = t.replace(/^\s*(?:(?:um+|uh+|okay|ok|so|yes|sure)[,.\s]+)*(?:(?:it(?:'s|\s+is)|that(?:'s|\s+is)|my (?:first |last )?name is|the name is|it is spelled|spelled)[,:\s]+)?/, '');
+  t = t.replace(/\b(?:hyphen|dash)\b/g, '~').replace(/\bapostrophe\b/g, "'").replace(/\bdouble\s+([a-z])\b/g, '$1$1');
+  const tokens = t.replace(/[.,;:!?]+/g, ' ').replace(/-/g, ' ').split(/\s+/).filter((x) => x !== '');
+  if (tokens.length === 0 || tokens.length > 40) return undefined;
+  let out = '';
+  for (const tok of tokens) { if (!/^(?:[a-z]|([a-z])\1|'|~)$/.test(tok)) return undefined; out += tok; }
+  if (!/[a-z]/.test(out) || /^['~]|['~]$/.test(out) || /['~]{2}/.test(out)) return undefined;
+  return out.replace(/~/g, '-').toUpperCase();
+}
+/** Letters from `lettersFrom` as a name: first letter and any letter after an apostrophe or hyphen in capitals, the rest in lower case ("DON" gives "Don", "O'BRIEN" gives "O'Brien"). */
+export function nameFromLetters(letters: string): string { return letters.toLowerCase().replace(/(^|['-])([a-z])/g, (_m, p: string, c: string) => `${p}${c.toUpperCase()}`); }
+
 /** What an answer to the size question looks like, as flags and a count only (never a word or a number): for the diagnostics, so a failed size answer can be told apart from a missing one. */
 export function sizeShape(raw: unknown): { bedWord: boolean; bathWord: boolean; numberWords: number; homophone: boolean } {
   if (typeof raw !== 'string' || raw.length > 300) return { bedWord: false, bathWord: false, numberWords: 0, homophone: false };

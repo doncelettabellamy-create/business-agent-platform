@@ -101,7 +101,7 @@ test('JOINED: the short opening, a yes, name, address with city and ZIP, day and
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
   assert.equal(r.voices[0].spoken[0], r.notice);
   await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented');   // the answer to the greeting's question: no yes is asked for
-  await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
+  await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await r.hears(/What day and time/, 'Tuesday at ten');
   await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
   assert.equal(await r.hears(/is one hundred ninety-nine dollars/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
@@ -146,20 +146,20 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   // 1. writes off: the booking is refused by the connector and the call says a person will follow up
   const a = await rig({ jobberWrites: false }); assert.equal(a.status.jobberWritesOn, false);
   const sa = await a.connect(); a.start(sa); await until(() => a.voices.length === 1 && a.voices[0].spoken.length >= 1, 'the opening');
-  await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
+  await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/Is that right\? Say yes or no/, 'yes'); await a.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
   await a.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.hears(/calling from/, 'yes'); await a.hears(/May we send you one automated/, 'yes'); await a.hears(/^To confirm/, 'yes');
   assert.match(await a.hears(/could not confirm the booking/), /a person will follow up/); await sa.closed;
   assert.equal(a.jobber.jobs.size, 0); assert.equal(a.twilio.messages.length, 0); assert.equal(a.outcomes[a.outcomes.length - 1].reason, 'BOOKING_NOT_VERIFIED');
   // 2. the 10 A M slot is busy in Jobber's calendar: a later time is offered instead, never the busy one
   const b = await rig(); b.jobber.opts.scheduled = [{ startAt: new Date(instantOf('2026-11-03', '09:00', 'America/Chicago')).toISOString(), endAt: new Date(instantOf('2026-11-03', '12:00', 'America/Chicago')).toISOString() }];
   const sb = await b.connect(); b.start(sb); await until(() => b.voices.length === 1 && b.voices[0].spoken.length >= 1, 'the opening');
-  await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
+  await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/Is that right\? Say yes or no/, 'yes'); await b.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
   const offer = await b.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /Tuesday, November third, 2026 at 12 P M/); sb.end(); await pause(30);
   assert.equal(b.jobber.jobs.size, 0);
   // 3. Jobber says more items exist than were returned: the calendar is treated as unreadable, nothing is offered
   const c = await rig(); c.jobber.opts.hasMoreScheduled = true;
   const sc = await c.connect(); c.start(sc); await until(() => c.voices.length === 1 && c.voices[0].spoken.length >= 1, 'the opening');
-  await c.hears(/Thanks for calling/, 'Testa Invented'); await c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await c.hears(/What day and time/, 'Tuesday at ten'); await c.hears(/bedrooms and bathrooms/, 'two and two');
+  await c.hears(/Thanks for calling/, 'Testa Invented'); await c.hears(/Is that right\? Say yes or no/, 'yes'); await c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await c.hears(/What day and time/, 'Tuesday at ten'); await c.hears(/bedrooms and bathrooms/, 'two and two');
   assert.match(await c.hears(/cannot check the schedule/), /a person will call you/); await sc.closed;
   assert.ok(!c.voices[0].spoken.some((l) => /is one hundred ninety-nine dollars/.test(l)), 'no price or time was offered'); assert.equal(c.jobber.jobs.size, 0);
 });
@@ -170,7 +170,7 @@ test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call 
   const sim = await r.connect(); r.start(sim);
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
   await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented');
-  await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
+  await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await r.hears(/What day and time/, 'Tuesday at ten');
   await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
   assert.equal(await r.hears(/is one hundred ninety-nine dollars/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
@@ -216,12 +216,12 @@ test('JOINED: an UNASSIGNED visit in Jobber (how Drew\'s own bookings are stored
   // 1. an unassigned visit at 9 to 12: the 10 A M asked for is not offered, and the query said it wants unassigned items
   const a = await rig(); a.jobber.opts.scheduled = [busyAt('09:00', '12:00')];
   const sa = await a.connect(); a.start(sa); await until(() => a.voices.length === 1 && a.voices[0].spoken.length >= 1, 'the opening');
-  await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
+  await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/Is that right\? Say yes or no/, 'yes'); await a.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
   const offer = await a.hears(/is one hundred ninety-nine dollars/); assert.match(offer, /Tuesday, November third, 2026 at 12 P M/, 'the unassigned visit was seen, so a later time is offered'); sa.end(); await pause(30);
   const read = a.jobber.ops.find((x) => x.field === 'scheduledItems')!; assert.equal((read.variables.filter as { includeUnassigned?: unknown }).includeUnassigned, true); assert.equal(a.jobber.jobs.size, 0);
   // 2. the slot is free at the offer, then an unassigned visit appears before the caller's final yes: the second read stops the booking and nothing is written
   const b = await rig(); const sb = await b.connect(); b.start(sb); await until(() => b.voices.length === 1 && b.voices[0].spoken.length >= 1, 'the opening');
-  await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
+  await b.hears(/Thanks for calling/, 'Testa Invented'); await b.hears(/Is that right\? Say yes or no/, 'yes'); await b.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await b.hears(/What day and time/, 'Tuesday at ten'); await b.hears(/bedrooms and bathrooms/, 'two and two');
   assert.match(await b.hears(/is one hundred ninety-nine dollars/, 'yes'), /at 10 A M/); await b.hears(/calling from/, 'yes'); await b.hears(/May we send you one automated/, 'yes');
   await b.hears(/^To confirm/); b.jobber.opts.scheduled = [busyAt('10:00', '12:00')]; b.voices[0].hear('yes');   // someone else took the time (an unassigned visit) while the read-back was being said
   assert.match(await b.hears(/no longer available/), /nothing was booked/); await sb.closed;
@@ -237,7 +237,7 @@ test('JOINED: a caller who talks over a short question is not interrupted (no AD
   const said = (id: string): number => r.logs.filter((l) => l.code === 'FAST_SAY' && l.detail?.id === id).length;
   // the line is being spoken (not just handed over: the OFFER waits behind "One moment."), and the caller starts to talk
   const talkOver = async (id: string, text: string, after?: RegExp): Promise<void> => { await until(() => said(id) > 0 && (after === undefined || r.voices[0].spoken.some((l) => after.test(l))) && r.voices[0].playing(), 'the ' + id + ' line to be playing'); r.voices[0].hear(text); };
-  await r.hears(/Thanks for calling/, 'Testa Invented'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
+  await r.hears(/Thanks for calling/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   // 1. the WHEN question is being spoken: the caller answers over it
   await talkOver('WHEN', 'Tuesday at ten');
   await r.hears(/What day and time/); await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');

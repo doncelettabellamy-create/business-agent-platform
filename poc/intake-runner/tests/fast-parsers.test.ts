@@ -1,7 +1,7 @@
 // The deterministic answer parsers of the fast Drew test call. Synthetic phrases only.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addDays, countFrom, instantOf, isAiQuestion, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
+import { addDays, countFrom, instantOf, isAiQuestion, lettersFrom, nameFromLetters, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
 
 const TZ = 'America/Chicago';
 const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 2 November 2026, 9:00 in Chicago (standard time, UTC-6; summer time ended on 1 November)
@@ -105,4 +105,13 @@ test('size shape: flags and a count that say what an answer looked like, and nev
   assert.deepEqual(sizeShape('banana smoothie please'), { bedWord: false, bathWord: false, numberWords: 0, homophone: false });
   for (const bad of [undefined, null, 5, 'x'.repeat(400)]) assert.deepEqual(sizeShape(bad), { bedWord: false, bathWord: false, numberWords: 0, homophone: false });
   for (const v of Object.values(sizeShape('two bedrooms and two baths'))) assert.ok(typeof v === 'boolean' || typeof v === 'number');
+});
+
+test('spelling: letters said or written one at a time are joined; only letters are read, so a spelling is never guessed; one letter alone is returned so pieces can be put together', () => {
+  for (const [said, letters] of [
+    ['D O N', 'DON'], ['d-o-n', 'DON'], ['D, O, N.', 'DON'], ['D as in David, O as in Oscar, N as in Nancy', 'DON'], ['B E double L A M Y', 'BELLAMY'], ['O apostrophe B R I E N', "O'BRIEN"], ['A N N dash M A R I E', 'ANN-MARIE'],
+    ["it's D O N", 'DON'], ['my first name is D O N', 'DON'], ['okay, spelled D O N', 'DON'], ['N', 'N'], ['double L', 'LL'], ['A as in Alpha, M, Y', 'AMY'], ['D as in', 'D'],
+  ]) assert.equal(lettersFrom(said), letters, said);
+  for (const bad of ['Don', 'Done', 'dee oh en', 'D O N please', 'yes', 'um', '', '   ', 'D O 5', 'hello there', "D O N B'", 'banana', 'x'.repeat(300), undefined, null, 7]) assert.equal(lettersFrom(bad), undefined, String(bad));
+  assert.equal(nameFromLetters('DON'), 'Don'); assert.equal(nameFromLetters("O'BRIEN"), "O'Brien"); assert.equal(nameFromLetters('ANN-MARIE'), 'Ann-Marie'); assert.equal(nameFromLetters('BELLAMY'), 'Bellamy');
 });
