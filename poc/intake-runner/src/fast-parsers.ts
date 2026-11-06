@@ -82,6 +82,42 @@ export function lettersFrom(raw: unknown): string | undefined {
   if (!/[a-z]/.test(out) || /^['~]|['~]$/.test(out) || /['~]{2}/.test(out)) return undefined;
   return out.replace(/~/g, '-').toUpperCase();
 }
+/**
+ * Letters said one at a time, in WORDS (a street name has several): "W O O D L A N D, H I L L S, D R I V E" gives ["Woodland", "Hills", "Drive"]. A word ends at a full stop, comma, semicolon, colon, question or exclamation mark (how a transcript writes a pause);
+ * the letters inside a word are read exactly as `lettersFrom` reads them. A plain road word said instead of spelled ("Drive", "Street") is kept as that word. Undefined unless EVERY part is letters or a plain road word: any other word means nothing is read,
+ * so a spelling is never guessed.
+ */
+const PLAIN_ROAD = /^(?:street|avenue|road|lane|drive|court|way|place|terrace|boulevard|circle|trail)$/i;
+export function lettersWordsFrom(raw: unknown): string[] | undefined {
+  if (typeof raw !== 'string' || raw.length > 300) return undefined;
+  const parts = raw.split(/[.,;:!?]+/).map((p) => p.trim()).filter((p) => p !== '');
+  if (parts.length === 0 || parts.length > 8) return undefined;
+  const out: string[] = [];
+  for (const p of parts) {
+    if (PLAIN_ROAD.test(p)) { out.push(p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()); continue; }
+    const l = lettersFrom(p); if (l === undefined) return undefined;
+    out.push(nameFromLetters(l));
+  }
+  return out;
+}
+
+/** The part of a booking the caller says is wrong, after a "no" to the read-back: the address, the day and time, the name, nothing is to be changed and the call is over ("no", "never mind"), or nothing is wrong after all ("it is fine"; the read-back is then spoken again and still needs its own yes). Undefined when no single part is named (two parts, or neither). Pure. */
+export type Field = 'address' | 'time' | 'name' | 'none' | 'ok';
+/** "It is fine", "that is right", "nothing is wrong": an explicit statement that nothing is wrong. A bare "go ahead" or "book it" is NOT one ("go ahead and fix it"; "do not book it"), and a negated phrase ("it is not fine") never matches. */
+const FINE = /(?:\b(?:it|that|everything) is (?:fine|right|correct|good|ok|okay)\b|\bnothing (?:is )?wrong\b|(?<!not )(?<!n't )\b(?:all good|all set|sounds good|looks good)\b)/;
+export function fieldFrom(raw: unknown): Field | undefined {
+  if (typeof raw !== 'string' || raw.length > 300) return undefined;
+  const t = raw.toLowerCase().replace(/[’]/g, "'").replace(/\b(it|that|what|there)'s\b/g, '$1 is').replace(/[^a-z0-9' ]+/g, ' ').replace(/\b(?:name|number)\s+of\s+(?:the\s+)?(street|city|state|road|house)\b/g, '$1').replace(/\b(street|city|state|road|house)\s+(?:name|number)\b/g, '$1').replace(/\s+/g, ' ').trim();
+  if (FINE.test(t)) return 'ok';
+  const found: Field[] = [];
+  if (/\b(?:address|street|city|zip|state|road|house|location)\b/.test(t)) found.push('address');
+  if (/\b(?:time|day|date|when|morning|afternoon|evening|appointment|schedule|tomorrow|today|(?:mon|tues|wednes|thurs|fri|satur|sun)day)\b/.test(t)) found.push('time');
+  if (/\bname\b/.test(t)) found.push('name');
+  if (found.length === 1) return found[0];
+  if (found.length > 1) return undefined;
+  return yesNo(raw) === 'no' || /\b(?:nothing|none|neither)\b/.test(t) ? 'none' : undefined;
+}
+
 /** Letters from `lettersFrom` as a name: first letter and any letter after an apostrophe or hyphen in capitals, the rest in lower case ("DON" gives "Don", "O'BRIEN" gives "O'Brien"). */
 export function nameFromLetters(letters: string): string { return letters.toLowerCase().replace(/(^|['-])([a-z])/g, (_m, p: string, c: string) => `${p}${c.toUpperCase()}`); }
 

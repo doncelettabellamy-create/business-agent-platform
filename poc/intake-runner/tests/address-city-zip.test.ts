@@ -220,3 +220,28 @@ test('a lower-case or mixed-case state is taken only when something anchors it: 
   assert.deepEqual(stateFrom('Hartford, CT'), { code: 'CT', rest: 'Hartford' }); assert.equal(stateFrom('Hartford CT'), undefined, 'no comma: it may end a street'); assert.deepEqual(stateFrom('Hartford Connecticut'), { code: 'CT', rest: 'Hartford' }, 'the full name always counts');
   assert.deepEqual(stateFrom('Springfield, tx'), { code: 'TX', rest: 'Springfield' }); assert.equal(stateFrom('Springfield tx'), undefined, 'lower case with no anchor'); assert.deepEqual(stateFrom('Springfield tx', true), { code: 'TX', rest: 'Springfield' }, 'anchored by a ZIP code just taken off');
 });
+
+test('correctStreet: a corrected street replaces ONLY the street; the city, ZIP code and state stay; a street name alone keeps the house number; a number alone is held for the name; anything else changes nothing', () => {
+  const held = (): ReturnType<typeof state> => { const s = state(); say(s, `${STREET}, Springfield, IL 91364`); return s; };
+  const parts = (s: ReturnType<typeof state>) => s.addressParts();
+  const a = held(); assert.deepEqual(parts(a), { street: STREET, city: 'Springfield', zip: '91364', state: 'IL' });
+  const r = a.correctStreet('456 Woodland Hills Drive'); assert.deepEqual([r.outcome, r.reason], ['captured', 'CORRECTED']);
+  assert.deepEqual(parts(a), { street: '456 Woodland Hills Drive', city: 'Springfield', zip: '91364', state: 'IL' }); assert.equal(a.value('address'), '456 Woodland Hills Drive, Springfield, 91364');
+  const b = held(); b.correctStreet('Woodland Hills Drive'); assert.equal(parts(b)?.street, '1427 Woodland Hills Drive', 'the house number that was held stays');
+  const c = held(); assert.equal(c.correctStreet('456').outcome, 'unclear'); assert.equal(parts(c)?.street, STREET, 'a number alone changes nothing yet');
+  const c2 = c.correctStreet('Woodland Hills Drive'); assert.equal(c2.outcome, 'captured'); assert.equal(parts(c)?.street, '456 Woodland Hills Drive', 'the number said first and the name after it are put together');
+  const d = held(); d.correctStreet('456 Woodland Hills Drive, Shelbyville, 62565'); assert.deepEqual(parts(d), { street: '456 Woodland Hills Drive', city: 'Shelbyville', zip: '62565', state: 'IL' }, 'a city and ZIP said with it replace those parts too');
+  for (const nothing of ['hmm', 'yeah', '', '   ', 'x'.repeat(400)]) { const e = held(); const x = e.correctStreet(nothing); assert.equal(x.outcome, 'unclear', nothing); assert.deepEqual(parts(e), { street: STREET, city: 'Springfield', zip: '91364', state: 'IL' }, 'nothing changed'); }
+  const empty = state(); assert.equal(empty.correctStreet('456 Woodland Hills Drive').reason, 'INACTIVE', 'no address is held yet: nothing to correct'); assert.equal(empty.addressParts(), undefined);
+  const plain = createContactState(); assert.equal(plain.correctStreet('456 Woodland Hills Drive').reason, 'INACTIVE', 'only the city-and-ZIP mode corrects a street');
+  const g = held(); g.dispose(); assert.equal(g.correctStreet('456 Woodland Hills Drive').reason, 'INACTIVE');
+});
+
+test('correctStreet (DEFECT-1-3): a street name said alone is taken only with a road word in it; any other word is not a street name, is not held, and changes nothing', () => {
+  const held = (): ReturnType<typeof state> => { const s = state(); say(s, `${STREET}, Springfield, IL 91364`); return s; };
+  for (const word of ['Sorry', 'Springfield', 'Woodland Hills', 'Maple', 'thank you']) { const s = held(); assert.equal(s.correctStreet(word).outcome, 'unclear', word); assert.equal(s.addressParts()?.street, STREET, word); assert.equal(s.correctStreet('456').outcome, 'unclear', 'a number said next is held alone'); assert.equal(s.addressParts()?.street, STREET, `"${word}" was not held: nothing is joined to the number`); }
+  const a = held(); assert.equal(a.correctStreet('Woodland Hills Drive').outcome, 'captured'); assert.equal(a.addressParts()?.street, '1427 Woodland Hills Drive', 'a road word makes it a street name; the house number held stays');
+  const b = held(); assert.equal(b.correctStreet('Maple St.').outcome, 'captured'); assert.equal(b.addressParts()?.street, '1427 Maple St', 'the closing full stop of a transcript is not part of the street');
+  const c = held(); assert.equal(c.correctStreet('456').outcome, 'unclear'); assert.equal(c.correctStreet('Maple').outcome, 'captured', 'a number said first and any street name after it are put together'); assert.equal(c.addressParts()?.street, '456 Maple');
+  const d = held(); assert.equal(d.correctStreet('456 Sorry').outcome, 'captured', 'with its house number it is a whole street, as in the first collection; the caller then hears it spelled and confirms it');
+});

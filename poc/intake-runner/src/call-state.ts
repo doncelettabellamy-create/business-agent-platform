@@ -38,7 +38,7 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   NEED_CITY / NEED_ZIP   (city-and-ZIP mode only) the street address is held and the city, or the ZIP code, is still needed: only that part is asked.   BAD_ZIP   the ZIP code heard was not five digits (or was all zeros): nothing was taken.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'JOINED' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'JOINED' | 'CORRECTED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -179,6 +179,8 @@ export interface ContactState {
   spokenAddress(): string | undefined;
   /** City-and-ZIP mode, once the address is whole: its parts kept apart (a street address, a city, a five-digit ZIP code, and the two-letter state when the caller said it), for a system that needs them separately. The state is never filled in from anywhere else: absent until the caller says it. RAW personal data. Undefined until the address is whole, or when the mode is off. */
   addressParts(): { street: string; city: string; zip: string; state?: string } | undefined;
+  /** City-and-ZIP mode, once the address is whole: a CORRECTED street (the house number and the street name said whole, or the street name alone with the house number kept) replaces ONLY the street. A city, ZIP code or state said with it replaces that part too; every part not said stays as it was. Anything else changes nothing and is `unclear`. RAW personal data in, nothing logged. */
+  correctStreet(raw: unknown): CollectResult;
   /** City-and-ZIP mode: which of the address parts are held (the state included), as booleans only (never a part itself), for a log line. */
   addressHeld(): { street: boolean; city: boolean; zip: boolean; state: boolean };
   status(): ContactStatus;
@@ -415,6 +417,22 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
     },
     spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aState === '' ? '' : `${stateName(aState)}, `}${aZip.split('').join(' ')}` : values.address; },
     addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' ? undefined : { street: aStreet, city: aCity, zip: aZip, ...(aState === '' ? {} : { state: aState }) }; },
+    correctStreet(raw) {
+      if (disposed || !cityZip || typeof raw !== 'string' || aStreet === '' || aCity === '' || aZip === '') return { field: 'address', outcome: 'unclear', learn: [], reason: 'INACTIVE' };
+      const keep = { street: aStreet, city: aCity, zip: aZip, state: aState };
+      // Read the line as an address of its own, then keep every part the caller did not say again. Half-heard pieces (a house number on its own) stay held for the next answer, as in the first collection.
+      aStreet = ''; aCity = ''; aZip = ''; aState = ''; delete values.address;
+      const r = collectAddressCZ(raw);
+      let street = aStreet;
+      // The street name said alone: the house number already held stays (the caller then hears the whole street spelled and confirms it). Only a name with a road word in it ("Woodland Hills Drive") is taken: any other word ("sorry", a city) is not a street name, and a failed correction must not be spent on it.
+      const hasRoadWord = pendStreet.split(' ').some((w) => ROAD_WORD.has(w.toLowerCase().replace(/\.$/, '')));
+      if (street === '' && pendStreet !== '' && pendNumber === '' && hasRoadWord) { const m = /^(\d[\d-]*[A-Za-z]?)\s/.exec(keep.street); if (m !== null) { const j = addressFrom(`${m[1]} ${pendStreet}`); if (j !== undefined) { street = j; pendStreet = ''; } } }
+      if (street === '') { aStreet = keep.street; aCity = keep.city; aZip = keep.zip; aState = keep.state; if (pendNumber === '') pendStreet = ''; assemble(); return { field: 'address', outcome: 'unclear', learn: [], reason: r.reason === 'BAD_ZIP' ? 'BAD_ZIP' : 'NO_STREET_NUMBER' }; }
+      aStreet = street; pendNumber = ''; pendStreet = '';
+      if (aCity === '') aCity = keep.city; if (aZip === '') aZip = keep.zip; if (aState === '') aState = keep.state;
+      assemble();
+      return { field: 'address', outcome: 'captured', learn: [...new Set([...r.learn, street])], reason: 'CORRECTED' };
+    },
     addressHeld() { return disposed ? { street: false, city: false, zip: false, state: false } : { street: aStreet !== '', city: aCity !== '', zip: aZip !== '', state: aState !== '' }; },
     status() {
       const captured: string[] = []; const missing: string[] = [];

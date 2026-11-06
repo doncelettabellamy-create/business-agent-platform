@@ -1,7 +1,7 @@
 // The deterministic answer parsers of the fast Drew test call. Synthetic phrases only.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addDays, countFrom, instantOf, isAiQuestion, lettersFrom, nameFromLetters, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
+import { addDays, countFrom, instantOf, fieldFrom, isAiQuestion, lettersFrom, lettersWordsFrom, nameFromLetters, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo, zonedParts } from '../src/fast-parsers.ts';
 
 const TZ = 'America/Chicago';
 const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 2 November 2026, 9:00 in Chicago (standard time, UTC-6; summer time ended on 1 November)
@@ -114,4 +114,27 @@ test('spelling: letters said or written one at a time are joined; only letters a
   ]) assert.equal(lettersFrom(said), letters, said);
   for (const bad of ['Don', 'Done', 'dee oh en', 'D O N please', 'yes', 'um', '', '   ', 'D O 5', 'hello there', "D O N B'", 'banana', 'x'.repeat(300), undefined, null, 7]) assert.equal(lettersFrom(bad), undefined, String(bad));
   assert.equal(nameFromLetters('DON'), 'Don'); assert.equal(nameFromLetters("O'BRIEN"), "O'Brien"); assert.equal(nameFromLetters('ANN-MARIE'), 'Ann-Marie'); assert.equal(nameFromLetters('BELLAMY'), 'Bellamy');
+});
+
+test('spelling in words: a street name spelled word by word is read as words; only letters (or a plain road word) are read, so nothing is guessed', () => {
+  assert.deepEqual(lettersWordsFrom('W O O D L A N D, H I L L S, D R I V E'), ['Woodland', 'Hills', 'Drive']);
+  assert.deepEqual(lettersWordsFrom('W-O-O-D-L-A-N-D. H-I-L-L-S. Drive.'), ['Woodland', 'Hills', 'Drive']);
+  assert.deepEqual(lettersWordsFrom('it is W O O D L A N D'), ['Woodland']);
+  assert.deepEqual(lettersWordsFrom('O apostrophe B R I E N, S T'), ["O'Brien", 'St']);
+  assert.deepEqual(lettersWordsFrom('O apostrophe B R I E N. Street'), ["O'Brien", 'Street']);
+  assert.deepEqual(lettersWordsFrom('E, M A I N, S T'), ['E', 'Main', 'St']);
+  for (const bad of ['Woodland Hills Drive', 'hmm', 'not sure', 'two bedrooms', '', '   ', '.,;', 'W O O D L A N D, Hills', 'x'.repeat(301), 'A. B. C. D. E. F. G. H. I.', undefined, null, 7]) assert.equal(lettersWordsFrom(bad), undefined, String(bad));
+});
+
+test('field: after a no to the read-back, the part named is the address, the day and time, the name, or nothing; two parts, or none, is not read', () => {
+  for (const [said, field] of [['the address', 'address'], ['wrong address', 'address'], ['the street name', 'address'], ['it is the city', 'address'], ['the zip code', 'address'], ['the street', 'address'], ['the house number', 'address'],
+    ['the day and time', 'time'], ['the time', 'time'], ['Tuesday', 'time'], ['the date is wrong', 'time'], ['my name', 'name'], ['the last name', 'name'], ['the name is wrong', 'name'],
+    ['no', 'none'], ['No.', 'none'], ['never mind', 'none'], ['nothing', 'none'], ['cancel', 'none']] as const) assert.equal(fieldFrom(said), field, said);
+  for (const bad of ['the name and the address', 'the address and the time', 'hmm', 'yes', 'maybe', '', 'x'.repeat(301), undefined, null, 7]) assert.equal(fieldFrom(bad), undefined, String(bad));
+});
+
+test('field (DEFECT-1-3): "it is fine" and the like say nothing is wrong, a negated or bare "go ahead" does not, and "the name of the street" names the address', () => {
+  for (const said of ["it's fine", 'no, it is fine, go ahead', 'that is right', "that's correct", 'everything is okay', 'nothing is wrong', 'nothing wrong', 'all good', 'sounds good', 'looks good']) assert.equal(fieldFrom(said), 'ok', said);
+  for (const [said, field] of [['it is not fine', 'none'], ["it isn't right", undefined], ['no that is not right', 'none'], ['not all good', 'none'], ['go ahead and fix the address', 'address'], ['do not book it', 'none'], ['go ahead', undefined], ['yes', undefined],
+    ['the name of the street', 'address'], ['the name of the city', 'address'], ['the number of the house', 'address'], ['the street name', 'address'], ['the name', 'name'], ['my last name', 'name'], ['nothing', 'none'], ['never mind', 'none']] as const) assert.equal(fieldFrom(said), field, said);
 });
