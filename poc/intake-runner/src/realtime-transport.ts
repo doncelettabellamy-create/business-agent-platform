@@ -190,7 +190,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
 
   const session = (interruptible: boolean): unknown => ({
     type: 'session.update',
-    session: { type: 'realtime', instructions: sessionInstructions, output_modalities: ['audio'], ...reasoning, ...tools, audio: { input: { transcription: { model: options.transcriptionModel, ...hints }, turn_detection: { type: 'server_vad', create_response: false, interrupt_response: interruptible } }, output: { voice: options.voice } } },
+    session: { type: 'realtime', instructions: sessionInstructions, output_modalities: ['audio'], ...reasoning, ...tools, audio: { input: { transcription: { model: options.transcriptionModel, ...hints }, turn_detection: { type: 'semantic_vad', create_response: false, interrupt_response: interruptible } }, output: { voice: options.voice } } },
   });
   const clearTimers = (): void => {
     if (hangupTimer !== undefined) { clearTimeout(hangupTimer); hangupTimer = undefined; }

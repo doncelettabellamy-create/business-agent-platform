@@ -150,6 +150,7 @@ test('consent: the notice is spoken first, exactly, and cannot be talked over; t
   assert.equal(r.sim.sent[2].response.conversation, 'none', 'out of band: nothing is added to the voice service\'s own conversation');
   assert.equal(r.sim.sent[0].session.instructions, SPEAK_ONLY);
   assert.equal(r.sim.sent[0].session.audio.input.turn_detection.create_response, false, 'the voice service never replies on its own');
+  assert.equal(r.sim.sent[0].session.audio.input.turn_detection.type, 'semantic_vad', 'turn taking is decided by meaning, not by silence alone'); assert.deepEqual(Object.keys(r.sim.sent[0].session.audio.input.turn_detection).sort(), ['create_response', 'interrupt_response', 'type'], 'no other turn-detection setting is changed (no threshold, silence or eagerness override)');
   assert.equal(r.handler.active(), 1);
   r.sim.drop({ cause: 'PEER', code: 1000 }); await r.handler.idle();
 });
