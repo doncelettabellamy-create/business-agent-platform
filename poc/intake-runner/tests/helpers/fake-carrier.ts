@@ -19,10 +19,10 @@ export function fakeCarrier(opts: { measures?: boolean } = {}) {
     finish(v: Verdict = 'played'): void { for (const r of waiting.splice(0)) r(v); },
     until,
     /** Waits for the handler to speak a line matching `re` (after the last one this helper matched), lets what is playing finish, then the caller answers. `early` answers BEFORE the line has finished. */
-    async hears(re: RegExp, reply: string | undefined, o: { early?: boolean; verdict?: Verdict } = {}): Promise<string> {
+    async hears(re: RegExp, reply: string | undefined, o: { early?: boolean; verdict?: Verdict; before?: () => void } = {}): Promise<string> {
       await until(() => spoken.slice(cursor).some((l) => re.test(l)), `a line matching ${re}`);
       const idx = spoken.findIndex((l, i) => i >= cursor && re.test(l)); cursor = idx + 1; const line = spoken[idx];
-      await until(() => waiting.length > 0, 'the line to be playing');
+      await until(() => waiting.length > 0, 'the line to be playing'); o.before?.();
       if (o.early && reply !== undefined) { api.emit({ kind: 'utterance', text: reply }); await new Promise((r) => setTimeout(r, 5)); api.finish(o.verdict ?? 'played'); }
       else { api.finish(o.verdict ?? 'played'); await new Promise((r) => setTimeout(r, 5)); if (reply !== undefined) api.emit({ kind: 'utterance', text: reply }); }
       return line;

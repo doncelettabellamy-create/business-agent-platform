@@ -87,7 +87,7 @@ const first = (s: string): string => s.trim().split(/\s+/)[0] ?? '';
 
 /** What Jack says, truthfully, when asked whether he is a person or a machine. */
 export const AI_ANSWER = "Yes, I'm an A I assistant for Drew Cleaning, not a person. This is a test call.";
-interface Awaiting { id: string; text: string; unit: boolean; playing: boolean; heldEarly: boolean; replays: number; reprompts: number; /** The caller asked if this is an A I: the question is repeated only after that answer has played. */ deferred?: boolean; /** The question is waiting for the caller to stop speaking; nothing has been said yet. */ holding?: boolean; ignored?: number; onAnswer: (heard: string) => Promise<void> }
+interface Awaiting { id: string; text: string; unit: boolean; playing: boolean; heldEarly: boolean; replays: number; reprompts: number; /** The caller asked if this is an A I: the question is repeated only after that answer has played. */ deferred?: boolean; /** The question is waiting for the caller to stop speaking; nothing has been said yet. */ holding?: boolean; ignored?: number; /** What this play will say (it may be changed while the question waits to be spoken). */ speakText?: string; /** The last replay was asked for because the caller's speech cut the unit; if that speech proves to be noise, the replay is plain. */ cutReplay?: boolean; onAnswer: (heard: string) => Promise<void> }
 
 /**
  * A name spoken letter by letter, so a near-identical word can be told apart by ear (Live Test #7: "Done" was heard as "Don" and confirmed): "Done" gives "D O N E"; the words of a longer name are set apart ("De La Cruz" gives "D E, L A, C R U Z");
@@ -184,7 +184,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const tick = (): void => {
         holdTimer = undefined; if (done || awaiting !== a) return;
         if (callerBusy() && waited < holdMaxMs) { waited += 25; holdTimer = setTimeout(tick, 25); holdTimer.unref?.(); return; }
-        a.holding = false; deps.log('FAST_HOLD', { waitedMs: waited, ignored: a.ignored ?? 0 }); speakIt(a, text);
+        a.holding = false; deps.log('FAST_HOLD', { waitedMs: waited, ignored: a.ignored ?? 0 }); speakIt(a, a.speakText ?? text);
       };
       holdTimer = setTimeout(tick, 25); holdTimer.unref?.();
     }
@@ -194,7 +194,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
 
     // ---------------------------------------------------------------- speaking, with the measured playback verdict
     function play(a: Awaiting, text: string): void {
-      a.playing = true; a.heldEarly = false;
+      a.playing = true; a.heldEarly = false; a.speakText = text;
       if (callerBusy()) { holdThenPlay(a, text); return; }
       speakIt(a, text);
     }
@@ -207,6 +207,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         if (a.unit && (v !== 'played' || a.heldEarly)) {
           a.replays++; deps.log('CONFIRM_REPLAY', { id: a.id, verdict: v, held: a.heldEarly, n: a.replays });
           if (a.replays > 2) return end('UNCONFIRMED', 'I could not confirm that, so I will end the call. Goodbye.');
+          a.cutReplay = !a.heldEarly && v === 'cut';   // cut by the caller's speech: if that speech turns out to be noise (an empty transcript) the replay is plain and costs no replay
           return play(a, `Please wait until I have finished, then answer. ${a.text}`);
         }
         armAnswerTimer(a);
@@ -589,8 +590,14 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         if (settleTimer !== undefined) { clearTimeout(settleTimer); settleTimer = undefined; } settleFn = undefined;
         if (isAiQuestion(heard)) { if (answerTimer !== undefined) { clearTimeout(answerTimer); answerTimer = undefined; } enqueue(async () => answerAi()); return; }   // answered truthfully before anything else, even over a line that is still playing
         const a = awaiting;
+        // A clear NO said over a confirmation unit (still playing, cut, or waiting to be replayed) is taken at once: a no never books anything, and a caller who has already said no should not hear the whole line again. A YES is never taken early.
+        if (a !== undefined && a.unit && (a.holding === true || a.playing) && yesNo(heard) === 'no') {
+          if (holdTimer !== undefined) { clearTimeout(holdTimer); holdTimer = undefined; }
+          a.holding = false; a.playing = false; a.cutReplay = false; deps.log('CONFIRM_EARLY_NO', { id: a.id });
+        } else {
         if (a !== undefined && a.unit && a.holding === true) { a.ignored = (a.ignored ?? 0) + 1; return; }   // said before this line was spoken at all: it confirms nothing, and it is not a reason to replay the line
         if (a !== undefined && a.unit && a.playing) { a.heldEarly = true; deps.log('CONFIRM_HELD', { id: a.id }); return; }   // a yes before the whole line was played confirms nothing
+        }
         if (answerTimer !== undefined) { clearTimeout(answerTimer); answerTimer = undefined; }
         enqueue(async () => { const cur = awaiting; if (cur === undefined || cur.playing && cur.unit) return; cur.reprompts = 0; await cur.onAnswer(heard); });
         return;
@@ -602,6 +609,11 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         if (ev.active) { graceOver = false; graceTimer = setTimeout(() => { graceOver = true; graceTimer = undefined; }, 10_000 + holdGraceMs); }   // the long timer only matters if the matching stop never arrives
         else graceTimer = setTimeout(() => { graceOver = true; graceTimer = undefined; }, holdGraceMs);
         graceTimer.unref?.();
+        return;
+      }
+      if (ev.kind === 'partial') {   // an empty or unusable transcript. After a cut, while the replay still waits for quiet, the cut was noise: the replay drops its "please wait" and does not count
+        const a = awaiting;
+        if (a !== undefined && a.unit && a.holding === true && a.cutReplay === true) { a.cutReplay = false; a.replays = Math.max(0, a.replays - 1); a.speakText = a.text; deps.log('CONFIRM_FALSE_CUT', { id: a.id, n: a.replays }); }
         return;
       }
       if (ev.kind === 'reply_failed') { const a = awaiting; if (a !== undefined) enqueue(async () => { if (awaiting !== a) return; if (++a.replays > 2) return end('REPLY_FAILED', undefined); play(a, a.text); }); return; }

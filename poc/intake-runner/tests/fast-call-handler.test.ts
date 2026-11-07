@@ -1055,3 +1055,44 @@ test('ADDRESS shape log: a rejected address answer logs only its shape (digit 9,
   for (const r of rows) { assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field'); if (typeof r.shape === 'string') assert.match(r.shape, /^[a9_.:CQSHP-]{1,48}$/); }
   const all = JSON.stringify(t.logs); for (const secret of ['Zorblax', 'Quentin', 'Quibble', '2468', 'Zorblax 2468']) assert.ok(!all.includes(secret), `${secret} must not appear in any log`);
 });
+
+// ---- Live Test #11: early NO and false-interruption recovery over a confirmation unit (no VAD change; a YES is never taken early)
+const noiseCut = async (c: ReturnType<typeof fakeCarrier>, re: RegExp): Promise<void> => {
+  await c.hears(re, undefined, { verdict: 'cut', before: () => c.emit({ kind: 'speech', active: true }) });   // the caller's speech cuts the line ...
+  c.emit({ kind: 'speech', active: false }); c.emit({ kind: 'partial' });   // ... and proves to be noise: nothing could be transcribed
+};
+
+test('early NO: a no said over the offer is taken at once (no held yes, no replay), nothing is booked; a YES said over it is still held and confirms nothing', async () => {
+  const a = build({ emails: 'accept', textsEnabled: false, holdGraceMs: 30 }); a.h.serve(a.c.transport); await toOffer(a.c);
+  await a.c.hears(/is one hundred ninety-nine dollars/, 'no', { early: true });
+  assert.equal(a.logs.filter(([c]) => c === 'CONFIRM_EARLY_NO').length, 1); assert.ok(!a.logs.some(([c]) => c === 'CONFIRM_HELD' || c === 'CONFIRM_REPLAY'), 'a no needs no replay');
+  await sleep(120); assert.ok(!a.c.lines.some((l) => /^Please wait until I have finished/.test(l)), 'the line was not read again'); assert.equal(a.booked.length, 0);
+  const b = build({ emails: 'accept', textsEnabled: false, holdGraceMs: 30 }); b.h.serve(b.c.transport); await toOffer(b.c);
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes', { early: true });
+  assert.ok(b.logs.some(([c]) => c === 'CONFIRM_HELD')); assert.ok(!b.logs.some(([c]) => c === 'CONFIRM_EARLY_NO'));
+  await b.c.hears(/^Please wait until I have finished, then answer\. /, 'yes'); await b.c.hears(/calling from a number ending in/, undefined);
+});
+
+test('early NO at the read-back: nothing is booked and the correction is asked; an early YES at the read-back books nothing until a fresh yes after the whole line', async () => {
+  const a = build({ emails: 'accept', textsEnabled: false, holdGraceMs: 30 }); await toReadback(a);
+  await a.c.hears(/^To confirm/, 'no', { early: true });
+  assert.ok(a.logs.some(([c]) => c === 'CONFIRM_EARLY_NO')); await a.c.until(() => a.c.lines.some((l) => /Which part is wrong/.test(l)), 'the correction question');
+  assert.equal(a.booked.length, 0, 'a no never books'); assert.ok(!a.logs.some(([c]) => c === 'JOBBER_BOOKING_CREATED'));
+  const b = build({ emails: 'accept', textsEnabled: false, holdGraceMs: 30 }); await toReadback(b);
+  await b.c.hears(/^To confirm/, 'yes', { early: true });
+  assert.ok(b.logs.some(([c]) => c === 'CONFIRM_HELD')); await sleep(60); assert.equal(b.booked.length, 0, 'a yes before the whole read-back confirms nothing');
+  await b.c.hears(/^Please wait until I have finished, then answer\. To confirm/, 'yes'); await finish(b.c);
+  assert.equal(b.booked.length, 1, 'only the fresh yes after the whole line books'); assert.equal(b.last().booked, true);
+});
+
+test('false interruption: noise that cuts a confirmation line (an empty transcript) replays it plainly, without "please wait", and does not use up the replays; a real cut still does', async () => {
+  const t = build({ emails: 'accept', textsEnabled: false, holdGraceMs: 30 }); t.h.serve(t.c.transport); await toOffer(t.c);
+  for (let i = 0; i < 4; i++) await noiseCut(t.c, i === 0 ? /is one hundred ninety-nine dollars/ : /^(?!Please wait).*is one hundred ninety-nine dollars/);
+  assert.equal(t.logs.filter(([c]) => c === 'CONFIRM_FALSE_CUT').length, 4, 'four noise cuts, each recovered');
+  assert.ok(!t.c.lines.some((l) => /^Please wait until I have finished/.test(l)), 'a plain replay each time');
+  await t.c.hears(/^(?!Please wait).*is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes');
+  const text = await t.c.hears(/^To confirm/, 'yes'); assert.match(text, /^To confirm/); await finish(t.c); assert.equal(t.booked.length, 1, 'the booking still needs, and gets, its own yes after the whole read-back');
+  const u = build({ emails: 'accept', textsEnabled: false, holdGraceMs: 30 }); u.h.serve(u.c.transport); await toOffer(u.c);
+  for (let i = 0; i < 3; i++) { await u.c.hears(i === 0 ? /is one hundred ninety-nine dollars/ : /^Please wait.*is one hundred ninety-nine dollars/, undefined, { verdict: 'cut', before: () => u.c.emit({ kind: 'speech', active: true }) }); u.c.emit({ kind: 'speech', active: false }); }   // cut, and no empty transcript: not noise
+  await sleep(120); assert.ok(u.c.lines.some((l) => /I could not confirm that/.test(l)), 'real cuts still end an unconfirmed call'); assert.equal(u.logs.filter(([c]) => c === 'CONFIRM_FALSE_CUT').length, 0); assert.equal(u.booked.length, 0);
+});
