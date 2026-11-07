@@ -62,6 +62,8 @@ const NUM_WORD = '(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleve
 const ADDRESS_LEAD = /^(?:(?:no|yes|yeah|well|um|uh|okay|ok|sure|so)[,.\s]+)*(?:(?:my|the)\s+(?:service\s+)?address\s+(?:is|:)\s+|(?:service\s+)?address\s+(?:is|:)\s+|i\s+live\s+(?:at|on)\s+|it(?:'s|\s+is)\s+(?:at\s+)?|located\s+at\s+|that(?:'s|\s+is)\s+|at\s+|actually[,\s]+(?:it(?:'s|\s+is)\s+)?)?/i;
 const ADDRESS_TAIL = /[\s,.]*(?:please|thanks|thank you)?[\s,.!?]*$/i;
 const PO_BOX = /\bp\.?\s?o\.?\s+box\s+\w+/i;
+/** A number written with thousands commas: one to three digits, then groups of exactly three ("15,951"). A comma followed by a space ("Springfield, 91364") is never one. */
+const THOUSANDS_GROUPS = /(?<![\d,])\d{1,3}(?:,\d{3})+(?!\d)/g;
 const ADDRESS_NUMBER = new RegExp(`(?:\\b\\d{1,6}\\b|\\b${NUM_WORD}\\b)`, 'i');
 
 const clean = (s: string): string => s.replace(/\s+/g, ' ').trim();
@@ -270,9 +272,10 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
    */
   function collectAddressCZ(raw: string): CollectResult {
     const hadParts = aStreet !== '' || aCity !== '' || aZip !== '' || aState !== '' || pendNumber !== '' || pendStreet !== '';
-    const t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '');
+    const grouped: string[] = [];   // a number written with thousands commas ("15,951", Live Test #9) is one house number: the commas go BEFORE the line is split on commas, and the written form is taught to the masker
+    const t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '').replace(THOUSANDS_GROUPS, (m) => { grouped.push(m); return m.replace(/,/g, ''); });
     if (t0.length < 1 || t0.length > 160 || /[@\[\]<>]/.test(t0)) return { field: 'address', outcome: 'unclear', learn: [], reason: 'NOT_AN_ADDRESS' };
-    let t = t0; let zip: string | undefined; let badZip = false; const learn: string[] = [];
+    let t = t0; let zip: string | undefined; let badZip = false; const learn: string[] = [...grouped];
     // 1. The ZIP code: the last run of digits, when it ends the line.
     const runs = [...t.matchAll(DIGIT_RUNS)]; const last = runs[runs.length - 1];
     if (last !== undefined && t.slice((last.index ?? 0) + last[0].length).replace(/[\s,.]+/g, '') === '') {

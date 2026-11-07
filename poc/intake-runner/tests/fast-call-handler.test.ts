@@ -998,3 +998,18 @@ test('ADDRESS (DEFECT-1-3): "the name of the street" goes straight to the street
   assert.deepEqual(t.booked.map((r) => r.address.street1), ['123 Woodland Hills Drive']); assert.equal(t.c.lines.filter((l) => /^I have 123/.test(l)).length, 1, 'the word "Sorry" was never read back as a street');
   assert.ok(!t.c.lines.some((l) => /S O R R Y/.test(l)));
 });
+
+test('ADDRESS (COMMA-NUMBER): a house number written with thousands commas is taken, said whole or after the street name, and the call still reaches the read-back and books it', async () => {
+  const t = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/Is that right[?] Say yes or no/, 'yes'); await t.c.hears(/street address/, 'Woodland Hills Drive.');
+  await t.c.hears(/house number/, '15,951.'); await t.c.hears(/city|ZIP/, 'Testville, CA 90210');
+  await t.c.hears(/What day and time/, 'Tuesday at ten'); await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes');
+  const text = await t.c.hears(/To confirm/, 'yes'); assert.match(text, /at 15951 Woodland Hills Drive, spelled/, 'the number is read back as one number'); await finish(t.c);
+  assert.deepEqual(t.booked.map((r) => r.address.street1), ['15951 Woodland Hills Drive']); assert.equal(t.last().booked, true);
+  const u = build({ emails: 'accept', textsEnabled: false });
+  u.h.serve(u.c.transport); u.c.setup(DREW, undefined, 'Testa Invented');
+  await u.c.hears(/Is that right[?] Say yes or no/, 'yes'); await u.c.hears(/street address/, '15,951 Woodland Hills Drive, Testville, CA 90210'); await u.c.hears(/What day and time/, 'Tuesday at ten');
+  assert.ok(!u.c.lines.some((l) => /house number/.test(l)), 'the number was not asked for again');
+});

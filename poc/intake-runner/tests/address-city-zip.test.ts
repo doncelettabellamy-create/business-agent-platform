@@ -245,3 +245,17 @@ test('correctStreet (DEFECT-1-3): a street name said alone is taken only with a 
   const c = held(); assert.equal(c.correctStreet('456').outcome, 'unclear'); assert.equal(c.correctStreet('Maple').outcome, 'captured', 'a number said first and any street name after it are put together'); assert.equal(c.addressParts()?.street, '456 Maple');
   const d = held(); assert.equal(d.correctStreet('456 Sorry').outcome, 'captured', 'with its house number it is a whole street, as in the first collection; the caller then hears it spelled and confirms it');
 });
+
+test('collectAddress (COMMA-NUMBER): a house number written with thousands commas is one number, whole or in pieces, and ordinary city and ZIP commas are unchanged', () => {
+  const WHOLE = '15951 Woodland Hills Drive, Encino, 91436';
+  for (const lines of [['15,951 Woodland Hills Drive, Encino, 91436'], ['15,951 Woodland Hills Drive', 'Encino', '91436'], ['15951 Woodland Hills Drive, Encino, 91436'], ['15,951 Woodland Hills Drive, Encino, 91436.'], ['15,951 Woodland Hills Drive Encino 91436']]) {
+    const s = state(); say(s, ...lines); assert.equal(s.value('address'), WHOLE, JSON.stringify(lines)); assert.equal(s.addressPart(), undefined);
+  }
+  const a = state(); assert.deepEqual(say(a, 'Woodland Hills Drive.', '15,951.'), ['partial:NEED_NUMBER', 'partial:NEED_CITY'], 'Live Test #9: the street name was held, then the number alone, said with a comma');
+  say(a, 'Encino, 91436'); assert.equal(a.value('address'), WHOLE, 'the held street name and the comma number made the street');
+  const b = state(); assert.deepEqual(say(b, '15,951'), ['partial:NEED_STREET']); assert.equal(b.addressPart(), 'street name'); say(b, 'Woodland Hills Drive', 'Encino, 91436'); assert.equal(b.value('address'), WHOLE);
+  const c = state(); const r = c.collect('address', '15,951 Woodland Hills Drive, Encino, 91436'); assert.ok(r.learn.includes('15,951'), 'the written form is taught to the masker'); assert.ok(r.learn.includes('15951 Woodland Hills Drive'));
+  const d = state(); say(d, '1,427 Sample Street, Springfield, 91364'); assert.equal(d.value('address'), '1427 Sample Street, Springfield, 91364');
+  for (const ordinary of ['1427 Sample Street, Springfield, 91364', '1427 Sample Street,Springfield,91364', '12 Main Street, Springfield, 91364', '1427 Sample Street, Springfield, IL, 91364']) { const s = state(); say(s, ordinary); assert.equal(s.value('address')?.startsWith(ordinary.split(',')[0]), true, ordinary); assert.equal(s.addressPart(), undefined, ordinary); }
+  const e = state(); say(e, '1427 Sample Street, Springfield, 91364'); assert.equal(e.correctStreet('15,951 Woodland Hills Drive').outcome, 'captured'); assert.equal(e.addressParts()?.street, '15951 Woodland Hills Drive', 'a street corrected with a comma number');
+});
