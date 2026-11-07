@@ -2,7 +2,7 @@
 // address is invented. The hours in SETTINGS are a SYNTHETIC test fixture, not the founder's.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AI_ANSWER, addressIssues, confirmedMismatches, spellHouseNumber, createFastCallHandler, spellOut, spellStreet } from '../src/fast-call-handler.ts';
+import { AI_ANSWER, addressIssues, confirmedMismatches, spellHouseNumber, transcriptShape, createFastCallHandler, spellOut, spellStreet } from '../src/fast-call-handler.ts';
 import type { FastDeps, FastOutcome, FastSettings } from '../src/fast-call-handler.ts';
 import { instantOf } from '../src/fast-parsers.ts';
 import type { BookingRequest, BookingResult } from '../src/jobber-booking.ts';
@@ -1039,4 +1039,19 @@ test('ADDRESS guard: addressIssues names what is wrong and never a value; spellH
   assert.deepEqual(addressIssues({ ...ok, street: 'Woodland Hills Drive' }), ['house_number']); assert.deepEqual(addressIssues({ ...ok, street: '91436' }), ['house_number']);
   assert.deepEqual(addressIssues({ ...ok, state: undefined }), ['state']); assert.deepEqual(addressIssues({ ...ok, zip: '9143' }), ['zip']); assert.deepEqual(addressIssues({ ...ok, city: '' }), ['city']);
   assert.equal(spellHouseNumber('15951 Woodland Hills Drive'), '1 5 9 5 1'); assert.equal(spellHouseNumber('12-B Elm Way'), '1 2 dash B'); assert.equal(spellHouseNumber('Woodland Hills Drive'), '');
+});
+
+test('ADDRESS shape log: a rejected address answer logs only its shape (digit 9, letter a, space _, punctuation by position); accepted and partial answers log none; no letter, digit or raw transcript reaches the log', async () => {
+  assert.equal(transcriptShape('15,951.'), '99C999.'); assert.equal(transcriptShape('12, 345.'), '99C_999.'); assert.equal(transcriptShape('1-5-9'), '9-9-9'); assert.equal(transcriptShape('15951-1234'), '99999-9999');
+  assert.equal(transcriptShape("O'Brien St. #4/5:"), 'aQaaaaa_aa._H9S9:'); assert.equal(transcriptShape('  \u00c9lm  '), 'aaa'); assert.equal(transcriptShape('a@b!'), 'aPaP'); assert.equal(transcriptShape(''), '');
+  assert.equal(transcriptShape('x'.repeat(100)).length, 48, 'capped at the sink limit'); assert.equal(transcriptShape('12345'), '99999', 'the digits are gone');
+  assert.deepEqual(cleanDetail({ shape: transcriptShape("O'Brien, 12-5 #4/5: x.y!") }), { shape: transcriptShape("O'Brien, 12-5 #4/5: x.y!") }, 'the real log sink keeps the shape whole');
+  const t = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/Is that right[?] Say yes or no/, 'yes'); await t.c.hears(/street address/, 'Zorblax 2468, Quentin');
+  await t.c.hears(/./, 'Quibble Zorblax'); await t.c.hears(/./, '2468 Quibble Lane');
+  const rows = t.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>);
+  assert.ok(rows.length >= 2); for (const r of rows) assert.equal('shape' in r, r.outcome === 'unclear', 'a shape only for a rejected answer'); assert.ok(rows.some((r) => r.outcome === 'unclear'), 'the test did reject an answer');
+  for (const r of rows) { assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field'); if (typeof r.shape === 'string') assert.match(r.shape, /^[a9_.:CQSHP-]{1,48}$/); }
+  const all = JSON.stringify(t.logs); for (const secret of ['Zorblax', 'Quentin', 'Quibble', '2468', 'Zorblax 2468']) assert.ok(!all.includes(secret), `${secret} must not appear in any log`);
 });

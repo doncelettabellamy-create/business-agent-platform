@@ -105,6 +105,19 @@ export function spellStreet(street: string): string {
   const name = words.filter((w, i) => !(i === 0 && /^\d[\d-]*[A-Za-z]?$/.test(w) && words.length > 1)).map((w) => w.replace(/\.+$/, '')).filter((w) => w !== '');
   return name.length === 0 ? '' : spellOut(name.join(' '));
 }
+/**
+ * The SHAPE of what a caller said, for the diagnostic log of a rejected address answer (Live Tests #10 and #11: which punctuation broke the parse is unknown while the log holds only counts).
+ * Every digit becomes 9, every letter a, every space _; the punctuation that matters stays at its position (. - :) or becomes a letter code the log sink keeps (C comma, Q quote, S slash, H hash), anything else is P.
+ * Nothing of what was said survives: no letter, digit or word, only the pattern ("99,999." is written "99C999."). At most 48 symbols, the sink's limit. Empty when nothing was said.
+ */
+export function transcriptShape(raw: string): string {
+  let out = '';
+  for (const ch of raw.trim()) {
+    if (out.length >= 48) break;
+    out += ch.toLowerCase() !== ch.toUpperCase() ? 'a' : ch >= '0' && ch <= '9' ? '9' : ch.trim() === '' ? '_' : ch === '.' || ch === '-' || ch === ':' ? ch : ch === ',' ? 'C' : ch === "'" || ch.charCodeAt(0) === 0x2019 ? 'Q' : ch === '/' ? 'S' : ch === '#' ? 'H' : 'P';
+  }
+  return out;
+}
 /** The house number of a street address, digit by digit ("15951 Woodland Hills Drive" gives "1 5 9 5 1"), so a ZIP code or a mis-heard digit cannot pass by ear (Live Test #10). Empty when the street has no leading number. */
 export function spellHouseNumber(street: string): string {
   const first = street.split(' ').find((w) => w !== '') ?? '';
@@ -279,7 +292,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       ask('ADDRESS', text, async (heard) => {
         const r = contact.collect('address', heard);
         const held = contact.addressHeld();
-        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, state: held.state, digitRuns: digitRuns(heard).length, zipDigits: trailingDigitCount(heard), words: wordsIn(heard), chars: heard.trim().length });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit
+        deps.log('FAST_ADDRESS', { outcome: r.outcome, reason: r.reason, street: held.street, city: held.city, zip: held.zip, state: held.state, digitRuns: digitRuns(heard).length, zipDigits: trailingDigitCount(heard), words: wordsIn(heard), chars: heard.trim().length, ...(r.outcome === 'unclear' ? { shape: transcriptShape(heard) } : {}) });   // codes, booleans and counts only (the log keeps flat values): never the address, a part of it or a digit. A REJECTED answer also logs its shape (9 for a digit, a for a letter, punctuation by position): nothing that was said
         if (r.outcome === 'captured') { tries = 0; return contact.addressParts()?.state === undefined ? askState() : askWhen(); }
         // A caller who says an address in pieces (Live Test #6: seven segments, two of them unusable) makes progress with most of them: a segment that adds a part clears the count of unusable ones before it, so only four in a row (or the same part again) end the call.
         if (r.outcome === 'partial' && r.reason !== 'SAME') tries = 0;
