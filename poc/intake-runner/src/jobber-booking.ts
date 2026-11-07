@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto';
 import { JobberError, mutate, query, verifyExpectedAccount } from './jobber-connector.ts';
 import type { Credentials, Ctx } from './jobber-connector.ts';
+import { stateCodeOf } from './us-state.ts';
 
 export interface BookingGate {
   /** The saved record passed eligibleForProcessing (the caller confirmed the read-back and the address). */ eligibleRecord: true;
@@ -93,7 +94,7 @@ const saveLedger = (ctx: Ctx, entries: Record<string, Entry>): Promise<void> => 
 const CREATE_CLIENT = 'mutation CreateTestClient($input: ClientCreateInput!) { clientCreate(input: $input) { client { id clientProperties(first: 5) { nodes { id } } } userErrors { message path } } }';
 const CREATE_JOB = 'mutation CreateTestJob($input: JobCreateAttributes!) { jobCreate(input: $input) { job { id jobNumber } userErrors { message path } } }';
 const FIND_JOBS = 'query FindTestJobs($term: String!) { jobs(first: 10, searchTerm: $term) { nodes { id title } } }';
-const READ_BACK = 'query ReadBackJob($id: EncodedId!) { job(id: $id) { id jobNumber title instructions jobStatus total client { firstName lastName phones { number } } property { address { street1 city postalCode } } visits(first: 5) { nodes { startAt endAt } } } }';
+const READ_BACK = 'query ReadBackJob($id: EncodedId!) { job(id: $id) { id jobNumber title instructions jobStatus total client { firstName lastName phones { number } } property { address { street1 city postalCode province } } visits(first: 5) { nodes { startAt endAt } } } }';
 
 const rec = (x: unknown): Record<string, unknown> => (typeof x === 'object' && x !== null ? x as Record<string, unknown> : {});
 const list = (x: unknown): unknown[] => (Array.isArray(x) ? x : []);
@@ -133,6 +134,8 @@ export async function readBackJob(ctx: Ctx, creds: Credentials, jobId: string, r
   if (!list(c.phones).some((p) => digitsOf(String(rec(p).number ?? '')) === digitsOf(r.client.phone))) bad.push('client_phone');
   const a = rec(rec(j.property).address);
   if (norm(a.street1) !== norm(r.address.street1) || norm(a.city) !== norm(r.address.city) || String(a.postalCode ?? '').trim().slice(0, 5) !== r.address.postalCode) bad.push('address');
+  // The STATE (Jobber's PropertyAddress.province, a nullable String, read from the live schema on 2026-11-07): the two-letter code or the full name, in any case. Missing, unknown or different from the requested state is NOT verified (the booking is uncertain, never claimed).
+  { const want = stateCodeOf(r.address.province); const got = stateCodeOf(a.province); if (want === undefined || got === undefined || want !== got) bad.push('province'); }
   const visits = list(rec(j.visits).nodes).map(rec);
   if (visits.length !== 1) bad.push('visit_count');
   else if (Date.parse(String(visits[0].startAt)) !== instant(r.when.date, r.when.startTime, r.when.utcOffset) || Date.parse(String(visits[0].endAt)) !== instant(r.when.date, r.when.endTime, r.when.utcOffset)) bad.push('visit_time');

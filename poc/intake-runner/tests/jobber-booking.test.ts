@@ -22,7 +22,7 @@ const REQ: BookingRequest = {
   title: 'Standard cleaning', service: 'Standard cleaning 2 bed 2 bath', priceDollars: 199,
 };
 
-interface Opts { account: { id: string; name: string }; searchBlind: boolean; jobUserErrors: boolean; clientUserErrors: boolean; shiftVisitMs: number; crashAfterJobCreate: boolean; failJobCreateStatus?: number }
+interface Opts { account: { id: string; name: string }; searchBlind: boolean; jobUserErrors: boolean; clientUserErrors: boolean; shiftVisitMs: number; crashAfterJobCreate: boolean; failJobCreateStatus?: number; /** What the read-back returns for the property's state: a string, null (Jobber has none), or undefined (the property is returned as it was written). */ readProvince?: string | null; /** Set by the stand-in: whether the last read-back query asked for the property's state. */ askedProvince?: boolean }
 interface Mock { endpoints: { authorize: string; token: string; graphql: string }; ops: Array<{ kind: 'query' | 'mutation'; field: string; variables: Record<string, unknown> }>; opts: Opts; jobs: Map<string, Record<string, unknown>>; clients: number; close(): Promise<void> }
 async function mockJobber(): Promise<Mock> {
   const ops: Mock['ops'] = []; const jobs = new Map<string, Record<string, unknown>>(); let clients = 0; let n = 0;
@@ -55,7 +55,11 @@ async function mockJobber(): Promise<Mock> {
         return data({ jobCreate: { job: { id, jobNumber: 1000 + n }, userErrors: [] } });
       }
       if (/FindTestJobs/.test(b.query)) { ops.push({ kind: 'query', field: 'jobs', variables: v }); return data({ jobs: { nodes: opts.searchBlind ? [] : [...jobs.values()].filter((j) => String(j.title).includes(String(v.term))).map((j) => ({ id: j.id, title: j.title })) } }); }
-      if (/ReadBackJob/.test(b.query)) { ops.push({ kind: 'query', field: 'job', variables: v }); return data({ job: jobs.get(String(v.id)) ?? null }); }
+      if (/ReadBackJob/.test(b.query)) {
+        ops.push({ kind: 'query', field: 'job', variables: v }); opts.askedProvince = /[{ ]province[ }]/.test(b.query); const jb = jobs.get(String(v.id));
+        if (jb !== undefined && opts.readProvince !== undefined) { const addr = { ...((jb.property as { address: Record<string, unknown> }).address) }; if (opts.readProvince === null) addr.province = null; else addr.province = opts.readProvince; return data({ job: { ...jb, property: { address: addr } } }); }
+        return data({ job: jb ?? null });
+      }
       return data({});
     });
   });
@@ -258,4 +262,26 @@ test('privacy and isolation: no name, phone, address or token in any diagnostic 
   for (const never of ['simulated-booking.ts', 'relay-handler.ts', 'realtime-bridge.ts', 'realtime-transport.ts', 'call-transport.ts', 'founder-voice-service.ts']) assert.ok(!/from '\.\/jobber-/.test(readFileSync(join(src, never), 'utf8')), `${never} imports no Jobber module`);
   const text = readFileSync(join(src, 'jobber-booking.ts'), 'utf8').replace(/\/\/.*$/gm, '');
   assert.ok(!/node:(http|https|net|child_process|fs)'|contact-vault|process\.env|fetch\(/.test(text), 'no network, file, process, environment or contact-vault access of its own');
+});
+
+test('independent read-back of the STATE: the requested state matches as a code in any case or as the full name; a missing, unknown or different state is uncertain with the field name only, never a verified booking', async () => {
+  const r = await rig();
+  try {
+    const ok = await bookTestVisit(r.ctx, CREDS, REQ);
+    assert.deepEqual([ok.status, ok.mismatches], ['booked_verified', undefined], 'the state as written (CA) matches the request (ca)');
+    const read = r.mock.ops.filter((o) => o.field === 'job' && o.kind === 'query').length; assert.ok(read >= 1, 'the job was read back by id');
+    assert.equal(r.mock.opts.askedProvince, true, 'the read-back query asks Jobber for the property state');
+    const n = { ca: 'ca', cap: 'CA', full: 'California', mixed: 'california', spaced: '  California ' };
+    let i = 0;
+    for (const [label, shown] of Object.entries(n)) {
+      r.mock.opts.readProvince = shown; const k = { ...REQ, key: 'call-state' + String(++i).padStart(4, '0') + '00001111' };
+      const res = await bookTestVisit(r.ctx, CREDS, k); assert.equal(res.status, 'booked_verified', label + ': ' + shown);
+    }
+    for (const [label, shown] of [['missing', null], ['empty', ''], ['unknown name', 'Ontario'], ['abbreviation that is no state', 'Calif.'], ['different state', 'TX'], ['different full name', 'Texas'], ['a sentence', 'the state of California']] as Array<[string, string | null]>) {
+      r.mock.opts.readProvince = shown; const k = { ...REQ, key: 'call-state' + String(++i).padStart(4, '0') + '00002222' };
+      const res = await bookTestVisit(r.ctx, CREDS, k);
+      assert.deepEqual([res.status, res.reason, res.mismatches], ['uncertain', 'READBACK_MISMATCH', ['province']], label);
+      assert.ok(!JSON.stringify(res).includes('Texas') && !JSON.stringify(res).includes('Ontario'), 'the field name only, never the value');
+    }
+  } finally { await r.done(); }
 });

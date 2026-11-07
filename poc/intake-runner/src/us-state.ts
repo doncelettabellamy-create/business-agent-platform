@@ -20,6 +20,13 @@ const TAIL = /[\s,.!?]*(?:please|thanks|thank you)?[\s,.!?]*$/i;
 
 /** The full name of a state code, for the read-back spoken to the caller. Undefined for anything that is not a code. */
 export function stateName(code: unknown): string | undefined { return typeof code === 'string' && Object.hasOwn(US_STATES, code) ? US_STATES[code] : undefined; }
+/** A state written as a field value (a record read back from Jobber, a booking request): its two-letter code, from the code in any case ("CA", "ca") or from the full name in any case ("California", "new york"). EXACT only: nothing is searched for inside longer text and nothing is guessed. Undefined when it is neither (empty, "Calif.", "Ontario", a sentence, a code that is no state). Pure. */
+export function stateCodeOf(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const t = raw.trim().replace(/\s+/g, ' ');
+  if (/^[A-Za-z]{2}$/.test(t)) { const c = t.toUpperCase(); return Object.hasOwn(US_STATES, c) ? c : undefined; }
+  return CODE_BY_NAME.get(t.toLowerCase());
+}
 
 /**
  * The state said at the END of a line: its two-letter code, and what is left of the line without it. "Austin, Texas" gives TX and "Austin"; "Austin, TX" gives TX and "Austin"; "Texas" or "the state is Texas" gives TX and an empty rest.

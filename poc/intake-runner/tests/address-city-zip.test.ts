@@ -6,7 +6,7 @@ import { cityFrom, createContactState, runContactTool } from '../src/call-state.
 import { createCallSession } from '../src/call-session.ts';
 import { SAY } from '../src/relay-handler.ts';
 import { scriptedQuestion } from '../src/scripted-questions.ts';
-import { US_STATES, stateFrom, stateName } from '../src/us-state.ts';
+import { US_STATES, stateCodeOf, stateFrom, stateName } from '../src/us-state.ts';
 
 const STREET = '1427 Sample Street';
 const state = () => createContactState({ cityZip: true });
@@ -270,4 +270,58 @@ test('collectAddress (ZIP-AS-NUMBER): a ZIP said where the house number was want
   const d = state(); say(d, 'Woodland Hills Drive.', '90001.', 'Springfield.', '90001.', '90001.'); assert.equal(d.addressParts(), undefined, 'said a third time it is still refused');
   const e = state(); assert.deepEqual(say(e, '12, 345.'), ['partial:NEED_STREET']); say(e, 'Woodland Hills Drive', 'Springfield, 90001'); assert.equal(e.addressParts()?.street, '12345 Woodland Hills Drive', '"12, 345" (a space after the comma) is the number 12345');
   const f = state(); say(f, '1427 Sample Street, Springfield, 91364'); assert.equal(f.addressParts()?.street, '1427 Sample Street'); const g = state(); say(g, '12, 345 Elm Street, Springfield, 91364'); assert.notEqual(g.addressParts()?.street, '12345 Elm Street', 'only a line that is just the number is joined');
+});
+
+test('collectAddress (DASHED-DIGITS, Live Test #12): a house number said one digit at a time is one number, alone or in a whole address; ranges, suffixes and ordinary lines are untouched', () => {
+  const WHOLE = '15951 Woodland Hills Drive, Encino, 91436';
+  for (const n of ['1-5-9-5-1.', '1-5-9-5-1', '1 5 9 5 1.', '1.5.9.5.1.', '1 - 5 - 9 - 5 - 1']) { const s = state(); assert.deepEqual(say(s, n), ['partial:NEED_STREET'], n); assert.equal(s.addressPart(), 'street name'); say(s, 'Woodland Hills Drive', 'Encino, 91436'); assert.equal(s.value('address'), WHOLE, n); }
+  const a = state(); say(a, '1-5-9-5-1 Woodland Hills Drive, Encino, 91436'); assert.equal(a.value('address'), WHOLE, 'in a whole address');
+  const b = state(); say(b, 'Woodland Hills Drive.', '1-5-9-5-1.'); say(b, 'Encino, 91436'); assert.equal(b.value('address'), WHOLE, 'after the street name');
+  const c = state(); const r = c.collect('address', '1-5-9-5-1 Woodland Hills Drive, Encino, 91436'); assert.ok(r.learn.includes('1-5-9-5-1'), 'the spoken form is taught to the masker'); assert.ok(r.learn.includes('15951 Woodland Hills Drive'));
+  const d = state(); say(d, '1427 Sample Street, Springfield, 9 1 3 6 4'); assert.equal(d.value('address'), '1427 Sample Street, Springfield, 91364', 'a ZIP code said digit by digit is still a ZIP code');
+  for (const kept of ['12-14 Elm Street, Springfield, 91364', '12-B Elm Way, Springfield, 91364', '1427 Sample Street, Springfield, 91364']) { const s = state(); say(s, kept); assert.equal(s.value('address'), kept, kept); }
+  const e = state(); assert.equal(say(e, '1-5.')[0].startsWith('unclear:'), true, 'two single digits are not a spoken number'); assert.equal(e.addressPart(), undefined);
+  const f = state(); say(f, '1-5-9-5-1.', 'Woodland Hills Drive.', 'Encino.', '91436.'); assert.equal(f.value('address'), WHOLE, 'the number first, then the rest in pieces');
+});
+
+test('collectAddress (HELD-STREET): a held street name is never replaced by words that are no street name; a new street with a road word replaces it and says so; the synthetic Live Test #12 sequence ends with the right street', () => {
+  const a = state(); assert.deepEqual(say(a, 'Woodland Hills Drive.', 'Encino.'), ['partial:NEED_NUMBER', 'partial:NEED_NUMBER'], 'a city said before the house number is a city');
+  assert.equal(a.addressHeld().city, true); assert.equal(a.addressPart(), 'house number'); say(a, '15951.', '91436.'); assert.equal(a.value('address'), '15951 Woodland Hills Drive, Encino, 91436');
+  const b = state(); say(b, 'Woodland Hills Drive.'); assert.deepEqual(say(b, 'Maple Street.'), ['partial:STREET_REPLACED'], 'a street with a road word is a new street, and the reason says it was replaced'); say(b, '15951.', 'Encino.', '91436.'); assert.equal(b.value('address'), '15951 Maple Street, Encino, 91436');
+  const c = state(); say(c, 'Woodland Hills Drive.'); assert.deepEqual(say(c, 'Woodland Hills Drive.'), ['partial:SAME'], 'the same street again changes nothing');
+  const d = state(); say(d, 'Woodland Hills Drive.', 'Encino.'); assert.equal(say(d, 'Springfield.')[0].startsWith('unclear:'), true, 'a second place name changes nothing: the city stays'); say(d, '15951.', '91436.'); assert.equal(d.value('address'), '15951 Woodland Hills Drive, Encino, 91436');
+  const e = state(); say(e, 'Woodland Hills Drive.'); say(e, 'um'); assert.equal(e.addressPart(), 'house number', 'a filler word changes nothing');
+  // the synthetic Live Test #12 sequence: the number (digit by digit) first, a street name with a ZIP in one line, a city, then the number again
+  const t = state(); say(t, '1-5-9-5-1.'); assert.equal(t.addressPart(), 'street name');
+  const u = state(); say(u, 'Woodland Hills Drive.', 'Woodland Hills Drive 91436.'); assert.equal(u.addressHeld().zip, true); assert.equal(u.addressPart(), 'house number'); say(u, 'Encino.', '1-5-9-5-1.'); assert.equal(u.value('address'), '15951 Woodland Hills Drive, Encino, 91436', 'the street name was kept through the city and the ZIP line');
+  const v = state(); say(v, 'Woodland Hills Drive.', 'Encino, 91436.'); assert.equal(v.addressParts(), undefined); say(v, '15951.'); assert.equal(v.addressParts()?.street, '15951 Woodland Hills Drive', 'a city and ZIP said together before the number never become the street');
+});
+
+test('collectAddress (SPOKEN-DIGIT-WORDS): three or more single digit words are one number; "fifteen", "forty two" and a lone digit word are left alone (they fail closed later); a street name with a digit word in it is untouched', () => {
+  const WHOLE = '15951 Woodland Hills Drive, Encino, 91436';
+  for (const n of ['one five nine five one.', 'One Five Nine Five One', 'one, five, nine, five, one.', 'one-five-nine-five-one']) { const s = state(); assert.deepEqual(say(s, n), ['partial:NEED_STREET'], n); say(s, 'Woodland Hills Drive', 'Encino, 91436'); assert.equal(s.value('address'), WHOLE, n); }
+  const a = state(); say(a, 'one five nine five one Woodland Hills Drive, Encino, 91436'); assert.equal(a.value('address'), WHOLE, 'in a whole address');
+  const b = state(); say(b, '1427 Sample Street, Springfield, nine one three six four'); assert.equal(b.value('address'), '1427 Sample Street, Springfield, 91364', 'a ZIP code said in words');
+  const c = state(); say(c, 'double five one two Elm Street, Springfield, 91364'); assert.equal(c.addressParts()?.street, '5512 Elm Street', '"double five" counts as two digits');
+  const d = state(); const r = d.collect('address', 'one five nine five one Woodland Hills Drive, Encino, 91436'); assert.ok(r.learn.includes('one five nine five one'), 'the spoken form is taught to the masker');
+  for (const kept of ['forty two Elm Street, Springfield, 91364', 'fifteen ninety five Woodland Hills Drive, Encino, 91436', 'one five Elm Street, Springfield, 91364']) { const s = state(); say(s, kept); assert.ok(!/^[0-9]/.test(s.addressParts()?.street ?? ''), 'not turned into digits (the booking guard then refuses it): ' + kept); }
+  const e = state(); say(e, '1427 Nine Mile Road, Springfield, 91364'); assert.equal(e.addressParts()?.street, '1427 Nine Mile Road', 'a street name with a digit word is untouched');
+  const f = state(); say(f, 'One Tree Hill Road, Springfield, 91364'); assert.ok(!/^[0-9]/.test(f.addressParts()?.street ?? 'x') || f.addressParts() === undefined, 'a street starting with a digit word is not a number');
+});
+
+test('collectAddress (UNCHECKED-STREET): a street joined from a house number and a name with no road word must be confirmed spelled out; a name with a road word, a whole street and a confirmed street are not flagged', () => {
+  const a = state(); say(a, '15951.', 'Testville.'); assert.equal(a.streetUnchecked(), true, 'a number, then a name with no road word (it may be a city)'); assert.equal(a.addressHeld().street, true);
+  a.streetChecked(); assert.equal(a.streetUnchecked(), false, 'the caller confirmed it');
+  const b = state(); say(b, '15951.', 'Broadway.'); assert.equal(b.streetUnchecked(), true, 'a roadless street name is kept and checked, never refused'); assert.equal(b.addressParts(), undefined); say(b, 'Encino, 91436'); assert.equal(b.value('address'), '15951 Broadway, Encino, 91436');
+  const c = state(); say(c, '15951.', 'Woodland Hills Drive.'); assert.equal(c.streetUnchecked(), false, 'a road word');
+  const d = state(); say(d, '1427 Broadway, Springfield, 91364'); assert.equal(d.streetUnchecked(), false, 'said whole');
+  const e = state(); say(e, 'Broadway.', '15951.'); assert.equal(e.streetUnchecked(), true, 'the name first, then the number');
+  const f = state(); say(f, '15951.', 'Testville.'); f.abandon('address'); assert.equal(f.streetUnchecked(), false, 'forgotten with the address');
+  const g = state(); say(g, '15951.', 'Testville.'); say(g, '1427 Sample Street'); assert.equal(g.streetUnchecked(), false, 'a street said whole replaces it');
+});
+
+test('stateCodeOf: a state written as a field value is its code from the code or the full name in any case; anything else is undefined (never guessed, never searched for in longer text)', () => {
+  for (const [raw, want] of [['CA', 'CA'], ['ca', 'CA'], [' Ca ', 'CA'], ['California', 'CA'], ['california', 'CA'], ['  NEW   YORK ', 'NY'], ['new york', 'NY'], ['West Virginia', 'WV'], ['Virginia', 'VA'], ['District of Columbia', 'DC'], ['dc', 'DC']] as Array<[string, string]>) assert.equal(stateCodeOf(raw), want, raw);
+  for (const bad of ['', '  ', 'C', 'CAL', 'Calif.', 'Ontario', 'ON', 'XX', 'the state of California', 'California, USA', 'Texas 90210', '12', null, undefined, 42, {}]) assert.equal(stateCodeOf(bad), undefined, String(bad));
+  for (const [code, name] of Object.entries(US_STATES)) { assert.equal(stateCodeOf(code), code); assert.equal(stateCodeOf(name), code); assert.equal(stateCodeOf(name.toUpperCase()), code); }
 });

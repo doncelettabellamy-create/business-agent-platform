@@ -1096,3 +1096,81 @@ test('false interruption: noise that cuts a confirmation line (an empty transcri
   for (let i = 0; i < 3; i++) { await u.c.hears(i === 0 ? /is one hundred ninety-nine dollars/ : /^Please wait.*is one hundred ninety-nine dollars/, undefined, { verdict: 'cut', before: () => u.c.emit({ kind: 'speech', active: true }) }); u.c.emit({ kind: 'speech', active: false }); }   // cut, and no empty transcript: not noise
   await sleep(120); assert.ok(u.c.lines.some((l) => /I could not confirm that/.test(l)), 'real cuts still end an unconfirmed call'); assert.equal(u.logs.filter(([c]) => c === 'CONFIRM_FALSE_CUT').length, 0); assert.equal(u.booked.length, 0);
 });
+
+test('ADDRESS (DASHED-DIGITS and HELD-STREET, Live Test #12): the number said digit by digit first, then the street name; or the street name, then a city before the number: the right street is read back digit by digit and booked, never a place name', async () => {
+  const a = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
+  await a.c.hears(/Is that right[?] Say yes or no/, 'yes'); await a.c.hears(/street address/, '1-5-9-5-1.');
+  await a.c.hears(/street name/, 'Woodland Hills Drive.'); await a.c.hears(/city|ZIP/, 'Testville, CA 90210');
+  await a.c.hears(/What day and time/, 'Tuesday at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from a number ending in/, 'yes');
+  const text = await a.c.hears(/To confirm/, 'yes'); assert.match(text, /at 15951 Woodland Hills Drive, house number 1 5 9 5 1, street spelled W O O D L A N D/); await finish(a.c);
+  assert.deepEqual(a.booked.map((r) => r.address.street1), ['15951 Woodland Hills Drive']); assert.equal(a.last().booked, true);
+  const b = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
+  await b.c.hears(/Is that right[?] Say yes or no/, 'yes'); await b.c.hears(/street address/, 'Woodland Hills Drive.');
+  await b.c.hears(/house number/, 'Testville.'); await b.c.hears(/house number/, '1-5-9-5-1.');
+  await b.c.hears(/ZIP/, '90210.'); await b.c.hears(/What state/, 'California');
+  await b.c.hears(/What day and time/, 'Tuesday at ten'); await b.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from a number ending in/, 'yes');
+  const t2 = await b.c.hears(/To confirm/, 'yes'); assert.match(t2, /at 15951 Woodland Hills Drive, house number 1 5 9 5 1, street spelled W O O D L A N D, H I L L S, D R I V E, Testville/); assert.doesNotMatch(t2, /Testville Drive|15951 Testville/); await finish(b.c);
+  assert.deepEqual(b.booked.map((r) => [r.address.street1, r.address.city, r.address.postalCode]), [['15951 Woodland Hills Drive', 'Testville', '90210']]);
+  const rows = b.logs.filter(([k]) => k === 'FAST_ADDRESS').map(([, v]) => v as Record<string, unknown>); assert.ok(rows.length >= 3); for (const r of rows) { assert.deepEqual(cleanDetail(r), r, 'the sink keeps every field'); }
+  const all = JSON.stringify(b.logs); for (const secret of ['Woodland', 'Testville', '15951', '90210']) assert.ok(!all.includes(secret), secret + ' must not appear in any log');
+});
+
+test('ADDRESS (UNCHECKED-STREET): a house number, then a name with no road word, must be confirmed spelled out BEFORE the read-back; a wrong name gets a no and a spelling; nothing is read back or booked until the street is confirmed; a right roadless name is kept', async () => {
+  const a = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
+  await a.c.hears(/Is that right[?] Say yes or no/, 'yes'); await a.c.hears(/street address/, '15951.');
+  await a.c.hears(/street name/, 'Testville.'); await a.c.hears(/city|ZIP/, 'Testville, CA 90210');
+  await a.c.hears(/What day and time/, 'Tuesday at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from a number ending in/, 'yes');
+  const ask = await a.c.hears(/^I have 15951 Testville, house number 1 5 9 5 1, street spelled T E S T V I L L E[.] Is that right[?] Say yes or no[.]$/, 'no');
+  assert.ok(ask.length > 0); assert.ok(!a.c.lines.some((l) => /^To confirm/.test(l)), 'no read-back before the street is confirmed'); assert.equal(a.booked.length, 0);
+  await a.c.hears(/^Please spell the street name/, 'W O O D L A N D. H I L L S. D R I V E');
+  await a.c.hears(/^I have 15951 Woodland Hills Drive, house number 1 5 9 5 1, street spelled W O O D L A N D, H I L L S, D R I V E[.]/, 'yes');
+  const text = await a.c.hears(/^To confirm/, 'yes'); assert.match(text, /at 15951 Woodland Hills Drive, house number 1 5 9 5 1, street spelled W O O D L A N D, H I L L S, D R I V E, Testville/); await finish(a.c);
+  assert.deepEqual(a.booked.map((r) => r.address.street1), ['15951 Woodland Hills Drive']); assert.equal(a.last().booked, true);
+  assert.ok(a.logs.some(([c, v]) => c === 'FAST_ADDRESS_CHECK' && (v as { reason: string }).reason === 'ROADLESS'));
+  const b = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
+  await b.c.hears(/Is that right[?] Say yes or no/, 'yes'); await b.c.hears(/street address/, '15951.');
+  await b.c.hears(/street name/, 'Broadway.'); await b.c.hears(/city|ZIP/, 'Testville, CA 90210');
+  await b.c.hears(/What day and time/, 'Tuesday at ten'); await b.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from a number ending in/, 'yes');
+  await b.c.hears(/^I have 15951 Broadway, house number 1 5 9 5 1, street spelled B R O A D W A Y[.]/, 'yes'); await b.c.hears(/^To confirm/, 'yes'); await finish(b.c);
+  assert.deepEqual(b.booked.map((r) => r.address.street1), ['15951 Broadway'], 'a right roadless street is kept');
+  const c = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  c.h.serve(c.c.transport); c.c.setup(DREW, undefined, 'Testa Invented');
+  await c.c.hears(/Is that right[?] Say yes or no/, 'yes'); await c.c.hears(/street address/, '15951.');
+  await c.c.hears(/street name/, 'Testville.'); await c.c.hears(/city|ZIP/, 'Testville, CA 90210');
+  await c.c.hears(/What day and time/, 'Tuesday at ten'); await c.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await c.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.c.hears(/calling from a number ending in/, 'yes');
+  await c.c.hears(/^I have 15951 Testville/, 'no'); await c.c.hears(/^Please spell the street name/, 'banana'); await c.c.hears(/^Sorry, please spell the street name again/, 'apple'); await finish(c.c);
+  assert.equal(c.booked.length, 0, 'an unconfirmed roadless street is never booked'); assert.ok(!c.c.lines.some((l) => /^To confirm/.test(l)), 'and never read back'); assert.equal(c.last().booked, false);
+});
+
+test('ADDRESS (SPOKEN-DIGIT-WORDS): a house number said as single digit words, whole or in pieces, is booked as digits; an ambiguous word number ("forty two") is never booked and the call ends with a person to follow up', async () => {
+  const a = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  a.h.serve(a.c.transport); a.c.setup(DREW, undefined, 'Testa Invented');
+  await a.c.hears(/Is that right[?] Say yes or no/, 'yes'); await a.c.hears(/street address/, 'one five nine five one Woodland Hills Drive, Testville, CA nine oh two one oh');
+  await a.c.hears(/What day and time/, 'Tuesday at ten'); await a.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from a number ending in/, 'yes');
+  const text = await a.c.hears(/^To confirm/, 'yes'); assert.match(text, /at 15951 Woodland Hills Drive, house number 1 5 9 5 1,/); await finish(a.c);
+  assert.deepEqual(a.booked.map((r) => [r.address.street1, r.address.postalCode]), [['15951 Woodland Hills Drive', '90210']]);
+  const b = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  b.h.serve(b.c.transport); b.c.setup(DREW, undefined, 'Testa Invented');
+  await b.c.hears(/Is that right[?] Say yes or no/, 'yes'); await b.c.hears(/street address/, 'one five nine five one.');
+  await b.c.hears(/street name/, 'Woodland Hills Drive.'); await b.c.hears(/city|ZIP/, 'Testville, CA 90210');
+  await b.c.hears(/What day and time/, 'Tuesday at ten'); await b.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from a number ending in/, 'yes');
+  await b.c.hears(/^To confirm/, 'yes'); await finish(b.c); assert.deepEqual(b.booked.map((r) => r.address.street1), ['15951 Woodland Hills Drive']);
+  const c = build({ emails: 'accept', textsEnabled: false, settleMs: 80 });
+  c.h.serve(c.c.transport); c.c.setup(DREW, undefined, 'Testa Invented');
+  await c.c.hears(/Is that right[?] Say yes or no/, 'yes'); await c.c.hears(/street address/, 'forty two Woodland Hills Drive, Testville, CA 90210');
+  await c.c.hears(/What day and time/, 'Tuesday at ten'); await c.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await c.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.c.hears(/calling from a number ending in/, 'yes'); await finish(c.c);
+  assert.equal(c.booked.length, 0, 'an ambiguous number is never booked'); assert.ok(!c.c.lines.some((l) => /^To confirm/.test(l)), 'and never read back'); assert.equal(c.last().reason, 'ADDRESS_INVALID');
+  assert.ok(c.logs.some(([k, v]) => k === 'FAST_ADDRESS_GUARD' && (v as { field: string }).field === 'house_number'));
+});

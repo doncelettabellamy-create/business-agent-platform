@@ -38,7 +38,7 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   NEED_CITY / NEED_ZIP   (city-and-ZIP mode only) the street address is held and the city, or the ZIP code, is still needed: only that part is asked.   BAD_ZIP   the ZIP code heard was not five digits (or was all zeros): nothing was taken.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'NUMBER_IS_ZIP' | 'JOINED' | 'CORRECTED' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'NUMBER_IS_ZIP' | 'STREET_REPLACED' | 'JOINED' | 'CORRECTED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -66,6 +66,11 @@ const PO_BOX = /\bp\.?\s?o\.?\s+box\s+\w+/i;
 const THOUSANDS_GROUPS = /(?<![\d,])\d{1,3}(?:,\d{3})+(?!\d)/g;
 /** The same number said as the whole line with a space after the comma ("15, 951", Live Test #10). Only a line that is nothing else: "Springfield, 91364" and "12, 345 Elm Street" are never touched. */
 const LONE_SPACED_GROUPS = /^\d{1,3}(?:,\s+\d{3})+$/;
+/** Digits said one at a time and written with spaces, dashes or full stops between them ("1-5-9-5-1", Live Test #12): three or more single digits. A range such as "12-14" or "12-B" has no run of three single digits and is never touched. */
+const SPOKEN_DIGITS = /(?<![\d-])\d(?:[\s.-]+\d){2,}(?![\d-])/g;
+/** Digits said as single words, three or more in a row ("one five nine five one", "nine oh two one oh", "double five" counts as two). "Fifteen", "ninety" and "hundred" forms are NOT here: they are ambiguous ("forty two" is 42, "four two" is 42 too), so they are left alone and fail closed later. */
+const SPOKEN_WORD_DIGIT = String.raw`(?:(?:double|triple|treble)[\s-]+)?(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)`;
+const SPOKEN_WORD_DIGITS = new RegExp(String.raw`\b${SPOKEN_WORD_DIGIT}(?:[\s,.-]+${SPOKEN_WORD_DIGIT}){2,}\b`, 'gi');
 /** The house number a street address starts with ("15951" of "15951 Woodland Hills Drive"), or '' when it has none. */
 const houseNumberOf = (street: string): string => /^(\d[\d-]*)(?=\s|$)/.exec(street)?.[1] ?? '';
 const ADDRESS_NUMBER = new RegExp(`(?:\\b\\d{1,6}\\b|\\b${NUM_WORD}\\b)`, 'i');
@@ -133,6 +138,7 @@ const HOUSE_NUMBER_LEAD = /^(?:the\s+)?(?:house|street)\s+number\s+(?:is\s+)?/i;
 const NOT_A_STREET = new Set(['about', 'price', 'quote', 'cost', 'talk', 'want', 'need', 'like', 'have', 'get', 'tell', 'ask', 'say', 'think', 'maybe', 'later', 'also', 'just', 'really', 'thing', 'something', 'anything', 'everything', 'here', 'there', 'where', 'when', 'which', 'who', 'from', 'in', 'on', 'of', 'and', 'but', 'or', 'so', 'because', 'if', 'then', 'than', 'are', 'was', 'were', 'be', 'been', 'am', 'let', 'me', 'check', 'look', 'find', 'give', 'hold', 'hang', 'moment', 'second', 'minute', 'repeat', 'pardon', 'hmm', 'yeah', 'yep', 'nope', 'nah', 'house', 'apartment', 'apt', 'unit', 'suite', 'floor', 'room', 'a']);
 /** Generic road words: they may be part of a street name ("Elm Street") but are not a street name by themselves. No suffix is ever REQUIRED. */
 const ROAD_WORD = new Set(['street', 'st', 'avenue', 'ave', 'road', 'rd', 'lane', 'ln', 'drive', 'dr', 'court', 'ct', 'way', 'place', 'pl', 'terrace', 'boulevard', 'blvd']);
+const namesRoad = (name: string): boolean => name.split(' ').some((w) => ROAD_WORD.has(w.toLowerCase().replace(/\.$/, '')));
 export type AddressPiece = { readonly kind: 'number' | 'street'; readonly text: string };
 const numericWord = (w: string): boolean => /^\d{1,6}[a-z]?$/i.test(w) || NUMBER_WORD_ONLY.test(w) || /^(?:oh|double|triple|treble)$/i.test(w);
 /** A house number alone, or a street name alone, from a caller's line; undefined for anything else (a whole address is addressFrom's). Pure. */
@@ -185,6 +191,10 @@ export interface ContactState {
   spokenAddress(): string | undefined;
   /** City-and-ZIP mode, once the address is whole: its parts kept apart (a street address, a city, a five-digit ZIP code, and the two-letter state when the caller said it), for a system that needs them separately. The state is never filled in from anywhere else: absent until the caller says it. RAW personal data. Undefined until the address is whole, or when the mode is off. */
   addressParts(): { street: string; city: string; zip: string; state?: string } | undefined;
+  /** True when the street was put together from a house number and a name with no road word ("15951" then a place name, Live Test #12 review): the name may be a city, so the caller must confirm the street, spelled out, before the read-back. */
+  streetUnchecked(): boolean;
+  /** The caller confirmed the street spelled out. */
+  streetChecked(): void;
   /** City-and-ZIP mode, once the address is whole: a CORRECTED street (the house number and the street name said whole, or the street name alone with the house number kept) replaces ONLY the street. A city, ZIP code or state said with it replaces that part too; every part not said stays as it was. Anything else changes nothing and is `unclear`. RAW personal data in, nothing logged. */
   correctStreet(raw: unknown): CollectResult;
   /** City-and-ZIP mode: which of the address parts are held (the state included), as booleans only (never a part itself), for a log line. */
@@ -217,9 +227,10 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
   let values: { name?: string; phone?: string; address?: string } = {};
   let aStreet = ''; let aCity = ''; let aZip = ''; let aState = '';   // city-and-ZIP mode: the parts of the address, held until all are known (the state is held apart: it is never needed for the address to be whole, and never guessed)
   const assemble = (): void => { if (aStreet !== '' && aCity !== '' && aZip !== '') values.address = `${aStreet}, ${aCity}, ${aZip}`.slice(0, 200); else delete values.address; };
-  const dropParts = (): void => { aStreet = ''; aCity = ''; aZip = ''; aState = ''; pendNumber = ''; pendStreet = ''; };
+  const dropParts = (): void => { aStreet = ''; aCity = ''; aZip = ''; aState = ''; pendNumber = ''; pendStreet = ''; streetCheck = false; };
   let pending = '';   // digits of a phone number heard in pieces
   let phoneAmbiguous = false;   // the pieces heard could not be fitted together and were forgotten: the caller is asked for the whole number again
+  let streetCheck = false;   // the street was joined from pieces and its name has no road word: it must be confirmed spelled out
   let pendNumber = ''; let pendStreet = '';   // one part of a service address heard on its own, held until the other arrives
   let disposed = false;
 
@@ -279,6 +290,8 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
     const grouped: string[] = [];   // a number written with thousands commas ("15,951", Live Test #9) is one house number: the commas go BEFORE the line is split on commas, and the written form is taught to the masker
     let t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '').replace(THOUSANDS_GROUPS, (m) => { grouped.push(m); return m.replace(/,/g, ''); });
     if (LONE_SPACED_GROUPS.test(t0)) { grouped.push(t0); t0 = t0.replace(/,\s+/g, ''); }
+    t0 = t0.replace(SPOKEN_WORD_DIGITS, (m) => { const d = digitsOf(m); if (d === undefined || d.length < 3 || d.length > 9) return m; grouped.push(m); return d; });   // "one five nine five one" is the number 15951; it is taught to the masker as said
+    t0 = t0.replace(SPOKEN_DIGITS, (m) => { grouped.push(m); return m.replace(/[\s.-]/g, ''); });   // "1-5-9-5-1" is the number 15951, before anything is split; the spoken form is taught to the masker
     if (t0.length < 1 || t0.length > 160 || /[@\[\]<>]/.test(t0)) return { field: 'address', outcome: 'unclear', learn: [], reason: 'NOT_AN_ADDRESS' };
     let t = t0; let zip: string | undefined; let badZip = false; const learn: string[] = [...grouped];
     // 1. The ZIP code: the last run of digits, when it ends the line.
@@ -317,20 +330,26 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
         } else {
           const c = cityFrom(s);
           // A bare city fills an EMPTY city only; replacing a held one takes the words "the city is ..." (or a whole new address), so an off-topic answer to the ZIP question cannot overwrite it.
-          if (c !== undefined && aStreet !== '') { if (aCity === '') city = c; } else if (aStreet === '') piece = addressPiece(s);
+          if (c !== undefined && aStreet !== '') { if (aCity === '') city = c; }
+          else if (aStreet === '') {
+            const p = addressPiece(s);
+            // A street name that is held is never replaced by words that are no street name (a city said before the house number, Live Test #12): a plain place name fills an empty city, anything else changes nothing. A street name WITH a road word is a new street and replaces it, and says so (STREET_REPLACED).
+            if (p !== undefined && p.kind === 'street' && pendStreet !== '' && p.text !== pendStreet && !namesRoad(p.text)) { if (c !== undefined && aCity === '') city = c; }
+            else piece = p;
+          }
         }
       }
     }
     // 3. Apply. A street said whole replaces the street; pieces join as in the street-only flow; a city or ZIP replaces its own part only.
-    let changed = false; const parsed = street !== undefined || piece !== undefined || city !== undefined || zip !== undefined || stateCode !== undefined;
-    if (street !== undefined) { if (aStreet !== street) changed = true; aStreet = street; pendNumber = ''; pendStreet = ''; learn.push(street); }
+    let changed = false; let replaced = false; const parsed = street !== undefined || piece !== undefined || city !== undefined || zip !== undefined || stateCode !== undefined;
+    if (street !== undefined) { if (aStreet !== street) changed = true; aStreet = street; pendNumber = ''; pendStreet = ''; streetCheck = false; learn.push(street); }
     else if (piece !== undefined) {
       const number = piece.kind === 'number' ? piece.text : pendNumber;
       const name = piece.kind === 'street' ? piece.text : pendStreet;
       const joined = number !== '' && name !== '' ? addressFrom(`${number} ${name}`) : undefined;
-      if (joined !== undefined) { aStreet = joined; pendNumber = ''; pendStreet = ''; changed = true; learn.push(joined); }
+      if (joined !== undefined) { aStreet = joined; pendNumber = ''; pendStreet = ''; changed = true; learn.push(joined); streetCheck = !namesRoad(name); }   // a name with no road word may be a place name taken for the street: the caller confirms it spelled out
       else if (piece.kind === 'number' && pendNumber !== piece.text) { pendNumber = piece.text; changed = true; if (/\d{3,}/.test(piece.text) || piece.text.split(' ').length >= 2) learn.push(piece.text); }
-      else if (piece.kind === 'street' && pendStreet !== piece.text) { pendStreet = piece.text; changed = true; learn.push(piece.text); }
+      else if (piece.kind === 'street' && pendStreet !== piece.text) { if (pendStreet !== '') replaced = true; pendStreet = piece.text; changed = true; learn.push(piece.text); }
     }
     if (city !== undefined) { if (aCity !== city) changed = true; aCity = city; learn.push(city); }
     if (zip !== undefined) { if (aZip !== zip) changed = true; aZip = zip; }
@@ -347,7 +366,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       if (parsed) return { field: 'address', outcome: 'partial', learn: [], reason: 'SAME' };
       return { field: 'address', outcome: 'unclear', learn: [], reason: badZip ? 'BAD_ZIP' : ADDRESS_NUMBER.test(raw) ? 'NOT_AN_ADDRESS' : 'NO_STREET_NUMBER' };
     }
-    const reason: CollectReason = pendNumber !== '' || (aStreet === '' && pendStreet === '') ? 'NEED_STREET' : pendStreet !== '' ? 'NEED_NUMBER' : aCity === '' ? 'NEED_CITY' : 'NEED_ZIP';
+    const reason: CollectReason = replaced ? 'STREET_REPLACED' : pendNumber !== '' || (aStreet === '' && pendStreet === '') ? 'NEED_STREET' : pendStreet !== '' ? 'NEED_NUMBER' : aCity === '' ? 'NEED_CITY' : 'NEED_ZIP';
     return { field: 'address', outcome: 'partial', learn: out, reason };
   }
   /** A city or a ZIP code said as a correction ("the city is ...", "the zip code is ..."): replaces that part only. */
@@ -430,9 +449,11 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
     },
     spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aState === '' ? '' : `${stateName(aState)}, `}${aZip.split('').join(' ')}` : values.address; },
     addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' || houseNumberOf(aStreet) === aZip ? undefined : { street: aStreet, city: aCity, zip: aZip, ...(aState === '' ? {} : { state: aState }) }; },
+    streetUnchecked() { return !disposed && streetCheck && aStreet !== ''; },
+    streetChecked() { streetCheck = false; },
     correctStreet(raw) {
       if (disposed || !cityZip || typeof raw !== 'string' || aStreet === '' || aCity === '' || aZip === '') return { field: 'address', outcome: 'unclear', learn: [], reason: 'INACTIVE' };
-      const keep = { street: aStreet, city: aCity, zip: aZip, state: aState };
+      const keep = { street: aStreet, city: aCity, zip: aZip, state: aState }; const keepCheck = streetCheck;
       // Read the line as an address of its own, then keep every part the caller did not say again. Half-heard pieces (a house number on its own) stay held for the next answer, as in the first collection.
       aStreet = ''; aCity = ''; aZip = ''; aState = ''; delete values.address;
       const r = collectAddressCZ(raw);
@@ -440,7 +461,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       // The street name said alone: the house number already held stays (the caller then hears the whole street spelled and confirms it). Only a name with a road word in it ("Woodland Hills Drive") is taken: any other word ("sorry", a city) is not a street name, and a failed correction must not be spent on it.
       const hasRoadWord = pendStreet.split(' ').some((w) => ROAD_WORD.has(w.toLowerCase().replace(/\.$/, '')));
       if (street === '' && pendStreet !== '' && pendNumber === '' && hasRoadWord) { const m = /^(\d[\d-]*[A-Za-z]?)\s/.exec(keep.street); if (m !== null) { const j = addressFrom(`${m[1]} ${pendStreet}`); if (j !== undefined) { street = j; pendStreet = ''; } } }
-      if (street === '') { aStreet = keep.street; aCity = keep.city; aZip = keep.zip; aState = keep.state; if (pendNumber === '') pendStreet = ''; assemble(); return { field: 'address', outcome: 'unclear', learn: [], reason: r.reason === 'BAD_ZIP' ? 'BAD_ZIP' : 'NO_STREET_NUMBER' }; }
+      if (street === '') { aStreet = keep.street; aCity = keep.city; aZip = keep.zip; aState = keep.state; streetCheck = keepCheck; if (pendNumber === '') pendStreet = ''; assemble(); return { field: 'address', outcome: 'unclear', learn: [], reason: r.reason === 'BAD_ZIP' ? 'BAD_ZIP' : 'NO_STREET_NUMBER' }; }
       aStreet = street; pendNumber = ''; pendStreet = '';
       if (aCity === '') aCity = keep.city; if (aZip === '') aZip = keep.zip; if (aState === '') aState = keep.state;
       assemble();
