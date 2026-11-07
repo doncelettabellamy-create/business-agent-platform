@@ -38,7 +38,7 @@ export type CollectOutcome = 'captured' | 'partial' | 'unclear';
  *   NEED_CITY / NEED_ZIP   (city-and-ZIP mode only) the street address is held and the city, or the ZIP code, is still needed: only that part is asked.   BAD_ZIP   the ZIP code heard was not five digits (or was all zeros): nothing was taken.
  *   INACTIVE          the call state was already closed.
  */
-export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'JOINED' | 'CORRECTED' | 'INACTIVE';
+export type CollectReason = 'CAPTURED' | 'PIECE' | 'MERGED' | 'SAME' | 'AMBIGUOUS' | 'NOT_DIGITS' | 'RESTART' | 'CORRECTED_LAST4' | 'NO_DIGITS' | 'TOO_MANY' | 'NOT_A_NAME' | 'NO_STREET_NUMBER' | 'NOT_AN_ADDRESS' | 'NEED_STREET' | 'NEED_NUMBER' | 'NEED_CITY' | 'NEED_ZIP' | 'BAD_ZIP' | 'NUMBER_IS_ZIP' | 'JOINED' | 'CORRECTED' | 'INACTIVE';
 export interface CollectResult {
   readonly field: ContactField;
   readonly outcome: CollectOutcome;
@@ -64,6 +64,10 @@ const ADDRESS_TAIL = /[\s,.]*(?:please|thanks|thank you)?[\s,.!?]*$/i;
 const PO_BOX = /\bp\.?\s?o\.?\s+box\s+\w+/i;
 /** A number written with thousands commas: one to three digits, then groups of exactly three ("15,951"). A comma followed by a space ("Springfield, 91364") is never one. */
 const THOUSANDS_GROUPS = /(?<![\d,])\d{1,3}(?:,\d{3})+(?!\d)/g;
+/** The same number said as the whole line with a space after the comma ("15, 951", Live Test #10). Only a line that is nothing else: "Springfield, 91364" and "12, 345 Elm Street" are never touched. */
+const LONE_SPACED_GROUPS = /^\d{1,3}(?:,\s+\d{3})+$/;
+/** The house number a street address starts with ("15951" of "15951 Woodland Hills Drive"), or '' when it has none. */
+const houseNumberOf = (street: string): string => /^(\d[\d-]*)(?=\s|$)/.exec(street)?.[1] ?? '';
 const ADDRESS_NUMBER = new RegExp(`(?:\\b\\d{1,6}\\b|\\b${NUM_WORD}\\b)`, 'i');
 
 const clean = (s: string): string => s.replace(/\s+/g, ' ').trim();
@@ -273,7 +277,8 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
   function collectAddressCZ(raw: string): CollectResult {
     const hadParts = aStreet !== '' || aCity !== '' || aZip !== '' || aState !== '' || pendNumber !== '' || pendStreet !== '';
     const grouped: string[] = [];   // a number written with thousands commas ("15,951", Live Test #9) is one house number: the commas go BEFORE the line is split on commas, and the written form is taught to the masker
-    const t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '').replace(THOUSANDS_GROUPS, (m) => { grouped.push(m); return m.replace(/,/g, ''); });
+    let t0 = clean(raw).replace(ADDRESS_LEAD, '').replace(ADDRESS_CUT, '').replace(ADDRESS_TAIL, '').trim().replace(/[.,!?]+$/, '').replace(THOUSANDS_GROUPS, (m) => { grouped.push(m); return m.replace(/,/g, ''); });
+    if (LONE_SPACED_GROUPS.test(t0)) { grouped.push(t0); t0 = t0.replace(/,\s+/g, ''); }
     if (t0.length < 1 || t0.length > 160 || /[@\[\]<>]/.test(t0)) return { field: 'address', outcome: 'unclear', learn: [], reason: 'NOT_AN_ADDRESS' };
     let t = t0; let zip: string | undefined; let badZip = false; const learn: string[] = [...grouped];
     // 1. The ZIP code: the last run of digits, when it ends the line.
@@ -330,6 +335,11 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
     if (city !== undefined) { if (aCity !== city) changed = true; aCity = city; learn.push(city); }
     if (zip !== undefined) { if (aZip !== zip) changed = true; aZip = zip; }
     if (stateCode !== undefined) { if (aState !== stateCode) changed = true; aState = stateCode; }
+    // A house number equal to the ZIP code is a ZIP said where the number was wanted (Live Test #10: "77346 Woodland Hills Drive"). The number is never trusted: it is dropped, the street name is held, the ZIP stays, and the number is asked again.
+    if (aZip !== '' && houseNumberOf(aStreet) === aZip) {
+      pendStreet = aStreet.replace(/^\S+\s+/, ''); pendNumber = ''; aStreet = ''; assemble();
+      return { field: 'address', outcome: 'unclear', learn: [...new Set(learn)], reason: 'NUMBER_IS_ZIP' };
+    }
     assemble();
     const out = [...new Set(learn)];
     if (values.address !== undefined) return { field: 'address', outcome: 'captured', learn: out, reason: hadParts ? 'JOINED' : 'CAPTURED' };
@@ -419,7 +429,7 @@ export function createContactState(options: ContactStateOptions = {}): ContactSt
       return aCity === '' ? 'city' : 'ZIP code';
     },
     spokenAddress() { if (disposed || values.address === undefined) return undefined; return cityZip ? `${aStreet}, ${aCity}, ${aState === '' ? '' : `${stateName(aState)}, `}${aZip.split('').join(' ')}` : values.address; },
-    addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' ? undefined : { street: aStreet, city: aCity, zip: aZip, ...(aState === '' ? {} : { state: aState }) }; },
+    addressParts() { return disposed || !cityZip || values.address === undefined || aStreet === '' || aCity === '' || aZip === '' || houseNumberOf(aStreet) === aZip ? undefined : { street: aStreet, city: aCity, zip: aZip, ...(aState === '' ? {} : { state: aState }) }; },
     correctStreet(raw) {
       if (disposed || !cityZip || typeof raw !== 'string' || aStreet === '' || aCity === '' || aZip === '') return { field: 'address', outcome: 'unclear', learn: [], reason: 'INACTIVE' };
       const keep = { street: aStreet, city: aCity, zip: aZip, state: aState };

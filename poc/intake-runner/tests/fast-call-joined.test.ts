@@ -107,7 +107,7 @@ test('JOINED: the short opening, a yes, name, address with city and ZIP, day and
   assert.equal(await r.hears(/is one hundred ninety-nine dollars/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
   await r.hears(/calling from a number ending in 0 0 0 2/, 'yes');
   await r.hears(/May we send you one automated/, 'yes');
-  assert.equal(await r.hears(/^To confirm/, 'yes'), 'To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, spelled I N V E N T E D, L A N E, Testville, California, 9 0 2 1 0. The price is one hundred ninety-nine dollars. Shall I book it? Say yes or no.');
+  assert.equal(await r.hears(/^To confirm/, 'yes'), 'To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, house number 1 2 3, street spelled I N V E N T E D, L A N E, Testville, California, 9 0 2 1 0. The price is one hundred ninety-nine dollars. Shall I book it? Say yes or no.');
   const bye = await r.hears(/You are booked/); assert.equal(bye, 'You are booked for Tuesday, November third, 2026 at 10 A M. A confirmation text is on its way. Goodbye.');
   await until(() => r.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'), 'the delivery check');
   // Jobber: one client, one job, the read-back matched
@@ -176,7 +176,7 @@ test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call 
   assert.equal(await r.hears(/is one hundred ninety-nine dollars/, 'yes'), 'A standard cleaning for two bedrooms and two bathrooms is one hundred ninety-nine dollars. We have Tuesday, November third, 2026 at 10 A M. Does that work?');
   // the verified caller ID is still the callback candidate; with texts off the very next question is the read-back
   assert.equal(await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'), 'I see you are calling from a number ending in 0 0 0 2. Is that the best number to reach you?');
-  assert.match(await r.hears(/^To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, spelled I N V E N T E D, L A N E, Testville, California, 9 0 2 1 0\. The price is one hundred ninety-nine dollars\./);
+  assert.match(await r.hears(/^To confirm/, 'yes'), /^To confirm: Standard cleaning for Testa Invented on Tuesday, November third, 2026 at 10 A M, at 123 Invented Lane, house number 1 2 3, street spelled I N V E N T E D, L A N E, Testville, California, 9 0 2 1 0\. The price is one hundred ninety-nine dollars\./);
   assert.equal(await r.hears(/You are booked/), 'You are booked for Tuesday, November third, 2026 at 10 A M. Goodbye.');
   await until(() => r.outcomes.some((o) => o.reason === 'BOOKED'), 'the outcome');
   const spoken = r.voices[0].spoken.join(' | '); assert.ok(!/May we send you|automated booking-details|confirmation text is on its way/.test(spoken), 'no text question, no promise of a text');

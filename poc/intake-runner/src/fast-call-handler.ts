@@ -105,6 +105,20 @@ export function spellStreet(street: string): string {
   const name = words.filter((w, i) => !(i === 0 && /^\d[\d-]*[A-Za-z]?$/.test(w) && words.length > 1)).map((w) => w.replace(/\.+$/, '')).filter((w) => w !== '');
   return name.length === 0 ? '' : spellOut(name.join(' '));
 }
+/** The house number of a street address, digit by digit ("15951 Woodland Hills Drive" gives "1 5 9 5 1"), so a ZIP code or a mis-heard digit cannot pass by ear (Live Test #10). Empty when the street has no leading number. */
+export function spellHouseNumber(street: string): string {
+  const first = street.split(' ').find((w) => w !== '') ?? '';
+  return /^\d[\d-]*[A-Za-z]?$/.test(first) ? first.replace(/[A-Za-z\d]/g, (c) => `${c.toUpperCase()} `).replace(/-/g, 'dash ').trim() : '';
+}
+/** The NAMES of the address parts that are not good enough to book (none = complete): a leading house number that is not the ZIP, a street name, a city, a two-letter state and a five-digit ZIP. Never a value. */
+export function addressIssues(p: { street: string; city: string; zip: string; state?: string }): string[] {
+  const bad: string[] = []; const m = /^(\d[\d-]*)[A-Za-z]?\s+\S/.exec(p.street);
+  if (m === null) bad.push('house_number'); else if (m[1] === p.zip) bad.push('house_number_is_zip');
+  if (!/^[\p{L} .'-]{2,60}$/u.test(p.city)) bad.push('city');
+  if (!/^[A-Za-z]{2}$/.test(p.state ?? '')) bad.push('state');
+  if (!/^\d{5}$/.test(p.zip) || p.zip === '00000') bad.push('zip');
+  return bad;
+}
 /** What the caller confirmed in the read-back, held until the booking is built: the booking must carry exactly these facts. */
 export interface ConfirmedFacts { first: string; last: string; date: string; start: string; end: string; street: string; city: string; zip: string; state: string; price: number }
 /** The NAMES of the facts in the booking request that differ from what the caller confirmed (none = the same). Nothing is booked, and nothing is sent, when any differs or when nothing was confirmed. */
@@ -404,9 +418,10 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       if (streetPending) return void giveUp('ADDRESS_NOT_CONFIRMED');   // a corrected street is never read back, or booked, before the caller has confirmed it spelled out
       if (!nameOk) return void giveUp('NAME_UNCONFIRMED');   // never read back, or booked, without the caller's own yes to the name
       if (p.state === undefined) return void giveUp('STATE_MISSING');   // never read back, or booked, without the caller's state
+      { const bad = addressIssues(p); if (bad.length > 0) { deps.log('FAST_ADDRESS_GUARD', { ok: false, count: bad.length, field: bad[0] }); return void giveUp('ADDRESS_INVALID'); } }   // fail closed: a complete address (number, street, city, state, five-digit ZIP) before anything is read back
       confirmed = { first: firstName, last: lastName, date: o.date, start: o.time, end: o.endTime, street: p.street, city: p.city, zip: p.zip, state: p.state, price: S.priceDollars };   // exactly what the caller is about to be asked to confirm
       const spokenZip = p.zip.split('').join(' '); const spelledStreet = spellStreet(p.street);   // the street name is spelled in the read-back, as the name is: a mis-heard word cannot pass by ear (Live Test #8)
-      ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}${spelledStreet === '' ? '' : `, spelled ${spelledStreet}`}, ${p.city}, ${stateName(p.state)}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
+      ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, house number ${spellHouseNumber(p.street)}${spelledStreet === '' ? '' : `, street spelled ${spelledStreet}`}, ${p.city}, ${stateName(p.state)}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
         if (y === 'yes') return book();
         if (y === 'no') return askField();   // a no opens the correction of the part that is wrong (the address); nothing is booked until a read-back is confirmed
@@ -445,7 +460,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     function confirmStreet(): void {
       const p = contact.addressParts(); if (p === undefined) return void giveUp('ADDRESS_MISSING');
       // The street is said AND spelled word by word ("I have 1427 Woodland Hills Drive, spelled W O O D L A N D, H I L L S, D R I V E."), as the name is.
-      ask('STREET_CONFIRM', `I have ${p.street}, spelled ${spellStreet(p.street)}. Is that right? Say yes or no.`, async (heard) => {
+      ask('STREET_CONFIRM', `I have ${p.street}, house number ${spellHouseNumber(p.street)}, street spelled ${spellStreet(p.street)}. Is that right? Say yes or no.`, async (heard) => {
         const y = yesNo(heard);
         deps.log('FAST_ADDRESS_FIX', { path: 'CONFIRM', answer: y, no: streetNo, spelled: true, letters: spellStreet(p.street).replace(/[^A-Za-z]/g, '').length });   // a short token, flags and counts: never the street or a letter
         if (y === 'yes') { streetPending = false; note('STREET_CONFIRMED'); return finalReadback(); }
@@ -474,6 +489,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       clearTimers(); awaiting = undefined;
       const o = offer!; const p = contact.addressParts();
       if (streetPending) return end('ADDRESS_NOT_CONFIRMED', 'Your request is recorded, and a person will confirm the booking. Goodbye.');   // fail closed: a street under correction is never booked
+      if (p !== undefined && addressIssues(p).length > 0) { deps.log('FAST_ADDRESS_GUARD', { ok: false, count: addressIssues(p).length, field: addressIssues(p)[0] }); return end('ADDRESS_INVALID', 'Your request is recorded, and a person will confirm the booking. Goodbye.'); }   // fail closed, again at the last moment: nothing is sent to Jobber without a complete address
       if (p === undefined || p.state === undefined || !nameOk || !S.standingApproval) return end(!S.standingApproval ? 'NO_STANDING_APPROVAL' : !nameOk ? 'NAME_UNCONFIRMED' : p === undefined ? 'ADDRESS_MISSING' : 'STATE_MISSING', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
       // Availability is checked once more, from the calendar, right before anything is written: the time must lie inside the window that was read and still be free.
       { const { from, to } = calendarWindow(); let cal: { busy: Busy[]; complete: boolean }; try { cal = await deps.busy(from, to); } catch { cal = { busy: [], complete: false }; }

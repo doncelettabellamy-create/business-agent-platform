@@ -111,6 +111,7 @@ test('request gate: the three literal approvals, strict patterns and a future, s
   assert.deepEqual(requestProblems(REQ, NOW), []);
   const far = { ...REQ.when, date: '2027-10-04' }; assert.ok(requestProblems({ ...REQ, when: far }, NOW).includes('when'), 'a visit more than 30 days ahead is refused before any write');
   const bad = (o: Partial<BookingRequest> | Record<string, unknown>) => requestProblems({ ...REQ, ...o }, NOW);
+  assert.ok(bad({ address: { ...REQ.address, street1: 'Woodland Hills Drive' } }).includes('address.street1'), 'a street without a house number is never written'); assert.ok(bad({ address: { ...REQ.address, street1: `${REQ.address.postalCode} Woodland Hills Drive` } }).includes('address.street1'), 'a house number equal to the ZIP is never written'); assert.ok(bad({ address: { ...REQ.address, province: undefined } }).includes('address.province'), 'no state, no write');
   assert.ok(bad({ gate: { ...REQ.gate, approvedByPerson: false } }).includes('gate'));
   assert.ok(bad({ gate: {} }).includes('gate')); assert.ok(bad({ gate: undefined }).includes('gate'));
   assert.ok(bad({ key: 'short' }).includes('key'));

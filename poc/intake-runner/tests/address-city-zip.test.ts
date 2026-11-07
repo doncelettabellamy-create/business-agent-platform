@@ -259,3 +259,15 @@ test('collectAddress (COMMA-NUMBER): a house number written with thousands comma
   for (const ordinary of ['1427 Sample Street, Springfield, 91364', '1427 Sample Street,Springfield,91364', '12 Main Street, Springfield, 91364', '1427 Sample Street, Springfield, IL, 91364']) { const s = state(); say(s, ordinary); assert.equal(s.value('address')?.startsWith(ordinary.split(',')[0]), true, ordinary); assert.equal(s.addressPart(), undefined, ordinary); }
   const e = state(); say(e, '1427 Sample Street, Springfield, 91364'); assert.equal(e.correctStreet('15,951 Woodland Hills Drive').outcome, 'captured'); assert.equal(e.addressParts()?.street, '15951 Woodland Hills Drive', 'a street corrected with a comma number');
 });
+
+test('collectAddress (ZIP-AS-NUMBER): a ZIP said where the house number was wanted is never kept as the house number; a valid five-digit house number is; a comma and a space inside a number is one number (Live Test #10)', () => {
+  const a = state(); assert.deepEqual(say(a, 'Woodland Hills Drive.', '90001.', 'Springfield.', '90001.'), ['partial:NEED_NUMBER', 'partial:NEED_CITY', 'partial:NEED_ZIP', 'unclear:NUMBER_IS_ZIP'], 'the ZIP said as the number, then said again as the ZIP: refused');
+  assert.equal(a.addressParts(), undefined, 'no address to book or read back'); assert.equal(a.addressPart(), 'house number', 'only the house number is asked again');
+  assert.equal(a.addressHeld().zip, true, 'the ZIP and the city are kept'); assert.equal(a.addressHeld().city, true);
+  assert.deepEqual(say(a, '12345.'), ['captured:JOINED']); assert.equal(a.addressParts()?.street, '12345 Woodland Hills Drive'); assert.equal(a.addressParts()?.zip, '90001', 'the real number joined the held street name; the ZIP stayed');
+  const b = state(); say(b, '12345 Woodland Hills Drive.', 'Springfield.', '90001.'); assert.equal(b.addressParts()?.street, '12345 Woodland Hills Drive', 'a valid five-digit house number is kept');
+  const c = state(); say(c, '90001 Woodland Hills Drive, Springfield, 90001'); assert.equal(c.addressParts(), undefined, 'a whole address whose number is its ZIP is refused'); assert.equal(c.addressPart(), 'house number');
+  const d = state(); say(d, 'Woodland Hills Drive.', '90001.', 'Springfield.', '90001.', '90001.'); assert.equal(d.addressParts(), undefined, 'said a third time it is still refused');
+  const e = state(); assert.deepEqual(say(e, '12, 345.'), ['partial:NEED_STREET']); say(e, 'Woodland Hills Drive', 'Springfield, 90001'); assert.equal(e.addressParts()?.street, '12345 Woodland Hills Drive', '"12, 345" (a space after the comma) is the number 12345');
+  const f = state(); say(f, '1427 Sample Street, Springfield, 91364'); assert.equal(f.addressParts()?.street, '1427 Sample Street'); const g = state(); say(g, '12, 345 Elm Street, Springfield, 91364'); assert.notEqual(g.addressParts()?.street, '12345 Elm Street', 'only a line that is just the number is joined');
+});

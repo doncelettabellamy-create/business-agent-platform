@@ -44,7 +44,7 @@ export interface BookingResult {
 
 const KEY = /^[A-Za-z0-9_-]{16,64}$/;
 const NAME = /^[\p{L}][\p{L} '.-]{0,59}$/u;
-const STREET = /^[\p{L}\p{N} .,'#/-]{3,80}$/u;
+const STREET = /^\d[\d-]*[A-Za-z]?\s+[\p{L}\p{N} .,'#/-]{2,80}$/u;   // a street address starts with a house number (a ZIP or a street name alone is never written)
 const CITY = /^[\p{L} .'-]{2,60}$/u;
 const TEXT = /^[A-Za-z0-9 .,'&()-]{3,80}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/; const CLOCK = /^([01]\d|2[0-3]):[0-5]\d$/; const OFFSET = /^[+-](0\d|1[0-4]):[0-5]\d$/;
@@ -66,7 +66,8 @@ export function requestProblems(r: unknown, now: number): string[] {
   if (!STREET.test(String(x.address?.street1 ?? ''))) p.push('address.street1');
   if (!CITY.test(String(x.address?.city ?? ''))) p.push('address.city');
   if (!/^\d{5}$/.test(String(x.address?.postalCode ?? ''))) p.push('address.postalCode');
-  if (x.address?.province !== undefined && !/^[A-Za-z]{2}$/.test(String(x.address.province))) p.push('address.province');
+  if (!/^[A-Za-z]{2}$/.test(String(x.address?.province ?? ''))) p.push('address.province');   // required: no write without the caller's state
+  if (String(x.address?.street1 ?? '').split(' ')[0] === String(x.address?.postalCode ?? '') && String(x.address?.postalCode ?? '') !== '') p.push('address.street1');   // the house number is the ZIP: a ZIP said as a number
   const w = x.when;
   if (!DATE.test(String(w?.date ?? '')) || !CLOCK.test(String(w?.startTime ?? '')) || !CLOCK.test(String(w?.endTime ?? '')) || !OFFSET.test(String(w?.utcOffset ?? ''))) p.push('when');
   else {
