@@ -12,7 +12,8 @@
 // Behaviour kept simple on purpose:
 //   * ONE request per line, NO retry: a failed line is reported as failed (the adapter and the call logic handle it); a retry could speak a line twice.
 //   * The key is asked for when a line starts (never at setup), is sent only in the xi-api-key header, and appears in no URL, body, log, diagnostic or error text.
-//   * The provider's error body is never read into a log or an error: only the status class is recorded.
+//   * The provider's error body is never put into a log or an error. For a non-OK status it is read (at most ERROR_BODY_MAX_BYTES, for at most ERROR_BODY_MS) ONLY to find `detail.status`; that word is
+//     looked up in a fixed list and the line logs the FIXED CODE from the list (or OTHER, or UNPARSED). The provider's message, any other field, the body, the key, the voice id and the line's text are never logged.
 //   * CANCEL aborts the request and cancels the reader; after a cancel (or a failure) nothing more is handed to the sink, whatever the provider or the stream still delivers.
 //   * Only the approved candidate settings are accepted (the voice id's shape, the approved model, the speed bounds, mu-law 8 kHz); anything else throws before any request is made.
 
@@ -40,6 +41,52 @@ export interface ElevenLabsConfig {
   /** The most audio one line may carry, in bytes. Default 4194304. */
   maxBytes?: number;
   diag?: DiagSink;
+}
+
+/** The provider error statuses that may be named in a diagnostic, as fixed codes. The key is the provider's `detail.status` word, matched exactly; the value is what is logged. Anything else logs OTHER. */
+export const ERROR_REASONS: Readonly<Record<string, string>> = Object.freeze({
+  voice_not_found: 'VOICE_NOT_FOUND', quota_exceeded: 'QUOTA_EXCEEDED', invalid_api_key: 'INVALID_API_KEY',
+  rate_limit_exceeded: 'RATE_LIMIT', concurrent_limit_exceeded: 'CONCURRENT_LIMIT', max_character_limit_exceeded: 'CHAR_LIMIT',
+});
+/** How much of a provider error body is read, and for how long. A late or oversize body is not waited for: the line fails (and falls back) on its own timing. */
+export const ERROR_BODY_MAX_BYTES = 2048;
+export const ERROR_BODY_MS = 250;
+/** The fixed code for a provider error body: one of the ERROR_REASONS values, OTHER (valid JSON that names nothing on the list) or UNPARSED (not JSON, truncated, empty or missing). Pure; never throws; never returns any text from the body. */
+export function errorReasonOf(text: unknown): string {
+  try {
+    if (typeof text !== 'string') return 'UNPARSED';
+    const body: unknown = JSON.parse(text);
+    const detail: unknown = typeof body === 'object' && body !== null ? (body as { detail?: unknown }).detail : undefined;
+    const status: unknown = typeof detail === 'object' && detail !== null && !Array.isArray(detail) ? (detail as { status?: unknown }).status : undefined;
+    return typeof status === 'string' && Object.hasOwn(ERROR_REASONS, status) ? ERROR_REASONS[status] : 'OTHER';
+  } catch { return 'UNPARSED'; }
+}
+/** Reads at most `max` bytes of the response body, for at most `ms`, as text; undefined when there is no body, it is late, or reading fails. Never throws. Cancels the stream when it is done with it. */
+async function readBounded(res: Response, ms: number, max: number): Promise<string | undefined> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    if (res.body === null) return undefined;
+    reader = res.body.getReader();
+    const late = new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), ms); timer.unref?.(); });
+    const parts: Uint8Array[] = [];
+    let total = 0;
+    while (total < max) {
+      const r = await Promise.race([reader.read(), late]);
+      if (r === undefined) return undefined;
+      if (r.done) break;
+      if (!(r.value instanceof Uint8Array)) continue;
+      parts.push(r.value.subarray(0, max - total));
+      total += parts[parts.length - 1].length;
+    }
+    const all = new Uint8Array(total);
+    let at = 0;
+    for (const p of parts) { all.set(p, at); at += p.length; }
+    return new TextDecoder().decode(all);
+  } catch { return undefined; } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    try { void reader?.cancel().catch(() => {}); } catch { /* nothing to cancel */ }
+  }
 }
 
 type Why = 'NO_KEY' | 'TIMEOUT_HEADERS' | 'HTTP_ERROR' | 'BAD_TYPE' | 'READ_ERROR' | 'REQUEST_ERROR' | 'TOO_BIG';
@@ -90,10 +137,10 @@ export function createElevenLabsSpeechSource(config: ElevenLabsConfig): SpeechSo
       let bytes = 0;
       const stop = (): void => { stopped = true; if (headersTimer !== undefined) { clearTimeout(headersTimer); headersTimer = undefined; } };
       const abort = (): void => { try { controller.abort(); } catch { /* already aborted */ } try { void reader?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } };
-      const fail = (why: Why, status?: number): void => {
+      const fail = (why: Why, status?: number, reason?: string): void => {
         if (stopped) return;
         stop(); abort();
-        diag('ELEVENLABS_FAILED', { why, ...(status === undefined ? {} : { status }), ms: Date.now() - began });
+        diag('ELEVENLABS_FAILED', { why, ...(status === undefined ? {} : { status }), ...(reason === undefined ? {} : { reason }), ms: Date.now() - began });
         sink.fail();
       };
 
@@ -109,7 +156,7 @@ export function createElevenLabsSpeechSource(config: ElevenLabsConfig): SpeechSo
         if (stopped) { try { void res.body?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } return; }
         if (headersTimer !== undefined) { clearTimeout(headersTimer); headersTimer = undefined; }
         diag('ELEVENLABS_HEADERS', { status: res.status, ms: Date.now() - began });
-        if (!res.ok) { try { void res.body?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } fail('HTTP_ERROR', res.status); return; }   // the error body is never read
+        if (!res.ok) { const text = await readBounded(res, ERROR_BODY_MS, ERROR_BODY_MAX_BYTES); fail('HTTP_ERROR', res.status, errorReasonOf(text)); return; }   // only a fixed code from the body is logged, never its text
         if (!AUDIO_TYPE.test(res.headers.get('content-type') ?? '') || res.body === null) { try { void res.body?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } fail('BAD_TYPE', res.status); return; }
         reader = res.body.getReader();
         let first = true;
