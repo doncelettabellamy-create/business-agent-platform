@@ -115,16 +115,36 @@ test('ON: with the settings each call\'s socket is wrapped - the line goes to th
   assert.ok(!JSON.stringify(diag).includes(XI));
 });
 
-test('ON, no key: the provider cannot be asked (no request is made), so zero audio is handed on and OpenAI is asked to speak the line as the fallback - the same words, once', async () => {
-  const { open, sent } = fakeOpen(); const p = providerStandIn();
-  const diag: Array<{ code: string; [k: string]: unknown }> = [];
-  const socket = withSelectedSpeaker(open, JACK_SPEAKER, { getKey: () => undefined, fetch: p.fetch })(((code: string, detail?: Record<string, unknown>) => { diag.push({ code, ...detail }); }) as never);
-  socket.send(request('Hello there.'));
-  await until(() => sent.some((m) => m.type === 'response.create'));
-  assert.equal(p.calls.length, 0, 'no request to the provider');
-  assert.equal(sent.filter((m) => m.type === 'response.create').length, 1);
-  assert.ok(String(sent[0].response.instructions).endsWith('Hello there.'));
-  assert.ok(diag.some((d) => d.code === 'SPEAKER_FALLBACK' && d.why === 'START_FAILED'));
+test('ON, Jack lock: when the provider cannot speak a line (no key, a refusal, a failed request, an empty or non-audio answer) the call ENDS; OpenAI is never asked to speak, not even once, and no line is spoken in any other voice', async () => {
+  const refuse = (status: number): typeof globalThis.fetch => (async () => new Response('{"detail":{"status":"x"}}', { status, headers: { 'content-type': 'application/json' } })) as unknown as typeof globalThis.fetch;
+  const cases: Array<[string, () => string | undefined, typeof globalThis.fetch, string]> = [
+    ['no key', () => undefined, providerStandIn().fetch, 'START_FAILED'],
+    ['HTTP 400', () => XI, refuse(400), 'SOURCE_ERROR'], ['HTTP 401', () => XI, refuse(401), 'SOURCE_ERROR'], ['HTTP 500', () => XI, refuse(500), 'SOURCE_ERROR'],
+    ['a failed request', () => XI, (async () => { throw new Error('network down'); }) as unknown as typeof globalThis.fetch, 'SOURCE_ERROR'],
+    ['an answer that is not audio', () => XI, (async () => new Response('hi', { status: 200, headers: { 'content-type': 'text/html' } })) as unknown as typeof globalThis.fetch, 'SOURCE_ERROR'],
+    ['an empty answer', () => XI, (async () => new Response(new ReadableStream<Uint8Array>({ start(c) { c.close(); } }), { status: 200, headers: { 'content-type': 'audio/basic' } })) as unknown as typeof globalThis.fetch, 'EMPTY'],
+  ];
+  for (const [label, getKey, f, why] of cases) {
+    const sent: any[] = []; const closed: Array<number | undefined> = [];
+    const inner: SpeakerSocket = { send(t: string) { sent.push(JSON.parse(t)); return true; }, close(c?: number) { closed.push(c); }, onOpen() {}, onMessage() {}, onClose() {} };
+    const diag: Array<{ code: string; [k: string]: unknown }> = []; const events: any[] = []; let closedBy = 0;
+    const socket = withSelectedSpeaker(() => inner as never, JACK_SPEAKER, { getKey, fetch: f })(((code: string, detail?: Record<string, unknown>) => { diag.push({ code, ...detail }); }) as never);
+    socket.onMessage = (t: string) => { events.push(JSON.parse(t)); }; socket.onClose = () => { closedBy++; };
+    socket.send(request('Hello there.'));
+    await until(() => closedBy === 1, 6000);
+    assert.deepEqual(sent.filter((m) => m.type === 'response.create'), [], `${label}: OpenAI was never asked to speak`);
+    assert.ok(!events.some((e) => e.type === 'response.output_audio.delta'), `${label}: no audio of any voice`);
+    assert.equal(events.find((e) => e.type === 'response.done')?.response.status, 'failed', label); assert.ok(events.some((e) => e.type === 'x_speaker_down'), `${label}: the call logic is told`);
+    assert.deepEqual(closed, [1011], label); assert.ok(diag.some((d) => d.code === 'SPEAKER_FAILED' && d.why === why), `${label}: ${why}`); assert.ok(!diag.some((d) => d.code === 'SPEAKER_FALLBACK'), label);
+    assert.equal(socket.send(request('Again.')), false, `${label}: nothing more is spoken`);
+  }
+});
+
+test('the Jack lock wiring: the switch hands the adapter allowFallback false, nothing else in the module turns it back on, and the adapter\'s default is untouched', () => {
+  const src = readFileSync(new URL('../src/founder-voice-speaker.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
+  assert.ok(/withSpeaker\(open\(d\), createElevenLabsSpeechSource\(\{ getKey: deps\.getKey, fetch: deps\.fetch, diag \}\), settings, \{ diag, allowFallback: false \}\)/.test(src), 'the production wiring passes the lock');
+  assert.equal([...src.matchAll(/allowFallback/g)].length, 1, 'named once, set to false');
+  assert.ok(!/allowFallback:\s*true/.test(src));
 });
 
 // ================================================================ the entry (child process: dry run and refused serve only)

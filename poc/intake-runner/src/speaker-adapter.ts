@@ -13,7 +13,8 @@
 //     arrives afterwards (or was queued) is dropped and counted. A cancel of a reply that already ended is answered with the error the voice service gives (`response_cancel_not_active`).
 //   * FALLBACK, the first-test rule: if the source fails and **zero source audio was handed on** (it could not start, answered with an error or no audio, sent nothing usable, or ended empty), OpenAI
 //     speaks the SAME line instead, as one reply: the original request goes to OpenAI and its events are relayed under the same reply id. There is no hold buffer and no estimate of playout time:
-//     once a single piece of source audio has been handed on, there is no fallback.
+//     once a single piece of source audio has been handed on, there is no fallback. THE JACK LOCK: with `allowFallback: false` (Drew's founder voice calls) there is NO fallback at all: a source failure with
+//     zero audio ends the call the same way a failure after audio started does (below), and OpenAI never speaks a line. The default stays true, so a caller of this module that does not ask for the lock is unchanged.
 //   * THE CALL ENDS, within a defined time, when (a) the source fails AFTER audio started, or (b) the fallback fails (OpenAI errors, answers with no audio in time, or does not complete). The
 //     line is answered `failed` with no transcript (so it never counts as heard), a `x_speaker_down` event tells the call logic (which saves what was collected as an incomplete, unconfirmed
 //     call and ends it), and `endDelayMs` later the splice closes the voice socket itself as a backstop. After that no line is spoken. The caller hears the line close: when both voices are
@@ -122,6 +123,8 @@ export interface SpeakerOptions {
   fallbackTotalMs?: number;
   /** After a failure that ends the call: how long to let the failure reach the call logic before the splice closes the voice socket itself. Default 300. */
   endDelayMs?: number;
+  /** Default true. FALSE is the Jack lock: if the source fails before any audio is handed on, the call ends (as for a failure after audio started) and OpenAI is never asked to speak the line. */
+  allowFallback?: boolean;
 }
 export interface SpeakerStats {
   replies: number; completed: number; cancelled: number; failed: number; chunksOut: number; lateDropped: number; fromVoiceDropped: number; refused: number; passedThrough: number;
@@ -155,10 +158,10 @@ export function withSpeaker(inner: SpeakerSocket, source: SpeechSource, settings
   const o = {
     firstAudioMs: options.firstAudioMs ?? 4000, gapMs: options.gapMs ?? 2500, totalMs: options.totalMs ?? 30_000,
     maxChars: options.maxChars ?? 1500, maxChunkBytes: options.maxChunkBytes ?? 65_536, maxAudioMs: options.maxAudioMs ?? 120_000,
-    fbFirstMs: options.fallbackFirstAudioMs ?? 4000, fbGapMs: options.fallbackGapMs ?? 2500, fbTotalMs: options.fallbackTotalMs ?? 30_000, endDelayMs: options.endDelayMs ?? 300,
+    fbFirstMs: options.fallbackFirstAudioMs ?? 4000, fbGapMs: options.fallbackGapMs ?? 2500, fbTotalMs: options.fallbackTotalMs ?? 30_000, endDelayMs: options.endDelayMs ?? 300, allowFallback: options.allowFallback === undefined ? true : options.allowFallback,
   };
   if (!within(o.firstAudioMs, 1, 600_000) || !within(o.gapMs, 1, 600_000) || !within(o.totalMs, 1, 3_600_000) || !within(o.maxChars, 1, 20_000) || !within(o.maxChunkBytes, 1, 8_388_608) || !within(o.maxAudioMs, 1, 3_600_000)
-    || !within(o.fbFirstMs, 1, 600_000) || !within(o.fbGapMs, 1, 600_000) || !within(o.fbTotalMs, 1, 3_600_000) || !within(o.endDelayMs, 0, 60_000)) {
+    || !within(o.fbFirstMs, 1, 600_000) || !within(o.fbGapMs, 1, 600_000) || !within(o.fbTotalMs, 1, 3_600_000) || !within(o.endDelayMs, 0, 60_000) || typeof o.allowFallback !== 'boolean') {
     throw new RangeError('the speaker options are not acceptable');
   }
   const diag = options.diag ?? noDiag;
@@ -250,7 +253,7 @@ export function withSpeaker(inner: SpeakerSocket, source: SpeechSource, settings
   /** The source failed. Zero source audio handed on: OpenAI speaks the same line. Any audio handed on: the call ends. */
   function sourceFailed(r: Reply, why: SpeechFailure): void {
     if (r.closed || r.phase !== 'source') return;
-    if (r.bytes > 0) { endCall(r, why); return; }
+    if (r.bytes > 0 || !o.allowFallback) { endCall(r, why); return; }   // audio had started, or the Jack lock is on: the call ends and OpenAI never speaks
     stopTimers(r); cancelSource(r);
     r.phase = 'fallback';
     stats.fallbacks++;

@@ -459,3 +459,78 @@ test('behind the bridge: a reply the voice service sends that is not the fallbac
   assert.equal(h.media(), before);
   assert.equal(h.sp.stats().fromVoiceDropped, 2);
 });
+
+// ================================================================ the JACK LOCK: allowFallback false, OpenAI never speaks
+const LOCK_CASES: Array<[StandInBehaviour, string]> = [['fail-start', 'START_FAILED'], ['never', 'NO_AUDIO'], [{ failAfter: 0 }, 'SOURCE_ERROR'], ['empty', 'EMPTY'], ['bad-audio', 'BAD_AUDIO'], ['huge', 'BAD_AUDIO']];
+
+test('the Jack lock: every way the source can fail with zero audio ends the call, and OpenAI is never asked to speak: no fallback voice for a failed line', async () => {
+  for (const [b, why] of LOCK_CASES) {
+    const r = rig({ source: { behave: (_q, n) => (n === 1 ? b : 'ok') }, opts: { firstAudioMs: 60, allowFallback: false } });
+    r.sp.send(create(LINE, 'r1', 'e1'));
+    await until(() => r.closes() === 1);
+    assert.deepEqual(creates(r.inner), [], `${why}: OpenAI is not asked to speak`); assert.equal(r.inner.spoke(), 0, why);
+    assert.equal(deltaBytes(r.events), 0, `${why}: no audio of any voice reached the phone`);
+    const done = doneOf(r.events); assert.deepEqual([done.length, done[0].response.status], [1, 'failed'], why);
+    assert.equal(r.events.filter((e) => e.type === 'response.output_audio_transcript.done').length, 0, `${why}: a failed line has no transcript, so it never counts as heard`);
+    const order = typesOf(r.events); assert.ok(order.indexOf('response.done') < order.indexOf('x_speaker_down'), `${why}: the line is reported failed, then the call logic is told`);
+    assert.deepEqual(r.inner.closed, [1011], why);
+    assert.equal(failedWhy(r.diagLines), why); assert.equal(r.diagLines.find((d) => d.code === 'SPEAKER_FAILED')?.phase, 'SOURCE', why);
+    assert.ok(!r.diagLines.some((d) => d.code === 'SPEAKER_FALLBACK'), `${why}: no fallback was even considered`);
+    assert.deepEqual([r.sp.stats().fallbacks, r.sp.stats().failed, r.sp.stats().callEnds], [0, 1, 1], why);
+    assert.equal(r.sp.send(create(LINE, 'r2')), false, `${why}: nothing more is spoken`); assert.deepEqual(creates(r.inner), [], why);
+  }
+  // a line too long for the adapter has no source audio either: with the lock it ends the call too
+  const wordy = rig({ opts: { maxChars: 20, allowFallback: false } });
+  wordy.sp.send(create(LINE)); await until(() => wordy.closes() === 1);
+  assert.deepEqual([wordy.source.started(), creates(wordy.inner).length, failedWhy(wordy.diagLines)], [0, 0, 'TOO_LONG']);
+});
+
+test('the Jack lock option: only a boolean is accepted (anything else is refused, never read as "off"), true is the default, and an explicit true still falls back as before', async () => {
+  for (const bad of ['no', 'false', 0, 1, null, {}, []]) assert.throws(() => withSpeaker(fakeVoice(), createStandInSource(), JACK_SPEAKER, { allowFallback: bad as never }), RangeError, String(bad));
+  for (const opts of [{}, { allowFallback: true }]) {
+    const r = rig({ source: { behave: (_q, n) => (n === 1 ? 'fail-start' : 'ok') }, opts: { firstAudioMs: 60, ...opts } });
+    r.sp.send(create(LINE, 'r1')); await until(() => doneOf(r.events).length === 1);
+    assert.equal(doneOf(r.events)[0].response.status, 'completed', JSON.stringify(opts)); assert.equal(creates(r.inner).length, 1, `${JSON.stringify(opts)}: the unlocked adapter falls back as before`);
+    assert.ok(r.diagLines.some((d) => d.code === 'SPEAKER_FALLBACK'));
+  }
+});
+
+test('the Jack lock does not touch a healthy call: lines go to the source, nothing is refused, and a failure AFTER audio started ends the call exactly as it does without the lock', async () => {
+  const ok = rig({ opts: { allowFallback: false } });
+  ok.sp.send(create(LINE, 'r1')); await until(() => doneOf(ok.events).length === 1); ok.sp.send(create(LINE, 'r2')); await until(() => doneOf(ok.events).length === 2);   // one reply at a time
+  assert.deepEqual(doneOf(ok.events).map((d) => d.response.status), ['completed', 'completed']); assert.equal(ok.source.started(), 2); assert.deepEqual(creates(ok.inner), []);
+  assert.deepEqual([ok.sp.stats().failed, ok.sp.stats().fallbacks, ok.sp.stats().callEnds], [0, 0, 0]);
+  const late = rig({ source: { behave: () => ({ failAfter: 2 }) }, opts: { allowFallback: false, gapMs: 60 } });
+  late.sp.send(create(LINE, 'r1')); await until(() => late.closes() === 1);
+  assert.ok(deltaBytes(late.events) > 0); assert.deepEqual(creates(late.inner), []); assert.equal(failedWhy(late.diagLines), 'SOURCE_ERROR'); assert.deepEqual(late.inner.closed, [1011]);
+});
+
+test('behind the bridge, with the lock: a consent notice the source cannot speak ends the call before the caller hears anything; OpenAI never speaks and the call logic never sees the call', async () => {
+  const h = bridgeRig({ source: { behave: () => 'fail-start' }, opts: { allowFallback: false } });
+  h.phone.start();
+  await until(() => h.closes.length >= 1, 4000);   // the transport reports the end once or twice (it closes from two places)
+  assert.ok(!h.kinds().includes('setup'), 'the call never started: no consent notice was heard');
+  assert.deepEqual(h.voice.received.filter((x: any) => x.type === 'response.create'), [], 'OpenAI was never asked to speak the notice'); assert.equal(h.voice.spoken.length, 0);
+  assert.equal(h.media(), 0, 'no audio of any voice reached the phone');
+  assert.ok(h.diagLines.some((d) => d.code === 'SPEAKER_FAILED' && d.why === 'START_FAILED') && !h.diagLines.some((d) => d.code === 'SPEAKER_FALLBACK'));
+});
+
+test('behind the bridge, with the lock: a later line the source cannot speak is reported not heard, the call logic is told, the phone stream is closed, and OpenAI never speaks', async () => {
+  const h = bridgeRig({ source: { behave: (_q, n) => (n === 2 ? 'fail-start' : 'ok') }, opts: { allowFallback: false, endDelayMs: 80 } });
+  await h.live();
+  h.t.speak('Is it a house or an apartment?', true);
+  await until(() => h.kinds().includes('reply_failed') && h.kinds().includes('speaker_down'), 4000);
+  assert.ok(h.kinds().indexOf('reply_failed') < h.kinds().indexOf('speaker_down'), 'not heard first, then the call is ended');
+  await until(() => h.phone.closedWith.length > 0, 3000);
+  assert.equal(h.toAdapter.filter((x) => x.type === 'response.done').at(-1).response.status, 'failed');
+  assert.deepEqual(h.voice.received.filter((x: any) => x.type === 'response.create'), [], 'OpenAI was never asked to speak'); assert.equal(h.voice.spoken.length, 0);
+  assert.equal(h.t.speak('Anything else?', true), false, 'no further line is spoken');
+});
+
+test('the Jack lock source guard: the one behavioural line is the source-failure gate, it reads the option, and no other path asks OpenAI to speak', () => {
+  const src = readFileSync(new URL('../src/speaker-adapter.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
+  assert.ok(/if \(r\.bytes > 0 \|\| !o\.allowFallback\) \{ endCall\(r, why\); return; \}/.test(src), 'the gate ends the call when the lock is on');
+  assert.ok(/allowFallback: options\.allowFallback === undefined \? true : options\.allowFallback/.test(src), 'undefined means the default (true); any other value is checked');
+  assert.ok(/typeof o\.allowFallback !== 'boolean'/.test(src), 'a non-boolean is refused');
+  assert.equal([...src.matchAll(/inner\.send\(r\.original\)/g)].length, 1, 'the only place a line is sent to OpenAI to speak is the fallback, behind the gate');
+});
