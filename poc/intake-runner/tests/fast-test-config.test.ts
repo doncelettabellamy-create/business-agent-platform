@@ -190,3 +190,26 @@ test('Jack guard, as a property: over every combination of speaker, fast_test an
   }
   assert.equal(combos, speakers.length * fasts.length * convs.length); assert.ok(passedWithFast >= 1, 'the property is not vacuous: the valid combination passes');
 });
+
+test('voice pin: a different but well-formed voice_id is refused at load, by the config check, the gate and the setup program, with fixed text and no id; Jack passes', () => {
+  const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
+  assert.deepEqual(founderVoiceConfigProblems(r.voice), [], 'Jack passes');
+  const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: 'x', twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true, fastTest: { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true } };
+  for (const id of ['aaaaaaaaaaaaaaaaaaaa', 'AAAAAAAAAAAAAAAAAAAA', '7EzWGsX10sAS4c9m9cPg', '7ezwgsx10sas4c9m9cpf', '12345678901234567890']) {
+    const wrong = { ...r.voice, speaker: { ...SPEAKER_OK, voice_id: id } };
+    const p = founderVoiceConfigProblems(wrong);
+    assert.ok(p.some((m) => /speaker must be/.test(m)), id.slice(-4)); assert.ok(!p.join(' ').includes(id), 'no id in the message');
+    assert.ok(founderVoiceGateProblems({ callConfig: r.call, voiceConfig: wrong, nowIso: '2026-11-02T12:00:00Z', env }).some((m) => /speaker must be/.test(m)), 'the gate refuses too');
+    const a = applyFastTest(CALL, { ...VOICE, speaker: { ...SPEAKER_OK, voice_id: id } }, ANSWERS); assert.equal(a.ok, false, 'the setup will not add a fast test to a wrong voice');
+  }
+});
+
+test('voice pin, as a property: any passing voice config (with or without the fast test) that has a speaker selects exactly the approved voice id', () => {
+  const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
+  let passed = 0;
+  for (const id of ['7EzWGsX10sAS4c9m9cPf', 'aaaaaaaaaaaaaaaaaaaa', 'AAAAAAAAAAAAAAAAAAAA', '7EzWGsX10sAS4c9m9cPg', '7ezwgsx10sas4c9m9cpf', '12345678901234567890']) for (const withFast of [true, false]) {
+    const v: Record<string, unknown> = { ...r.voice, speaker: { ...SPEAKER_OK, voice_id: id } }; if (!withFast) delete v.fast_test;
+    if (founderVoiceConfigProblems(v).length === 0) { passed++; assert.equal(speakerSettingsOf(v as never)?.voiceId, '7EzWGsX10sAS4c9m9cPf'); }
+  }
+  assert.equal(passed, 2, 'only Jack passes, with and without the fast test');
+});

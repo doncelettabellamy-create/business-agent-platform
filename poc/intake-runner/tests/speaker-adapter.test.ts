@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { APPROVED_SPEAKER_MODELS, JACK_SPEAKER, speakerSettingsProblems, withSpeaker } from '../src/speaker-adapter.ts';
+import { APPROVED_SPEAKER_MODELS, APPROVED_SPEAKER_VOICE_IDS, JACK_SPEAKER, speakerSettingsProblems, withSpeaker } from '../src/speaker-adapter.ts';
 import type { SpeakerOptions, SpeakerSocket, SpeakerSplice } from '../src/speaker-adapter.ts';
 import { createRealtimeBridge } from '../src/realtime-bridge.ts';
 import { createRealtimeTransport, SAY_PREFIX, SPEAK_ONLY, wordsOf } from '../src/realtime-transport.ts';
@@ -533,4 +533,28 @@ test('the Jack lock source guard: the one behavioural line is the source-failure
   assert.ok(/allowFallback: options\.allowFallback === undefined \? true : options\.allowFallback/.test(src), 'undefined means the default (true); any other value is checked');
   assert.ok(/typeof o\.allowFallback !== 'boolean'/.test(src), 'a non-boolean is refused');
   assert.equal([...src.matchAll(/inner\.send\(r\.original\)/g)].length, 1, 'the only place a line is sent to OpenAI to speak is the fallback, behind the gate');
+});
+
+// ---------------------------------------------------------------- the voice is pinned: Jack, and only Jack
+test('voice pin: Jack passes; any other well-formed voice id is refused with fixed text that never echoes the id; the approved list is exactly Jack', () => {
+  assert.deepEqual([...APPROVED_SPEAKER_VOICE_IDS], [JACK_SPEAKER.voiceId], 'the list is built from the one constant');
+  assert.deepEqual(speakerSettingsProblems(JACK_SPEAKER), []);
+  for (const id of ['aaaaaaaaaaaaaaaaaaaa', 'AAAAAAAAAAAAAAAAAAAA', '7EzWGsX10sAS4c9m9cPg', '7ezwgsx10sas4c9m9cpf', '12345678901234567890']) {
+    const p = speakerSettingsProblems({ ...JACK_SPEAKER, voiceId: id });
+    assert.deepEqual(p, ['voiceId is not the approved voice'], id.slice(-4)); assert.ok(!p.join(' ').includes(id), 'the id is not echoed');
+  }
+  // a malformed id is still refused for its shape, not as "not approved"
+  for (const id of ['short', '', 12345, null, undefined, 'aaaaaaaaaaaaaaaaaaa!']) assert.deepEqual(speakerSettingsProblems({ ...JACK_SPEAKER, voiceId: id }), ['voiceId must be a 20-character provider id']);
+});
+
+test('voice pin: the adapter refuses to be built with a different voice id, and the call never starts', () => {
+  for (const id of ['aaaaaaaaaaaaaaaaaaaa', 'AAAAAAAAAAAAAAAAAAAA', '7EzWGsX10sAS4c9m9cPg', '7ezwgsx10sas4c9m9cpf', '12345678901234567890']) assert.throws(() => withSpeaker(fakeVoice(), createStandInSource(), { ...JACK_SPEAKER, voiceId: id }), RangeError, id.slice(-4));
+  assert.doesNotThrow(() => withSpeaker(fakeVoice(), createStandInSource(), JACK_SPEAKER));
+});
+
+test('voice pin source: the check is in the validator, by exact list membership on the approved constant', () => {
+  const src = readFileSync(new URL('../src/speaker-adapter.ts', import.meta.url), 'utf8');
+  assert.ok(/APPROVED_SPEAKER_VOICE_IDS: readonly string\[\] = Object\.freeze\(\[JACK_SPEAKER\.voiceId\]\)/.test(src), 'built from the one constant');
+  assert.ok(/else if \(!APPROVED_SPEAKER_VOICE_IDS\.includes\(s\.voiceId\)\) p\.push\('voiceId is not the approved voice'\)/.test(src), 'the validator enforces it');
+  assert.equal([...src.matchAll(/7EzWGsX10sAS4c9m9cPf/g)].length, 1, 'the id is written once in the source');
 });

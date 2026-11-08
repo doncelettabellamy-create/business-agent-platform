@@ -56,6 +56,8 @@ export interface SpeakerSettings {
 export const JACK_SPEAKER: SpeakerSettings = Object.freeze({ provider: 'elevenlabs', voiceId: '7EzWGsX10sAS4c9m9cPf', modelId: 'eleven_flash_v2_5', speed: 0.95, outputFormat: 'ulaw_8000' });
 /** The models this adapter will use. A different model is a code change with its own approval. */
 export const APPROVED_SPEAKER_MODELS: readonly string[] = Object.freeze(['eleven_flash_v2_5']);
+/** The only voice this adapter will use: Jack (the one constant above). A different voice is a code change with its own approval. */
+export const APPROVED_SPEAKER_VOICE_IDS: readonly string[] = Object.freeze([JACK_SPEAKER.voiceId]);
 /** The project's own bounds for the speed. The provider's documented range is not on file, so this is deliberately narrow. */
 export const SPEED_MIN = 0.7;
 export const SPEED_MAX = 1.2;
@@ -68,6 +70,7 @@ export function speakerSettingsProblems(x: unknown): string[] {
   if (Object.keys(s).sort().join(',') !== 'modelId,outputFormat,provider,speed,voiceId') p.push('speaker settings must have exactly the expected keys');
   if (s.provider !== 'elevenlabs') p.push('provider must be elevenlabs');
   if (typeof s.voiceId !== 'string' || !/^[A-Za-z0-9]{20}$/.test(s.voiceId)) p.push('voiceId must be a 20-character provider id');
+  else if (!APPROVED_SPEAKER_VOICE_IDS.includes(s.voiceId)) p.push('voiceId is not the approved voice');
   if (typeof s.modelId !== 'string' || !APPROVED_SPEAKER_MODELS.includes(s.modelId)) p.push('modelId is not an approved model');
   if (typeof s.speed !== 'number' || !Number.isFinite(s.speed) || s.speed < SPEED_MIN || s.speed > SPEED_MAX) p.push('speed is outside the allowed range');
   if (s.outputFormat !== 'ulaw_8000') p.push('outputFormat must be ulaw_8000 (the phone format)');

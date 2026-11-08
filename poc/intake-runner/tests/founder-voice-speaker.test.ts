@@ -248,3 +248,17 @@ test('entry, Jack guard source: the speaker the gate saw is the speaker that wra
   assert.ok(/const speaker = speakerSettingsOf\(voice\);/.test(src) && /\}\), speaker, \{/.test(src), 'the same speaker value goes to the switch');
   assert.ok(/founderVoiceConfigProblems\(voice\)/.test(src) && /process\.exit\(65\)/.test(src), 'the config check exits before anything is opened');
 });
+
+test('entry, voice pin: a different well-formed voice_id is refused at startup (exit 65, dry run and serve) before any banner; Jack starts', () => {
+  const { opening, fast } = fastPair();
+  for (const id of ['aaaaaaaaaaaaaaaaaaaa', 'AAAAAAAAAAAAAAAAAAAA', '7EzWGsX10sAS4c9m9cPg', '7ezwgsx10sas4c9m9cpf', '12345678901234567890']) {
+    const w = workdir({ call: { opening }, voice: { fast_test: fast, speaker: { ...SPEAKER, voice_id: id } } });
+    for (const extra of [[], ['--serve']]) {
+      const r = run([...w.args, ...extra], { JOBBER_STORE_DIR: w.dir });
+      assert.equal(r.status, 65, id.slice(-4)); assert.ok(/config problem: speaker must be/.test(r.stderr), r.stderr.slice(0, 200)); assert.ok(!r.stdout.includes('Mode:') && !r.stdout.includes('Speaker:'));
+      assert.ok(!r.stderr.includes(id) && !r.stdout.includes(id), 'the id is never printed');
+    }
+  }
+  const ok = workdir({ call: { opening }, voice: { fast_test: fast, speaker: SPEAKER } });
+  const r = run(ok.args, { JOBBER_STORE_DIR: ok.dir }); assert.equal(r.status, 0, r.stderr.slice(0, 200)); assert.ok(r.stdout.includes('Speaker: ElevenLabs ON'));
+});
