@@ -12,7 +12,7 @@
 // WHAT IT SHOWS: fixed words and numbers only: the result, a code, the HTTP status, the provider's reason as one of a fixed list (never its words), the audio byte count, the milliseconds and the
 // character count. Never the key, a response body, a message, a voice id (only its last four characters in the plan) or any customer data.
 import { createInterface } from 'node:readline/promises';
-import { createElevenLabsSpeechSource } from '../src/elevenlabs-speech-source.ts';
+import { createElevenLabsSpeechSource, ERROR_SHAPES, PROVIDER_CODES } from '../src/elevenlabs-speech-source.ts';
 import { JACK_SPEAKER } from '../src/speaker-adapter.ts';
 import { looksLikeKey } from '../src/hidden-prompt.ts';
 
@@ -23,7 +23,7 @@ const MAX_AUDIO_BYTES = 200_000;
 const LOOPBACK = /^http:\/\/(?:127\.0\.0\.1|localhost):\d{1,5}$/;
 
 export type CheckCode = 'AUDIO_RECEIVED' | 'NO_KEY' | 'BAD_KEY_SHAPE' | 'HTTP_ERROR' | 'TIMEOUT_HEADERS' | 'REQUEST_ERROR' | 'BAD_TYPE' | 'READ_ERROR' | 'TOO_BIG' | 'EMPTY_AUDIO' | 'TIMEOUT_TOTAL' | 'START_FAILED';
-export interface CheckResult { result: 'PASS' | 'FAIL'; code: CheckCode; status?: number; reason?: string; audioBytes: number; ms: number; chars: number; requests: number }
+export interface CheckResult { result: 'PASS' | 'FAIL'; code: CheckCode; status?: number; reason?: string; shape?: string; providerCodes?: string[]; audioBytes: number; ms: number; chars: number; requests: number }
 export interface CheckDeps {
   key: string | undefined;
   fetch: typeof globalThis.fetch;
@@ -38,8 +38,8 @@ const REASONS: readonly string[] = ['VOICE_NOT_FOUND', 'QUOTA_EXCEEDED', 'INVALI
 /** Sends at most ONE request and returns a fixed-code result. Never throws; never returns anything but fixed words and numbers. */
 export async function runCheck(d: CheckDeps): Promise<CheckResult> {
   const now = d.clock ?? ((): number => Date.now()); const began = now();
-  let sent = 0; let bytes = 0; let failed: { why: string; status?: number; reason?: string } | undefined;
-  const result = (r: 'PASS' | 'FAIL', code: CheckCode, extra: { status?: number; reason?: string } = {}): CheckResult => ({ result: r, code, ...extra, audioBytes: bytes, ms: Math.max(0, now() - began), chars: CHECK_TEXT.length, requests: sent });
+  let sent = 0; let bytes = 0; let failed: { why: string; status?: number; reason?: string } | undefined; let detail: { shape: string; codes: string[] } | undefined;
+  const result = (r: 'PASS' | 'FAIL', code: CheckCode, extra: { status?: number; reason?: string } = {}): CheckResult => ({ result: r, code, ...extra, ...(detail === undefined ? {} : { shape: detail.shape, providerCodes: detail.codes }), audioBytes: bytes, ms: Math.max(0, now() - began), chars: CHECK_TEXT.length, requests: sent });
   try {
     if (typeof d.key !== 'string' || d.key.length === 0) return result('FAIL', 'NO_KEY');
     if (!looksLikeKey(d.key)) return result('FAIL', 'BAD_KEY_SHAPE');
@@ -53,6 +53,8 @@ export async function runCheck(d: CheckDeps): Promise<CheckResult> {
     };
     const source = createElevenLabsSpeechSource({
       getKey: () => key, fetch: d.fetch, diag, maxBytes: d.maxBytes ?? MAX_AUDIO_BYTES,
+      // only a fixed shape word and EXACT allowlisted identifiers are kept (re-checked here); the client never hands over the body
+      onErrorDetail: (e) => { detail = { shape: ERROR_SHAPES.includes(e.shape) ? e.shape : 'UNPARSED', codes: e.codes.filter((c) => PROVIDER_CODES.includes(c)).slice(0, 3) }; },
       ...(d.headersTimeoutMs === undefined ? {} : { headersTimeoutMs: d.headersTimeoutMs }),
       ...(d.origin === undefined ? {} : { origin: d.origin, testOnlyAllowLocalHttp: true }),
     });
@@ -89,7 +91,7 @@ const MEANING: Readonly<Record<string, string>> = Object.freeze({
   'HTTP_ERROR:RATE_LIMIT': 'The account is rate limited.',
   'HTTP_ERROR:CONCURRENT_LIMIT': 'The account is at its concurrent-request limit.',
   'HTTP_ERROR:CHAR_LIMIT': 'The text was too long for the plan.',
-  'HTTP_ERROR:OTHER': 'ElevenLabs refused the request for a reason not on the known list. Compare the status with the account Request Log.',
+  'HTTP_ERROR:OTHER': 'ElevenLabs refused the request for a reason not on the short list. See ERROR_SHAPE and PROVIDER_CODE, and compare the status with the account Request Log.',
   'HTTP_ERROR:UNPARSED': 'ElevenLabs refused the request and its reason could not be read. Compare the status with the account Request Log.',
 });
 /** The result as lines of fixed words and numbers. Pure. */
@@ -97,6 +99,7 @@ export function show(r: CheckResult): string {
   const meaning = MEANING[r.code === 'HTTP_ERROR' ? `HTTP_ERROR:${r.reason ?? 'UNPARSED'}` : r.code] ?? '';
   return [
     `RESULT: ${r.result}`, `CODE: ${r.code}`, `HTTP_STATUS: ${r.status === undefined ? 'none' : r.status}`, `PROVIDER_REASON: ${r.reason ?? 'none'}`,
+    `ERROR_SHAPE: ${r.shape ?? 'none'}`, `PROVIDER_CODE: ${r.providerCodes === undefined || r.providerCodes.length === 0 ? 'none' : r.providerCodes.join(',')}`,
     `AUDIO_BYTES: ${r.audioBytes}`, `LATENCY_MS: ${Math.round(r.ms)}`, `TEXT_CHARACTERS_SENT: ${r.requests === 0 ? 0 : r.chars}`, `REQUESTS_SENT: ${r.requests}`,
     `MEANING: ${meaning}`, 'Nothing else was sent. No key, response text or customer data is shown.',
   ].join('\n');

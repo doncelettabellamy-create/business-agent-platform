@@ -5,7 +5,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { readFileSync, readdirSync } from 'node:fs';
-import { createElevenLabsSpeechSource, ELEVENLABS_ORIGIN, ERROR_BODY_MAX_BYTES, ERROR_BODY_MS, ERROR_REASONS, errorReasonOf, speechRequestProblems, VOICE_SETTINGS_DEFAULTS } from '../src/elevenlabs-speech-source.ts';
+import { createElevenLabsSpeechSource, ELEVENLABS_ORIGIN, ERROR_BODY_MAX_BYTES, ERROR_BODY_MS, ERROR_REASONS, ERROR_SHAPES, PROVIDER_CODES, errorReasonOf, errorShapeOf, providerCodesOf, speechRequestProblems, VOICE_SETTINGS_DEFAULTS } from '../src/elevenlabs-speech-source.ts';
 import { fileDiagSink } from '../src/call-diag.ts';
 import type { ElevenLabsConfig } from '../src/elevenlabs-speech-source.ts';
 import { JACK_SPEAKER, withSpeaker } from '../src/speaker-adapter.ts';
@@ -193,7 +193,7 @@ test('classification: each listed provider status is logged as its fixed code, w
     const r = await failWith(status, JSON.stringify({ detail: { status: word, message: `${DETAIL} ${KEY} ${REQUEST.text} ${REQUEST.voiceId}` } }));
     assert.deepEqual(r.c.order, ['fail'], `${status} ${word}`);
     assert.deepEqual([r.failed.why, r.failed.status, r.failed.reason], ['HTTP_ERROR', status, code], `${status} ${word}`);
-    assert.deepEqual(Object.keys(r.failed).sort(), ['code', 'ms', 'reason', 'status', 'why'], 'the failure carries exactly these fields');
+    assert.deepEqual(Object.keys(r.failed).sort(), ['code', 'ms', 'reason', 'shape', 'status', 'why'], 'the failure carries exactly these fields');
     const all = JSON.stringify(r.lines);
     assert.ok(!all.match(/CANARY|KEY-/) && !all.includes(REQUEST.text) && !all.includes(REQUEST.voiceId) && !all.includes(word), 'no body text, key, line text, voice id or provider word in any diagnostic');
   }
@@ -258,7 +258,7 @@ test('classification: through the real log sanitizer the reason survives as a fi
   createElevenLabsSpeechSource(config(m.origin, { diag: (code, detail) => sink(code, detail as Record<string, string | number | boolean>) })).start(REQUEST, c.sink);
   await until(() => c.count('fail') === 1);
   const line = written.find((l) => l.includes(' ELEVENLABS_FAILED ')) ?? '';
-  assert.match(line, /^2026-11-08T00:00:00Z ELEVENLABS_FAILED \{"why":"HTTP_ERROR","status":400,"reason":"VOICE_NOT_FOUND","ms":\d+\}$/);
+  assert.match(line, /^2026-11-08T00:00:00Z ELEVENLABS_FAILED \{"why":"HTTP_ERROR","status":400,"reason":"VOICE_NOT_FOUND","shape":"STATUS_LISTED","ms":\d+\}$/);
   assert.ok(!written.join('\n').match(/CANARY|KEY-|Let me check/));
 });
 
@@ -267,7 +267,7 @@ test('classification: the client source reads a response body only through its t
   assert.ok(!/\.text\(\)|\.json\(\)|\.arrayBuffer\(\)|\.blob\(\)/.test(src), 'no unbounded read of a response');
   assert.equal([...src.matchAll(/getReader\(\)/g)].length, 2, 'one reader for the bounded error body, one for the audio');
   assert.ok(/await readBounded\(res, ERROR_BODY_MS, ERROR_BODY_MAX_BYTES\)/.test(src));
-  assert.ok(/diag\('ELEVENLABS_FAILED', \{ why, \.\.\.\(status === undefined \? \{\} : \{ status \}\), \.\.\.\(reason === undefined \? \{\} : \{ reason \}\), ms: Date\.now\(\) - began \}\)/.test(src), 'the failure line carries only why, status, reason and ms');
+  assert.ok(/diag\('ELEVENLABS_FAILED', \{ why, \.\.\.\(status === undefined \? \{\} : \{ status \}\), \.\.\.\(reason === undefined \? \{\} : \{ reason \}\), \.\.\.\(shape === undefined \? \{\} : \{ shape \}\), ms: Date\.now\(\) - began \}\)/.test(src), 'the failure line carries only why, status, reason, shape and ms');
 });
 
 test('other provider failures: a non-audio success, a reset before the headers, a drop mid-stream, an empty body, a refused connection and an over-long stream', async () => {
@@ -358,4 +358,74 @@ test('contained: only the switch module imports the client, it reads no environm
     assert.equal(/speaker-adapter/.test(code(f)), ['founder-voice-speaker.ts', 'founder-voice-gate.ts', 'elevenlabs-speech-source.ts'].includes(f), `${f}: only the switch, the gate (settings checks) and the client may use the adapter`);
   }
   for (const f of ['founder-voice-service.ts', 'relay-handler.ts', 'realtime-bridge.ts', 'realtime-transport.ts', 'call-session.ts', 'call-state.ts']) assert.ok(!/speaker-adapter|elevenlabs|founder-voice-speaker/i.test(code(f)), `${f}: the current speaker path does not name the adapter or the client`);
+});
+
+// ---------------------------------------------------------------- the error SHAPE (a fixed word) and the allowlisted provider identifiers (diagnostic hook only)
+const refuse = (status: number, body: unknown) => (_q: http.IncomingMessage, res: http.ServerResponse): void => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+const ALLOWED_CODES = ['validation_error', 'invalid_request', 'authentication_error', 'payment_required', 'authorization_error', 'not_found', 'conflict', 'rate_limit_error', 'internal_error', 'service_unavailable',
+  'text_too_long', 'text_too_short', 'invalid_text', 'empty_text', 'invalid_parameters', 'missing_required_field', 'invalid_voice_settings', 'invalid_voice_id', 'unsupported_model', 'invalid_output_format',
+  'bad_request', 'malformed_json', 'invalid_content_type', 'request_too_large', 'invalid_api_key', 'missing_api_key', 'invalid_authorization_header', 'unauthorized',
+  'forbidden', 'insufficient_permissions', 'voice_access_denied', 'model_access_denied', 'feature_not_available', 'subscription_required', 'missing_permissions', 'voice_not_found', 'model_not_found',
+  'rate_limit_exceeded', 'concurrent_limit_exceeded', 'system_busy', 'insufficient_credits', 'quota_exceeded', 'max_character_limit_exceeded', 'maintenance'];
+
+test('shape and codes: the allowlist is exactly this fixed list of provider identifiers, and the shapes are exactly these fixed words', () => {
+  assert.deepEqual([...PROVIDER_CODES], ALLOWED_CODES); assert.ok(Object.isFrozen(PROVIDER_CODES)); assert.equal(new Set(PROVIDER_CODES).size, PROVIDER_CODES.length, 'no repeats');
+  for (const c of PROVIDER_CODES) assert.match(c, /^[a-z][a-z_]{2,47}$/);
+  assert.deepEqual([...ERROR_SHAPES], ['STATUS_LISTED', 'STATUS_UNLISTED', 'NO_STATUS', 'DETAIL_LIST', 'DETAIL_TEXT', 'NO_DETAIL', 'NOT_OBJECT', 'UNPARSED']); assert.ok(Object.isFrozen(ERROR_SHAPES));
+});
+
+test('errorShapeOf: names only the STRUCTURE of the body, as one fixed word, whatever the body says', () => {
+  const cases: Array<[unknown, string]> = [
+    [JSON.stringify({ detail: { status: 'voice_not_found', message: DETAIL } }), 'STATUS_LISTED'], [JSON.stringify({ detail: { status: 'something_new', message: DETAIL } }), 'STATUS_UNLISTED'],
+    [JSON.stringify({ detail: { status: ['x'] } }), 'NO_STATUS'], [JSON.stringify({ detail: { message: DETAIL } }), 'NO_STATUS'], [JSON.stringify({ detail: { status: 7 } }), 'NO_STATUS'],
+    [JSON.stringify({ detail: [{ loc: ['body'], msg: DETAIL }] }), 'DETAIL_LIST'], [JSON.stringify({ detail: `${DETAIL} ${KEY}` }), 'DETAIL_TEXT'], [JSON.stringify({ message: DETAIL }), 'NO_DETAIL'], ['{}', 'NO_DETAIL'],
+    [JSON.stringify({ detail: 5 }), 'NOT_OBJECT'], [JSON.stringify({ detail: null }), 'NOT_OBJECT'], ['[]', 'NOT_OBJECT'], ['null', 'NOT_OBJECT'], ['7', 'NOT_OBJECT'], ['"detail"', 'NOT_OBJECT'],
+    ['', 'UNPARSED'], ['not json', 'UNPARSED'], [`${DETAIL} ${KEY}`, 'UNPARSED'], ['{"detail":{"status":"voice_not_found"', 'UNPARSED'], [undefined, 'UNPARSED'], [null, 'UNPARSED'], [5, 'UNPARSED'], [{}, 'UNPARSED'],
+  ];
+  for (const [text, shape] of cases) { assert.equal(errorShapeOf(text), shape, String(text)); assert.ok(ERROR_SHAPES.includes(errorShapeOf(text))); }
+  for (const hostile of ['{"detail":{"status":"' + 'a'.repeat(5000) + '"}}', '{"detail":{"status":"' + KEY + '"}}', '\u0000\u0001', '{"detail":{"status":"__proto__"}}', '{"detail":{"status":"toString"}}']) { const s = errorShapeOf(hostile); assert.ok(ERROR_SHAPES.includes(s), s); assert.ok(!s.includes('CANARY') && !s.includes('KEY')); }
+});
+
+test('providerCodesOf: returns only identifiers that are EXACTLY on the allowlist, from status, code and type only; never the message, a look-alike, a mixed-case or padded word, or anything from a list or text body', () => {
+  const codes = (detail: unknown): string[] => providerCodesOf(JSON.stringify({ detail }));
+  assert.deepEqual(codes({ status: 'voice_not_found', message: DETAIL }), ['voice_not_found']);
+  assert.deepEqual(codes({ status: 'insufficient_credits', code: 'quota_exceeded', type: 'payment_required' }), ['insufficient_credits', 'quota_exceeded', 'payment_required']);
+  assert.deepEqual(codes({ status: 'quota_exceeded', code: 'quota_exceeded', type: 'quota_exceeded' }), ['quota_exceeded'], 'no repeats');
+  assert.deepEqual(codes({ type: 'validation_error', code: 'invalid_voice_id' }), ['invalid_voice_id', 'validation_error']);
+  for (const word of ALLOWED_CODES) assert.deepEqual(codes({ status: word }), [word], word);
+  for (const bad of ['Voice_Not_Found', 'VOICE_NOT_FOUND', ' voice_not_found', 'voice_not_found ', 'voice_not_found\n', 'voice-not-found', 'voice_not_found_x', 'voice_not_foun', 'something_new', 'canary_status_leak', KEY, `${KEY}_x`, '', '__proto__', 'constructor', 'toString', 'hasOwnProperty', 'a'.repeat(5000), 'voice_not_found,quota_exceeded'])
+    assert.deepEqual(codes({ status: bad, message: 'voice_not_found' }), [], JSON.stringify(bad).slice(0, 40));
+  assert.deepEqual(codes({ message: 'voice_not_found', error: 'quota_exceeded', msg: 'invalid_api_key', detail: 'forbidden' }), [], 'only status, code and type are read');
+  for (const text of [JSON.stringify({ detail: [{ status: 'voice_not_found' }] }), JSON.stringify({ detail: 'voice_not_found' }), JSON.stringify({ status: 'voice_not_found' }), JSON.stringify({ detail: ['voice_not_found'] }), JSON.stringify({ detail: { status: ['voice_not_found'] } }), JSON.stringify({ detail: { status: 7 } }), 'not json', '', undefined, null, 7, {}, '[]', 'null'])
+    assert.deepEqual(providerCodesOf(text), [], String(text));
+  const ok = providerCodesOf(JSON.stringify({ detail: { status: 'voice_not_found', code: KEY, type: 'canary_status_leak' } })); assert.deepEqual(ok, ['voice_not_found']); assert.ok(!JSON.stringify(ok).includes('CANARY'));
+});
+
+test('the diagnostic hook: a refused request tells it the shape and the allowlisted identifiers only (never the body, a message, the key or the text); it is not called for a success; a throwing hook changes nothing; without it nothing extra is logged but the shape', async () => {
+  const seen: Array<{ shape: string; codes: readonly string[] }> = [];
+  const m = await mockServer(refuse(400, { detail: { status: 'insufficient_credits', code: 'canary_code_leak', message: `${DETAIL} ${KEY} ${REQUEST.text}` } }));
+  const { lines, diag } = diagInto(); const c = collector();
+  createElevenLabsSpeechSource(config(m.origin, { diag, onErrorDetail: (d) => { seen.push(d); } })).start(REQUEST, c.sink);
+  await until(() => c.count('fail') === 1);
+  assert.deepEqual(seen, [{ shape: 'STATUS_UNLISTED', codes: ['insufficient_credits'] }]); assert.deepEqual(Object.keys(seen[0]).sort(), ['codes', 'shape']);
+  assert.ok(!JSON.stringify(seen).match(/CANARY|KEY-|canary/i) && !JSON.stringify(seen).includes(REQUEST.text), 'nothing from the body, the key or the text reaches the hook');
+  const failed = lines.find((l) => l.code === 'ELEVENLABS_FAILED') as { [k: string]: unknown }; assert.equal(failed.shape, 'STATUS_UNLISTED'); assert.ok(!('providerCode' in failed) && !('codes' in failed), 'the call log gets the shape only');
+  // a success: the hook is never called
+  const ok = await mockServer((_q, res) => { audio(res); res.end(Buffer.alloc(10, 7)); }); const c2 = collector(); let called = 0;
+  createElevenLabsSpeechSource(config(ok.origin, { onErrorDetail: () => { called++; } })).start(REQUEST, c2.sink); await until(() => c2.count('end') === 1); assert.equal(called, 0);
+  // a hook that throws: the line still fails once, with the same log
+  const bad = await mockServer(refuse(401, { detail: { status: 'invalid_api_key', message: DETAIL } })); const { lines: l3, diag: d3 } = diagInto(); const c3 = collector();
+  createElevenLabsSpeechSource(config(bad.origin, { diag: d3, onErrorDetail: () => { throw new Error(`${KEY}`); } })).start(REQUEST, c3.sink); await until(() => c3.count('fail') === 1); await sleep(30);
+  assert.deepEqual(c3.order, ['fail']); assert.deepEqual((l3.find((l) => l.code === 'ELEVENLABS_FAILED') as { reason: string; shape: string }).reason, 'INVALID_API_KEY');
+  // no hook (what Drew's entry does): the same failure, and only the shape is added to the log
+  const none = await mockServer(refuse(400, { detail: { status: 'voice_not_found' } })); const { lines: l4, diag: d4 } = diagInto(); const c4 = collector();
+  createElevenLabsSpeechSource(config(none.origin, { diag: d4 })).start(REQUEST, c4.sink); await until(() => c4.count('fail') === 1);
+  assert.deepEqual(Object.keys(l4.find((l) => l.code === 'ELEVENLABS_FAILED')!).sort(), ['code', 'ms', 'reason', 'shape', 'status', 'why']);
+});
+
+test('the hook source guard: the raw body never leaves the client: it reaches the hook only as a shape and allowlisted identifiers, and Drew\'s entry does not pass the hook', () => {
+  const src = readFileSync(new URL('../src/elevenlabs-speech-source.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
+  assert.ok(/config\.onErrorDetail\?\.\(\{ shape, codes: providerCodesOf\(text\) \}\)/.test(src), 'the hook gets a shape and the allowlisted codes only');
+  assert.equal([...src.matchAll(/onErrorDetail/g)].length, 2, 'declared once, called once');
+  for (const f of readdirSync(new URL('../src/', import.meta.url))) { const s = readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8'); if (f !== 'elevenlabs-speech-source.ts') assert.ok(!/onErrorDetail/.test(s), `${f} must not use the diagnostic hook`); }
 });

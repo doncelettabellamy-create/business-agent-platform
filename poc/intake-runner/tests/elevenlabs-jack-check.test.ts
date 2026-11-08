@@ -29,7 +29,7 @@ async function mockServer(handler: (req: http.IncomingMessage, res: http.ServerR
 }
 const audio = (res: http.ServerResponse, n: number): void => { res.writeHead(200, { 'content-type': 'audio/basic' }); res.end(Buffer.alloc(n, 7)); };
 const refuse = (status: number, body: unknown) => (_q: http.IncomingMessage, res: http.ServerResponse): void => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(typeof body === 'string' ? body : JSON.stringify(body)); };
-const SHOW_LINES: RegExp[] = [/^RESULT: (PASS|FAIL)$/, /^CODE: [A-Z_]+$/, /^HTTP_STATUS: (none|\d{3})$/, /^PROVIDER_REASON: (none|[A-Z_]+)$/, /^AUDIO_BYTES: \d+$/, /^LATENCY_MS: \d+$/, /^TEXT_CHARACTERS_SENT: \d+$/, /^REQUESTS_SENT: [01]$/,
+const SHOW_LINES: RegExp[] = [/^RESULT: (PASS|FAIL)$/, /^CODE: [A-Z_]+$/, /^HTTP_STATUS: (none|\d{3})$/, /^PROVIDER_REASON: (none|[A-Z_]+)$/, /^ERROR_SHAPE: (none|[A-Z_]+)$/, /^PROVIDER_CODE: (none|[a-z_]+(,[a-z_]+){0,2})$/, /^AUDIO_BYTES: \d+$/, /^LATENCY_MS: \d+$/, /^TEXT_CHARACTERS_SENT: \d+$/, /^REQUESTS_SENT: [01]$/,
   /^MEANING: [A-Za-z0-9_ ,.()'"-]+$/, /^Nothing else was sent\. No key, response text or customer data is shown\.$/];
 const allowedLines = (text: string): void => { for (const l of text.split('\n')) assert.ok(SHOW_LINES.some((re) => re.test(l)), `an unexpected output line: ${l}`); };
 
@@ -51,7 +51,8 @@ test('fixed-code outcomes: every refused status is a FAIL with the HTTP status a
     const m = await mockServer(refuse(status, { detail: { status: word, message: `${DETAIL} ${KEY} ${CHECK_TEXT}` } }));
     const r = await runCheck({ key: KEY, fetch: globalThis.fetch, origin: m.origin });
     assert.equal(m.seen.length, 1, `${status} ${word}: not retried`); assert.deepEqual([r.result, r.code, r.status, r.reason, r.audioBytes, r.requests], ['FAIL', 'HTTP_ERROR', status, code, 0, 1], `${status} ${word}`);
-    const out = show(r); allowedLines(out); assert.ok(!/CANARY|KEYCANARY|voice_not_found|quota_exceeded/.test(out) && !out.includes(CHECK_TEXT), `${status} ${word}`);
+    const out = show(r); allowedLines(out); const rest = out.split('\n').filter((l) => !l.startsWith('PROVIDER_CODE: ')).join('\n');   // an exact allowlisted identifier may appear on its own line, nowhere else
+    assert.ok(!/CANARY|KEYCANARY|voice_not_found|quota_exceeded|invalid_api_key/.test(rest) && !/CANARY/.test(out) && !out.includes(CHECK_TEXT), `${status} ${word}`);
   }
   for (const [status, body, reason] of [[400, 'not json', 'UNPARSED'], [422, { detail: [{ loc: ['body'], msg: DETAIL }] }, 'OTHER'], [429, { detail: { status: 'something_new', message: DETAIL } }, 'OTHER'], [500, '', 'UNPARSED'], [502, `${DETAIL} ${KEY}`, 'UNPARSED']] as Array<[number, unknown, string]>) {
     const m = await mockServer(refuse(status, body)); const r = await runCheck({ key: KEY, fetch: globalThis.fetch, origin: m.origin });
@@ -139,4 +140,25 @@ test('isolation: nothing in src/ imports the check; it reads one environment var
   assert.equal([...src.matchAll(/source\.start\(/g)].length, 1, 'the request is started in one place');
   const bare = src.replace(/'(?:[^'\\]|\\.)*'/g, "''").replace(/`(?:[^`\\]|\\.)*`/g, '``');   // the words inside quotes are text, not variables
   assert.ok(!/console\.log\([^)]*\b(?:key|process\.env)\b/.test(bare), 'the key is never handed to a print');
+});
+
+test('the diagnostic prints the error SHAPE and only EXACT allowlisted provider identifiers: an unlisted word, a look-alike, the message, the key and the text never appear', async () => {
+  const cases: Array<[string, unknown, string, string]> = [
+    ['an allowlisted status', { detail: { status: 'insufficient_credits', message: `${DETAIL} ${KEY} ${CHECK_TEXT}` } }, 'STATUS_UNLISTED', 'insufficient_credits'],
+    ['status, code and type', { detail: { status: 'invalid_voice_id', code: 'voice_not_found', type: 'validation_error', message: DETAIL } }, 'STATUS_UNLISTED', 'invalid_voice_id,voice_not_found,validation_error'],
+    ['an unlisted word', { detail: { status: 'something_new_and_odd', message: DETAIL } }, 'STATUS_UNLISTED', 'none'],
+    ['a look-alike', { detail: { status: 'Voice_Not_Found', code: 'canary_code_leak', message: DETAIL } }, 'STATUS_UNLISTED', 'none'],
+    ['a list body', { detail: [{ loc: ['body', 'text'], msg: DETAIL, input: CHECK_TEXT }] }, 'DETAIL_LIST', 'none'],
+    ['a text body', { detail: `${DETAIL} ${KEY}` }, 'DETAIL_TEXT', 'none'],
+    ['a listed status word', { detail: { status: 'voice_not_found' } }, 'STATUS_LISTED', 'voice_not_found'],
+  ];
+  for (const [label, body, shape, codes] of cases) {
+    const m = await mockServer(refuse(400, body)); const r = await runCheck({ key: KEY, fetch: globalThis.fetch, origin: m.origin });
+    assert.equal(m.seen.length, 1, label); assert.equal(r.shape, shape, label); assert.equal(r.providerCodes?.join(',') || 'none', codes, label);
+    const out = show(r); allowedLines(out); assert.ok(out.includes(`ERROR_SHAPE: ${shape}`) && out.includes(`PROVIDER_CODE: ${codes}`), label); assert.ok(!/CANARY|KEYCANARY|canary|something_new|Voice_Not_Found/.test(out) && !out.includes(CHECK_TEXT), `${label}: nothing but allowlisted words`);
+  }
+  const unreadable = await mockServer(refuse(400, 'not json')); const u = await runCheck({ key: KEY, fetch: globalThis.fetch, origin: unreadable.origin }); assert.deepEqual([u.shape, u.reason], ['UNPARSED', 'UNPARSED']); assert.ok(show(u).includes('PROVIDER_CODE: none'));
+  const ok = await mockServer((_q, res) => audio(res, 10)); const p = await runCheck({ key: KEY, fetch: globalThis.fetch, origin: ok.origin }); assert.equal(p.shape, undefined); assert.ok(show(p).includes('ERROR_SHAPE: none') && show(p).includes('PROVIDER_CODE: none'));
+  const cli = await mockServer(refuse(400, { detail: { status: 'insufficient_credits', message: DETAIL } })); const run = await runTool(['--run', '--origin', cli.origin], `${CONFIRM}\n`, { ELEVENLABS_API_KEY: KEY });
+  assert.ok(run.out.includes('PROVIDER_CODE: insufficient_credits') && run.out.includes('ERROR_SHAPE: STATUS_UNLISTED') && run.code === 1 && !/CANARY/.test(run.out), 'through the real command line');
 });

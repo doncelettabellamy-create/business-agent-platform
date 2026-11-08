@@ -41,6 +41,8 @@ export interface ElevenLabsConfig {
   /** The most audio one line may carry, in bytes. Default 4194304. */
   maxBytes?: number;
   diag?: DiagSink;
+  /** DIAGNOSTIC ONLY (Drew's entry never passes it). Told, for a refused request, the structure of the error body (a fixed word) and the allowlisted provider identifiers in it: never the body, a message, a key or any text of the request. */
+  onErrorDetail?: (d: { shape: string; codes: readonly string[] }) => void;
 }
 
 /** The provider error statuses that may be named in a diagnostic, as fixed codes. The key is the provider's `detail.status` word, matched exactly; the value is what is logged. Anything else logs OTHER. */
@@ -60,6 +62,48 @@ export function errorReasonOf(text: unknown): string {
     const status: unknown = typeof detail === 'object' && detail !== null && !Array.isArray(detail) ? (detail as { status?: unknown }).status : undefined;
     return typeof status === 'string' && Object.hasOwn(ERROR_REASONS, status) ? ERROR_REASONS[status] : 'OTHER';
   } catch { return 'UNPARSED'; }
+}
+/**
+ * The ONLY provider identifiers that may ever be shown (by the diagnostic hook): ElevenLabs' documented error types and the error codes that can come from a text-to-speech request, plus the three
+ * words its help pages use for quota and permission refusals. An identifier is shown only when it is EXACTLY one of these; anything else, including a word that merely looks like an identifier, is dropped.
+ */
+export const PROVIDER_CODES: readonly string[] = Object.freeze([
+  'validation_error', 'invalid_request', 'authentication_error', 'payment_required', 'authorization_error', 'not_found', 'conflict', 'rate_limit_error', 'internal_error', 'service_unavailable',
+  'text_too_long', 'text_too_short', 'invalid_text', 'empty_text', 'invalid_parameters', 'missing_required_field', 'invalid_voice_settings', 'invalid_voice_id', 'unsupported_model', 'invalid_output_format',
+  'bad_request', 'malformed_json', 'invalid_content_type', 'request_too_large',
+  'invalid_api_key', 'missing_api_key', 'invalid_authorization_header', 'unauthorized',
+  'forbidden', 'insufficient_permissions', 'voice_access_denied', 'model_access_denied', 'feature_not_available', 'subscription_required', 'missing_permissions',
+  'voice_not_found', 'model_not_found',
+  'rate_limit_exceeded', 'concurrent_limit_exceeded', 'system_busy',
+  'insufficient_credits', 'quota_exceeded', 'max_character_limit_exceeded',
+  'maintenance',
+]);
+/** The fixed shapes a provider error body can have. The shape names the STRUCTURE only, never a word of the body. */
+export const ERROR_SHAPES: readonly string[] = Object.freeze(['STATUS_LISTED', 'STATUS_UNLISTED', 'NO_STATUS', 'DETAIL_LIST', 'DETAIL_TEXT', 'NO_DETAIL', 'NOT_OBJECT', 'UNPARSED']);
+const detailOf = (text: unknown): unknown => { const body: unknown = typeof text === 'string' ? JSON.parse(text) : undefined; return typeof body === 'object' && body !== null && !Array.isArray(body) ? (body as { detail?: unknown }).detail : undefined; };
+/** The structure of a provider error body, as one fixed word. Pure; never throws; never returns any text from the body. */
+export function errorShapeOf(text: unknown): string {
+  try {
+    if (typeof text !== 'string') return 'UNPARSED';
+    const body: unknown = JSON.parse(text);
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return 'NOT_OBJECT';
+    const detail = (body as { detail?: unknown }).detail;
+    if (detail === undefined) return 'NO_DETAIL';
+    if (Array.isArray(detail)) return 'DETAIL_LIST';
+    if (typeof detail === 'string') return 'DETAIL_TEXT';
+    if (typeof detail !== 'object' || detail === null) return 'NOT_OBJECT';
+    const status = (detail as { status?: unknown }).status;
+    return typeof status !== 'string' ? 'NO_STATUS' : Object.hasOwn(ERROR_REASONS, status) ? 'STATUS_LISTED' : 'STATUS_UNLISTED';
+  } catch { return 'UNPARSED'; }
+}
+/** The allowlisted provider identifiers found in `detail.status`, `detail.code` and `detail.type` (each only if it is EXACTLY a PROVIDER_CODES member), without repeats, at most three. Pure; never throws; never reads `message` or any other field. */
+export function providerCodesOf(text: unknown): string[] {
+  try {
+    const detail = detailOf(text); const out: string[] = [];
+    if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) return out;
+    for (const k of ['status', 'code', 'type'] as const) { const v: unknown = (detail as Record<string, unknown>)[k]; if (typeof v === 'string' && PROVIDER_CODES.includes(v) && !out.includes(v)) out.push(v); }
+    return out.slice(0, 3);
+  } catch { return []; }
 }
 /** Reads at most `max` bytes of the response body, for at most `ms`, as text; undefined when there is no body, it is late, or reading fails. Never throws. Cancels the stream when it is done with it. */
 async function readBounded(res: Response, ms: number, max: number): Promise<string | undefined> {
@@ -137,10 +181,10 @@ export function createElevenLabsSpeechSource(config: ElevenLabsConfig): SpeechSo
       let bytes = 0;
       const stop = (): void => { stopped = true; if (headersTimer !== undefined) { clearTimeout(headersTimer); headersTimer = undefined; } };
       const abort = (): void => { try { controller.abort(); } catch { /* already aborted */ } try { void reader?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } };
-      const fail = (why: Why, status?: number, reason?: string): void => {
+      const fail = (why: Why, status?: number, reason?: string, shape?: string): void => {
         if (stopped) return;
         stop(); abort();
-        diag('ELEVENLABS_FAILED', { why, ...(status === undefined ? {} : { status }), ...(reason === undefined ? {} : { reason }), ms: Date.now() - began });
+        diag('ELEVENLABS_FAILED', { why, ...(status === undefined ? {} : { status }), ...(reason === undefined ? {} : { reason }), ...(shape === undefined ? {} : { shape }), ms: Date.now() - began });
         sink.fail();
       };
 
@@ -156,7 +200,7 @@ export function createElevenLabsSpeechSource(config: ElevenLabsConfig): SpeechSo
         if (stopped) { try { void res.body?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } return; }
         if (headersTimer !== undefined) { clearTimeout(headersTimer); headersTimer = undefined; }
         diag('ELEVENLABS_HEADERS', { status: res.status, ms: Date.now() - began });
-        if (!res.ok) { const text = await readBounded(res, ERROR_BODY_MS, ERROR_BODY_MAX_BYTES); fail('HTTP_ERROR', res.status, errorReasonOf(text)); return; }   // only a fixed code from the body is logged, never its text
+        if (!res.ok) { const text = await readBounded(res, ERROR_BODY_MS, ERROR_BODY_MAX_BYTES); const shape = errorShapeOf(text); try { config.onErrorDetail?.({ shape, codes: providerCodesOf(text) }); } catch { /* a diagnostic hook never changes the outcome */ } fail('HTTP_ERROR', res.status, errorReasonOf(text), shape); return; }   // only a fixed code from the body is logged, never its text
         if (!AUDIO_TYPE.test(res.headers.get('content-type') ?? '') || res.body === null) { try { void res.body?.cancel().catch(() => {}); } catch { /* nothing to cancel */ } fail('BAD_TYPE', res.status); return; }
         reader = res.body.getReader();
         let first = true;
