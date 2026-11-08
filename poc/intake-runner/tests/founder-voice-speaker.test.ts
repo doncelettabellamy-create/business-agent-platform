@@ -15,6 +15,7 @@ import { withSelectedSpeaker } from '../src/founder-voice-speaker.ts';
 import { JACK_SPEAKER } from '../src/speaker-adapter.ts';
 import type { SpeakerSocket } from '../src/speaker-adapter.ts';
 import { SAY_PREFIX, SPEAK_ONLY } from '../src/realtime-transport.ts';
+import { applyFastTest } from '../src/fast-test-config.ts';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const NOW = '2026-10-27T12:00:00Z';
@@ -199,4 +200,51 @@ test('entry, wiring: the entry reads the ElevenLabs key only in the getter it ha
   assert.equal((src.match(/ELEVENLABS_API_KEY/g) ?? []).length, 3, 'twice in the presence check for the gate and once in the getter handed to the switch');
   assert.equal((src.match(/withSelectedSpeaker\(/g) ?? []).length, 1);
   assert.ok(/getKey: \(\) => process\.env\.ELEVENLABS_API_KEY/.test(src));
+});
+
+// ================================================================ the Jack guard at startup: the real entry, as a child process (dry run and refused serve only: nothing is opened, read or sent)
+const FAST_ANSWERS = { jobber_account_name: 'Test Cleaning Developer Account', timezone: 'America/Chicago', hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, duration_minutes: 120, standing_approval: true, state: 'CA' };
+function fastPair() {
+  const r = applyFastTest(callConfig({ opening: { business_name: 'Drew Cleaning', special: '$25 off a qualifying first standard cleaning', disclosure: 'This is a disclosure that names OpenAI and ElevenLabs.' } }), voiceConfig({ speaker: SPEAKER }), FAST_ANSWERS as never);
+  assert.equal(r.ok, true, JSON.stringify(r.ok ? [] : r.problems)); if (!r.ok) throw new Error('setup');
+  return { opening: r.call.opening, fast: r.voice.fast_test };
+}
+const NEEDS = 'the fast test needs the ElevenLabs speaker section (without it OpenAI would speak the calls)';
+
+test('entry, Jack guard: a fast test with NO speaker section is refused at load (exit 65, in dry run and in serve), before any gate, banner or port; nothing from the config is echoed', () => {
+  const { opening, fast } = fastPair(); const w = workdir({ call: { opening }, voice: { fast_test: fast } });
+  for (const extra of [[], ['--serve']]) {
+    const r = run([...w.args, ...extra], { JOBBER_STORE_DIR: w.dir });
+    assert.equal(r.status, 65, JSON.stringify(extra)); assert.ok(r.stderr.includes(`config problem: ${NEEDS}`), r.stderr.slice(0, 300));
+    assert.ok(!r.stdout.includes('Mode:') && !r.stdout.includes('Speaker:'), 'it never got as far as the banner');
+    assert.ok(!r.stderr.includes(SECRET) && !r.stdout.includes(SECRET), 'no secret from the config');
+  }
+});
+
+test('entry, Jack guard: a speaker section that is present but invalid (null, empty, not ElevenLabs, an extra "enabled" switch, a wrong model) is refused at load; OpenAI never gets the call', () => {
+  const { opening, fast } = fastPair();
+  for (const speaker of [null, {}, { ...SPEAKER, provider: 'openai' }, { ...SPEAKER, enabled: false }, { ...SPEAKER, model_id: 'eleven_multilingual_v2' }]) {
+    const w = workdir({ call: { opening }, voice: { fast_test: fast, speaker } });
+    for (const extra of [[], ['--serve']]) {
+      const r = run([...w.args, ...extra], { JOBBER_STORE_DIR: w.dir });
+      assert.equal(r.status, 65, JSON.stringify([speaker, extra])); assert.ok(/config problem: speaker must be/.test(r.stderr), r.stderr.slice(0, 300)); assert.ok(!r.stdout.includes('Mode:'));
+    }
+  }
+});
+
+test('entry, Jack guard: a valid speaker with the fast test starts normally: the dry run says ElevenLabs is ON and opens nothing, and a serve without the keys is refused by the gate (exit 78), not by the guard', () => {
+  const { opening, fast } = fastPair(); const w = workdir({ call: { opening }, voice: { fast_test: fast, speaker: SPEAKER } });
+  const dry = run(w.args, { JOBBER_STORE_DIR: w.dir });
+  assert.equal(dry.status, 0, dry.stderr.slice(0, 300)); assert.ok(dry.stdout.includes('Speaker: ElevenLabs ON') && dry.stdout.includes('Fast test call: ON'), 'the speaker is on'); assert.ok(!dry.stdout.includes('OpenAI speaks'));
+  assert.ok(!dry.stderr.includes('config problem'), 'the guard did not fire');
+  const serve = run([...w.args, '--serve'], { JOBBER_STORE_DIR: w.dir });
+  assert.equal(serve.status, 78); assert.ok(/serve refused: .*ElevenLabs key is not set/.test(serve.stderr), serve.stderr.slice(0, 400)); assert.ok(!serve.stderr.includes(NEEDS));
+});
+
+test('entry, Jack guard source: the speaker the gate saw is the speaker that wraps the voice socket, and the voice socket is built in one place only', () => {
+  const src = readFileSync(new URL('../src/founder-voice-entry.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.equal([...src.matchAll(/openVoice:/g)].length, 1, 'one place builds the voice socket');
+  assert.ok(/openVoice: withSelectedSpeaker\(\(d\) => createOpenAiVoiceSocket\(/.test(src), 'it is always wrapped by the switch');
+  assert.ok(/const speaker = speakerSettingsOf\(voice\);/.test(src) && /\}\), speaker, \{/.test(src), 'the same speaker value goes to the switch');
+  assert.ok(/founderVoiceConfigProblems\(voice\)/.test(src) && /process\.exit\(65\)/.test(src), 'the config check exits before anything is opened');
 });

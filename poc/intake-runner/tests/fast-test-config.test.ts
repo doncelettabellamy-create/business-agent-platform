@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { answersFromText, applyFastTest, parseClock, parseDays, parseMinutes } from '../src/fast-test-config.ts';
 import type { FastTestAnswers } from '../src/fast-test-config.ts';
-import { fastSettingsOf, founderVoiceConfigProblems, founderVoiceDigest, founderVoiceGateProblems, fastTestProblems } from '../src/founder-voice-gate.ts';
+import { fastSettingsOf, founderVoiceConfigProblems, founderVoiceDigest, founderVoiceGateProblems, fastTestProblems, speakerSettingsOf } from '../src/founder-voice-gate.ts';
+import { speakerSettingsProblems } from '../src/speaker-adapter.ts';
 import type { FounderVoiceConfig } from '../src/founder-voice-gate.ts';
 import { founderConfigDigest, founderConfigProblems } from '../src/founder-call-gate.ts';
 import type { FounderCallConfig } from '../src/founder-call-gate.ts';
@@ -136,4 +137,56 @@ test('the entry point takes the answers as typed, and says which answer is wrong
     const bad = run(JSON.stringify({ raw: { timezone: 'America/Chicago', days: 'weekdays', open: '9am', close: '5pm', duration: '120' } }));
     assert.equal(bad.status, 1); assert.match(bad.stdout, /problem: days: not understood/); assert.match(bad.stdout, /nothing was changed/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------- the Jack guard: the fast test needs the ElevenLabs speaker (OpenAI must never speak the pilot's calls)
+const NEEDS_SPEAKER = 'the fast test needs the ElevenLabs speaker section (without it OpenAI would speak the calls)';
+const SPEAKER_OK = { provider: 'elevenlabs', voice_id: '7EzWGsX10sAS4c9m9cPf', model_id: 'eleven_flash_v2_5', speed: 0.95 };
+const without = <T extends object>(o: T, k: string): Record<string, unknown> => { const c: Record<string, unknown> = { ...o }; delete c[k]; return c; };
+
+test('Jack guard: a voice config with fast_test and NO speaker section is refused at load (the config check, the gate and the setup program), with fixed text and no value', () => {
+  const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
+  const bare = without(r.voice, 'speaker');
+  assert.deepEqual(founderVoiceConfigProblems(bare).filter((m) => /speaker/.test(m)), [NEEDS_SPEAKER], 'exactly one problem about the speaker, in fixed words');
+  const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: 'x', twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true, fastTest: { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true } };
+  assert.ok(founderVoiceGateProblems({ callConfig: r.call, voiceConfig: bare, nowIso: '2026-11-02T12:00:00Z', env }).includes(NEEDS_SPEAKER), 'the gate refuses too');
+  // the setup program will not ADD a fast test to a voice config that has no speaker
+  const a = applyFastTest(CALL, without(VOICE, 'speaker'), ANSWERS); assert.equal(a.ok, false);
+  if (!a.ok) assert.ok(a.problems.some((m) => m.includes(NEEDS_SPEAKER)), 'the setup says why');
+  // a valid pair passes and selects the speaker
+  assert.deepEqual(founderVoiceConfigProblems(r.voice), []); assert.notEqual(speakerSettingsOf(r.voice), undefined);
+});
+
+test('Jack guard: a speaker section that is present but null, empty, not ElevenLabs, extended with a switch, or with a wrong model or speed is refused; native conversation is refused with it', () => {
+  const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
+  const variants: unknown[] = [null, {}, [], 'elevenlabs', true, { ...SPEAKER_OK, provider: 'openai' }, { ...SPEAKER_OK, enabled: false }, { ...SPEAKER_OK, extra: 1 }, without(SPEAKER_OK, 'voice_id'),
+    { ...SPEAKER_OK, model_id: 'eleven_multilingual_v2' }, { ...SPEAKER_OK, speed: 0 }, { ...SPEAKER_OK, speed: 3 }, { ...SPEAKER_OK, speed: '0.95' }];
+  for (const speaker of variants) {
+    const p = founderVoiceConfigProblems({ ...r.voice, speaker });
+    assert.ok(p.some((m) => /speaker must be/.test(m)), `refused: ${JSON.stringify(speaker)}`); assert.ok(!p.includes(NEEDS_SPEAKER), 'it is present, so the problem is its content, not its absence');
+  }
+  assert.ok(founderVoiceConfigProblems({ ...r.voice, conversation: 'native' }).some((m) => /speaker works with scripted/.test(m)));
+  assert.ok(founderVoiceConfigProblems({ ...r.voice, conversation: 'scripted' }).length === 0);
+});
+
+test('Jack guard: the rule is for the fast test only: a voice config with neither section (the long flow) is unchanged, and a valid speaker alone still passes', () => {
+  const plain = without(without(VOICE, 'speaker'), 'fast_test'); assert.deepEqual(founderVoiceConfigProblems(plain), [], 'neither section: unchanged');
+  assert.deepEqual(founderVoiceConfigProblems({ ...plain, speaker: SPEAKER_OK }), [], 'a speaker without the fast test: unchanged');
+});
+
+test('Jack guard, as a property: over every combination of speaker, fast_test and conversation, any config that passes the load check and has a fast test has a valid speaker selected', () => {
+  const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
+  const speakers: unknown[] = ['absent', SPEAKER_OK, null, {}, [], { ...SPEAKER_OK, provider: 'openai' }, { ...SPEAKER_OK, enabled: false }, { ...SPEAKER_OK, speed: 9 }];
+  const fasts: unknown[] = ['absent', r.voice.fast_test, null, {}, 'on', { ...r.voice.fast_test, price_dollars: -1 }];
+  const convs: unknown[] = ['absent', 'scripted', 'native', 'other'];
+  let passedWithFast = 0; let combos = 0;
+  for (const s of speakers) for (const f of fasts) for (const cv of convs) {
+    const v: Record<string, unknown> = { ...without(without(without(r.voice, 'speaker'), 'fast_test'), 'conversation') };
+    if (s !== 'absent') v.speaker = s; if (f !== 'absent') v.fast_test = f; if (cv !== 'absent') v.conversation = cv; combos++;
+    if (founderVoiceConfigProblems(v).length === 0 && 'fast_test' in v) {
+      passedWithFast++; const sel = speakerSettingsOf(v as unknown as FounderVoiceConfig);
+      assert.ok(sel !== undefined && speakerSettingsProblems(sel).length === 0, `a passing fast config must select a valid speaker: ${JSON.stringify([s, f, cv])}`);
+    }
+  }
+  assert.equal(combos, speakers.length * fasts.length * convs.length); assert.ok(passedWithFast >= 1, 'the property is not vacuous: the valid combination passes');
 });

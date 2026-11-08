@@ -128,6 +128,8 @@ export function founderVoiceConfigProblems(cfg: unknown): string[] {
   }
   if ('fast_test' in c) {
     for (const m of fastTestProblems(c.fast_test)) p.push(m);
+    // THE JACK GUARD: the fast test is the pilot's call flow, and it must never be spoken by OpenAI. Without a `speaker` section nothing wraps the voice socket, so OpenAI would speak every line. Fail closed at load.
+    if (!('speaker' in c)) p.push('the fast test needs the ElevenLabs speaker section (without it OpenAI would speak the calls)');
     if (c.conversation === 'native') p.push('the fast test works with scripted conversation only');
   }
   if ('transcription' in c) {
