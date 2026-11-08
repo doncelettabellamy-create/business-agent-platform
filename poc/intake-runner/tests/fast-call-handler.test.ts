@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AI_ANSWER, addressIssues, confirmedMismatches, spellHouseNumber, transcriptShape, createFastCallHandler, spellOut, spellStreet } from '../src/fast-call-handler.ts';
-import type { FastDeps, FastOutcome, FastSettings } from '../src/fast-call-handler.ts';
+import type { AddressToValidate, AddressVerdict, FastDeps, FastOutcome, FastSettings } from '../src/fast-call-handler.ts';
 import { instantOf } from '../src/fast-parsers.ts';
 import type { BookingRequest, BookingResult } from '../src/jobber-booking.ts';
 import type { Delivery, SendResult } from '../src/twilio-messaging.ts';
@@ -15,7 +15,7 @@ const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15
 const SETTINGS: FastSettings = { businessName: 'Drew Cleaning', serviceLabel: 'Standard cleaning', bedrooms: 2, bathrooms: 2, priceDollars: 199, standingApproval: true, state: 'CA',
   availability: { timezone: TZ, hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, durationMinutes: 120, stepMinutes: 30, leadMinutes: 60 } };
 
-function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw'; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number } = {}) {
+function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw'; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
   const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: BookingRequest[] = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
   const deps: FastDeps = {
     settings: { ...SETTINGS, ...o.settings }, numbers: new Set([DREW]), approvedCallers: new Set([CUSTOMER]), approvedCustomerNumbers: new Set(o.customers ?? [CUSTOMER]), ownerNumber: OWNER, maxCalls: o.maxCalls ?? 5,
@@ -26,6 +26,7 @@ function build(o: { settings?: Partial<FastSettings>; caller?: string | undefine
     verifyText: async () => o.delivery ?? 'delivered', log: (c, d) => { logs.push([c, d]); }, onOutcome: (x) => { outcomes.push(x); },
     emailsEnabled: o.emails !== undefined, ...(o.emails === undefined ? {} : { sendEmail: async (role: 'customer' | 'owner', subject: string, text: string) => { mails.push({ role, subject, text }); if (o.emails === 'throw') throw new Error('mail down'); return { ok: o.emails === 'accept' }; } }),
     answerWaitMs: o.answerWaitMs ?? 5000, settleMs: o.settleMs === null ? undefined : o.settleMs ?? 15, playbackMaxMs: 5000, afterSpeechMs: 5, holdGraceMs: o.holdGraceMs ?? 15, holdMaxMs: o.holdMaxMs ?? 300,
+    ...(o.validate === undefined ? {} : { validateAddress: o.validate as (a: AddressToValidate) => Promise<AddressVerdict> }), ...(o.validateMs === undefined ? {} : { validateMs: o.validateMs }),
   };
   const h = createFastCallHandler(deps); const c = fakeCarrier();
   return { h, c, logs, outcomes, mails, booked, texts, consents, busyCalls: () => busyCalls, last: () => outcomes[outcomes.length - 1] };
@@ -1173,4 +1174,104 @@ test('ADDRESS (SPOKEN-DIGIT-WORDS): a house number said as single digit words, w
   await c.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.c.hears(/calling from a number ending in/, 'yes'); await finish(c.c);
   assert.equal(c.booked.length, 0, 'an ambiguous number is never booked'); assert.ok(!c.c.lines.some((l) => /^To confirm/.test(l)), 'and never read back'); assert.equal(c.last().reason, 'ADDRESS_INVALID');
   assert.ok(c.logs.some(([k, v]) => k === 'FAST_ADDRESS_GUARD' && (v as { field: string }).field === 'house_number'));
+});
+
+/** The caller's side of a complete call, with the usual answers, up to the answer to the text-permission question (the next thing is the address check, then the read-back). */
+async function toTexts(c: ReturnType<typeof fakeCarrier>): Promise<void> {
+  await toOffer(c);
+  await c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.hears(/calling from a number ending in/, 'yes');
+  await c.hears(/May we send you one automated/, 'yes');
+}
+const GOOD: AddressToValidate = { street: '123 Invented Lane', city: 'Testville', state: 'CA', zip: '90210' };
+
+test('ADDRESS CHECK (VALID): the checker is asked once, with exactly the address that is booked; a valid verdict lets the read-back and the booking go on; the diagnostics hold a status token and a count, never the address', async () => {
+  const asked: AddressToValidate[] = [];
+  const t = build({ validate: async (a) => { asked.push(a); return { status: 'valid' }; } });
+  t.h.serve(t.c.transport); await toTexts(t.c);
+  const readback = await t.c.hears(/To confirm/, 'yes'); assert.match(readback, /at 123 Invented Lane, house number 1 2 3/);
+  await finish(t.c);
+  assert.deepEqual(asked, [GOOD], 'asked once, with the address that was heard');
+  assert.deepEqual(t.booked.map((r) => r.address), [{ street1: '123 Invented Lane', city: 'Testville', postalCode: '90210', province: 'CA' }]);
+  assert.equal(t.last().booked, true);
+  const rows = t.logs.filter(([k]) => k === 'FAST_ADDRESS_VALIDATE').map(([, v]) => v as Record<string, unknown>);
+  assert.deepEqual(rows, [{ status: 'valid', attempt: 1 }]);
+  noPersonalDetail(t.logs, ['Lane']);
+});
+
+test('ADDRESS CHECK (NO CHECKER): without a validateAddress dependency nothing changes: no check is logged and the call books as before', async () => {
+  const t = build();
+  t.h.serve(t.c.transport); await toTexts(t.c);
+  await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+  assert.equal(t.booked.length, 1); assert.ok(!t.logs.some(([k]) => k === 'FAST_ADDRESS_VALIDATE'));
+});
+
+test('ADDRESS CHECK (MISMATCH ON ZIP, UNKNOWN, MALFORMED, THROW, TIMEOUT): each fails closed: no read-back, nothing sent to Jobber, no text, no email, a person follows up', async () => {
+  const cases: Array<[string, (a: AddressToValidate) => Promise<unknown>, string, Record<string, unknown>, number?]> = [
+    ['zip does not fit the state', async () => ({ status: 'mismatch', field: 'zip_state' }), 'ADDRESS_UNVERIFIED', { status: 'mismatch', field: 'zip_state', attempt: 1 }],
+    ['zip does not fit the city', async () => ({ status: 'mismatch', field: 'zip_city' }), 'ADDRESS_UNVERIFIED', { status: 'mismatch', field: 'zip_city', attempt: 1 }],
+    ['unknown', async () => ({ status: 'unknown' }), 'ADDRESS_UNVERIFIED', { status: 'unknown', attempt: 1 }],
+    ['a mismatch with no known field', async () => ({ status: 'mismatch', field: 'whatever' }), 'ADDRESS_UNVERIFIED', { status: 'malformed', attempt: 1 }],
+    ['a malformed answer', async () => 'valid', 'ADDRESS_UNVERIFIED', { status: 'malformed', attempt: 1 }],
+    ['no answer value', async () => undefined, 'ADDRESS_UNVERIFIED', { status: 'error', attempt: 1 }],
+    ['the checker throws', async () => { throw new Error('checker down'); }, 'ADDRESS_UNVERIFIED', { status: 'error', attempt: 1 }],
+    ['the checker never answers', () => new Promise<unknown>(() => undefined), 'ADDRESS_UNVERIFIED', { status: 'timeout', attempt: 1 }, 40],
+  ];
+  for (const [label, validate, reason, row, ms] of cases) {
+    const t = build({ emails: 'accept', validate, ...(ms === undefined ? {} : { validateMs: ms }) });
+    t.h.serve(t.c.transport); await toTexts(t.c); await finish(t.c);
+    assert.equal(t.last().reason, reason, label); assert.equal(t.last().booked, false, label);
+    assert.equal(t.booked.length, 0, label + ': nothing sent to Jobber'); assert.equal(t.texts.length, 0, label + ': no text'); assert.equal(t.mails.length, 0, label + ': no email');
+    assert.ok(!t.c.lines.some((l) => /^To confirm/.test(l)), label + ': nothing was read back');
+    assert.deepEqual(t.logs.filter(([k]) => k === 'FAST_ADDRESS_VALIDATE').map(([, v]) => v), [row], label);
+    noPersonalDetail(t.logs, ['Lane']);
+  }
+});
+
+test('ADDRESS CHECK (MISMATCH ON THE STREET, THEN A CORRECTION): the caller is asked once for the street, hears it spelled, and the corrected address is checked AGAIN before the read-back; the booking carries the corrected, validated street', async () => {
+  const asked: AddressToValidate[] = [];
+  const t = build({ validate: async (a) => { asked.push(a); return a.street === '123 Invented Lane' ? { status: 'mismatch', field: 'street' } : { status: 'valid' }; } });
+  t.h.serve(t.c.transport); await toTexts(t.c);
+  await t.c.hears(/^Sorry, I could not match that address[.] Please say the street address again/, '456 Sample Street');
+  assert.ok(!t.c.lines.some((l) => /^To confirm/.test(l)), 'nothing is read back before the corrected street is confirmed and checked');
+  await t.c.hears(/^I have 456 Sample Street, house number 4 5 6, street spelled S A M P L E, S T R E E T[.]/, 'yes');
+  const readback = await t.c.hears(/To confirm/, 'yes'); assert.match(readback, /at 456 Sample Street, house number 4 5 6/);
+  await finish(t.c);
+  assert.deepEqual(asked.map((a) => a.street), ['123 Invented Lane', '456 Sample Street'], 'the corrected address is checked again');
+  assert.deepEqual(t.booked.map((r) => r.address.street1), ['456 Sample Street']); assert.equal(t.last().booked, true);
+  assert.deepEqual(t.logs.filter(([k]) => k === 'FAST_ADDRESS_VALIDATE').map(([, v]) => v), [{ status: 'mismatch', field: 'street', attempt: 1 }, { status: 'valid', attempt: 2 }]);
+  noPersonalDetail(t.logs, ['Lane', 'Sample']);
+});
+
+test('ADDRESS CHECK (HOUSE NUMBER MISMATCH, CORRECTED VERDICT): a house-number mismatch, or a checker that would CHANGE the address, asks for the street once; a second failure ends the call with nothing booked (a corrected address is never booked silently)', async () => {
+  for (const [label, first] of [['house number', { status: 'mismatch', field: 'house_number' }], ['corrected', { status: 'corrected' }]] as Array<[string, unknown]>) {
+    const t = build({ emails: 'accept', validate: async () => first });
+    t.h.serve(t.c.transport); await toTexts(t.c);
+    await t.c.hears(/^Sorry, I could not match that address/, '456 Sample Street');
+    await t.c.hears(/^I have 456 Sample Street/, 'yes'); await finish(t.c);
+    assert.equal(t.last().reason, 'ADDRESS_UNVERIFIED', label); assert.equal(t.booked.length, 0, label); assert.equal(t.mails.length, 0, label); assert.equal(t.texts.length, 0, label);
+    assert.ok(!t.c.lines.some((l) => /^To confirm/.test(l)), label + ': never read back');
+    assert.equal(t.logs.filter(([k]) => k === 'FAST_ADDRESS_VALIDATE').length, 2, label + ': checked twice, no more');
+    noPersonalDetail(t.logs, ['Lane', 'Sample']);
+  }
+});
+
+test('ADDRESS CHECK (BOOKING BLOCK): a read-back "no" that corrects the street makes the old verdict worthless: the new street is checked, a failing check ends the call, and what was booked is never an address the checker did not call valid', async () => {
+  const asked: string[] = [];
+  const t = build({ emails: 'accept', validate: async (a) => { asked.push(a.street); return a.street === '123 Invented Lane' ? { status: 'valid' } : { status: 'mismatch', field: 'street' }; } });
+  t.h.serve(t.c.transport); await toTexts(t.c);
+  await t.c.hears(/To confirm/, 'no'); await t.c.hears(/Which part is wrong/, 'the address');
+  await t.c.hears(/Please say the street address again/, '456 Sample Street'); await t.c.hears(/^I have 456 Sample Street/, 'yes');
+  await t.c.hears(/^Sorry, I could not match that address/, '789 Other Road'); await t.c.hears(/^I have 789 Other Road/, 'yes'); await finish(t.c);
+  assert.deepEqual(asked, ['123 Invented Lane', '456 Sample Street', '789 Other Road']);
+  assert.equal(t.booked.length, 0, 'the first street was valid but the caller changed it; the later ones failed'); assert.equal(t.last().reason, 'ADDRESS_UNVERIFIED'); assert.equal(t.mails.length, 0);
+});
+
+test('ADDRESS CHECK (NOT ASKED FOR AN UNUSABLE ADDRESS): an address the shape guard already refuses never reaches the checker', async () => {
+  let calls = 0;
+  const t = build({ validate: async () => { calls++; return { status: 'valid' }; } });
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/Is that right[?] Say yes or no/, 'yes'); await t.c.hears(/street address/, 'forty two Woodland Hills Drive, Testville, CA 90210');
+  await t.c.hears(/What day and time/, 'Tuesday at ten'); await t.c.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await finish(t.c);
+  assert.equal(calls, 0); assert.equal(t.last().reason, 'ADDRESS_INVALID'); assert.equal(t.booked.length, 0);
 });

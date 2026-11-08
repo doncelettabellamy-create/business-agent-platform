@@ -72,11 +72,23 @@ export interface FastDeps {
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number | boolean>): void;
   onOutcome?(o: FastOutcome): void;
+  /**
+   * OPTIONAL independent check that the caller's address exists and fits together (ZIP, city, state, street). Absent = no such check (today's behaviour). When present it is asked before the read-back and again guards the booking: only a `valid` verdict for exactly the address that is booked lets the call go on.
+   * Anything else fails closed: a mismatch on the street or house number (or a `corrected` verdict: the checker changed something, which is never booked silently) asks the caller for the street once more; every other verdict, a throw, a malformed answer or a timeout ends the call with nothing booked and a person to follow up.
+   * The address goes to this function and nowhere else; the handler logs only a status token and a field NAME, never a value.
+   */
+  validateAddress?(a: AddressToValidate): Promise<AddressVerdict>;
+  /** How long the check may take before it counts as a timeout (default 4000 ms). */
+  validateMs?: number;
   /** Timings (milliseconds). Defaults: answer wait 12000, contact settle 1200, playback bound 60000, after-speech 400. */
   answerWaitMs?: number; settleMs?: number; playbackMaxMs?: number; afterSpeechMs?: number;
   /** A question waits while the caller is speaking and this long after they stop (default 600), for at most holdMaxMs in all (default 3000). */
   holdGraceMs?: number; holdMaxMs?: number;
 }
+/** What the checker is given: exactly the address that would be booked. */
+export interface AddressToValidate { street: string; city: string; state: string; zip: string }
+/** What the checker answers. `valid` = exists and fits; `mismatch` names the part that does not fit; `corrected` = the checker would change the address; `unknown` = it cannot tell. */
+export type AddressVerdict = { status: 'valid' } | { status: 'mismatch'; field: 'zip_state' | 'zip_city' | 'street' | 'house_number' } | { status: 'corrected' } | { status: 'unknown' };
 export interface FastHandler { serve(transport: CallTransport): void; active(): number; idle(): Promise<void> }
 
 const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']; const WDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -166,6 +178,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
     let confirmed: ConfirmedFacts | undefined;   // set when the read-back is spoken; the booking must carry exactly these facts
     let nameOk = false; let nameNo = 0; let spellBuf = ''; let spellBad = 0;   // the caller's own yes to the name (nothing is booked without it); how many times they said it was wrong; the letters of a spelling heard so far, and the spellings that gave nothing
+    let validatedKey: string | undefined; let validateTries = 0;   // the address the checker said is valid (the booking must carry exactly it); how many times the street was asked again after a failed check
     let readbackAgain = 0; let fixCycles = 0; let streetPending = false; let streetNo = 0; let streetBad = 0; let streetBuf: string[] = [];   // a street correction is under way and not yet confirmed (nothing is read back or booked while it is); the caller's "no" answers to the spelled street; unusable answers; the words of a spelling heard so far
     const note = (s: string): void => { if (steps.length < 40) steps.push(s); };
     const wordsIn = (s: string): number => (s.trim() === '' ? 0 : s.trim().split(/\s+/).length);   // diagnostics only: how many words, never which
@@ -435,6 +448,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       { const bad = addressIssues(p); if (bad.length > 0) { deps.log('FAST_ADDRESS_GUARD', { ok: false, count: bad.length, field: bad[0] }); return void giveUp('ADDRESS_INVALID'); } }
       // A street joined from a house number and a name with no road word may be a place name taken for the street: it is spoken and spelled and must be confirmed BEFORE the read-back (nothing is read back or booked until it is).
       if (contact.streetUnchecked()) { streetPending = true; streetNo = 0; streetBad = 0; streetBuf = []; deps.log('FAST_ADDRESS_CHECK', { reason: 'ROADLESS' }); return confirmStreet(); }   // fail closed: a complete address (number, street, city, state, five-digit ZIP) before anything is read back
+      if (deps.validateAddress !== undefined && validatedKey !== addressKey(p)) return void checkAddress({ street: p.street, city: p.city, state: p.state, zip: p.zip });   // fail closed: nothing is read back, and nothing is booked, until the checker has said this address is valid
       confirmed = { first: firstName, last: lastName, date: o.date, start: o.time, end: o.endTime, street: p.street, city: p.city, zip: p.zip, state: p.state, price: S.priceDollars };   // exactly what the caller is about to be asked to confirm
       const spokenZip = p.zip.split('').join(' '); const spelledStreet = spellStreet(p.street);   // the street name is spelled in the read-back, as the name is: a mis-heard word cannot pass by ear (Live Test #8)
       ask('READBACK', `To confirm: ${S.serviceLabel} for ${`${firstName} ${lastName}`.trim()} on ${sayDayYear(o.date)} at ${sayTime(o.time)}, at ${p.street}, house number ${spellHouseNumber(p.street)}${spelledStreet === '' ? '' : `, street spelled ${spelledStreet}`}, ${p.city}, ${stateName(p.state)}, ${spokenZip}. The price is ${sayDollars(S.priceDollars)}. Shall I book it? Say yes or no.`, async (heard) => {
@@ -443,6 +457,34 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         if (y === 'no') return askField();   // a no opens the correction of the part that is wrong (the address); nothing is booked until a read-back is confirmed
         return replayUnclear();
       }, true);
+    }
+
+    // ---------------------------------------------------------------- the independent address check (optional)
+    const addressKey = (a: AddressToValidate): string => `${a.street}|${a.city}|${a.state}|${a.zip}`;
+    /** Asks the checker with a time bound. Never throws; a throw, a timeout or a malformed answer is an `unknown` verdict. The status token is the only thing that is logged. */
+    async function runCheck(a: AddressToValidate): Promise<{ v: AddressVerdict; token: string }> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const limit = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), deps.validateMs ?? 4_000); timer.unref?.(); });
+        const got = await Promise.race([Promise.resolve().then(() => deps.validateAddress!({ ...a })), limit]);
+        if (got === 'timeout') return { v: { status: 'unknown' }, token: 'timeout' };
+        const s = typeof got === 'object' && got !== null ? (got as { status?: unknown }).status : undefined; const f = (got as { field?: unknown }).field;
+        if (s === 'valid') return { v: { status: 'valid' }, token: 'valid' };
+        if (s === 'corrected') return { v: { status: 'corrected' }, token: 'corrected' };
+        if (s === 'mismatch' && (f === 'zip_state' || f === 'zip_city' || f === 'street' || f === 'house_number')) return { v: { status: 'mismatch', field: f }, token: 'mismatch' };
+        return { v: { status: 'unknown' }, token: s === 'unknown' ? 'unknown' : 'malformed' };
+      } catch { return { v: { status: 'unknown' }, token: 'error' }; } finally { if (timer !== undefined) clearTimeout(timer); }
+    }
+    function checkAddress(a: AddressToValidate): void {
+      clearTimers(); awaiting = undefined;   // while the checker runs nothing is asked, and a stray word is not taken as an answer
+      enqueue(async () => {
+        const { v, token } = await runCheck(a);
+        deps.log('FAST_ADDRESS_VALIDATE', { status: token, ...(v.status === 'mismatch' ? { field: v.field } : {}), attempt: validateTries + 1 });   // a token, a field NAME and a count: never a value
+        if (v.status === 'valid') { validatedKey = addressKey(a); return finalReadback(); }
+        const streetFix = v.status === 'corrected' || (v.status === 'mismatch' && (v.field === 'street' || v.field === 'house_number'));
+        if (streetFix && validateTries < 1) { validateTries++; streetPending = true; streetNo = 0; streetBad = 0; streetBuf = []; return askStreetAgain(false, 'Sorry, I could not match that address. Please say the street address again: the house number and the street name.'); }
+        return giveUp('ADDRESS_UNVERIFIED');
+      });
     }
 
     // ---------------------------------------------------------------- a "no" to the read-back: the address is corrected, as the name is
@@ -463,8 +505,8 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         return askField(true);
       });
     }
-    function askStreetAgain(retry = false): void {
-      ask('ADDRESS_FIX', retry ? 'Sorry, please say the house number and the street name.' : 'Please say the street address again: the house number and the street name.', async (heard) => {
+    function askStreetAgain(retry = false, lead?: string): void {
+      ask('ADDRESS_FIX', retry ? 'Sorry, please say the house number and the street name.' : lead ?? 'Please say the street address again: the house number and the street name.', async (heard) => {
         const r = contact.correctStreet(heard);
         deps.log('FAST_ADDRESS_FIX', { path: 'SAY', outcome: r.outcome, attempt: streetNo + 1, bad: streetBad, words: wordsIn(heard), chars: heard.trim().length });   // flags and counts only: never the street or a part of it
         if (r.outcome === 'captured') { streetBad = 0; return confirmStreet(); }
@@ -507,6 +549,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       if (streetPending || contact.streetUnchecked()) return end('ADDRESS_NOT_CONFIRMED', 'Your request is recorded, and a person will confirm the booking. Goodbye.');   // fail closed: a street under correction is never booked
       if (p !== undefined && addressIssues(p).length > 0) { deps.log('FAST_ADDRESS_GUARD', { ok: false, count: addressIssues(p).length, field: addressIssues(p)[0] }); return end('ADDRESS_INVALID', 'Your request is recorded, and a person will confirm the booking. Goodbye.'); }   // fail closed, again at the last moment: nothing is sent to Jobber without a complete address
       if (p === undefined || p.state === undefined || !nameOk || !S.standingApproval) return end(!S.standingApproval ? 'NO_STANDING_APPROVAL' : !nameOk ? 'NAME_UNCONFIRMED' : p === undefined ? 'ADDRESS_MISSING' : 'STATE_MISSING', 'Your request is recorded, and a person will confirm the booking. Goodbye.');
+      if (deps.validateAddress !== undefined && validatedKey !== addressKey({ street: p.street, city: p.city, state: p.state, zip: p.zip })) { deps.log('FAST_ADDRESS_GUARD', { ok: false, count: 1, field: 'unvalidated' }); return end('ADDRESS_UNVERIFIED', 'Your request is recorded, and a person will confirm the booking. Goodbye.'); }   // fail closed, last moment: what is booked is exactly what the checker said is valid
       // Availability is checked once more, from the calendar, right before anything is written: the time must lie inside the window that was read and still be free.
       { const { from, to } = calendarWindow(); let cal: { busy: Busy[]; complete: boolean }; try { cal = await deps.busy(from, to); } catch { cal = { busy: [], complete: false }; }
         const still = cal.complete ? chooseOffer({ date: o.date, time: o.time }, S.availability, cal.busy, deps.now(), []) : undefined;
