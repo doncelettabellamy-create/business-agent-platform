@@ -1383,7 +1383,7 @@ test('M1 source guard: the notice is built from a short fixed list, sent to the 
   assert.ok(!/firstName|lastName|heard|contact\.|street|zip|\bp\.|offer|pref|size|price|callSid|confirmed/i.test(fn.replace(/priceDollars/g, '')), 'no caller-given value is read');
   assert.ok(/send\('owner', msg\.subject, msg\.text\)/.test(fn) && !/'customer'/.test(fn), 'the owner role only');
   assert.equal([...src.matchAll(/notifyFollowUp\(/g)].length, 3, 'defined once and called from end(): when the call ends and when an ending is reached after a hang-up');
-  assert.equal([...src.matchAll(/sendOwnerNotice\(/g)].length, 3, 'defined once and called from the promise check and from the skipped booking');
+  assert.equal([...src.matchAll(/sendOwnerNotice\(/g)].length, 4, 'defined once and called from the promise check, from the skipped booking and from the speaker failure');
   assert.ok(/deps\.onOutcome\?\.\(\{ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, \.\.\.extra \}\);\r?\n\s+notifyFollowUp\(reason, line, booked\);/.test(src), 'called from end(), after the outcome');
 });
 
@@ -1494,9 +1494,105 @@ test('M2 unchanged behaviour: a hang-up before the read-back yes records only th
 
 test('M2 source guard: the hang-up flag is set only by a hang-up, nothing is written or texted after it, and the late ending is the one place that records and notifies', () => {
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
-  assert.equal([...src.matchAll(/hungUp = true/g)].length, 1, 'set once'); assert.ok(/t\.onClose = \(\) => \{ if \(!done\) \{ done = true; hungUp = true;/.test(src), 'only inside the hang-up branch');
+  assert.equal([...src.matchAll(/hungUp = true/g)].length, 2, 'set in two places only'); assert.ok(/t\.onClose = \(\) => \{ if \(!done\) \{ done = true; hungUp = true;/.test(src), 'inside the hang-up branch'); assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ hungUp = true;/.test(src), 'and in the speaker-failure branch (the voice is gone)');
   assert.ok(src.indexOf("deps.log('FAST_BOOKING_SKIPPED'") > 0 && src.indexOf("deps.log('FAST_BOOKING_SKIPPED'") < src.indexOf('await deps.book(req)'), 'the skip comes before the booking request');
   assert.ok(src.indexOf("deps.log('FAST_TEXTS_SKIPPED', { reason: 'CALLER_HUNG_UP' })") > 0 && src.indexOf("deps.log('FAST_TEXTS_SKIPPED', { reason: 'CALLER_HUNG_UP' })") < src.indexOf('await deps.sendText(callback'), 'the text skip comes before any text');
   assert.ok(/async function book\(\): Promise<void> \{ booking = true; try \{ await bookInner\(\); \} finally \{ booking = false; releaseSlot\(\); \} \}/.test(src), 'the slot is released when the booking settles');
   assert.ok(/if \(done\) \{ if \(hungUp && !lateEnd\) \{ lateEnd = true;/.test(src), 'one late ending');
+});
+
+// ================================================================ the speaker fails (Jack is gone): the call is treated like a hang-up; nothing unsent is written, a write in flight is recorded when it settles, the slot is held until then, and the owner is told at most once
+/** The speaker adapter's two signals, in order: the call logic is told, then the connection closes (1011). */
+const speakerDown = (c: ReturnType<typeof fakeCarrier>): void => { c.emit({ kind: 'speaker_down' }); c.transport.close(1011); };
+const nothingPersonal = (t: ReturnType<typeof build>): void => { noPersonalDetail(t.logs); for (const m of notices(t)) for (const s of ['Testa', 'Invented', 'Testville', '90210', '5550100003']) assert.ok(!m.text.includes(s) && !m.subject.includes(s), 'no caller detail in a follow-up notice: ' + s); };
+
+test('speaker down at intake: the call ends as SPEAKER_DOWN, nothing is booked, the owner gets exactly one fixed notice (no caller words), the slot is free, and a second signal or the close changes nothing', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept' });
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented'); await t.c.hears(/Is that right\? Say yes or no/, 'yes'); await t.c.hears(/street address/, undefined);
+  speakerDown(t.c); t.c.emit({ kind: 'speaker_down' }); t.c.hangUp(); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(t.booked.length, 0); assert.equal(t.texts.length, 0);
+  assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]], 'one owner notice and nothing else');
+  const lines = t.mails[0].text.split('\n'); assert.ok(lines.includes('Reason code: SPEAKER_DOWN')); assert.ok(lines.includes('No booking was sent to Jobber.'));
+  for (const l of lines) assert.ok(FOLLOW_UP_LINES.some((re) => re.test(l)), 'an unexpected line: ' + l);
+  assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1); assert.equal(t.h.active(), 0); nothingPersonal(t);
+  assert.deepEqual(row(t, 'FAST_FOLLOWUP'), { owner: 'accepted', reason: 'SPEAKER_DOWN' });
+});
+
+test('speaker down with test emails off: the outcome is recorded, nothing is sent and nothing is logged as a notice', async () => {
+  const t = build({ textsEnabled: false });
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented'); await t.c.hears(/Is that right\? Say yes or no/, 'yes'); speakerDown(t.c); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(t.mails.length, 0); assert.ok(!t.logs.some(([c]) => c === 'FAST_FOLLOWUP')); assert.equal(t.h.active(), 0);
+});
+
+test('speaker down while the Jobber write is in flight, verified later: the booking is recorded as booked, the two booking emails go out once, no follow-up notice, nothing more is spoken or texted, and the slot stays busy until the write settles', async () => {
+  for (const texts of [false, true]) {
+    const g = gate<BookingResult>(); const t = build({ textsEnabled: texts, emails: 'accept', book: () => g.p });
+    await toPendingWrite(t, texts); speakerDown(t.c); const spokenBefore = t.c.lines.length;
+    assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]], 'the failure is recorded at once'); assert.equal(t.mails.length, 0, 'no notice while the write is unresolved');
+    assert.equal(t.h.active(), 1, 'the slot is held while the write is unresolved');
+    const redial = fakeCarrier(); t.h.serve(redial.transport); assert.equal(redial.closed, 1, 'a redial is refused'); assert.deepEqual(row(t, 'FAST_REFUSED'), { reason: 'BUSY' });
+    g.res(OK_RESULT); await t.h.idle();
+    assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false], ['BOOKED', true]], 'texts ' + texts); assert.equal(t.booked.length, 1, 'the request is never repeated');
+    assert.deepEqual(t.mails.map((m) => m.role).sort(), ['customer', 'owner']); assert.equal(notices(t).length, 0);
+    assert.equal(t.c.lines.length, spokenBefore, 'nothing spoken after the failure'); assert.equal(t.texts.length, 0, 'no text after the failure');
+    assert.equal(t.h.active(), 0, 'free once settled'); const after = fakeCarrier(); t.h.serve(after.transport); assert.equal(after.closed, 0); after.hangUp(); nothingPersonal(t);
+  }
+});
+
+test('speaker down while the write is in flight, not verified (uncertain, refused after a write, an error): the result is recorded, the owner is told once that a job may exist, and the request is never repeated', async () => {
+  const cases: Array<[string, (g: ReturnType<typeof gate<BookingResult>>) => void, string]> = [
+    ['uncertain', (g) => g.res({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }), 'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.'],
+    ['refused after a client was written', (g) => g.res({ status: 'refused', reason: 'JOBBER_REFUSED', writes: 1 }), 'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.'],
+    ['the adapter throws', (g) => g.rej(new Error('adapter down')), 'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.'],
+    ['refused before any write', (g) => g.res({ status: 'refused', reason: 'WRITES_OFF', writes: 0 }), 'No booking was sent to Jobber.'],
+  ];
+  for (const [label, settle, line] of cases) {
+    const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
+    await toPendingWrite(t); speakerDown(t.c); assert.equal(t.mails.length, 0, label + ': nothing yet'); settle(g); await t.h.idle();
+    assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false], ['BOOKING_NOT_VERIFIED', false]], label);
+    assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]], label + ': one owner notice and no booking email');
+    const lines = t.mails[0].text.split('\n'); assert.ok(lines.includes('Reason code: BOOKING_NOT_VERIFIED'), label); assert.ok(lines.includes(line), label);
+    assert.equal(t.booked.length, 1, label); assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1, label); assert.equal(t.h.active(), 0, label); nothingPersonal(t);
+  }
+});
+
+test('speaker down before the request is sent (the last availability check still running): nothing is written, the one notice says so, and the booking emails are never sent', async () => {
+  const hold = gate<void>(); const t = build({ textsEnabled: false, emails: 'accept', busyHold: hold.p });
+  t.h.serve(t.c.transport); await toOffer(t.c); await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, 'yes');
+  await t.c.until(() => t.busyCalls() >= 2, 'the last availability check'); speakerDown(t.c); hold.res(); await t.h.idle();
+  assert.equal(t.booked.length, 0, 'the booking adapter was never called'); assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false], ['BOOKING_SKIPPED_HUNG_UP', false]]);
+  assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]]); assert.ok(t.mails[0].text.split('\n').includes('No booking was sent to Jobber.')); assert.equal(t.h.active(), 0); nothingPersonal(t);
+});
+
+test('speaker down while a write never settles: the slot is held for at most slotHoldMs, and no booking is ever repeated (limitation: an unresolved write sends no notice)', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept', slotHoldMs: 40, book: () => new Promise<BookingResult>(() => undefined) });
+  await toPendingWrite(t); speakerDown(t.c); assert.equal(t.h.active(), 1); await sleep(160);
+  assert.equal(t.h.active(), 0, 'released after the bound'); assert.equal(t.booked.length, 1); assert.equal(t.mails.length, 0, 'documented limitation: nothing is sent while the write is still unresolved');
+  assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]);
+});
+
+test('speaker down, as a property: at every step of the call, with the signal repeated and followed by hang-ups, there is at most one booking request, at most one owner notice, a recorded outcome, and the slot ends free', async () => {
+  const cases: Array<[string, (t: ReturnType<typeof build>, g: ReturnType<typeof gate<BookingResult>>) => Promise<void>]> = [
+    ['after the name prompt', async (t) => { t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented'); await t.c.until(() => t.c.lines.length > 0, 'a line'); }],
+    ['at the offer', async (t) => { t.h.serve(t.c.transport); await toOffer(t.c); await t.c.hears(/is one hundred ninety-nine dollars/, undefined); }],
+    ['at the read-back', async (t) => { t.h.serve(t.c.transport); await toOffer(t.c); await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, undefined); }],
+    ['write in flight, then verified', async (t, g) => { await toPendingWrite(t); setTimeout(() => g.res(OK_RESULT), 10); }],
+    ['write in flight, then uncertain', async (t, g) => { await toPendingWrite(t); setTimeout(() => g.res({ status: 'uncertain', reason: 'NOT_FOUND', writes: 2 }), 10); }],
+    ['write in flight, then an error', async (t, g) => { await toPendingWrite(t); setTimeout(() => g.rej(new Error('down')), 10); }],
+  ];
+  for (const [label, go] of cases) {
+    const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
+    await go(t, g); speakerDown(t.c); t.c.emit({ kind: 'speaker_down' }); t.c.hangUp(); t.c.hangUp(); await sleep(60); await t.h.idle();
+    assert.ok(t.booked.length <= 1, label + ': at most one booking request'); assert.ok(notices(t).length <= 1, label + ': at most one notice'); assert.equal(t.mails.filter((m) => m.role === 'customer').length <= 1, true, label);
+    assert.equal(outcomes(t)[0][0], 'SPEAKER_DOWN', label); if (t.booked.length === 1) assert.ok(outcomes(t).some(([r]) => r === 'BOOKED' || r === 'BOOKING_NOT_VERIFIED'), label + ': a sent request always has its result recorded');
+    assert.equal(t.h.active(), 0, label + ': the slot ends free'); nothingPersonal(t);
+  }
+});
+
+test('speaker down source guard: the failure sets the hang-up flag before it ends the call, notifies at once only when no write is in flight, and the notice is guarded to once per call', () => {
+  const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
+  assert.equal([...src.matchAll(/ev\.kind === 'speaker_down'/g)].length, 1);
+  assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ hungUp = true; if \(!booking\) sendOwnerNotice\('SPEAKER_DOWN', bookSent\); void end\('SPEAKER_DOWN'\); return; \}/.test(src), 'flag, then the guarded notice, then the end');
+  assert.ok(/function sendOwnerNotice\(reason: string, mayExist: boolean\): void \{\r?\n\s+if \(noticed\) return; noticed = true;/.test(src), 'the once-per-call guard is the first statement');
+  assert.equal([...src.matchAll(/noticed = true/g)].length, 1);
 });

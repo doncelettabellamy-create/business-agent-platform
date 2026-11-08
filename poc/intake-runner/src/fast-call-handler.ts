@@ -238,7 +238,9 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     async function say(text: string): Promise<void> { if (done) return; if (!t.speak(text, true, { interruptible: false })) return; deps.log('FAST_SAY', { id: 'info', unit: false }); await t.playbackDone!(playbackMaxMs); }
     /** An ending that told the caller "a person will ..." sends the OWNER one fixed email (only when test emails are on): the reason code, the time, the callback number and the steps reached, never anything the caller said. It never throws and never delays the end of the call; the call ends once, so it is sent once. */
     const PROMISED = /\ba person will\b/i;
+    let noticed = false;   // a call sends at most one notice, whichever ending reaches it first
     function sendOwnerNotice(reason: string, mayExist: boolean): void {
+      if (noticed) return; noticed = true;
       try {
         if (deps.emailsEnabled !== true || deps.sendEmail === undefined) return;
         const tz = S.availability.timezone; const at = deps.now(); const number = callback !== '' ? callback : caller;
@@ -693,7 +695,8 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         return;
       }
       if (ev.kind === 'reply_failed') { const a = awaiting; if (a !== undefined) enqueue(async () => { if (awaiting !== a) return; if (++a.replays > 2) return end('REPLY_FAILED', undefined); play(a, a.text); }); return; }
-      if (ev.kind === 'speaker_down') { void end('SPEAKER_DOWN'); return; }
+      // The voice is gone: from here the call is treated like a hang-up. `hungUp` stops a booking that has not been sent yet, makes a write already in flight record its real result when it settles, and holds the slot until then. With no write in flight the owner is told now; with one in flight the notice waits for its result.
+      if (ev.kind === 'speaker_down') { hungUp = true; if (!booking) sendOwnerNotice('SPEAKER_DOWN', bookSent); void end('SPEAKER_DOWN'); return; }
     };
   }
 
