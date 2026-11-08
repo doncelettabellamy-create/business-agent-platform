@@ -99,6 +99,11 @@ Written 2026-10-26. Documentation only. This file orders the work and records wh
 3. **No repeat audits.** An audit is recorded once (date, scope, the commit it covered). It is repeated only when the founder asks, or when the audited code or risk has materially changed since; otherwise the record is cited and updated. The 2026-11-02 takeover audit, the commit-boundary audit, the docs review and the backup review are recorded (5a-52 and the backup document) and are not repeated.
 4. **Reconcile, don't duplicate.** One place for each thing: this section for milestones, done, approvals and reporting; the roadmap's 5a records for evidence; `ROADMAP_BACKLOG.md` for the DRF requirements; `PRODUCT_CONTINUITY.md` for the dashboard rule; `PRIVATE_BACKUP_AND_RESTORE.md` for backups. A change that would restate another document's content points to it instead.
 5. **The existing code and the dashboard are preserved.** Nothing is deleted, replaced or rebuilt without the founder's written instruction naming it.
+6. **Not complete until enforced, tested and caveated.** For any behavior a task adds or changes that protects a caller, a booking, an email, a log or a spend:
+   1. **Enforced in code.** The protection is enforced by code that fails closed, not by wording, a prompt or the model. A spoken promise (for example "a person will follow up") is behavior: something in code carries it out.
+   2. **Failure and recovery are defined.** For each way it can fail, the code and the report say what the caller hears, what is recorded (fixed codes only), who is told, and how it recovers or stops safely.
+   3. **Material paths and regression are tested.** A test pins the normal path and every failure path above, a hand-broken copy of the rule fails that test (a mutation check), and a defect found on the way gets its own regression test. The new tests run in the suite that `npm test` runs; if they do not, the report says so.
+   4. **Evidence and gaps are explicit.** Every claim carries its status word and source (0.2). Every path that is not enforced, not tested or not seen live is named, in the same sentence, as UNVERIFIED, PARTIAL or MISSING. A task that lacks any of 1 to 3 is reported PARTIAL, never complete, and only the founder can set DONE (0.2 item 7).
 
 
 ## 1. The product in one paragraph
