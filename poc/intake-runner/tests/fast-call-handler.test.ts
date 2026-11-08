@@ -16,18 +16,18 @@ const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15
 const SETTINGS: FastSettings = { businessName: 'Drew Cleaning', serviceLabel: 'Standard cleaning', bedrooms: 2, bathrooms: 2, priceDollars: 199, standingApproval: true, state: 'CA',
   availability: { timezone: TZ, hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, durationMinutes: 120, stepMinutes: 30, leadMinutes: 60 } };
 
-function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
+function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
   const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: BookingRequest[] = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
   const deps: FastDeps = {
     settings: { ...SETTINGS, ...o.settings }, numbers: new Set([DREW]), approvedCallers: new Set([CUSTOMER]), approvedCustomerNumbers: new Set(o.customers ?? [CUSTOMER]), ownerNumber: OWNER, maxCalls: o.maxCalls ?? 5,
-    now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; return (busyCalls > 1 && o.busyLater !== undefined ? o.busyLater : o.busy) ?? { busy: [], complete: true }; },
+    now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; if (o.busyHold !== undefined && busyCalls > 1) await o.busyHold; return (busyCalls > 1 && o.busyLater !== undefined ? o.busyLater : o.busy) ?? { busy: [], complete: true }; },
     book: async (r) => { booked.push(r); return (o.book ?? (() => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2 })))(r); },
     sendText: async (to, body) => { texts.push({ to, body }); return (o.send ?? (() => ({ ok: true, sid: `SM${'1'.repeat(32)}` })))(to, body); },
     textsEnabled: o.textsEnabled ?? true, ownerConsent: o.ownerConsent ?? true, recordConsent: async (e) => { consents.push(e); return o.consentOk ?? true; },
     verifyText: async () => o.delivery ?? 'delivered', log: (c, d) => { logs.push([c, d]); }, onOutcome: (x) => { outcomes.push(x); },
     emailsEnabled: o.emails !== undefined && o.emailsOff !== true, ...(o.emails === undefined ? {} : { sendEmail: async (role: 'customer' | 'owner', subject: string, text: string) => { mails.push({ role, subject, text }); if (o.emails === 'hang') return new Promise<{ ok: boolean }>(() => undefined); if (o.emails === 'throw') throw new Error('mail down'); return { ok: o.emails === 'accept' }; } }),
     answerWaitMs: o.answerWaitMs ?? 5000, settleMs: o.settleMs === null ? undefined : o.settleMs ?? 15, playbackMaxMs: 5000, afterSpeechMs: 5, holdGraceMs: o.holdGraceMs ?? 15, holdMaxMs: o.holdMaxMs ?? 300,
-    ...(o.validate === undefined ? {} : { validateAddress: o.validate as (a: AddressToValidate) => Promise<AddressVerdict> }), ...(o.validateMs === undefined ? {} : { validateMs: o.validateMs }), ...(o.followUpMs === undefined ? {} : { followUpMs: o.followUpMs }),
+    ...(o.validate === undefined ? {} : { validateAddress: o.validate as (a: AddressToValidate) => Promise<AddressVerdict> }), ...(o.validateMs === undefined ? {} : { validateMs: o.validateMs }), ...(o.followUpMs === undefined ? {} : { followUpMs: o.followUpMs }), ...(o.slotHoldMs === undefined ? {} : { slotHoldMs: o.slotHoldMs }),
   };
   const h = createFastCallHandler(deps); const c = fakeCarrier();
   return { h, c, logs, outcomes, mails, booked, texts, consents, busyCalls: () => busyCalls, last: () => outcomes[outcomes.length - 1] };
@@ -1379,9 +1379,124 @@ test('M1 callback number: the number the caller gave and confirmed is the one in
 
 test('M1 source guard: the notice is built from a short fixed list, sent to the owner role only, from the one place a call ends, and never from what the caller said', () => {
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  const fn = /function notifyFollowUp[\s\S]*?\r?\n    \}\r?\n/.exec(src)?.[0] ?? ''; assert.ok(fn.length > 200, 'the function was found');
+  const fn = /function sendOwnerNotice[\s\S]*?\r?\n    \}\r?\n/.exec(src)?.[0] ?? ''; assert.ok(fn.length > 200, 'the function was found');
   assert.ok(!/firstName|lastName|heard|contact\.|street|zip|\bp\.|offer|pref|size|price|callSid|confirmed/i.test(fn.replace(/priceDollars/g, '')), 'no caller-given value is read');
   assert.ok(/send\('owner', msg\.subject, msg\.text\)/.test(fn) && !/'customer'/.test(fn), 'the owner role only');
-  assert.equal([...src.matchAll(/notifyFollowUp\(/g)].length, 2, 'defined once and called once');
+  assert.equal([...src.matchAll(/notifyFollowUp\(/g)].length, 3, 'defined once and called from end(): when the call ends and when an ending is reached after a hang-up');
+  assert.equal([...src.matchAll(/sendOwnerNotice\(/g)].length, 3, 'defined once and called from the promise check and from the skipped booking');
   assert.ok(/deps\.onOutcome\?\.\(\{ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, \.\.\.extra \}\);\r?\n\s+notifyFollowUp\(reason, line, booked\);/.test(src), 'called from end(), after the outcome');
+});
+
+// ---------------------------------------------------------------- M2: the caller hangs up while the Jobber booking is pending
+const gate = <T>() => { let res!: (v: T) => void; let rej!: (e: unknown) => void; const p = new Promise<T>((a, b) => { res = a; rej = b; }); return { p, res, rej }; };
+/** The caller's side up to "yes" at the read-back; returns once the booking request has reached the (held) booking adapter. */
+async function toPendingWrite(t: ReturnType<typeof build>, texts = false): Promise<void> {
+  t.h.serve(t.c.transport); await toOffer(t.c);
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes');
+  if (texts) await t.c.hears(/May we send you one automated/, 'yes');
+  await t.c.hears(/To confirm/, 'yes'); await t.c.until(() => t.booked.length === 1, 'the booking request');
+}
+const OK_RESULT: BookingResult = { status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2 };
+const row = (t: ReturnType<typeof build>, code: string): unknown => t.logs.find(([c]) => c === code)?.[1];
+const outcomes = (t: ReturnType<typeof build>): Array<[string, boolean]> => t.outcomes.map((o) => [o.reason, o.booked]);
+
+test('M2 verified after the hang-up: the booking is recorded as booked (after the hang-up outcome), the two booking emails go out once, nothing is spoken and no text is sent, even with texts on', async () => {
+  for (const texts of [false, true]) {
+    const g = gate<BookingResult>(); const t = build({ textsEnabled: texts, emails: 'accept', book: () => g.p });
+    await toPendingWrite(t, texts); const spokenBefore = t.c.lines.length; t.c.hangUp(); g.res(OK_RESULT); await t.h.idle();
+    assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKED', true]], `texts ${texts}`); assert.equal(t.booked.length, 1);
+    assert.deepEqual(row(t, 'FAST_BOOKING_AFTER_HANGUP'), { status: 'booked_verified', verified: true });
+    assert.deepEqual(t.mails.map((m) => m.role).sort(), ['customer', 'owner']); assert.equal(notices(t).length, 0, 'a booked call sends no follow-up notice');
+    assert.equal(t.c.lines.length, spokenBefore, 'nothing was spoken after the hang-up'); assert.equal(t.texts.length, 0, 'no text to a caller who has gone');
+    assert.deepEqual([t.last().customerEmail, t.last().ownerEmail, t.last().customerText, t.last().ownerText], ['accepted', 'accepted', 'skipped', 'skipped']);
+    if (texts) assert.deepEqual(row(t, 'FAST_TEXTS_SKIPPED'), { reason: 'CALLER_HUNG_UP' });
+    assert.equal(t.logs.filter(([c]) => c === 'FAST_END').length, 2, 'the hang-up and the late ending'); assert.equal(t.h.active(), 0); noPersonalDetail(t.logs);
+  }
+});
+
+test('M2 not verified after the hang-up (uncertain, refused after a write, or an error): the owner is told once that a job may exist, no booking email is sent, and the outcome says not booked', async () => {
+  const cases: Array<[string, (g: ReturnType<typeof gate<BookingResult>>) => void]> = [
+    ['uncertain', (g) => g.res({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 })],
+    ['not found', (g) => g.res({ status: 'uncertain', reason: 'NOT_FOUND', jobId: 'JOB-9', writes: 2 })],
+    ['refused after a client was written', (g) => g.res({ status: 'refused', reason: 'JOBBER_REFUSED', writes: 1 })],
+    ['the adapter throws', (g) => g.rej(new Error('adapter down'))],
+    ['a verified result that still names a differing field', (g) => g.res({ ...OK_RESULT, mismatches: ['street'] })],
+  ];
+  for (const [label, settle] of cases) {
+    const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
+    await toPendingWrite(t); t.c.hangUp(); settle(g); await t.h.idle();
+    assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_NOT_VERIFIED', false]], label);
+    assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]], `${label}: one owner notice and no booking email`);
+    const lines = t.mails[0].text.split('\n'); assert.ok(lines.includes('Reason code: BOOKING_NOT_VERIFIED'), label); assert.ok(lines.includes('Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.'), label);
+    for (const l of lines) assert.ok(FOLLOW_UP_LINES.some((re) => re.test(l)), `${label}: an unexpected line: ${l}`);
+    assert.equal((row(t, 'FAST_BOOKING_AFTER_HANGUP') as { verified: boolean }).verified, false, label); assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1, label);
+    assert.equal(t.booked.length, 1, `${label}: the request is never repeated`); assert.equal(t.texts.length, 0); noPersonalDetail(t.logs);
+  }
+});
+
+test('M2 refused before any write (nothing can exist): the owner notice says no booking was sent', async () => {
+  const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
+  await toPendingWrite(t); t.c.hangUp(); g.res({ status: 'refused', reason: 'WRITES_OFF', writes: 0 }); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_NOT_VERIFIED', false]]); assert.equal(t.mails.length, 1);
+  assert.ok(t.mails[0].text.split('\n').includes('No booking was sent to Jobber.'));
+});
+
+test('M2 hang-up before the write begins: nothing is written, the owner is told that no booking was made, and the booking emails are never sent', async () => {
+  const hold = gate<void>(); const t = build({ textsEnabled: false, emails: 'accept', busyHold: hold.p });
+  t.h.serve(t.c.transport); await toOffer(t.c); await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, 'yes');
+  await t.c.until(() => t.busyCalls() >= 2, 'the last availability check'); t.c.hangUp(); hold.res(); await t.h.idle();
+  assert.equal(t.booked.length, 0, 'the booking adapter was never called'); assert.ok(!t.logs.some(([c]) => c === 'FAST_BOOKING'));
+  assert.deepEqual(row(t, 'FAST_BOOKING_SKIPPED'), { reason: 'CALLER_HUNG_UP' }); assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_SKIPPED_HUNG_UP', false]]);
+  assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]]); const lines = t.mails[0].text.split('\n');
+  assert.ok(lines.includes('Reason code: BOOKING_SKIPPED_HUNG_UP')); assert.ok(lines.includes('No booking was sent to Jobber.')); assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1); noPersonalDetail(t.logs);
+});
+
+test('M2 duplicate: a result Jobber reports as already booked, after a hang-up, writes nothing new and sends no second email', async () => {
+  const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
+  await toPendingWrite(t); t.c.hangUp(); g.res({ ...OK_RESULT, writes: 0, duplicate: true }); await t.h.idle();
+  assert.equal(t.booked.length, 1); assert.equal(t.mails.length, 0); assert.deepEqual(row(t, 'FAST_EMAILS_SKIPPED'), { reason: 'DUPLICATE' }); assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKED', true]]);
+});
+
+test('M2 redial protection: while a booking is still being written after a hang-up the line is busy, then it is free again; a booking that never settles frees it after the bound; a normal ending frees it at once', async () => {
+  const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
+  await toPendingWrite(t); t.c.hangUp(); assert.equal(t.h.active(), 1, 'the call keeps its slot while the booking is in flight');
+  const second = fakeCarrier(); t.h.serve(second.transport); assert.equal(second.closed, 1, 'a redial is refused'); assert.deepEqual(row(t, 'FAST_REFUSED'), { reason: 'BUSY' });
+  g.res(OK_RESULT); await t.h.idle(); assert.equal(t.h.active(), 0); const third = fakeCarrier(); t.h.serve(third.transport); assert.equal(third.closed, 0, 'free again once the booking settled'); third.hangUp();
+  // a booking that never answers: the slot is held for at most slotHoldMs
+  const stuck = build({ textsEnabled: false, emails: 'accept', slotHoldMs: 40, book: () => new Promise<BookingResult>(() => undefined) });
+  await toPendingWrite(stuck); stuck.c.hangUp(); assert.equal(stuck.h.active(), 1); await sleep(160); assert.equal(stuck.h.active(), 0, 'released after the bound');
+  const next = fakeCarrier(); stuck.h.serve(next.transport); assert.equal(next.closed, 0); next.hangUp();
+  // a normal ending (no hang-up) frees the slot immediately, as before
+  const n = build({ textsEnabled: false, emails: 'accept' }); await toBooked(n); await sleep(30); assert.equal(n.h.active(), 0); const after = fakeCarrier(); n.h.serve(after.transport); assert.equal(after.closed, 0);
+});
+
+test('M2 recovery: a failing or silent mail server after the hang-up never throws and never blocks; the outcome and the log are still written', async () => {
+  for (const mode of ['throw', 'refuse', 'hang'] as const) {
+    const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: mode, followUpMs: 120, book: () => g.p });
+    await toPendingWrite(t); t.c.hangUp(); g.res({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }); await t.h.idle();
+    assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_NOT_VERIFIED', false]], mode);
+    assert.deepEqual((row(t, 'FAST_FOLLOWUP') as { owner: string }).owner, mode === 'hang' ? 'timeout' : 'refused', mode); assert.equal(t.h.active(), 0, mode);
+  }
+});
+
+test('M2 off by default: with test emails off the hang-up path records the outcome and sends nothing', async () => {
+  const g = gate<BookingResult>(); const t = build({ textsEnabled: false, book: () => g.p });
+  await toPendingWrite(t); t.c.hangUp(); g.res({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_NOT_VERIFIED', false]]); assert.equal(t.mails.length, 0); assert.ok(!t.logs.some(([c]) => c === 'FAST_FOLLOWUP'));
+});
+
+test('M2 unchanged behaviour: a hang-up before the read-back yes records only the hang-up and writes nothing; a caller who hangs up after a normal ending adds no late outcome', async () => {
+  const early = build({ textsEnabled: false, emails: 'accept' }); early.h.serve(early.c.transport); early.c.setup(DREW, undefined, 'Testa Invented'); await early.c.hears(/Is that right\? Say yes or no/, 'yes'); await early.c.hears(/street address/, undefined); early.c.hangUp(); await sleep(60); await early.h.idle();
+  assert.deepEqual(outcomes(early), [['CALLER_HUNG_UP', false]]); assert.equal(early.booked.length, 0); assert.equal(early.mails.length, 0);
+  const normal = build({ textsEnabled: false, emails: 'accept' }); await toBooked(normal); normal.c.hangUp(); await sleep(40); await normal.h.idle();
+  assert.deepEqual(outcomes(normal), [['BOOKED', true]], 'a hang-up after the call already ended adds no outcome'); assert.equal(normal.mails.length, 2);
+});
+
+test('M2 source guard: the hang-up flag is set only by a hang-up, nothing is written or texted after it, and the late ending is the one place that records and notifies', () => {
+  const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
+  assert.equal([...src.matchAll(/hungUp = true/g)].length, 1, 'set once'); assert.ok(/t\.onClose = \(\) => \{ if \(!done\) \{ done = true; hungUp = true;/.test(src), 'only inside the hang-up branch');
+  assert.ok(src.indexOf("deps.log('FAST_BOOKING_SKIPPED'") > 0 && src.indexOf("deps.log('FAST_BOOKING_SKIPPED'") < src.indexOf('await deps.book(req)'), 'the skip comes before the booking request');
+  assert.ok(src.indexOf("deps.log('FAST_TEXTS_SKIPPED', { reason: 'CALLER_HUNG_UP' })") > 0 && src.indexOf("deps.log('FAST_TEXTS_SKIPPED', { reason: 'CALLER_HUNG_UP' })") < src.indexOf('await deps.sendText(callback'), 'the text skip comes before any text');
+  assert.ok(/async function book\(\): Promise<void> \{ booking = true; try \{ await bookInner\(\); \} finally \{ booking = false; releaseSlot\(\); \} \}/.test(src), 'the slot is released when the booking settles');
+  assert.ok(/if \(done\) \{ if \(hungUp && !lateEnd\) \{ lateEnd = true;/.test(src), 'one late ending');
 });
