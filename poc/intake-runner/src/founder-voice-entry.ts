@@ -30,6 +30,7 @@ import { createFounderVoiceService } from './founder-voice-service.ts';
 import { withSelectedSpeaker } from './founder-voice-speaker.ts';
 import { streamTwimlFor } from './stream-twiml.ts';
 import { fileDiagSink } from './call-diag.ts';
+import { headCommit, logSteps } from './run-evidence.ts';
 import { consentNoticeFor } from './opening.ts';
 import { windowsProtector } from './jobber-dpapi.ts';
 import { buildFastDeps, emailStatus, fastStatus } from './founder-voice-fast.ts';
@@ -109,7 +110,9 @@ const textClient = { responses: { async create(params: object, options?: { signa
 // DURABLE DIAGNOSTICS: fixed codes and numbers only (call-diag.ts), appended to a git-ignored file AND echoed to the console, so a call can be reconstructed afterwards whatever the console shows or hides.
 const DIAG_FILE = 'founder-voice.log';
 const sink = fileDiagSink({ append: (line) => appendFileSync(DIAG_FILE, line, 'utf8'), nowIso, echo: (line) => console.log(`[founder-voice] ${line}`) });
-sink('SERVER_START', { pid: process.pid, relayPort: config.relay_port, maxCalls: config.max_calls, maxMinutes: config.max_minutes });
+// Which commit was HEAD when this server started (12 hex characters, read from the .git files; nothing is logged when it cannot be read). It does not say the working tree was clean.
+const commit = headCommit((p) => { try { return readFileSync(p, 'utf8'); } catch { return undefined; } }, fileURLToPath(new URL('../../../.git', import.meta.url)));
+sink('SERVER_START', { pid: process.pid, relayPort: config.relay_port, maxCalls: config.max_calls, maxMinutes: config.max_minutes, ...(commit === undefined ? {} : { commit }) });
 
 const rawContactKey = process.env.FOUNDER_CONTACT_KEY;
 const contactKey = keyFromEnv(rawContactKey);
@@ -123,7 +126,8 @@ const store = createIntakeRecordStore({ path: config.db_path });
 // The fast test call's pieces (Jobber, Twilio, the approved numbers) are built only here, only after the gate passed. Its outcomes are logged as fixed codes.
 const fast = fastCfg === undefined ? undefined : await buildFastDeps({
   config, voice, vaultDir: fastDir, protector: windowsProtector(), env: process.env, fetch: globalThis.fetch, now: () => Date.now(), log: (code, detail) => sink(code, detail),
-  onOutcome: (o) => sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length }),
+  // The outcome, then its step tokens in order (fixed codes only; logSteps never throws, so logging cannot interrupt the end of a call).
+  onOutcome: (o) => { sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length }); logSteps(sink, o.steps); },
 });
 const service = createFounderVoiceService({
   config, voice, textClient,
