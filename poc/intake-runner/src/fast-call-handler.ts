@@ -29,7 +29,7 @@ import type { BookingRequest, BookingResult } from './jobber-booking.ts';
 import type { CallTransport, TransportEvent } from './call-transport.ts';
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
-import { customerEmail, ownerEmail } from './fast-email-copy.ts';
+import { customerEmail, followUpEmail, ownerEmail } from './fast-email-copy.ts';
 import { CUSTOMER_SCRIPT_ID, MAX_TEXT_CHARS, customerConsentLine, customerText, ownerText, zoneLabelOf } from './fast-sms-copy.ts';
 
 export interface FastSettings {
@@ -69,6 +69,8 @@ export interface FastDeps {
   emailsEnabled?: boolean;
   /** Sends one fixed test email to a ROLE's approved address. The addresses live only behind this function: the call logic never holds or chooses one. */
   sendEmail?(role: 'customer' | 'owner', subject: string, text: string): Promise<{ ok: boolean }>;
+  /** How long the owner's follow-up notice may take before it counts as a timeout (default 15000 ms). It never delays the end of a call. */
+  followUpMs?: number;
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number | boolean>): void;
   onOutcome?(o: FastOutcome): void;
@@ -174,7 +176,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     let awaiting: Awaiting | undefined; let answerTimer: ReturnType<typeof setTimeout> | undefined; let settleTimer: ReturnType<typeof setTimeout> | undefined;
     let graceOver = true; let graceTimer: ReturnType<typeof setTimeout> | undefined; let holdTimer: ReturnType<typeof setTimeout> | undefined;
     let settleFn: (() => Promise<void>) | undefined; let speakingSince: number | undefined;   // the pending "ask only what is missing", and when the caller last started speaking
-    let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
+    let bookSent = false; let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
     let confirmed: ConfirmedFacts | undefined;   // set when the read-back is spoken; the booking must carry exactly these facts
     let nameOk = false; let nameNo = 0; let spellBuf = ''; let spellBad = 0;   // the caller's own yes to the name (nothing is booked without it); how many times they said it was wrong; the letters of a spelling heard so far, and the spellings that gave nothing
@@ -232,11 +234,29 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     function armAnswerTimer(a: Awaiting): void { if (answerTimer !== undefined) clearTimeout(answerTimer); answerTimer = setTimeout(() => enqueue(async () => { if (awaiting !== a || a.playing) return; if (callerSpeaking()) return armAnswerTimer(a); a.reprompts++; deps.log('FAST_SILENCE', { id: a.id, n: a.reprompts }); if (a.reprompts >= 2) return end('NO_ANSWER', 'I am not hearing a reply, so I will end the call. Goodbye.'); play(a, `Sorry, I did not catch that. ${a.text}`); }), answerWaitMs); }
     /** A line that needs no answer, played to its end (its measured verdict is not needed). */
     async function say(text: string): Promise<void> { if (done) return; if (!t.speak(text, true, { interruptible: false })) return; deps.log('FAST_SAY', { id: 'info', unit: false }); await t.playbackDone!(playbackMaxMs); }
+    /** An ending that told the caller "a person will ..." sends the OWNER one fixed email (only when test emails are on): the reason code, the time, the callback number and the steps reached, never anything the caller said. It never throws and never delays the end of the call; the call ends once, so it is sent once. */
+    const PROMISED = /\ba person will\b/i;
+    function notifyFollowUp(reason: string, line: string | undefined, booked: boolean): void {
+      try {
+        if (booked || line === undefined || !PROMISED.test(line) || deps.emailsEnabled !== true || deps.sendEmail === undefined) return;
+        const tz = S.availability.timezone; const at = deps.now(); const number = callback !== '' ? callback : caller;
+        const msg = followUpEmail({ businessName: S.businessName, reason, whenText: `${new Date(at).toLocaleString('en-US', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' })} ${zoneLabelOf(tz, at)}`, ...(number === '' ? {} : { callbackNumber: number }), steps, bookingMayExist: bookSent });
+        const send = deps.sendEmail; let timer: ReturnType<typeof setTimeout> | undefined;
+        const late = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), deps.followUpMs ?? 15_000); timer.unref?.(); });
+        const job = (async (): Promise<void> => {
+          let verdict = 'refused';
+          try { const r = await Promise.race([send('owner', msg.subject, msg.text), late]); verdict = r === 'timeout' ? 'timeout' : r.ok === true ? 'accepted' : 'refused'; } catch { verdict = 'refused'; } finally { if (timer !== undefined) clearTimeout(timer); }
+          try { deps.log('FAST_FOLLOWUP', { owner: verdict, reason: /^[A-Z][A-Z0-9_]{2,47}$/.test(reason) ? reason : 'UNKNOWN' }); } catch { /* logging never interrupts */ }
+        })();
+        work.add(job); void job.finally(() => work.delete(job));
+      } catch { /* the notice is best effort: it must never interrupt the end of a call */ }
+    }
     async function end(reason: string, line?: string, booked = false, extra: Partial<FastOutcome> = {}): Promise<void> {
       if (done) return; done = true; clearTimers(); awaiting = undefined;
       try { if (line !== undefined) { if (t.speak(line, true)) await t.playbackDone!(playbackMaxMs); } } catch { /* the call is going anyway */ }
       deps.log('FAST_END', { reason, booked });
       deps.onOutcome?.({ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, ...extra });
+      notifyFollowUp(reason, line, booked);
       contact.dispose(); try { t.endCall(); } catch { /* gone */ }
       setTimeout(() => { try { t.close(1000); } catch { /* gone */ } }, afterSpeechMs).unref?.();
     }
@@ -571,7 +591,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       deps.log('FAST_BOOKING_GUARD', { ok: true, count: 0, startMin: minutesOf(req.when.startTime), sameAsOffer: req.when.date === o.date && req.when.startTime === o.time && req.when.endTime === o.endTime });
       void say('Booking that now.');
       let res: BookingResult;
-      try { res = await deps.book(req); } catch { res = { status: 'uncertain', reason: 'API_ERROR', writes: 0 }; }
+      try { bookSent = true; res = await deps.book(req); } catch { res = { status: 'uncertain', reason: 'API_ERROR', writes: 0 }; }
       const readBackDiffs = res.mismatches?.length ?? 0;
       note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }), ...(readBackDiffs === 0 ? {} : { readBackDiffs }) });
       // Jobber's own read-back must have matched in every field: a "verified" result that still names a differing field is not a booking, and nothing is emailed or texted for it.

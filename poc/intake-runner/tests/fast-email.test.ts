@@ -10,8 +10,9 @@ import { createEmailSender, EMAIL_BLOB, emailCheck, emailProblems, isTestEmails,
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import type { TestEmails } from '../src/fast-email.ts';
-import { customerEmail, emailDay, ownerEmail, sampleEmail } from '../src/fast-email-copy.ts';
-import type { EmailFacts } from '../src/fast-email-copy.ts';
+import { customerEmail, emailDay, followUpEmail, ownerEmail, sampleEmail } from '../src/fast-email-copy.ts';
+import type { EmailFacts, FollowUpFacts } from '../src/fast-email-copy.ts';
+import { SENDER_LABEL } from '../src/fast-sms-copy.ts';
 import { createVault } from '../src/jobber-connector.ts';
 import type { Protector } from '../src/jobber-connector.ts';
 import { buildFastDeps, emailStatus, loadTestEmails, NUMBERS_BLOB } from '../src/founder-voice-fast.ts';
@@ -229,4 +230,26 @@ test('email check (the real command, no saved settings): it says so, exits non-z
     const r = spawnSync('node', ['src/fast-test-setup-main.ts', 'email-check', ...extra], { encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir }, cwd: new URL('..', import.meta.url) });
     assert.equal(r.status, 1, JSON.stringify(extra)); assert.match(r.stdout, /^not ready: the test email sender and addresses are not saved/); noSecrets([r.stdout, r.stderr]);
   }
+});
+
+test('the owner follow-up notice (M1): fixed words, a fixed reason code, the callback number only when it is a plain US number, only step codes, and every hostile input is neutralized', () => {
+  const base = { businessName: 'Drew Cleaning', reason: 'BOOKING_NOT_VERIFIED', whenText: 'Monday, November 2, 2026 at 9:00 AM Central', callbackNumber: '+15550100002', steps: ['CALLER_VERIFIED', 'NAME', 'BOOKING_UNCERTAIN'], bookingMayExist: true };
+  const m = followUpEmail(base);
+  assert.equal(m.subject, 'Drew Cleaning DEMO: call needs a follow-up');
+  assert.deepEqual(m.text.split('\n'), ['A Drew Cleaning DEMO call told the caller that a person would follow up. Nobody else has been told.', '', 'Reason code: BOOKING_NOT_VERIFIED', 'Callback number: (555) 010-0002', 'Call ended: Monday, November 2, 2026 at 9:00 AM Central', 'Steps reached: CALLER_VERIFIED, NAME, BOOKING_UNCERTAIN',
+    'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.', '', 'This notice holds no name, address or anything else the caller said.', `Sent by ${SENDER_LABEL}. This address was approved for this test only.`, '']);
+  assert.ok(followUpEmail({ ...base, bookingMayExist: false }).text.includes('No booking was sent to Jobber.'));
+  // a reason that is not a fixed code, a number that is not a plain US number, steps that are not codes
+  for (const reason of ['', 'lower_case', 'HAS SPACE', 'A', 'X'.repeat(49), 'CODE\nInjected: yes', 42 as unknown as string, undefined as unknown as string]) assert.ok(followUpEmail({ ...base, reason }).text.split('\n').includes('Reason code: UNKNOWN'), String(reason));
+  for (const callbackNumber of [undefined, '', '+442071234567', '5550100002', '+1555010000', '+15550100002 ', 'Testa Invented', '(555) 010-0002']) assert.ok(followUpEmail({ ...base, callbackNumber }).text.split('\n').includes('Callback number: not available'), String(callbackNumber));
+  const steps = ['NAME', 'Jane Doe', '12 Elm Street', 'lower', 'AB', 'A'.repeat(49), 'OK_STEP', '', 42, null, undefined, {}, ['X'], 'LINE\nBREAK', 'STEP_WITH_9'];
+  assert.ok(followUpEmail({ ...base, steps: steps as unknown as string[] }).text.split('\n').includes('Steps reached: NAME, OK_STEP, STEP_WITH_9'));
+  assert.ok(followUpEmail({ ...base, steps: [] }).text.split('\n').includes('Steps reached: none')); assert.ok(followUpEmail({ ...base, steps: 'NAME' as unknown as string[] }).text.split('\n').includes('Steps reached: none'));
+  assert.equal(followUpEmail({ ...base, steps: Array.from({ length: 60 }, (_v, i) => `STEP_${String.fromCharCode(65 + (i % 26))}`) }).text.split('\n').find((l) => l.startsWith('Steps reached: '))!.split(', ').length, 40, 'at most 40');
+  // control characters and line breaks in the free-text fields cannot add a line or a header
+  const hostile = followUpEmail({ ...base, businessName: 'Drew\r\nBcc: x@example.com', whenText: 'Monday\nInjected: yes\u0000' });
+  assert.ok(!hostile.subject.includes('\n') && !hostile.subject.includes('\r')); assert.ok(!hostile.text.split('\n').some((l) => l.startsWith('Injected') || l.startsWith('Bcc')));
+  // nothing but the six fields can reach the text: extra properties (a name, an address) are ignored
+  const extra = followUpEmail({ ...base, customerName: 'Testa Invented', address: '123 Invented Lane', price: 199 } as unknown as FollowUpFacts);
+  assert.ok(!/Testa|Invented|199/.test(extra.subject + extra.text));
 });

@@ -46,3 +46,41 @@ export function sampleEmail(businessName = 'Drew Cleaning'): EmailMessage {
 export function ownerEmail(f: EmailFacts): EmailMessage {
   return { subject: `${clean(f.businessName)} DEMO: new booking, ${emailDay(f.date)}`, text: body(f, `New ${clean(f.businessName)} DEMO booking for ${clean(f.customerName)}.`, true) };
 }
+
+// ---------------------------------------------------------------- the owner's follow-up notice
+export interface FollowUpFacts {
+  businessName: string;
+  /** The ending's fixed reason code. Anything that is not an upper-case code of at most 48 characters is shown as UNKNOWN. */
+  reason: string;
+  /** When the call ended, as text built by the caller of this function (a date, a time and the zone). */
+  whenText: string;
+  /** The callback number: E.164. Shown only when it is a plain US number. */
+  callbackNumber?: string;
+  /** The call's step tokens in order (fixed codes). Anything that is not such a code is dropped, so nothing a caller said can appear. */
+  steps: readonly string[];
+  /** True when the booking request had already been sent to Jobber when the call ended: a job may exist even though it was not verified. */
+  bookingMayExist: boolean;
+}
+const CODE = /^[A-Z][A-Z0-9_]{2,47}$/;
+/**
+ * The ONE notice the owner gets when the call told the caller that "a person will follow up" (or call): the reason code, the time, the callback number and the steps reached. Fixed words only; no name,
+ * address, day, price or anything else the caller said (none of it is passed in). PURE: strings only.
+ */
+export function followUpEmail(f: FollowUpFacts): EmailMessage {
+  const phone = usPhone(f.callbackNumber);
+  const steps = (Array.isArray(f.steps) ? f.steps : []).filter((s): s is string => typeof s === 'string' && CODE.test(s)).slice(0, 40);
+  const reason = typeof f.reason === 'string' && CODE.test(f.reason) ? f.reason : 'UNKNOWN';
+  return {
+    subject: `${clean(f.businessName)} DEMO: call needs a follow-up`,
+    text: [
+      `A ${clean(f.businessName)} DEMO call told the caller that a person would follow up. Nobody else has been told.`, '',
+      `Reason code: ${reason}`,
+      `Callback number: ${phone ?? 'not available'}`,
+      `Call ended: ${clean(f.whenText)}`,
+      `Steps reached: ${steps.length === 0 ? 'none' : steps.join(', ')}`,
+      f.bookingMayExist === true ? 'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.' : 'No booking was sent to Jobber.', '',
+      'This notice holds no name, address or anything else the caller said.',
+      `Sent by ${SENDER_LABEL}. This address was approved for this test only.`, '',
+    ].join('\n'),
+  };
+}
