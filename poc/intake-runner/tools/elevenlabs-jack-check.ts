@@ -12,6 +12,7 @@
 // WHAT IT SHOWS: fixed words and numbers only: the result, a code, the HTTP status, the provider's reason as one of a fixed list (never its words), the audio byte count, the milliseconds and the
 // character count. Never the key, a response body, a message, a voice id (only its last four characters in the plan) or any customer data.
 import { createInterface } from 'node:readline/promises';
+import { pathToFileURL } from 'node:url';
 import { createElevenLabsSpeechSource, ERROR_SHAPES, PROVIDER_CODES } from '../src/elevenlabs-speech-source.ts';
 import { JACK_SPEAKER } from '../src/speaker-adapter.ts';
 import { looksLikeKey } from '../src/hidden-prompt.ts';
@@ -130,4 +131,4 @@ async function main(): Promise<void> {
   const r = await runCheck({ key, fetch: (u, i) => fetch(u, i), ...(origin === undefined ? {} : { origin }) });
   console.log(show(r)); process.exitCode = r.result === 'PASS' ? 0 : 1;
 }
-if (process.argv[1] !== undefined && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href) await main();
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) await main();   // a file URL built by Node itself: correct for a Windows path and for a Linux one

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { CHECK_TEXT, CONFIRM, MAX_REQUESTS, runCheck, show } from '../tools/elevenlabs-jack-check.ts';
 import type { CheckCode, CheckResult } from '../tools/elevenlabs-jack-check.ts';
 import { JACK_SPEAKER } from '../src/speaker-adapter.ts';
@@ -133,7 +133,7 @@ test('isolation: nothing in src/ imports the check; it reads one environment var
   const dir = fileURLToPath(new URL('../src/', import.meta.url));
   for (const f of readdirSync(dir)) assert.ok(!/elevenlabs-jack-check/.test(readFileSync(dir + f, 'utf8')), `${f} must not import the diagnostic`);
   const src = readFileSync(TOOL, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  assert.deepEqual([...src.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]).sort(), ['../src/elevenlabs-speech-source.ts', '../src/hidden-prompt.ts', '../src/speaker-adapter.ts', 'node:readline/promises']);
+  assert.deepEqual([...src.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]).sort(), ['../src/elevenlabs-speech-source.ts', '../src/hidden-prompt.ts', '../src/speaker-adapter.ts', 'node:readline/promises', 'node:url']);
   assert.deepEqual([...src.matchAll(/process\.env\.[A-Z_]+/g)].map((m) => m[0]), ['process.env.ELEVENLABS_API_KEY'], 'one variable, read once');
   assert.ok(!/writeFile|appendFile|createWriteStream|child_process|execSync|spawn|process\.stdout\.write/.test(src), 'writes no file and starts no process');
   assert.ok(/export const MAX_REQUESTS = 1;/.test(src) && /export const CONFIRM = 'RUN-1';/.test(src));
@@ -161,4 +161,13 @@ test('the diagnostic prints the error SHAPE and only EXACT allowlisted provider 
   const ok = await mockServer((_q, res) => audio(res, 10)); const p = await runCheck({ key: KEY, fetch: globalThis.fetch, origin: ok.origin }); assert.equal(p.shape, undefined); assert.ok(show(p).includes('ERROR_SHAPE: none') && show(p).includes('PROVIDER_CODE: none'));
   const cli = await mockServer(refuse(400, { detail: { status: 'insufficient_credits', message: DETAIL } })); const run = await runTool(['--run', '--origin', cli.origin], `${CONFIRM}\n`, { ELEVENLABS_API_KEY: KEY });
   assert.ok(run.out.includes('PROVIDER_CODE: insufficient_credits') && run.out.includes('ERROR_SHAPE: STATUS_UNLISTED') && run.code === 1 && !/CANARY/.test(run.out), 'through the real command line');
+});
+
+test('entry-point guard (found by CI on Linux): the tool starts itself from a file URL Node builds, which is right for a Windows path and for a Linux path; the old hand-built URL never matched on Linux', () => {
+  const src = readFileSync(TOOL, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(/import\.meta\.url === pathToFileURL\(process\.argv\[1\]\)\.href\) await main\(\)/.test(src), 'the guard compares with pathToFileURL');
+  assert.ok(!/file:\/\/\/\$\{/.test(src), 'no hand-built file URL remains');
+  assert.equal(new URL('file:///' + '/home/runner/x.ts').href, 'file:////home/runner/x.ts', 'why the old guard failed: four slashes for a Linux path');
+  assert.equal(pathToFileURL('/home/runner/x.ts', { windows: false }).href, 'file:///home/runner/x.ts', 'a Linux path gives the module URL a Linux run sees');
+  assert.equal(pathToFileURL('C:\\dev\\x\\t.ts', { windows: true }).href, 'file:///C:/dev/x/t.ts', 'a Windows path gives the module URL a Windows run sees');
 });
