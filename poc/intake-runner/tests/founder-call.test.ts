@@ -93,7 +93,7 @@ function fakeClaude(o: { failDialogue?: boolean; failIntake?: boolean; delayMs?:
   return { client, sent, counts };
 }
 
-interface RigOptions { contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean }; scripted?: boolean; addressCityZip?: boolean }
+interface RigOptions { now?: () => number; contactSettleMs?: number; contactCollectMaxMs?: number; fixedQuestions?: Record<string, string>; firstCleanQuestion?: string; policeOptional?: boolean; transportWrap?: (t: CallTransport) => CallTransport; playbackMaxMs?: number; residential?: { declined: readonly string[]; keywords: readonly string[]; question: string; declineLine: string }; connWrap?: (c: RelayConnection) => RelayConnection; wrapIntake?: (e: IntakeEntry) => IntakeEntry; confirmedHandoff?: (h: HandoffEnvelopeV1, call: { tenant: string; callRef: string }) => unknown; skill?: unknown; contacts?: boolean | ContactVault; previewBudgetMs?: number; replyRetryMs?: number; replyFirstWordMs?: number; replyGapMs?: number; replyTotalMs?: number; confirmWaitMs?: number; speechMs?: (t: string) => number; maxCalls?: number; claude?: ReturnType<typeof fakeClaude>; limits?: { maxTurns?: number }; store?: IntakeRecordStore; dialogue?: DialogueModel; killed?: { v: boolean }; scripted?: boolean; addressCityZip?: boolean }
 let dbn = 0;
 async function rig(o: RigOptions = {}) {
   const claude = o.claude ?? fakeClaude();
@@ -124,7 +124,7 @@ async function rig(o: RigOptions = {}) {
     ...(o.scripted === true ? { scripted: { ask: scriptedQuestion, clarify: scriptedClarify } } : {}),
     ...(o.addressCityZip === true ? { addressCityZip: true } : {}),
     dialogue: o.dialogue ?? createClaudeDialogueModel(claude.client as never, { model: 'claude-haiku-5-5' }), store,
-    limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: () => Date.now(), nowIso: () => '2026-10-26T12:00:00Z',
+    limits: { maxTurns: o.limits?.maxTurns ?? 30, maxMinutes: 8, maxChars: 4000 }, names: ['Sam Example'], maxCalls: o.maxCalls ?? 50, now: o.now ?? (() => Date.now()), nowIso: () => '2026-10-26T12:00:00Z',
     killed: () => killed.v, afterSpeechMs: 0, speechMs: o.speechMs ?? (() => 0), confirmWaitMs: o.confirmWaitMs ?? 5000, ...(o.contactSettleMs === undefined ? {} : { contactSettleMs: o.contactSettleMs }), ...(o.contactCollectMaxMs === undefined ? {} : { contactCollectMaxMs: o.contactCollectMaxMs }), ...(o.fixedQuestions === undefined ? {} : { fixedQuestions: o.fixedQuestions }), ...(o.playbackMaxMs === undefined ? {} : { playbackMaxMs: o.playbackMaxMs }), ...(vault === undefined ? {} : { contacts: vault }), log: (code, detail) => { logs.push({ code, detail }); },
   });
   const ws = createRelayWsServer({ path: SECRET_PATH, authToken: TOKEN, urls: [URL_WSS], maxConnections: 3, idleMs: 20_000, lockout: { failures: 100, windowMs: 60_000 }, onConnection: (c) => (o.transportWrap ? handler.serve(o.transportWrap(createConversationRelayTransport(o.connWrap ? o.connWrap(c) : c))) : handler.handle(o.connWrap ? o.connWrap(c) : c)) });
@@ -3240,6 +3240,14 @@ const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
 const asksSpoken = (sim: Sim) => sim.messages.filter((m: any) => m.type === 'text' && m.last === true).length;
 const partial = (sim: Sim, text: string) => sim.send({ type: 'prompt', voicePrompt: text, lang: 'en-US', last: false });
 const SETTLE = { contactSettleMs: 250, contactCollectMaxMs: 1500 };
+/** A clock for the handler that is the real one until freeze(), and then moves only when told to (advance), so a real stall can never change what the handler decides. */
+const fakeClock = () => { let frozen: number | undefined; return { now: (): number => frozen ?? Date.now(), freeze: (): void => { frozen = Date.now(); }, advance: (ms: number): void => { if (frozen === undefined) throw new Error('freeze first'); frozen += ms; } }; };
+/** Moves the clock by `stepMs` immediately BEFORE the handler is given each interim result (`last: false`), in the same synchronous step: the clock and the message cannot come apart. `seen()` counts the interim results handed over. */
+const clockedPartials = (clock: ReturnType<typeof fakeClock>, stepMs: number) => { let n = 0; return { seen: (): number => n, wrap: (c: RelayConnection): RelayConnection => new Proxy(c, {
+  get(t, k) { return (t as any)[k]; },
+  set(t, k, v) { if (k !== 'onMessage') { (t as any)[k] = v; return true; } (t as any)[k] = (text: string) => { try { const m = JSON.parse(text); if (m?.type === 'prompt' && m.last === false) { clock.advance(stepMs); n++; } } catch { /* not JSON: passed on as it is */ } v(text); }; return true; },
+}) }; };
+const waitUntil = async (fn: () => boolean, label: string, ms = 10_000): Promise<void> => { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw new Error(`timed out waiting for ${label}`); await sleep(5); } };
 /** Answers questions plainly until the newest ASK is for `code` (the number or address being collected), without answering it. */
 async function driveUntilAsk(r: Rig, sim: Sim, code: string, opening = OPEN_C) {
   setup(sim); say(sim, 'yes'); await reply(r, sim);
@@ -3309,17 +3317,36 @@ test('SETTLE silence after a fragment: the question comes once the caller has be
   sim.end(); await sim.closed; await r.handler.idle();
 });
 
-test('SETTLE speech that keeps arriving cannot hold the call open: the wait is bounded by the maximum, then the question is asked', async () => {
-  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, contactSettleMs: 300, contactCollectMaxMs: 800 });
+test('SETTLE speech that keeps arriving cannot hold the call open: the wait is bounded by the maximum, then the question is asked (a clock that moves only with the speech: no stall can change the outcome)', async () => {
+  const clock = fakeClock(); const cp = clockedPartials(clock, 100);
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, contactSettleMs: 300, contactCollectMaxMs: 800, now: clock.now, connWrap: cp.wrap });
   const sim = await r.connect();
   await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
-  const before = asksSpoken(sim);
-  const t0 = Date.now(); say(sim, 'two one two five five five');
-  let askAt = 0;
-  for (let i = 0; i < 60 && askAt === 0; i++) { partial(sim, 'um'); if (asksSpoken(sim) > before) askAt = Date.now(); else await sleep(100); }   // interim results every 100 ms for up to six seconds
-  assert.ok(askAt > 0, 'a question came although speech never stopped');
-  assert.ok(askAt - t0 < 4500, `bounded: ${askAt - t0} ms`);
-  assert.equal(diag(r, 'CONTACT_SETTLE').at(-1)?.detail?.outcome, 'MAX');
+  const before = asksSpoken(sim); clock.freeze(); const t0 = clock.now(); const seen0 = cp.seen();
+  say(sim, 'two one two five five five');
+  // before the deadline: five interim results move the clock 500 ms, so the caller is never quiet and the maximum (800 ms) cannot have been reached: nothing may be asked and no settle outcome may be logged
+  for (let i = 0; i < 5; i++) partial(sim, 'um');
+  await waitUntil(() => cp.seen() - seen0 === 5, 'the five interim results'); await sleep(350);   // three or more wake-ups of the wait: a stall can only make this later, never earlier
+  assert.equal(asksSpoken(sim), before, 'no question before the deadline'); assert.equal(diag(r, 'CONTACT_SETTLE').length, 0, 'no settle outcome before the deadline');
+  // at the deadline: more speech takes the clock past 800 ms from the start of the wait; the bound ends it, and the question is asked
+  for (let i = 0; i < 60 && asksSpoken(sim) === before; i++) { partial(sim, 'um'); await sleep(20); }
+  await waitUntil(() => asksSpoken(sim) > before, 'the question after the bound');
+  assert.equal(diag(r, 'CONTACT_SETTLE').at(-1)?.detail?.outcome, 'MAX'); assert.ok(clock.now() - t0 >= 800, `the maximum was reached by the clock: ${clock.now() - t0} ms`);
+  sim.end(); await sim.closed; await r.handler.idle();
+});
+
+test('SETTLE a caller who stops speaking is asked after the quiet window, not the maximum: QUIET (a clock that moves only when told to)', async () => {
+  const clock = fakeClock(); const cp = clockedPartials(clock, 100);
+  const r = await servicesRig({ contacts: true, firstCleanQuestion: FQ, contactSettleMs: 300, contactCollectMaxMs: 800, now: clock.now, connWrap: cp.wrap });
+  const sim = await r.connect();
+  await driveUntilAsk(r, sim, 'CALLBACK_PHONE_NUMBER');
+  const before = asksSpoken(sim); clock.freeze(); const t0 = clock.now(); const seen0 = cp.seen();
+  say(sim, 'two one two five five five'); partial(sim, 'um'); partial(sim, 'um');
+  await waitUntil(() => cp.seen() - seen0 === 2, 'the two interim results'); await sleep(350);
+  assert.equal(asksSpoken(sim), before, 'while the caller is still within the quiet window nothing is asked'); assert.equal(diag(r, 'CONTACT_SETTLE').length, 0);
+  clock.advance(300);   // the caller has now been quiet for exactly the settle window (300 ms), and 500 ms in all: below the maximum
+  await waitUntil(() => asksSpoken(sim) > before, 'the question after the quiet window');
+  assert.equal(diag(r, 'CONTACT_SETTLE').at(-1)?.detail?.outcome, 'QUIET'); assert.equal(clock.now() - t0, 500);
   sim.end(); await sim.closed; await r.handler.idle();
 });
 
