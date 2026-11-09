@@ -125,9 +125,18 @@ test('JOINED: the short opening, a yes, name, address with city and ZIP, day and
   const ev = await readConsent(createVault(r.dir, fakeProtector)); assert.deepEqual(ev.map((e) => [e.role, e.method, e.result]), [['owner', 'private_setup', 'yes'], ['customer', 'call_verbal', 'yes']]);
   assert.ok(!JSON.stringify(ev).match(/555|Testa|Invented|Lane|\+1/), 'the evidence holds no personal detail');
   const last = r.outcomes[r.outcomes.length - 1]; assert.deepEqual([last.reason, last.booked, last.customerText, last.ownerText], ['TEXTS_VERIFIED', true, 'delivered', 'delivered']);
-  // measured playback: every response was acknowledged by the phone, and the stream closed after the goodbye
-  assert.ok(r.diagLines.some((d) => d.code === 'BRIDGE_RESPONSE_RELEASED' && d.how === 'acked'));
+  // measured playback: every response was played in full and acknowledged by the phone, and the stream closed after the goodbye. Whether a reply is released as `acked` (the last mark returned after the voice service's
+  // response.done) or `immediate` (every mark had already returned) is only an ordering race between two timers, so both count; anything else (a timeout, a cut, a lost or short reply) does not.
+  const released = r.diagLines.filter((d) => d.code === 'BRIDGE_RESPONSE_RELEASED'); assert.ok(released.length > 0, 'replies were released');
+  for (const d of released) {
+    assert.ok(d.how === 'acked' || d.how === 'immediate', `released by ${String(d.how)}`); assert.deepEqual([d.status, d.lost], ['completed', false]);
+    assert.ok((d.sentMs as number) > 0 && (d.ackedMs as number) >= (d.sentMs as number), 'the phone acknowledged all of the audio sent');
+  }
+  assert.ok(!r.diagLines.some((d) => d.code === 'ADAPTER_REPLY_FAILED'), 'no reply failed or was cut');
   await sim.closed; assert.equal(sim.closeCode(), 1000);
+  const ends = r.diagLines.filter((d) => d.code === 'BRIDGE_END'); assert.equal(ends.length, 1, 'the call ended once');
+  assert.deepEqual([ends[0].path, ends[0].closeCode, ends[0].closedPhone], ['adapter_hangup', 1000, true], 'the call logic hung up after the goodbye');
+  assert.ok(r.diagLines.lastIndexOf(released[released.length - 1]) < r.diagLines.indexOf(ends[0]), 'every reply was released before the stream closed');
   noPersonal(r.logs); noPersonal(r.diagLines);
 });
 
