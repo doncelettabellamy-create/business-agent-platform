@@ -170,6 +170,7 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
   const tools = native === undefined ? {} : { tools: native.tools.map((t) => ({ type: 'function', name: t.name, description: t.description, parameters: t.parameters })), tool_choice: 'auto' };
   let phase: 'idle' | 'notice' | 'live' | 'ended' = 'idle';
   let start: { to: unknown; callSid: unknown } | undefined;
+  let noticeDown: { speakerDown: true; callSid: unknown } | undefined;
   let seq = 0;
   let current: Out | undefined;
   let queue: Out[] = [];
@@ -303,9 +304,10 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     clearTimers();
     if (phase === 'ended') return;
     phase = 'ended'; dropNative();
+    if (reason === 'status_failed') noticeDown = { speakerDown: true, callSid: start?.callSid };   // set BEFORE the hang-up: closing the phone makes the first close, and it must carry this. Only a notice the speaker answered `failed` is a speaker failure; every other way of failing is the phone's or the caller's
     diag('ADAPTER_NOTICE_FAILED', { reason });   // the call ends here: the caller did not hear the consent notice as it was written
     link.hangup();
-    transport.onClose({ cause: 'PROTOCOL', code: 1011 });
+    transport.onClose({ cause: 'PROTOCOL', code: 1011, ...(noticeDown ?? {}) });
   }
   /** What of a reply was spoken when the caller started talking, from a played-time the phone layer reports. Nothing when it reports none: then it is treated as not heard. */
   function spokenOf(o: Out, playedMs: unknown): string {
@@ -502,6 +504,6 @@ export function createRealtimeTransport(link: RealtimeLink, options: RealtimeOpt
     };
   }
   link.onMessage = (m: unknown): void => { try { onMessage(m); } catch { emit({ kind: 'other' }); } };
-  link.onClose = (info?: CloseInfo): void => { clearTimers(); phase = 'ended'; dropNative(); transport.onClose(info); };
+  link.onClose = (info?: CloseInfo): void => { clearTimers(); phase = 'ended'; dropNative(); transport.onClose(noticeDown === undefined ? info : { ...(info ?? { cause: 'PROTOCOL' as const, code: 1011 }), ...noticeDown }); };
   return transport;
 }

@@ -17,6 +17,12 @@ import { isRecord } from './contracts.ts';
 import type { CloseInfo, RelayConnection } from './ws-server.ts';
 import type { CallStatus, Directive } from './dialogue-model.ts';
 
+/**
+ * What a transport tells the call logic when the connection ends. `speakerDown` is set only when the consent notice could not be spoken because the speaker failed (the call logic never saw the call
+ * start, so this is its only way to know); `callSid` then carries the carrier's value UNCHECKED (the call logic validates it). A caller who hung up, or any other close, sets neither.
+ */
+export interface TransportCloseInfo extends CloseInfo { speakerDown?: true; callSid?: unknown }
+
 export type TransportEvent =
   /** A frame that could not be read as a message with a string `type`. */
   | { kind: 'malformed' }
@@ -59,7 +65,7 @@ export interface CallTransport {
   /** Set by the call logic. Called once per inbound event, in order. */
   onEvent: (event: TransportEvent) => void;
   /** Set by the call logic. Called once when the connection ends for any reason. */
-  onClose: (info?: CloseInfo) => void;
+  onClose: (info?: TransportCloseInfo) => void;
   /**
    * Speaks one piece of text. `last` marks the end of the reply (an empty `token` with `last` closes words already sent). `interruptible: false` means the caller
    * cannot talk over it. False when the connection is gone or too slow to take it.

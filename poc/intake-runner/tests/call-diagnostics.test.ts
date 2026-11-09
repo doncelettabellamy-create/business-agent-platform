@@ -292,3 +292,19 @@ test('entry: serve mode prints no digest and no TwiML (so no console filter is n
   const ignore = readFileSync(new URL('../../../.gitignore', import.meta.url), 'utf8').split(/\r?\n/);
   assert.ok(ignore.includes('*.log'), 'founder-voice.log is covered by the *.log rule');
 });
+
+test('consent-phase close: only a notice the speaker answered "failed" tells the call logic the speaker is down (with the carrier\'s raw SID); every other way a notice fails, and a caller who hangs up, close the same way without it', async () => {
+  const SIDX = 'CA' + '0123456789abcdef'.repeat(2);
+  const cases: Array<[string, Behaviour | 'hangup' | 'oversize', boolean]> = [['failed', 'fail', true], ['silent', 'silent', false], ['other words', { say: 'Hi, how can I help?' }, false], ['incomplete', 'oversize', false], ['caller hangs up', 'hangup', false]];
+  for (const [label, how, flagged] of cases) {
+    const r = how === 'oversize' ? rig({ bridge: { maxVoiceChars: 1000 } }) : how === 'hangup' ? rig({ voice: behave('exact') }) : rig({ voice: behave(how) });
+    r.voice.open(); r.phone.start({ callSid: SIDX });
+    if (how === 'hangup') r.phone.stop();
+    await until(() => r.closes.length > 0);
+    const first = r.closes[0] as Record<string, unknown>;
+    assert.ok(!r.kinds().includes('setup'), label + ': the call logic never saw the call start');
+    if (flagged) { assert.equal(first.speakerDown, true, label); assert.equal(first.callSid, SIDX, label); assert.deepEqual(Object.keys(first).sort(), ['callSid', 'cause', 'code', 'speakerDown'], label + ': the first close carries it'); }
+    else { assert.ok(!('speakerDown' in first) && !('callSid' in first), label + ': no flag and no SID: ' + JSON.stringify(first)); }
+    assert.ok(r.closes.every((c) => (c as Record<string, unknown>).speakerDown === (flagged ? true : undefined)), label + ': every close agrees');
+  }
+});

@@ -26,7 +26,7 @@ import type { AvailabilityConfig, Busy, Offer } from './fast-availability.ts';
 import { countFrom, fieldFrom, instantOf, isAiQuestion, lettersFrom, lettersWordsFrom, nameFromLetters, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
 import type { When } from './fast-parsers.ts';
 import type { BookingRequest, BookingResult } from './jobber-booking.ts';
-import type { CallTransport, TransportEvent } from './call-transport.ts';
+import type { CallTransport, TransportCloseInfo, TransportEvent } from './call-transport.ts';
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
 import { customerEmail, followUpEmail, ownerEmail } from './fast-email-copy.ts';
@@ -650,7 +650,9 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     }
 
     // ---------------------------------------------------------------- events
-    t.onClose = () => { if (!done) { done = true; hungUp = true; deps.log('FAST_END', { reason: 'CALLER_HUNG_UP', booked: false }); deps.onOutcome?.({ reason: 'CALLER_HUNG_UP', booked: false, customerText: 'not_sent', ownerText: 'not_sent', steps }); } clearTimers(); contact.dispose(); if (booking && hungUp) { if (!slotDeferred) { slotDeferred = true; slotTimer = setTimeout(releaseSlot, deps.slotHoldMs ?? 60_000); slotTimer.unref?.(); } } else active = Math.max(0, active - 1); };
+    /** The voice is gone, during the call (`speaker_down`) or during the consent notice (the close says so, and the SID is the carrier's raw one). */
+    function speakerFailed(sid: unknown): void { hungUp = true; speakerSid = sidOf(sid) ?? sidOf(callSid); if (!booking) sendOwnerNotice('SPEAKER_DOWN', bookSent); void end('SPEAKER_DOWN'); }
+    t.onClose = (info?: TransportCloseInfo) => { if (!done && info?.speakerDown === true) speakerFailed(info.callSid); if (!done) { done = true; hungUp = true; deps.log('FAST_END', { reason: 'CALLER_HUNG_UP', booked: false }); deps.onOutcome?.({ reason: 'CALLER_HUNG_UP', booked: false, customerText: 'not_sent', ownerText: 'not_sent', steps }); } clearTimers(); contact.dispose(); if (booking && hungUp) { if (!slotDeferred) { slotDeferred = true; slotTimer = setTimeout(releaseSlot, deps.slotHoldMs ?? 60_000); slotTimer.unref?.(); } } else active = Math.max(0, active - 1); };
     t.onEvent = (ev: TransportEvent): void => {
       if (done) return;
       if (ev.kind === 'setup') {
@@ -699,7 +701,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       }
       if (ev.kind === 'reply_failed') { const a = awaiting; if (a !== undefined) enqueue(async () => { if (awaiting !== a) return; if (++a.replays > 2) return end('REPLY_FAILED', undefined); play(a, a.text); }); return; }
       // The voice is gone: from here the call is treated like a hang-up. `hungUp` stops a booking that has not been sent yet, makes a write already in flight record its real result when it settles, and holds the slot until then. With no write in flight the owner is told now; with one in flight the notice waits for its result.
-      if (ev.kind === 'speaker_down') { hungUp = true; speakerSid = sidOf(callSid); if (!booking) sendOwnerNotice('SPEAKER_DOWN', bookSent); void end('SPEAKER_DOWN'); return; }
+      if (ev.kind === 'speaker_down') { speakerFailed(callSid); return; }
     };
   }
 

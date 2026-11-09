@@ -10,6 +10,9 @@ import type { BookingRequest, BookingResult } from '../src/jobber-booking.ts';
 import type { Delivery, SendResult } from '../src/twilio-messaging.ts';
 import { cleanDetail } from '../src/call-diag.ts';
 import { fakeCarrier } from './helpers/fake-carrier.ts';
+import { createRealtimeBridge } from '../src/realtime-bridge.ts';
+import { createRealtimeTransport } from '../src/realtime-transport.ts';
+import { createWirePhone, createWireVoice } from './helpers/realtime-wire-sim.ts';
 
 const TZ = 'America/Chicago'; const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 9:00 in Chicago
 const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15550100003'; const STRANGER = '+15550100099';
@@ -1494,7 +1497,7 @@ test('M2 unchanged behaviour: a hang-up before the read-back yes records only th
 
 test('M2 source guard: the hang-up flag is set only by a hang-up, nothing is written or texted after it, and the late ending is the one place that records and notifies', () => {
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
-  assert.equal([...src.matchAll(/hungUp = true/g)].length, 2, 'set in two places only'); assert.ok(/t\.onClose = \(\) => \{ if \(!done\) \{ done = true; hungUp = true;/.test(src), 'inside the hang-up branch'); assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ hungUp = true;/.test(src), 'and in the speaker-failure branch (the voice is gone)');
+  assert.equal([...src.matchAll(/hungUp = true/g)].length, 2, 'set in two places only'); assert.ok(/t\.onClose = \(info\?: TransportCloseInfo\) => \{ if \(!done && info\?\.speakerDown === true\) speakerFailed\(info\.callSid\); if \(!done\) \{ done = true; hungUp = true;/.test(src), 'inside the hang-up branch (after the speaker-failure check)'); assert.ok(/function speakerFailed\(sid: unknown\): void \{ hungUp = true;/.test(src), 'and in the one speaker-failure function (the voice is gone)');
   assert.ok(src.indexOf("deps.log('FAST_BOOKING_SKIPPED'") > 0 && src.indexOf("deps.log('FAST_BOOKING_SKIPPED'") < src.indexOf('await deps.book(req)'), 'the skip comes before the booking request');
   assert.ok(src.indexOf("deps.log('FAST_TEXTS_SKIPPED', { reason: 'CALLER_HUNG_UP' })") > 0 && src.indexOf("deps.log('FAST_TEXTS_SKIPPED', { reason: 'CALLER_HUNG_UP' })") < src.indexOf('await deps.sendText(callback'), 'the text skip comes before any text');
   assert.ok(/async function book\(\): Promise<void> \{ booking = true; try \{ await bookInner\(\); \} finally \{ booking = false; releaseSlot\(\); \} \}/.test(src), 'the slot is released when the booking settles');
@@ -1592,8 +1595,10 @@ test('speaker down, as a property: at every step of the call, with the signal re
 test('speaker down source guard: the failure sets the hang-up flag before it ends the call, notifies at once only when no write is in flight, and the notice is guarded to once per call', () => {
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
   assert.equal([...src.matchAll(/ev\.kind === 'speaker_down'/g)].length, 1);
-  assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ hungUp = true; speakerSid = sidOf\(callSid\); if \(!booking\) sendOwnerNotice\('SPEAKER_DOWN', bookSent\); void end\('SPEAKER_DOWN'\); return; \}/.test(src), 'flag, the validated SID, then the guarded notice, then the end');
-  assert.equal([...src.matchAll(/speakerSid = /g)].length, 1, 'the SID is set in the speaker-failure branch only (behavior is pinned by the Call SID tests)');
+  assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ speakerFailed\(callSid\); return; \}/.test(src), 'the live event calls the one function');
+  assert.ok(/function speakerFailed\(sid: unknown\): void \{ hungUp = true; speakerSid = sidOf\(sid\) \?\? sidOf\(callSid\); if \(!booking\) sendOwnerNotice\('SPEAKER_DOWN', bookSent\); void end\('SPEAKER_DOWN'\); \}/.test(src), 'flag, the validated SID, then the guarded notice, then the end');
+  assert.equal([...src.matchAll(/speakerSid = /g)].length, 1, 'the SID is set in the speaker-failure function only (behavior is pinned by the Call SID tests)');
+  assert.equal([...src.matchAll(/speakerFailed\(/g)].length, 3, 'defined once, called from the live event and from the close that says the notice failed');
   assert.ok(/function sendOwnerNotice\(reason: string, mayExist: boolean\): void \{\r?\n\s+if \(noticed\) return; noticed = true;/.test(src), 'the once-per-call guard is the first statement');
   assert.equal([...src.matchAll(/noticed = true/g)].length, 1);
 });
@@ -1654,4 +1659,76 @@ test('Call SID, other notices unchanged: a declined or unverified booking, a ski
   assert.equal(notices(c).length, 1); assert.deepEqual(sidLines(c), []); assert.ok(!notices(c)[0].text.includes(SID));
   // a caller who hangs up with nothing promised sends no notice at all
   const d = build({ textsEnabled: false, emails: 'accept' }); d.h.serve(d.c.transport); d.c.setup(DREW, SID, 'Testa Invented'); await d.c.hears(/Is that right\? Say yes or no/, 'yes'); d.c.hangUp(); await d.h.idle(); assert.equal(notices(d).length, 0);
+});
+
+// ================================================================ the speaker fails during the consent notice (the call logic never saw the call start)
+const SIDN = 'CA' + '0123456789abcdef'.repeat(2);
+/** The transport's close for a notice the speaker answered "failed" (its raw SID), then the connection closes. */
+const noticeFailedClose = (c: ReturnType<typeof fakeCarrier>, callSid: unknown, flag: boolean = true): void => { c.transport.onClose({ cause: 'PROTOCOL', code: 1011, ...(flag ? { speakerDown: true as const, callSid } : {}) }); };
+const onlyLines = (t: ReturnType<typeof build>): string[] => notices(t).flatMap((m) => m.text.split('\n'));
+
+test('consent-phase speaker failure: the call is recorded as SPEAKER_DOWN (not a hang-up), the owner gets exactly one fixed notice with the Call SID, a number that is not available and no steps, nothing is booked, spoken or texted, and the slot is free', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept' }); t.h.serve(t.c.transport); assert.equal(t.h.active(), 1, 'the call holds the slot from the start');
+  noticeFailedClose(t.c, SIDN); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(t.booked.length, 0); assert.equal(t.texts.length, 0); assert.equal(t.c.lines.length, 0, 'nothing spoken'); assert.equal(t.h.active(), 0);
+  assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]]);
+  const lines = onlyLines(t); assert.ok(lines.includes('Reason code: SPEAKER_DOWN')); assert.ok(lines.includes('Callback number: not available')); assert.ok(lines.includes('Steps reached: none')); assert.ok(lines.includes('No booking was sent to Jobber.')); assert.deepEqual(lines.filter((l) => l.startsWith('Call SID')), ['Call SID: ' + SIDN]);
+  allLinesFixed(t); nothingPersonal(t); assert.deepEqual(row(t, 'FAST_FOLLOWUP'), { owner: 'accepted', reason: 'SPEAKER_DOWN' }); assert.ok(!t.logs.some(([c, d]) => c === 'FAST_END' && (d as { reason: string }).reason === 'CALLER_HUNG_UP'));
+});
+
+test('consent-phase speaker failure, the SID: missing, malformed or hostile adds no Call SID line and the notice is still sent once', async () => {
+  const bad: unknown[] = [undefined, null, '', 'CA', 'ca' + '0123456789abcdef'.repeat(2), 'CA' + '0123456789ABCDEF'.repeat(2), SIDN + '0', SIDN.slice(1), SIDN + '\nInjected: yes', ' ' + SIDN, 42, {}, [SIDN]];
+  for (const x of bad) {
+    const t = build({ textsEnabled: false, emails: 'accept' }); t.h.serve(t.c.transport); noticeFailedClose(t.c, x); await t.h.idle();
+    assert.equal(notices(t).length, 1, JSON.stringify(x)); assert.deepEqual(sidLines(t), [], 'no SID line: ' + JSON.stringify(x)); allLinesFixed(t); assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(t.h.active(), 0);
+  }
+});
+
+test('consent-phase close that is not a speaker failure is unchanged: a caller who hangs up, a protocol close without the flag, and a flag arriving after the call already ended record the hang-up (or nothing more) and send no notice', async () => {
+  const a = build({ textsEnabled: false, emails: 'accept' }); a.h.serve(a.c.transport); a.c.hangUp(); await a.h.idle();
+  assert.deepEqual(outcomes(a), [['CALLER_HUNG_UP', false]]); assert.equal(a.mails.length, 0); assert.equal(a.h.active(), 0);
+  const b = build({ textsEnabled: false, emails: 'accept' }); b.h.serve(b.c.transport); noticeFailedClose(b.c, SIDN, false); await b.h.idle();
+  assert.deepEqual(outcomes(b), [['CALLER_HUNG_UP', false]]); assert.equal(b.mails.length, 0); assert.equal(b.h.active(), 0);
+  // the flag after the call has already ended changes nothing
+  const c = build({ textsEnabled: false, emails: 'accept' }); c.h.serve(c.c.transport); c.c.hangUp(); noticeFailedClose(c.c, SIDN); await c.h.idle();
+  assert.deepEqual(outcomes(c), [['CALLER_HUNG_UP', false]]); assert.equal(c.mails.length, 0);
+  // a call that ended normally earlier and then closes with the flag sends nothing new
+  const d = build({ textsEnabled: false, emails: 'accept', caller: STRANGER }); d.h.serve(d.c.transport); d.c.setup(DREW); await d.c.drain(() => d.outcomes.length > 0, 'the refusal'); const before = d.mails.length; noticeFailedClose(d.c, SIDN); await d.h.idle();
+  assert.equal(d.mails.length, before); assert.equal(d.outcomes.length, 1);
+});
+
+test('consent-phase speaker failure, repeated: more closes, a later live speaker_down and a caller hang-up give one outcome and at most one notice', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept' }); t.h.serve(t.c.transport);
+  noticeFailedClose(t.c, SIDN); noticeFailedClose(t.c, SIDN); t.c.emit({ kind: 'speaker_down' }); t.c.hangUp(); t.c.transport.close(1011); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(notices(t).length, 1); assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1); assert.equal(t.h.active(), 0);
+});
+
+test('consent-phase speaker failure, attempt versus delivery: the outcome is always recorded; with emails off no attempt is made; a refusing, throwing or silent mail server is one attempt whose verdict is logged, and the call still ends', async () => {
+  const off = build({ textsEnabled: false }); off.h.serve(off.c.transport); noticeFailedClose(off.c, SIDN); await off.h.idle();
+  assert.deepEqual(outcomes(off), [['SPEAKER_DOWN', false]]); assert.equal(off.mails.length, 0); assert.ok(!off.logs.some(([c]) => c === 'FAST_FOLLOWUP'), 'no attempt, no verdict');
+  for (const [mode, verdict] of [['refuse', 'refused'], ['throw', 'refused'], ['hang', 'timeout']] as const) {
+    const t = build({ textsEnabled: false, emails: mode, followUpMs: 40 }); t.h.serve(t.c.transport); noticeFailedClose(t.c, SIDN); await t.h.idle();
+    assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]], mode); assert.equal(t.mails.length, 1, mode + ': one attempt'); assert.deepEqual(row(t, 'FAST_FOLLOWUP'), { owner: verdict, reason: 'SPEAKER_DOWN' }, mode); assert.equal(t.h.active(), 0);
+  }
+});
+
+test('consent-phase speaker failure, as a property: for every flag, SID value and mail mode there is exactly one outcome, at most one mail attempt, never a booking, and the slot ends free', async () => {
+  let combos = 0;
+  for (const flag of [true, false]) for (const sid of [SIDN, undefined, 'CA-bad', 7]) for (const mode of [undefined, 'accept', 'refuse', 'throw'] as const) {
+    const t = build({ textsEnabled: false, ...(mode === undefined ? {} : { emails: mode }) }); t.h.serve(t.c.transport); noticeFailedClose(t.c, sid, flag); noticeFailedClose(t.c, sid, flag); await t.h.idle(); combos++;
+    assert.equal(t.outcomes.length, 1); assert.equal(t.outcomes[0].reason, flag ? 'SPEAKER_DOWN' : 'CALLER_HUNG_UP'); assert.ok(t.mails.length <= (flag && mode !== undefined ? 1 : 0)); assert.equal(t.booked.length, 0); assert.equal(t.h.active(), 0);
+  }
+  assert.equal(combos, 2 * 4 * 4);
+});
+
+test('consent-phase speaker failure, end to end through the real transport and bridge: the speaker answers the notice "failed", the handler records SPEAKER_DOWN and sends one notice with the carrier\'s SID; a silent notice is a plain hang-up with no notice', async () => {
+  for (const [how, reason, mails] of [['fail', 'SPEAKER_DOWN', 1], ['silent', 'CALLER_HUNG_UP', 0]] as const) {
+    const t = build({ textsEnabled: false, emails: 'accept' });
+    const phone = createWirePhone(); const voice = createWireVoice({ msPerChar: 1, behave: (_x: string, n: number) => (n === 1 ? how : 'exact') });
+    const b = createRealtimeBridge(phone, voice, {}); const transport = createRealtimeTransport(b.link, { notice: 'Hello. This is an automated A I assistant for Drew Cleaning. Please say yes to continue, or hang up now.', transcriptionModel: 'x', voice: 'y', msPerChar: 1, endWaitMs: 300 });
+    t.h.serve(transport); voice.open(); phone.start({ to: DREW, callSid: SIDN });
+    await t.c.until(() => t.outcomes.length > 0, 'the outcome'); await t.h.idle();
+    assert.deepEqual(outcomes(t), [[reason, false]], how); assert.equal(t.mails.length, mails, how); assert.equal(t.booked.length, 0); assert.equal(t.h.active(), 0);
+    if (mails === 1) { assert.deepEqual(sidLines(t), ['Call SID: ' + SIDN]); allLinesFixed(t); nothingPersonal(t); }
+  }
 });
