@@ -34,7 +34,7 @@ export interface BookingRequest {
   title: string; service: string; priceDollars: number;
 }
 export type BookingStatus = 'booked_verified' | 'not_booked' | 'uncertain' | 'refused';
-export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST';
+export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE';
 export interface BookingResult {
   status: BookingStatus; reason?: BookingReason;
   /** True when this key had already been booked and nothing new was written. */ duplicate?: boolean;
@@ -82,13 +82,59 @@ export function requestProblems(r: unknown, now: number): string[] {
 }
 
 // ---------------------------------------------------------------- the ledger (ids only; protected; written before each write)
-interface Entry { state: 'pending' | 'client_created' | 'created'; clientId?: string; propertyId?: string; jobId?: string }
-const LEDGER = 'jobber-booking-ledger';
-async function loadLedger(ctx: Ctx): Promise<Record<string, Entry>> {
-  const t = await ctx.vault.loadBlob(LEDGER); if (t === undefined) return {};
-  try { const j = JSON.parse(t) as { entries?: Record<string, Entry> }; return typeof j.entries === 'object' && j.entries !== null ? j.entries : {}; } catch { return {}; }
+// One set of generation files per key (`jobber-booking-ledger-<marker>.<n>.enc`, n = 1, 2, 3 ...). Each generation is published once and never replaced (`publishBlob`), and the highest one is the key's state.
+// Anything unreadable or invalid is LEDGER_UNREADABLE (uncertain, nothing written), never "empty", and an older generation is never used instead of an unreadable newer one. The older single-file ledger
+// (`jobber-booking-ledger.enc`) is READ-ONLY: it is consulted only for a key that has no generation file yet, and it is never written or removed.
+type EntryState = 'none' | 'pending' | 'client_created' | 'created';
+interface Entry { state: EntryState; clientId?: string; propertyId?: string; jobId?: string }
+const LEGACY_LEDGER = 'jobber-booking-ledger';
+const MAX_GENERATION = 99;
+const ledgerBase = (marker: string): string => `${LEGACY_LEDGER}-${marker.toLowerCase()}`;
+const unreadable = (): JobberError => new JobberError('LEDGER_UNREADABLE');
+/** A stored entry is accepted only if it has exactly one of the shapes this code writes; anything else is undefined (the caller fails closed). */
+function validEntry(x: unknown, allowNone: boolean): Entry | undefined {
+  if (typeof x !== 'object' || x === null || Array.isArray(x)) return undefined;
+  const o = x as Record<string, unknown>;
+  if (Object.keys(o).some((k) => k !== 'state' && k !== 'clientId' && k !== 'propertyId' && k !== 'jobId')) return undefined;
+  const idOk = (v: unknown): boolean => v === undefined || (typeof v === 'string' && JOB_ID.test(v));
+  if (!idOk(o.clientId) || !idOk(o.propertyId) || !idOk(o.jobId)) return undefined;
+  const pair = (o.clientId === undefined) === (o.propertyId === undefined);
+  const ids = { ...(o.clientId === undefined ? {} : { clientId: o.clientId as string }), ...(o.propertyId === undefined ? {} : { propertyId: o.propertyId as string }) };
+  if (o.state === 'none') return allowNone && o.clientId === undefined && o.propertyId === undefined && o.jobId === undefined ? { state: 'none' } : undefined;
+  if (o.state === 'pending') return pair && o.jobId === undefined ? { state: 'pending', ...ids } : undefined;
+  if (o.state === 'client_created') return o.clientId !== undefined && o.propertyId !== undefined && o.jobId === undefined ? { state: 'client_created', ...ids } : undefined;
+  if (o.state === 'created') return o.jobId !== undefined ? { state: 'created', ...ids, jobId: o.jobId as string } : undefined;
+  return undefined;
 }
-const saveLedger = (ctx: Ctx, entries: Record<string, Entry>): Promise<void> => ctx.vault.saveBlob(LEDGER, JSON.stringify({ version: 1, entries }));
+function parseGeneration(text: string | undefined, marker: string, gen: number): Entry | undefined {
+  if (text === undefined) return undefined;
+  let j: unknown; try { j = JSON.parse(text); } catch { return undefined; }
+  if (typeof j !== 'object' || j === null || Array.isArray(j)) return undefined;
+  const o = j as Record<string, unknown>;
+  if (Object.keys(o).length !== 4 || o.version !== 2 || o.marker !== marker || o.gen !== gen) return undefined;
+  return validEntry(o.entry, true);
+}
+/** The older single-file ledger, read only. Absent: no prior state. Present but unreadable or malformed: LEDGER_UNREADABLE (it may hold this key's state). */
+async function legacyEntry(ctx: Ctx, marker: string): Promise<Entry | undefined> {
+  if (!ctx.vault.hasBlob(LEGACY_LEDGER)) return undefined;
+  const text = await ctx.vault.loadBlob(LEGACY_LEDGER); if (text === undefined) throw unreadable();
+  let j: unknown; try { j = JSON.parse(text); } catch { throw unreadable(); }
+  const o = typeof j === 'object' && j !== null && !Array.isArray(j) ? j as Record<string, unknown> : {};
+  const entries = o.entries;
+  if (o.version !== 1 || typeof entries !== 'object' || entries === null || Array.isArray(entries)) throw unreadable();
+  if (!Object.hasOwn(entries, marker)) return undefined;
+  const e = validEntry((entries as Record<string, unknown>)[marker], false); if (e === undefined) throw unreadable();
+  return e;
+}
+/** This key's state: the highest generation (the numbers must run 1..n without a gap, n at most 99, and the file must be valid for this marker and number); with no generation file, the older ledger's entry. */
+async function loadEntry(ctx: Ctx, marker: string): Promise<{ gen: number; entry: Entry | undefined }> {
+  const base = ledgerBase(marker); const gens = ctx.vault.generations(base);
+  if (gens.length === 0) return { gen: 0, entry: await legacyEntry(ctx, marker) };
+  const top = gens[gens.length - 1];
+  if (top > MAX_GENERATION || gens.length !== top || gens[0] !== 1) throw unreadable();
+  const entry = parseGeneration(await ctx.vault.loadBlob(`${base}.${top}`), marker, top); if (entry === undefined) throw unreadable();
+  return { gen: top, entry: entry.state === 'none' ? undefined : entry };
+}
 
 // ---------------------------------------------------------------- the documents (names and types from the live schema, 2026-11-01)
 const CREATE_CLIENT = 'mutation CreateTestClient($input: ClientCreateInput!) { clientCreate(input: $input) { client { id clientProperties(first: 5) { nodes { id } } } userErrors { message path } } }';
@@ -162,9 +208,16 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
     const tokens = await ctx.vault.loadTokens(); if (tokens === undefined) throw new JobberError('NOT_CONNECTED');
     await verifyExpectedAccount(ctx, creds, ctx.allowWrites.expectedAccountName, tokens.account_id);   // the test account, before anything else
     return await ctx.vault.withLock(`booking-${marker.toLowerCase()}`, async (lock) => {
-      const ledger = await loadLedger(ctx); const prior = ledger[marker];
+      const base = ledgerBase(marker); const loaded = await loadEntry(ctx, marker); let generation = loaded.gen;
+      const ledger: Record<string, Entry> = loaded.entry === undefined ? {} : { [marker]: loaded.entry }; const prior = ledger[marker];
       // Every ledger write and every Jobber write first checks that this call still owns the lock; a call that lost it stops here, before the next write (LOCK_LOST).
-      const save = async (): Promise<void> => { lock.assertHeld(); await saveLedger(ctx, ledger); };
+      const save = async (): Promise<void> => {
+        if (generation >= MAX_GENERATION) throw new JobberError('LEDGER_UNAVAILABLE');
+        const next = generation + 1; const text = JSON.stringify({ version: 2, marker, gen: next, entry: ledger[marker] ?? { state: 'none' } });
+        // The lock is checked inside publishBlob, after the protect step and immediately before the file is linked into place; a name that is already taken means another writer got there first.
+        if (await ctx.vault.publishBlob(`${base}.${next}`, text, () => lock.assertHeld()) === 'exists') throw new JobberError('LEDGER_CONFLICT');
+        generation = next;
+      };
       const write = (query: string, variables: Record<string, unknown>): ReturnType<typeof mutate> => { lock.assertHeld(); writes++; return mutate(ctx, creds, query, variables); };
       const verify = async (jobId: string, duplicate: boolean): Promise<BookingResult> => {
         const rb = await readBackJob(ctx, creds, jobId, req, marker);
@@ -200,9 +253,10 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
     });
   } catch (e) {
     const code = e instanceof JobberError ? e.code : 'API_ERROR';
-    const reason: BookingReason = code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' ? 'LOCK_LOST' : 'API_ERROR';
+    const reason: BookingReason = code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' || code === 'LEDGER_UNREADABLE' || code === 'LEDGER_CONFLICT' || code === 'LEDGER_UNAVAILABLE' ? code : 'API_ERROR';
     ctx.diag('JOBBER_BOOKING_FAILED', { reason });
     // Before any write an error is simply "not booked"; after a write was sent its outcome is unknown, so the status says so.
-    return done(writes > 0 ? 'uncertain' : 'not_booked', { reason });
+    const unsure = reason === 'LEDGER_UNREADABLE' || reason === 'LEDGER_CONFLICT';   // a ledger that cannot be trusted may be hiding a booking
+    return done(writes > 0 || unsure ? 'uncertain' : 'not_booked', { reason });
   }
 }

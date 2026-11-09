@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -391,4 +391,94 @@ test('lock: a lock replaced by a FRESH one between the staleness check and the t
   assert.equal(existsSync(f), true, 'the fresh lock was put back'); assert.equal(readFileSync(f, 'utf8'), 'fresh-holder', 'unchanged');
   assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.old')), [], 'no moved-aside file is left behind');
   rmSync(dir, { recursive: true, force: true });
+});
+
+// ================================================================ generation files: published once, never replaced, lock checked at the last moment
+const noOpGuard = (): void => undefined;
+const leftovers = (dir: string): string[] => readdirSync(dir).filter((n) => n.endsWith('.tmp'));
+
+test('generations: only <base>.<n>.enc with n = 0 or 1..999 (no leading zero) counts, for exactly that base, in numeric order; temporary files, other bases and odd names are ignored', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector);
+  assert.deepEqual(v.generations('led-a'), [], 'an empty folder'); assert.deepEqual(createVault(join(dir, 'not-there'), fakeProtector).generations('led-a'), [], 'a folder that does not exist yet');
+  for (const n of ['led-a.1.enc', 'led-a.2.enc', 'led-a.10.enc', 'led-a.0.enc', 'led-a.01.enc', 'led-a.1000.enc', 'led-a.x.enc', 'led-a.3.enc.tmp', 'led-a.4', 'led-a-b.1.enc', 'led-ab.1.enc', 'led-a..5.enc']) writeFileSync(join(dir, n), 'x');
+  assert.deepEqual(v.generations('led-a'), [0, 1, 2, 10], 'numeric order, not text order');
+  assert.deepEqual(v.generations('led-a-b'), [1]);
+  assert.throws(() => v.generations('Bad Name'), (e: unknown) => e instanceof JobberError && e.code === 'BAD_CONFIG');
+  assert.equal(v.hasBlob('led-ab.1'), true); assert.equal(v.hasBlob('led-zz'), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish: a new file is protected, flushed and linked into place; a second publish of the same name is refused and changes nothing; no temporary file is left', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector);
+  assert.equal(await v.publishBlob('pub.1', 'first', noOpGuard), 'published'); const bytes = readFileSync(join(dir, 'pub.1.enc'), 'utf8');
+  assert.equal(await v.loadBlob('pub.1'), 'first'); assert.notEqual(bytes, 'first', 'it is stored protected');
+  assert.equal(await v.publishBlob('pub.1', 'second', noOpGuard), 'exists'); assert.equal(readFileSync(join(dir, 'pub.1.enc'), 'utf8'), bytes, 'the existing generation is untouched');
+  assert.deepEqual(leftovers(dir), []);
+  await assert.rejects(v.publishBlob('Bad Name', 'x', noOpGuard), (e: unknown) => e instanceof JobberError && e.code === 'BAD_CONFIG');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish: two publishers of the same name at once - exactly one wins, the other gets "exists", and the file holds the winner\'s content', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector);
+  const r = await Promise.all([v.publishBlob('pub.2', 'A', noOpGuard), v.publishBlob('pub.2', 'B', noOpGuard)]);
+  assert.deepEqual([...r].sort(), ['exists', 'published']); const winner = r[0] === 'published' ? 'A' : 'B'; assert.equal(await v.loadBlob('pub.2'), winner); assert.deepEqual(leftovers(dir), []);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish: the guard runs AFTER the protect step - a guard that fails once the (slow) protect step has finished stops the publish: nothing is linked, nothing is left, and the guard error reaches the caller', async () => {
+  const dir = lockDir(); let release: () => void = () => undefined; const gate = new Promise<void>((ok) => { release = ok; }); let entered = false;
+  const slow: Protector = { protect: async (p) => { entered = true; await gate; return fakeProtector.protect(p); }, unprotect: fakeProtector.unprotect };
+  const v = createVault(dir, slow); let lockHeld = true; let guardRan = false;
+  const p = v.publishBlob('pub.3', 'late', () => { guardRan = true; if (!lockHeld) throw new JobberError('LOCK_LOST'); });
+  while (!entered) await sleepMs(2);
+  assert.equal(guardRan, false, 'the guard has not run while the protect step is still going'); lockHeld = false; release();
+  await assert.rejects(p, (e: unknown) => e instanceof JobberError && e.code === 'LOCK_LOST');
+  assert.equal(guardRan, true); assert.equal(existsSync(join(dir, 'pub.3.enc')), false, 'nothing was linked'); assert.deepEqual(leftovers(dir), []);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish: a link that cannot be made is LEDGER_UNAVAILABLE (never "exists", never silently skipped) and leaves no file; only EEXIST means the name was taken', async () => {
+  const dir = lockDir();
+  for (const code of ['EPERM', 'ENOTSUP', 'EXDEV', 'EIO']) {
+    const v = createVault(dir, fakeProtector, { linkFile: () => { throw Object.assign(new Error('x'), { code }); } });
+    await assert.rejects(v.publishBlob('pub.4', 'x', noOpGuard), (e: unknown) => e instanceof JobberError && e.code === 'LEDGER_UNAVAILABLE', code);
+    assert.equal(existsSync(join(dir, 'pub.4.enc')), false, code); assert.deepEqual(leftovers(dir), [], code);
+  }
+  const taken = createVault(dir, fakeProtector, { linkFile: () => { throw Object.assign(new Error('x'), { code: 'EEXIST' }); } });
+  assert.equal(await taken.publishBlob('pub.4', 'x', noOpGuard), 'exists'); assert.deepEqual(leftovers(dir), []);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish: crash windows - a temporary file left behind by a crash before the link is never read as a generation, and a publish after it works; a half-written final file is not possible (the content is complete before the link)', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector);
+  writeFileSync(join(dir, 'pub.5.enc.deadbeef.tmp'), 'half a file');   // what a crash between the write and the link leaves
+  assert.deepEqual(v.generations('pub'), [], 'an orphan temporary file is not a generation'); assert.equal(v.hasBlob('pub.5'), false);
+  assert.equal(await v.publishBlob('pub.5', 'ok', noOpGuard), 'published'); assert.equal(await v.loadBlob('pub.5'), 'ok');
+  let seenWhenLinked = ''; const peek = createVault(dir, fakeProtector, { linkFile: (from, to) => { seenWhenLinked = readFileSync(from, 'utf8'); linkSync(from, to); } });
+  await peek.publishBlob('pub.6', 'whole', noOpGuard); assert.equal(await fakeProtector.unprotect(seenWhenLinked), 'whole', 'the temporary file already held the complete content when it was linked');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish: four processes race to publish generation 1..40 of one name - each generation has exactly ONE winner (hard-link create-if-absent holds across processes), every file holds its winner\'s content, nothing is left over', async () => {
+  const dir = lockDir(); const worker = fileURLToPath(new URL('./helpers/generation-worker.ts', import.meta.url)); const rounds = 40;
+  const run = (): Promise<{ code: number; out: string }> => new Promise((res) => { const p = spawn(process.execPath, [worker, dir, String(rounds)], { stdio: ['ignore', 'pipe', 'ignore'] }); let out = ''; p.stdout.on('data', (b: Buffer) => { out += b.toString(); }); p.on('close', (c) => res({ code: c ?? -1, out })); });
+  const all = [run(), run(), run(), run()]; await sleepMs(900); writeFileSync(join(dir, 'go.signal'), 'go');
+  const done = await Promise.all(all); assert.deepEqual(done.map((d) => d.code), [0, 0, 0, 0]);
+  const results = done.map((d) => JSON.parse(d.out.trim().split('\n').pop() as string) as { pid: number; wins: number[] });
+  for (let g = 1; g <= rounds; g++) {
+    const winners = results.filter((r) => r.wins.includes(g)); assert.equal(winners.length, 1, `generation ${g} had ${winners.length} winners`);
+    assert.equal(readFileSync(join(dir, `race.${g}.enc`), 'utf8'), String(winners[0].pid), `generation ${g} holds its winner's content`);
+  }
+  assert.deepEqual(leftovers(dir), []); rmSync(dir, { recursive: true, force: true });
+});
+
+test('publish source: nothing after the protect step awaits; the content is flushed, then the guard runs, then the exclusive hard link (default linkSync) is made; the temporary file is always removed', () => {
+  const src = readFileSync(new URL('../src/jobber-connector.ts', import.meta.url), 'utf8');
+  const a = src.indexOf('// SYNC-BEGIN'); const b = src.indexOf('// SYNC-END'); assert.ok(a > 0 && b > a, 'the synchronous section is marked');
+  const sync = src.slice(a, b); assert.ok(!/\bawait\b/.test(sync), 'no await between the flush, the guard and the link');
+  const iOpen = sync.indexOf("openSync(tmp, 'wx'"); const iSync = sync.indexOf('fsyncSync(fd)'); const iGuard = sync.indexOf('guard();'); const iLink = sync.indexOf('(timings.linkFile ?? linkSync)(tmp, final)');
+  assert.ok(iOpen >= 0 && iOpen < iSync && iSync < iGuard && iGuard < iLink, 'open, flush, guard, link - in that order');
+  assert.ok(/finally \{ rmSync\(tmp, \{ force: true \}\); \}/.test(sync), 'the temporary file is always removed');
+  assert.ok(/code === 'EEXIST'\) return 'exists'; throw new JobberError\('LEDGER_UNAVAILABLE'\)/.test(sync), 'only EEXIST means "exists"');
+  const before = src.slice(src.indexOf('async publishBlob('), a); assert.equal([...before.matchAll(/\bawait\b/g)].length, 1, 'the only await is the protect step'); assert.ok(/const blob = await protector\.protect\(text\);/.test(before));
 });

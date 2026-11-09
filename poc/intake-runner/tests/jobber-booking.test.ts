@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createVault, JobberError, mutate, mutationFields, query, WRITE_ALLOWLIST } from '../src/jobber-connector.ts';
@@ -288,7 +288,7 @@ test('independent read-back of the STATE: the requested state matches as a code 
 
 // ================================================================ lock ownership: a booking that has lost its lock stops before the next write
 const lockOf = (r: Rig, req: BookingRequest): string => join(r.dir, 'booking-' + markerFor(req.key).toLowerCase() + '.lock');
-const ledgerOf = async (r: Rig): Promise<Record<string, { state: string; jobId?: string }>> => { const t = await r.ctx.vault.loadBlob('jobber-booking-ledger'); return t === undefined ? {} : (JSON.parse(t) as { entries: Record<string, { state: string; jobId?: string }> }).entries; };
+const ledgerOf = async (r: Rig, req: BookingRequest = REQ): Promise<Record<string, { state: string; jobId?: string }>> => { const base = 'jobber-booking-ledger-' + markerFor(req.key).toLowerCase(); const gens = r.ctx.vault.generations(base); if (gens.length === 0) return {}; const t = await r.ctx.vault.loadBlob(`${base}.${gens[gens.length - 1]}`); return t === undefined ? {} : { [markerFor(req.key)]: (JSON.parse(t) as { entry: { state: string; jobId?: string } }).entry }; };
 type FetchInit = { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal };
 /** Runs `act` once, right after the first response to a request whose body matches `when` (the lock is taken away at exactly that moment). */
 const afterResponse = (r: Rig, when: RegExp, act: () => void): void => { const real = r.ctx.fetch; let fired = false; r.ctx.fetch = (async (url: string, init: FetchInit) => { const res = await real(url, init); if (!fired && when.test(String(init.body ?? ''))) { fired = true; act(); } return res; }) as unknown as FetchLike; };
@@ -361,6 +361,268 @@ test('lock ownership, at every check: losing the lock at the k-th check (before 
 test('lock source: every Jobber write and every ledger write in the booking goes through a checked helper; no other call to mutate or the ledger save exists inside the lock', () => {
   const src = readFileSync(new URL('../src/jobber-booking.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.equal([...src.matchAll(/\bmutate\(/g)].length, 1, 'one call to mutate, inside write()'); assert.ok(/const write = \(query: string, variables: Record<string, unknown>\): ReturnType<typeof mutate> => \{ lock\.assertHeld\(\); writes\+\+; return mutate\(ctx, creds, query, variables\); \};/.test(src));
-  assert.equal([...src.matchAll(/saveLedger\(ctx, ledger\)/g)].length, 1, 'one call to the ledger save, inside save()'); assert.ok(/const save = async \(\): Promise<void> => \{ lock\.assertHeld\(\); await saveLedger\(ctx, ledger\); \};/.test(src));
-  assert.ok(/code === 'LOCK_LOST' \? 'LOCK_LOST'/.test(src), 'a lost lock has its own reason');
+  assert.ok(/const save = async \(\): Promise<void> => \{/.test(src), 'every ledger write goes through save()');
+  assert.ok(/code === 'LOCK_LOST' \|\| code === 'LEDGER_UNREADABLE'/.test(src), 'a lost lock has its own reason');
+});
+
+// ================================================================ the per-key generation ledger: layout, concurrency, migration from the older single file, corruption, crash windows
+const ledgerName = (req: BookingRequest = REQ): string => 'jobber-booking-ledger-' + markerFor(req.key).toLowerCase();
+const genPath = (r: Rig, n: number, req: BookingRequest = REQ): string => join(r.dir, `${ledgerName(req)}.${n}.enc`);
+const legacyPath = (r: Rig): string => join(r.dir, 'jobber-booking-ledger.enc');
+const ledgerFileBytes = (r: Rig): Record<string, string> => Object.fromEntries(readdirSync(r.dir).filter((f) => f.startsWith('jobber-booking-ledger')).sort().map((f) => [f, readFileSync(join(r.dir, f), 'utf8')]));
+const chainOf = async (r: Rig, req: BookingRequest = REQ): Promise<Array<{ gen: number; state: string; clientId?: string; jobId?: string }>> => {
+  const out: Array<{ gen: number; state: string; clientId?: string; jobId?: string }> = [];
+  for (const n of r.ctx.vault.generations(ledgerName(req))) { const o = JSON.parse((await r.ctx.vault.loadBlob(`${ledgerName(req)}.${n}`)) as string) as { entry: { state: string; clientId?: string; jobId?: string } }; out.push({ gen: n, ...o.entry }); }
+  return out;
+};
+const seedGen = async (r: Rig, n: number, entry: unknown, over: Record<string, unknown> = {}, req: BookingRequest = REQ): Promise<void> => { writeFileSync(genPath(r, n, req), await fakeProtector.protect(JSON.stringify({ version: 2, marker: markerFor(req.key), gen: n, entry, ...over }))); };
+const seedLegacy = async (r: Rig, entries: unknown, version: unknown = 1): Promise<void> => { await r.ctx.vault.saveBlob('jobber-booking-ledger', JSON.stringify({ version, entries })); };
+/** Turns the key's generation chain back into what the older code would have left: one legacy file with that entry, no generation files. */
+const toLegacy = async (r: Rig, req: BookingRequest = REQ): Promise<{ state: string; clientId?: string; propertyId?: string; jobId?: string }> => {
+  const gens = r.ctx.vault.generations(ledgerName(req)); const last = JSON.parse((await r.ctx.vault.loadBlob(`${ledgerName(req)}.${gens[gens.length - 1]}`)) as string) as { entry: { state: string; clientId?: string; propertyId?: string; jobId?: string } };
+  for (const n of gens) rmSync(genPath(r, n, req)); await seedLegacy(r, { [markerFor(req.key)]: last.entry }); return last.entry;
+};
+const blockedClean = (res: { status: string; reason?: string; writes: number }, reason: string): void => { assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', reason, 0]); };
+
+test('ledger layout: each key has its own chain of generation files 1..n, each written before the step it guards (pending, client_created, pending, created), each published once; no single shared file is created; no temporary file is left', async () => {
+  const r = await rig();
+  try {
+    const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.equal(res.status, 'booked_verified');
+    const chain = await chainOf(r); assert.deepEqual(chain.map((c) => [c.gen, c.state]), [[1, 'pending'], [2, 'client_created'], [3, 'pending'], [4, 'created']]);
+    assert.equal(chain[3].jobId, res.jobId); assert.equal(chain[1].clientId, chain[2].clientId);
+    assert.equal(readdirSync(r.dir).includes('jobber-booking-ledger.enc'), false, 'the single shared file is not created'); assert.deepEqual(readdirSync(r.dir).filter((f) => f.endsWith('.tmp')), []);
+    for (const t of Object.values(ledgerFileBytes(r))) assert.ok(!/Invented|Testville|5550104242/.test(t), 'no personal detail');
+  } finally { await r.done(); }
+});
+
+test('two different keys at once keep both chains (the old shared file lost one of them): both book, each chain is complete, and one key\'s files are never touched by the other', async () => {
+  const r = await rig();
+  try {
+    const k2 = { ...REQ, key: 'call-fedcba9876543210' };
+    const [a, b] = await Promise.all([bookTestVisit(r.ctx, CREDS, REQ), bookTestVisit(r.ctx, CREDS, k2)]);
+    assert.deepEqual([a.status, b.status], ['booked_verified', 'booked_verified']);
+    assert.equal((await chainOf(r, REQ)).at(-1)?.state, 'created'); assert.equal((await chainOf(r, k2)).at(-1)?.state, 'created'); assert.equal((await chainOf(r, REQ)).length, 4); assert.equal((await chainOf(r, k2)).length, 4);
+    const before = ledgerFileBytes(r); const k3 = { ...REQ, key: 'call-0000111122223333' }; await bookTestVisit(r.ctx, CREDS, k3);
+    const after = ledgerFileBytes(r); for (const [f, bytes] of Object.entries(before)) assert.equal(after[f], bytes, 'untouched: ' + f);
+  } finally { await r.done(); }
+});
+
+test('an EXPIRED holder cannot publish: its lock is replaced while its protect step is still running, so when the step finishes the guard stops it - no generation file, no write, the other holder\'s lock is left alone', async () => {
+  const r = await rig(); let release: () => void = () => undefined; const gate = new Promise<void>((ok) => { release = ok; }); let entered = false;
+  try {
+    const slow: Protector = { protect: async (p) => { entered = true; await gate; return fakeProtector.protect(p); }, unprotect: fakeProtector.unprotect };
+    const ctx: Ctx = { ...r.ctx, vault: createVault(r.dir, slow) };
+    const p = bookTestVisit(ctx, CREDS, REQ);
+    while (!entered) await new Promise((ok) => setTimeout(ok, 2));
+    writeFileSync(lockOf(r, REQ), 'another-holder'); release();
+    const res = await p;
+    assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'LOCK_LOST', 0]); assert.deepEqual(mutations(r.mock), []);
+    assert.deepEqual(r.ctx.vault.generations(ledgerName()), [], 'nothing was published'); assert.equal(readFileSync(lockOf(r, REQ), 'utf8'), 'another-holder'); assert.deepEqual(readdirSync(r.dir).filter((f) => f.endsWith('.tmp')), []);
+  } finally { release(); await r.done(); }
+});
+
+test('a really expired holder (its heartbeat never ran, another call took the lock after the stale age) is refused when it wakes, and the valid holder - which took over - finishes: one job, a clean chain written only by the valid holder', async () => {
+  const r = await rig(); let release: () => void = () => undefined; const gate = new Promise<void>((ok) => { release = ok; }); let entered = false;
+  try {
+    const slow: Protector = { protect: async (p) => { entered = true; await gate; return fakeProtector.protect(p); }, unprotect: fakeProtector.unprotect };
+    const ctxA: Ctx = { ...r.ctx, vault: createVault(r.dir, slow, { heartbeatMs: 60_000, staleMs: 600 }) };
+    const ctxB: Ctx = { ...r.ctx, vault: createVault(r.dir, fakeProtector, { heartbeatMs: 40, staleMs: 600 }) };
+    const a = bookTestVisit(ctxA, CREDS, REQ);
+    while (!entered) await new Promise((ok) => setTimeout(ok, 2));
+    const b = await bookTestVisit(ctxB, CREDS, REQ);   // waits for the stale age, takes the lock over, and books
+    assert.equal(b.status, 'booked_verified'); assert.equal(b.writes, 2);
+    release(); const resA = await a;
+    assert.deepEqual([resA.status, resA.reason, resA.writes], ['not_booked', 'LOCK_LOST', 0], 'the expired holder wrote nothing');
+    assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); assert.equal(r.mock.jobs.size, 1);
+    assert.deepEqual((await chainOf(r)).map((c) => [c.gen, c.state]), [[1, 'pending'], [2, 'client_created'], [3, 'pending'], [4, 'created']], 'the chain is the valid holder\'s alone');
+    assert.deepEqual(readdirSync(r.dir).filter((f) => f.endsWith('.tmp')), []);
+  } finally { release(); await r.done(); }
+});
+
+test('the backstop: if another writer takes the next generation in the instant after this holder loaded the chain, the publish is refused - LEDGER_CONFLICT, uncertain, nothing sent, the other file untouched - and the next attempt fails closed on it', async () => {
+  const r = await rig();
+  try {
+    afterResponse(r, /FindTestJobs/, () => writeFileSync(genPath(r, 1), 'a foreign writer got here first'));
+    const res = await bookTestVisit(r.ctx, CREDS, REQ); blockedClean(res, 'LEDGER_CONFLICT'); assert.deepEqual(mutations(r.mock), []);
+    assert.equal(readFileSync(genPath(r, 1), 'utf8'), 'a foreign writer got here first', 'overwritten by nobody'); assert.deepEqual(readdirSync(r.dir).filter((f) => f.endsWith('.tmp')), []);
+    blockedClean(await bookTestVisit(r.ctx, CREDS, REQ), 'LEDGER_UNREADABLE'); assert.deepEqual(mutations(r.mock), []);
+  } finally { await r.done(); }
+});
+
+test('a link that fails: at the first save it is LEDGER_UNAVAILABLE and not_booked with nothing sent; after the client was created it is uncertain, no job is sent, and a retry is stopped as PENDING_UNRESOLVED (no second client)', async () => {
+  for (const failAt of [1, 2]) {
+    const r = await rig();
+    try {
+      let n = 0; const vault = createVault(r.dir, fakeProtector, { linkFile: (from, to) => { if (++n === failAt) throw Object.assign(new Error('x'), { code: 'EPERM' }); linkSync(from, to); } });
+      const res = await bookTestVisit({ ...r.ctx, vault }, CREDS, REQ);
+      if (failAt === 1) { assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'LEDGER_UNAVAILABLE', 0]); assert.deepEqual(mutations(r.mock), []); assert.deepEqual(r.ctx.vault.generations(ledgerName()), []); }
+      else {
+        assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'LEDGER_UNAVAILABLE', 1]); assert.deepEqual(mutations(r.mock), ['clientCreate'], 'the job was never sent'); assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending']);
+        const again = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([again.status, again.reason, again.writes], ['uncertain', 'PENDING_UNRESOLVED', 0]); assert.deepEqual(mutations(r.mock), ['clientCreate']);
+      }
+      assert.deepEqual(readdirSync(r.dir).filter((f) => f.endsWith('.tmp')), [], 'failAt=' + failAt);
+    } finally { await r.done(); }
+  }
+});
+
+test('the generation cap: a chain at 99 cannot grow (LEDGER_UNAVAILABLE, nothing sent); a chain beyond 99 is unreadable', async () => {
+  const r = await rig();
+  try {
+    for (let n = 1; n <= 99; n++) await seedGen(r, n, { state: 'none' });
+    const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'LEDGER_UNAVAILABLE', 0]); assert.deepEqual(mutations(r.mock), []); assert.equal(r.ctx.vault.generations(ledgerName()).length, 99);
+    await seedGen(r, 100, { state: 'none' }); blockedClean(await bookTestVisit(r.ctx, CREDS, REQ), 'LEDGER_UNREADABLE'); assert.deepEqual(mutations(r.mock), []);
+  } finally { await r.done(); }
+});
+
+test('a cleared key ("none" after a refused client) is no prior state: the next attempt books normally, and the chain keeps growing from where it was', async () => {
+  const r = await rig();
+  try {
+    r.mock.opts.clientUserErrors = true; assert.equal((await bookTestVisit(r.ctx, CREDS, REQ)).reason, 'JOBBER_REFUSED'); assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending', 'none']);
+    r.mock.opts.clientUserErrors = false; const ok = await bookTestVisit(r.ctx, CREDS, REQ); assert.equal(ok.status, 'booked_verified');
+    assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending', 'none', 'pending', 'client_created', 'pending', 'created']);
+  } finally { await r.done(); }
+});
+
+// ---- corruption: every unreadable or invalid chain fails closed (uncertain, 0 writes, nothing sent) and is left exactly as it was
+const BAD_CHAINS: Array<[string, (r: Rig) => Promise<void>]> = [
+  ['an empty highest file', async (r) => { writeFileSync(genPath(r, 1), ''); }],
+  ['garbage that cannot be decoded', async (r) => { writeFileSync(genPath(r, 1), 'zzzz not a protected file'); }],
+  ['valid protection around text that is not JSON', async (r) => { writeFileSync(genPath(r, 1), await fakeProtector.protect('not json')); }],
+  ['another key\'s marker inside', async (r) => { await seedGen(r, 1, { state: 'pending' }, { marker: 'DREWTEST-000000000000' }); }],
+  ['a different generation number inside', async (r) => { await seedGen(r, 1, { state: 'pending' }, { gen: 2 }); }],
+  ['an extra field in the file', async (r) => { await seedGen(r, 1, { state: 'pending' }, { extra: 1 }); }],
+  ['the older file version', async (r) => { await seedGen(r, 1, { state: 'pending' }, { version: 1 }); }],
+  ['a "created" entry with no job id', async (r) => { await seedGen(r, 1, { state: 'created' }); }],
+  ['a "client_created" entry with no ids', async (r) => { await seedGen(r, 1, { state: 'client_created' }); }],
+  ['a "pending" entry with a job id', async (r) => { await seedGen(r, 1, { state: 'pending', jobId: 'JOB-12345' }); }],
+  ['a "pending" entry with only one id', async (r) => { await seedGen(r, 1, { state: 'pending', clientId: 'CLIENT-1' }); }],
+  ['a "none" entry with ids', async (r) => { await seedGen(r, 1, { state: 'none', jobId: 'JOB-12345' }); }],
+  ['an unknown state', async (r) => { await seedGen(r, 1, { state: 'done', jobId: 'JOB-12345' }); }],
+  ['an unknown entry field', async (r) => { await seedGen(r, 1, { state: 'pending', note: 'x' }); }],
+  ['an id that is not text', async (r) => { await seedGen(r, 1, { state: 'created', jobId: 12345 }); }],
+  ['an id with forbidden characters', async (r) => { await seedGen(r, 1, { state: 'created', jobId: 'JOB 12 345; drop' }); }],
+  ['an entry that is not an object', async (r) => { await seedGen(r, 1, 'created'); }],
+  ['a gap in the numbers (1 and 3)', async (r) => { await seedGen(r, 1, { state: 'pending' }); await seedGen(r, 3, { state: 'pending' }); }],
+  ['a generation 0 file', async (r) => { await seedGen(r, 0, { state: 'pending' }); }],
+  ['a valid older generation under an unreadable newer one (no fallback)', async (r) => { await seedGen(r, 1, { state: 'pending' }); writeFileSync(genPath(r, 2), 'garbage'); }],
+];
+test('corruption: every bad generation chain (' + BAD_CHAINS.length + ' kinds) fails closed - uncertain, LEDGER_UNREADABLE, 0 writes, nothing sent - and every file is left byte-for-byte as it was', async () => {
+  for (const [name, make] of BAD_CHAINS) {
+    const r = await rig();
+    try {
+      await make(r); const before = ledgerFileBytes(r);
+      const res = await bookTestVisit(r.ctx, CREDS, REQ); try { blockedClean(res, 'LEDGER_UNREADABLE'); } catch (e) { throw new Error(name + ': ' + (e as Error).message); }
+      assert.deepEqual(mutations(r.mock), [], name); assert.deepEqual(ledgerFileBytes(r), before, name + ': untouched'); assert.deepEqual(readdirSync(r.dir).filter((f) => f.endsWith('.tmp')), [], name);
+    } finally { await r.done(); }
+  }
+});
+
+test('stray files do not matter: temporary files, other keys\' chains and misnumbered names beside a valid chain are ignored', async () => {
+  const r = await rig();
+  try {
+    const stem = ledgerName(); writeFileSync(join(r.dir, `${stem}.1.enc.0123abcd.tmp`), 'orphan'); writeFileSync(join(r.dir, `${stem}.01.enc`), 'x'); writeFileSync(join(r.dir, `${stem}.1000.enc`), 'x'); writeFileSync(join(r.dir, `${stem}.x.enc`), 'x');
+    await seedGen(r, 1, { state: 'pending' }, {}, { ...REQ, key: 'call-aaaabbbbccccdddd' });
+    const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.equal(res.status, 'booked_verified'); assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending', 'client_created', 'pending', 'created']);
+  } finally { await r.done(); }
+});
+
+// ---- migration: the older single-file ledger is read only, and a key's own chain always wins over it
+test('migration: a legacy "created" entry is verified again with no write, no generation file and the legacy file unchanged', async () => {
+  const r = await rig();
+  try {
+    const first = await bookTestVisit(r.ctx, CREDS, REQ); const legacy = await toLegacy(r); assert.equal(legacy.state, 'created'); const bytes = ledgerFileBytes(r); const sent = mutations(r.mock).length;
+    r.mock.opts.searchBlind = true;   // the ledger alone must prevent the repeat
+    const again = await bookTestVisit(r.ctx, CREDS, REQ);
+    assert.deepEqual([again.status, again.duplicate, again.writes, again.jobId], ['booked_verified', true, 0, first.jobId]); assert.equal(mutations(r.mock).length, sent); assert.deepEqual(ledgerFileBytes(r), bytes, 'legacy untouched, no new file');
+  } finally { await r.done(); }
+});
+
+test('migration: a legacy "pending" entry blocks the key (PENDING_UNRESOLVED, 0 writes) and is not rewritten; with the job visible in Jobber it is adopted, the chain starts at generation 1 with the ids kept, and the legacy file is still unchanged', async () => {
+  const r = await rig();
+  try {
+    await seedLegacy(r, { [markerFor(REQ.key)]: { state: 'pending' } }); const bytes = ledgerFileBytes(r);
+    blockedClean(await bookTestVisit(r.ctx, CREDS, REQ), 'PENDING_UNRESOLVED'); assert.deepEqual(mutations(r.mock), []); assert.deepEqual(ledgerFileBytes(r), bytes);
+  } finally { await r.done(); }
+  const r2 = await rig();
+  try {
+    r2.mock.opts.crashAfterJobCreate = true; assert.equal((await bookTestVisit(r2.ctx, CREDS, REQ)).status, 'uncertain'); r2.mock.opts.crashAfterJobCreate = false;
+    const legacy = await toLegacy(r2); assert.equal(legacy.state, 'pending'); assert.ok(legacy.clientId !== undefined); const legacyBytes = readFileSync(legacyPath(r2), 'utf8'); const sent = mutations(r2.mock).length;
+    const adopted = await bookTestVisit(r2.ctx, CREDS, REQ); assert.deepEqual([adopted.status, adopted.duplicate, adopted.writes], ['booked_verified', true, 0]); assert.equal(mutations(r2.mock).length, sent);
+    const chain = await chainOf(r2); assert.deepEqual(chain.map((c) => [c.gen, c.state]), [[1, 'created']]); assert.equal(chain[0].clientId, legacy.clientId, 'the ids from the legacy entry were kept'); assert.equal(chain[0].jobId, adopted.jobId);
+    assert.equal(readFileSync(legacyPath(r2), 'utf8'), legacyBytes, 'the legacy file is unchanged');
+  } finally { await r2.done(); }
+});
+
+test('migration: a legacy "client_created" entry reuses its client (one job write only), the chain starts at generation 1 with the ids kept, and the legacy file is unchanged', async () => {
+  const r = await rig();
+  try {
+    r.mock.opts.jobUserErrors = true; assert.equal((await bookTestVisit(r.ctx, CREDS, REQ)).reason, 'JOBBER_REFUSED'); r.mock.opts.jobUserErrors = false;
+    const legacy = await toLegacy(r); assert.equal(legacy.state, 'client_created'); const legacyBytes = readFileSync(legacyPath(r), 'utf8');
+    const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([res.status, res.writes], ['booked_verified', 1]); assert.equal(r.mock.clients, 1, 'no second client');
+    const chain = await chainOf(r); assert.deepEqual(chain.map((c) => [c.gen, c.state]), [[1, 'pending'], [2, 'created']]); assert.equal(chain[0].clientId, legacy.clientId); assert.equal(chain[1].jobId, res.jobId);
+    assert.equal(readFileSync(legacyPath(r), 'utf8'), legacyBytes);
+  } finally { await r.done(); }
+});
+
+test('migration precedence: once a key has its own chain, the legacy file is never consulted for it - not even a legacy "pending" or an unreadable legacy file', async () => {
+  const r = await rig();
+  try {
+    const first = await bookTestVisit(r.ctx, CREDS, REQ); const sent = mutations(r.mock).length;
+    await seedLegacy(r, { [markerFor(REQ.key)]: { state: 'pending' } });
+    const a = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([a.status, a.duplicate, a.writes, a.jobId], ['booked_verified', true, 0, first.jobId]);
+    writeFileSync(legacyPath(r), 'garbage'); const b = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([b.status, b.duplicate, b.writes], ['booked_verified', true, 0]); assert.equal(mutations(r.mock).length, sent);
+  } finally { await r.done(); }
+});
+
+const BAD_LEGACY: Array<[string, (r: Rig) => Promise<void>]> = [
+  ['garbage', async (r) => { writeFileSync(legacyPath(r), 'zzzz'); }],
+  ['an empty file', async (r) => { writeFileSync(legacyPath(r), ''); }],
+  ['not JSON', async (r) => { writeFileSync(legacyPath(r), await fakeProtector.protect('not json')); }],
+  ['a JSON list', async (r) => { writeFileSync(legacyPath(r), await fakeProtector.protect('[]')); }],
+  ['no entries', async (r) => { writeFileSync(legacyPath(r), await fakeProtector.protect(JSON.stringify({ version: 1 }))); }],
+  ['entries that are a list', async (r) => { await seedLegacy(r, []); }],
+  ['another file version', async (r) => { await seedLegacy(r, {}, 2); }],
+  ['this key\'s entry: "created" with no job id', async (r) => { await seedLegacy(r, { [markerFor(REQ.key)]: { state: 'created' } }); }],
+  ['this key\'s entry: the "none" state (never written by the older code)', async (r) => { await seedLegacy(r, { [markerFor(REQ.key)]: { state: 'none' } }); }],
+  ['this key\'s entry: an unknown state', async (r) => { await seedLegacy(r, { [markerFor(REQ.key)]: { state: 'finished', jobId: 'JOB-12345' } }); }],
+  ['this key\'s entry: an extra field', async (r) => { await seedLegacy(r, { [markerFor(REQ.key)]: { state: 'pending', x: 1 } }); }],
+  ['this key\'s entry: not an object', async (r) => { await seedLegacy(r, { [markerFor(REQ.key)]: 'pending' }); }],
+];
+test('migration, malformed legacy file (' + BAD_LEGACY.length + ' kinds): a key with no chain fails closed - uncertain, LEDGER_UNREADABLE, 0 writes, nothing sent - and the legacy file is left byte-for-byte as it was; entries of OTHER keys never matter', async () => {
+  for (const [name, make] of BAD_LEGACY) {
+    const r = await rig();
+    try {
+      await make(r); const before = ledgerFileBytes(r);
+      const res = await bookTestVisit(r.ctx, CREDS, REQ); try { blockedClean(res, 'LEDGER_UNREADABLE'); } catch (e) { throw new Error(name + ': ' + (e as Error).message); }
+      assert.deepEqual(mutations(r.mock), [], name); assert.deepEqual(ledgerFileBytes(r), before, name + ': untouched');
+    } finally { await r.done(); }
+  }
+  const r = await rig();
+  try {
+    await seedLegacy(r, { 'DREWTEST-AAAAAAAAAAAA': { state: 'created', jobId: 'JOB-OTHER' }, 'DREWTEST-BBBBBBBBBBBB': { state: 'bogus' } }); const bytes = readFileSync(legacyPath(r), 'utf8');
+    assert.equal((await bookTestVisit(r.ctx, CREDS, REQ)).status, 'booked_verified', 'a legacy file that does not mention this key does not block it'); assert.equal(readFileSync(legacyPath(r), 'utf8'), bytes);
+  } finally { await r.done(); }
+});
+
+test('ledger source: the booking publishes only through publishBlob with the lock guard, never writes or removes any ledger file itself, never touches the older single file, and has its own reasons and the 99 cap', () => {
+  const src = readFileSync(new URL('../src/jobber-booking.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.equal([...src.matchAll(/publishBlob\(/g)].length, 1, 'one publish, inside save()'); assert.ok(/await ctx\.vault\.publishBlob\(`\$\{base\}\.\$\{next\}`, text, \(\) => lock\.assertHeld\(\)\) === 'exists'\) throw new JobberError\('LEDGER_CONFLICT'\)/.test(src));
+  assert.ok(!/saveBlob\(|saveLedger|loadLedger|rmSync|unlinkSync|renameSync|writeFileSync|from 'node:fs'/.test(src), 'no other way to write, replace or remove a ledger file');
+  assert.equal([...src.matchAll(/LEGACY_LEDGER/g)].length, 4, 'the older file name appears only in its definition, the chain file prefix, its existence check and its read'); assert.ok(/hasBlob\(LEGACY_LEDGER\)/.test(src) && /loadBlob\(LEGACY_LEDGER\)/.test(src));
+  assert.ok(/const MAX_GENERATION = 99;/.test(src) && /generation >= MAX_GENERATION\) throw new JobberError\('LEDGER_UNAVAILABLE'\)/.test(src));
+  assert.ok(/code === 'LOCK_LOST' \|\| code === 'LEDGER_UNREADABLE' \|\| code === 'LEDGER_CONFLICT' \|\| code === 'LEDGER_UNAVAILABLE' \? code : 'API_ERROR'/.test(src), 'each has its own reason');
+  assert.ok(/const unsure = reason === 'LEDGER_UNREADABLE' \|\| reason === 'LEDGER_CONFLICT';/.test(src) && /done\(writes > 0 \|\| unsure \? 'uncertain' : 'not_booked'/.test(src), 'an untrustworthy ledger is uncertain, not "not booked"');
+  assert.ok(/if \(gens\.length === 0\) return \{ gen: 0, entry: await legacyEntry\(ctx, marker\) \};/.test(src), 'the older file is read only when the key has no chain');
+  assert.ok(/top > MAX_GENERATION \|\| gens\.length !== top \|\| gens\[0\] !== 1/.test(src), 'the numbers must run 1..n');
+});
+test('an undecodable file (the protector itself refuses it, as Windows does for another user\'s or a damaged blob) fails closed for the highest generation and for the older file, and is left as it was', async () => {
+  const strict: Protector = { protect: fakeProtector.protect, unprotect: async (b) => { if (!b.startsWith('P1:')) throw new JobberError('BAD_CONFIG'); return fakeProtector.unprotect(b); } };
+  for (const where of ['generation', 'legacy']) {
+    const r = await rig();
+    try {
+      const ctx: Ctx = { ...r.ctx, vault: createVault(r.dir, strict) };
+      writeFileSync(where === 'generation' ? genPath(r, 1) : legacyPath(r), 'zzzz'); const before = ledgerFileBytes(r);
+      blockedClean(await bookTestVisit(ctx, CREDS, REQ), 'LEDGER_UNREADABLE'); assert.deepEqual(mutations(r.mock), [], where); assert.deepEqual(ledgerFileBytes(r), before, where);
+    } finally { await r.done(); }
+  }
 });

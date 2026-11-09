@@ -12,7 +12,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const JOBBER_ENDPOINTS = Object.freeze({ authorize: 'https://api.getjobber.com/api/oauth/authorize', token: 'https://api.getjobber.com/api/oauth/token', graphql: 'https://api.getjobber.com/api/graphql' });
@@ -23,7 +23,7 @@ export const CALLBACK_PATH = '/jobber/callback';
 /** The exact OAuth Callback URL to enter in the Jobber Developer Center for this connector. */
 export const callbackUrlFor = (port: number): string => `http://localhost:${port}${CALLBACK_PATH}`;
 
-export type ConnectorCode = 'NO_CREDENTIALS' | 'NOT_CONNECTED' | 'RECONNECT_REQUIRED' | 'DENIED' | 'EXCHANGE_FAILED' | 'ACCOUNT_MISMATCH' | 'ACCOUNT_UNREADABLE' | 'RATE_LIMITED' | 'API_ERROR' | 'NOT_READ_ONLY' | 'TIMEOUT' | 'BAD_CONFIG' | 'BAD_RESPONSE' | 'LOCK_LOST';
+export type ConnectorCode = 'NO_CREDENTIALS' | 'NOT_CONNECTED' | 'RECONNECT_REQUIRED' | 'DENIED' | 'EXCHANGE_FAILED' | 'ACCOUNT_MISMATCH' | 'ACCOUNT_UNREADABLE' | 'RATE_LIMITED' | 'API_ERROR' | 'NOT_READ_ONLY' | 'TIMEOUT' | 'BAD_CONFIG' | 'BAD_RESPONSE' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE';
 /** An error whose message is a fixed code word only: it can never carry a secret. */
 export class JobberError extends Error { readonly code: ConnectorCode; /** Only for ACCOUNT_MISMATCH: the NAME of the account that answered (a business name, not a secret), so the founder can see which account it was. */ readonly foundAccountName?: string; constructor(code: ConnectorCode, foundAccountName?: string) { super(code); this.code = code; this.name = 'JobberError'; if (foundAccountName !== undefined) this.foundAccountName = foundAccountName; } }
 
@@ -50,7 +50,7 @@ export function pkcePair(random: (n: number) => Buffer = randomBytes): { verifie
 /** The private folder: credentials and tokens, each protected by the Protector, written atomically. Never inside the repository (the entry point defaults to the user's home folder). */
 /** Handed to the code that runs under a lock. `assertHeld` throws LOCK_LOST unless this holder still owns the lock and its heartbeat is current: call it right before every write that must not overlap another holder's. */
 export interface LockHandle { assertHeld(): void }
-export interface LockTimings { /** how often the holder refreshes its lock file (default 5000 ms) */ heartbeatMs?: number; /** a lock whose file has not been refreshed for this long is abandoned (default 30000 ms) */ staleMs?: number; /** TEST SEAM, never set in production: called once a lock has been judged abandoned and before it is moved aside, so a test can replace it at exactly that moment */ beforeTakeover?: () => void }
+export interface LockTimings { /** how often the holder refreshes its lock file (default 5000 ms) */ heartbeatMs?: number; /** a lock whose file has not been refreshed for this long is abandoned (default 30000 ms) */ staleMs?: number; /** TEST SEAM, never set in production: called once a lock has been judged abandoned and before it is moved aside, so a test can replace it at exactly that moment */ beforeTakeover?: () => void; /** TEST SEAM, never set in production: replaces the hard link that publishes a generation file, so a test can make the link fail */ linkFile?: (from: string, to: string) => void }
 export function createVault(dir: string, protector: Protector, timings: LockTimings = {}) {
   const heartbeatMs = timings.heartbeatMs ?? 5_000; const staleMs = timings.staleMs ?? 30_000;
   const credFile = join(dir, 'credentials.enc'); const tokFile = join(dir, 'tokens.enc');
@@ -73,6 +73,33 @@ export function createVault(dir: string, protector: Protector, timings: LockTimi
     /** A named protected text file in the private folder (the booking ledger). */
     async saveBlob(name: string, text: string): Promise<void> { if (!NAME.test(name)) throw new JobberError('BAD_CONFIG'); atomic(join(dir, `${name}.enc`), await protector.protect(text)); },
     async loadBlob(name: string): Promise<string | undefined> { if (!NAME.test(name)) throw new JobberError('BAD_CONFIG'); const p = join(dir, `${name}.enc`); if (!existsSync(p)) return undefined; try { return await protector.unprotect(readFileSync(p, 'utf8').trim()); } catch { return undefined; } },
+    /** True when the named protected file exists (it says nothing about whether it can be read). */
+    hasBlob(name: string): boolean { if (!NAME.test(name)) throw new JobberError('BAD_CONFIG'); return existsSync(join(dir, `${name}.enc`)); },
+    /** The generation numbers present for `base` (files `<base>.<n>.enc`, n = 0 or 1 to 999 without leading zeros), ascending. Synchronous; it reads no content. */
+    generations(base: string): number[] {
+      if (!NAME.test(base)) throw new JobberError('BAD_CONFIG');
+      let names: string[]; try { names = readdirSync(dir); } catch { return []; }
+      const own = `${base}.`; const found: number[] = [];
+      for (const f of names) { if (!f.startsWith(own) || !f.endsWith('.enc')) continue; const mid = f.slice(own.length, -4); if (/^(0|[1-9][0-9]{0,2})$/.test(mid)) found.push(Number(mid)); }
+      return found.sort((a, b) => a - b);
+    },
+    /**
+     * Publishes a NEW protected file that never replaces an existing one: 'published', or 'exists' when that name is already taken (the caller lost a race). The only await is the protect step. After it,
+     * with no await in between: the content is written to a private temporary file and flushed to disk, `guard()` is called (it throws if the caller no longer owns its lock), and the file is linked
+     * into place with an exclusive hard link. A hard link that cannot be made for any other reason, or a write that fails, is LEDGER_UNAVAILABLE. The temporary file is always removed.
+     */
+    async publishBlob(name: string, text: string, guard: () => void): Promise<'published' | 'exists'> {
+      if (!NAME.test(name)) throw new JobberError('BAD_CONFIG');
+      const blob = await protector.protect(text);
+      // SYNC-BEGIN (nothing below awaits: the lock is checked immediately before the link)
+      ensure(); const final = join(dir, `${name}.enc`); const tmp = `${final}.${randomBytes(8).toString('hex')}.tmp`;
+      try {
+        try { const fd = openSync(tmp, 'wx', 0o600); try { writeSync(fd, blob); fsyncSync(fd); } finally { closeSync(fd); } } catch { throw new JobberError('LEDGER_UNAVAILABLE'); }
+        guard();
+        try { (timings.linkFile ?? linkSync)(tmp, final); return 'published'; } catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') return 'exists'; throw new JobberError('LEDGER_UNAVAILABLE'); }
+      } finally { rmSync(tmp, { force: true }); }
+      // SYNC-END
+    },
     withRefreshLock<T>(fn: () => Promise<T>, waitMs = 8000): Promise<T> { return this.withLock('refresh', fn, waitMs); },
     /**
      * Runs `fn` while holding the named lock (one holder at a time, even across processes). The lock file holds the holder's own random token and is refreshed while the holder lives (the heartbeat); a lock
