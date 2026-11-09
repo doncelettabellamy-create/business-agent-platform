@@ -163,6 +163,8 @@ export function confirmedMismatches(c: ConfirmedFacts | undefined, req: BookingR
 /** A clock time "HH:MM" as minutes since midnight, for the diagnostics (a number, never text). */
 const minutesOf = (hm: string): number => { const [h, m] = hm.split(':').map(Number); return h * 60 + m; };
 
+/** A Twilio Call SID, only if it is exactly one; anything else is nothing. */
+const sidOf = (x: unknown): string | undefined => (typeof x === 'string' && /^CA[0-9a-f]{32}$/.test(x) ? x : undefined);
 export function createFastCallHandler(deps: FastDeps): FastHandler {
   if (typeof deps !== 'object' || deps === null || !Number.isInteger(deps.maxCalls) || deps.maxCalls < 1 || typeof deps.settings !== 'object' || !(deps.numbers instanceof Set) || !(deps.approvedCallers instanceof Set) || !(deps.approvedCustomerNumbers instanceof Set) || !/^\+[1-9]\d{9,14}$/.test(String(deps.ownerNumber))
     || ['callerOf', 'busy', 'book', 'sendText', 'verifyText', 'now', 'log'].some((k) => typeof (deps as unknown as Record<string, unknown>)[k] !== 'function')) throw new RangeError('the fast call handler needs its dependencies');
@@ -239,12 +241,13 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     /** An ending that told the caller "a person will ..." sends the OWNER one fixed email (only when test emails are on): the reason code, the time, the callback number and the steps reached, never anything the caller said. It never throws and never delays the end of the call; the call ends once, so it is sent once. */
     const PROMISED = /\ba person will\b/i;
     let noticed = false;   // a call sends at most one notice, whichever ending reaches it first
+    let speakerSid: string | undefined;   // set only when the speaker fails: only that notice names the call
     function sendOwnerNotice(reason: string, mayExist: boolean): void {
       if (noticed) return; noticed = true;
       try {
         if (deps.emailsEnabled !== true || deps.sendEmail === undefined) return;
         const tz = S.availability.timezone; const at = deps.now(); const number = callback !== '' ? callback : caller;
-        const msg = followUpEmail({ businessName: S.businessName, reason, whenText: `${new Date(at).toLocaleString('en-US', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' })} ${zoneLabelOf(tz, at)}`, ...(number === '' ? {} : { callbackNumber: number }), steps, bookingMayExist: mayExist });
+        const msg = followUpEmail({ businessName: S.businessName, reason, whenText: `${new Date(at).toLocaleString('en-US', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' })} ${zoneLabelOf(tz, at)}`, ...(number === '' ? {} : { callbackNumber: number }), steps, bookingMayExist: mayExist, ...(speakerSid === undefined ? {} : { callSid: speakerSid }) });
         const send = deps.sendEmail; let timer: ReturnType<typeof setTimeout> | undefined;
         const late = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), deps.followUpMs ?? 15_000); timer.unref?.(); });
         const job = (async (): Promise<void> => {
@@ -696,7 +699,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       }
       if (ev.kind === 'reply_failed') { const a = awaiting; if (a !== undefined) enqueue(async () => { if (awaiting !== a) return; if (++a.replays > 2) return end('REPLY_FAILED', undefined); play(a, a.text); }); return; }
       // The voice is gone: from here the call is treated like a hang-up. `hungUp` stops a booking that has not been sent yet, makes a write already in flight record its real result when it settles, and holds the slot until then. With no write in flight the owner is told now; with one in flight the notice waits for its result.
-      if (ev.kind === 'speaker_down') { hungUp = true; if (!booking) sendOwnerNotice('SPEAKER_DOWN', bookSent); void end('SPEAKER_DOWN'); return; }
+      if (ev.kind === 'speaker_down') { hungUp = true; speakerSid = sidOf(callSid); if (!booking) sendOwnerNotice('SPEAKER_DOWN', bookSent); void end('SPEAKER_DOWN'); return; }
     };
   }
 

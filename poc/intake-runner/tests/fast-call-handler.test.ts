@@ -1282,7 +1282,7 @@ test('ADDRESS CHECK (NOT ASKED FOR AN UNUSABLE ADDRESS): an address the shape gu
 
 // ---------------------------------------------------------------- M1: the owner's follow-up notice (an ending that tells the caller "a person will ..." sends the OWNER one fixed email)
 const notices = (t: ReturnType<typeof build>) => t.mails.filter((m) => m.subject === FOLLOW_UP_SUBJECT);
-const FOLLOW_UP_LINES: RegExp[] = [/^A Drew Cleaning DEMO call told the caller that a person would follow up\. Nobody else has been told\.$/, /^$/, /^Reason code: [A-Z][A-Z0-9_]{2,47}$/, /^Callback number: (\(555\) 010-\d{4}|not available)$/, /^Call ended: [A-Za-z0-9:, ]+$/,
+const FOLLOW_UP_LINES: RegExp[] = [/^A Drew Cleaning DEMO call told the caller that a person would follow up\. Nobody else has been told\.$/, /^$/, /^Reason code: [A-Z][A-Z0-9_]{2,47}$/, /^Callback number: (\(555\) 010-\d{4}|not available)$/, /^Call ended: [A-Za-z0-9:, ]+$/, /^Call SID: CA[0-9a-f]{32}$/,
   /^Steps reached: ([A-Z][A-Z0-9_]{2,47})(, [A-Z][A-Z0-9_]{2,47})*$|^Steps reached: none$/, /^(Check Jobber \(the Developer Test Account\): the booking request was sent, so a job may exist even though it was not verified\.|No booking was sent to Jobber\.)$/,
   /^This notice holds no name, address or anything else the caller said\.$/, /^Sent by .+\. This address was approved for this test only\.$/];
 
@@ -1380,7 +1380,7 @@ test('M1 callback number: the number the caller gave and confirmed is the one in
 test('M1 source guard: the notice is built from a short fixed list, sent to the owner role only, from the one place a call ends, and never from what the caller said', () => {
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   const fn = /function sendOwnerNotice[\s\S]*?\r?\n    \}\r?\n/.exec(src)?.[0] ?? ''; assert.ok(fn.length > 200, 'the function was found');
-  assert.ok(!/firstName|lastName|heard|contact\.|street|zip|\bp\.|offer|pref|size|price|callSid|confirmed/i.test(fn.replace(/priceDollars/g, '')), 'no caller-given value is read');
+  assert.ok(!/firstName|lastName|heard|contact\.|street|zip|\bp\.|offer|pref|size|price|confirmed/i.test(fn.replace(/priceDollars/g, '')), 'no caller-given value is read');
   assert.ok(/send\('owner', msg\.subject, msg\.text\)/.test(fn) && !/'customer'/.test(fn), 'the owner role only');
   assert.equal([...src.matchAll(/notifyFollowUp\(/g)].length, 3, 'defined once and called from end(): when the call ends and when an ending is reached after a hang-up');
   assert.equal([...src.matchAll(/sendOwnerNotice\(/g)].length, 4, 'defined once and called from the promise check, from the skipped booking and from the speaker failure');
@@ -1512,7 +1512,7 @@ test('speaker down at intake: the call ends as SPEAKER_DOWN, nothing is booked, 
   speakerDown(t.c); t.c.emit({ kind: 'speaker_down' }); t.c.hangUp(); await t.h.idle();
   assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(t.booked.length, 0); assert.equal(t.texts.length, 0);
   assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]], 'one owner notice and nothing else');
-  const lines = t.mails[0].text.split('\n'); assert.ok(lines.includes('Reason code: SPEAKER_DOWN')); assert.ok(lines.includes('No booking was sent to Jobber.'));
+  const lines = t.mails[0].text.split('\n'); assert.ok(lines.includes('Reason code: SPEAKER_DOWN')); assert.ok(lines.includes('No booking was sent to Jobber.')); assert.deepEqual(lines.filter((l) => l.startsWith('Call SID')), ['Call SID: ' + SID], 'the call is named once');
   for (const l of lines) assert.ok(FOLLOW_UP_LINES.some((re) => re.test(l)), 'an unexpected line: ' + l);
   assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1); assert.equal(t.h.active(), 0); nothingPersonal(t);
   assert.deepEqual(row(t, 'FAST_FOLLOWUP'), { owner: 'accepted', reason: 'SPEAKER_DOWN' });
@@ -1592,7 +1592,66 @@ test('speaker down, as a property: at every step of the call, with the signal re
 test('speaker down source guard: the failure sets the hang-up flag before it ends the call, notifies at once only when no write is in flight, and the notice is guarded to once per call', () => {
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
   assert.equal([...src.matchAll(/ev\.kind === 'speaker_down'/g)].length, 1);
-  assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ hungUp = true; if \(!booking\) sendOwnerNotice\('SPEAKER_DOWN', bookSent\); void end\('SPEAKER_DOWN'\); return; \}/.test(src), 'flag, then the guarded notice, then the end');
+  assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ hungUp = true; speakerSid = sidOf\(callSid\); if \(!booking\) sendOwnerNotice\('SPEAKER_DOWN', bookSent\); void end\('SPEAKER_DOWN'\); return; \}/.test(src), 'flag, the validated SID, then the guarded notice, then the end');
+  assert.equal([...src.matchAll(/speakerSid = /g)].length, 1, 'the SID is set in the speaker-failure branch only (behavior is pinned by the Call SID tests)');
   assert.ok(/function sendOwnerNotice\(reason: string, mayExist: boolean\): void \{\r?\n\s+if \(noticed\) return; noticed = true;/.test(src), 'the once-per-call guard is the first statement');
   assert.equal([...src.matchAll(/noticed = true/g)].length, 1);
+});
+
+// ================================================================ the Call SID in the speaker-failure notice (and only there)
+const SID = 'CA' + 'ab'.repeat(16);   // the fake carrier's default
+const sidLines = (t: ReturnType<typeof build>): string[] => notices(t).flatMap((m) => m.text.split('\n').filter((l) => l.startsWith('Call SID')));
+const allLinesFixed = (t: ReturnType<typeof build>): void => { for (const m of notices(t)) for (const l of m.text.split('\n')) assert.ok(FOLLOW_UP_LINES.some((re) => re.test(l)), 'an unexpected line: ' + l); };
+const sidAnywhereElse = (t: ReturnType<typeof build>, sid: string): void => { assert.ok(!JSON.stringify(t.logs).includes(sid), 'the SID is not in the diagnostics'); for (const m of t.mails.filter((x) => x.subject !== FOLLOW_UP_SUBJECT)) assert.ok(!m.text.includes(sid) && !m.subject.includes(sid), 'the SID is not in a booking email'); for (const x of t.texts) assert.ok(!x.body.includes(sid)); };
+
+test('Call SID, valid: every speaker-failure notice (at intake, with a write in flight that is not verified, and before the request is sent) names the call once, with fixed lines only and no caller detail; the SID appears nowhere else', async () => {
+  // at intake
+  const a = build({ textsEnabled: false, emails: 'accept' }); a.h.serve(a.c.transport); a.c.setup(DREW, SID, 'Testa Invented'); await a.c.hears(/Is that right\? Say yes or no/, 'yes'); speakerDown(a.c); await a.h.idle();
+  assert.deepEqual(sidLines(a), ['Call SID: ' + SID]); allLinesFixed(a); nothingPersonal(a); sidAnywhereElse(a, SID);
+  // a write in flight: the notice is deferred until the result, and still names the call
+  const g = gate<BookingResult>(); const b = build({ textsEnabled: false, emails: 'accept', book: () => g.p }); await toPendingWrite(b); speakerDown(b.c);
+  assert.equal(b.mails.length, 0, 'deferred'); g.res({ status: 'uncertain', reason: 'NOT_FOUND', writes: 2 }); await b.h.idle();
+  assert.deepEqual(sidLines(b), ['Call SID: ' + SID]); assert.equal(notices(b).length, 1); allLinesFixed(b); nothingPersonal(b); sidAnywhereElse(b, SID);
+  // before the request is sent
+  const hold = gate<void>(); const c = build({ textsEnabled: false, emails: 'accept', busyHold: hold.p });
+  c.h.serve(c.c.transport); await toOffer(c.c); await c.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.c.hears(/calling from a number ending in/, 'yes'); await c.c.hears(/To confirm/, 'yes');
+  await c.c.until(() => c.busyCalls() >= 2, 'the last availability check'); speakerDown(c.c); hold.res(); await c.h.idle();
+  assert.deepEqual(sidLines(c), ['Call SID: ' + SID]); assert.equal(notices(c).length, 1); allLinesFixed(c); sidAnywhereElse(c, SID);
+});
+
+test('Call SID, deferred and verified: a write that verifies after the voice failed sends no follow-up notice, so the SID is sent nowhere', async () => {
+  const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p }); await toPendingWrite(t); speakerDown(t.c); g.res(OK_RESULT); await t.h.idle();
+  assert.equal(notices(t).length, 0); assert.deepEqual(sidLines(t), []); sidAnywhereElse(t, SID);
+});
+
+test('Call SID, missing or malformed (it reached the handler unchecked): the notice is still sent, once, with no Call SID line and nothing else changed', async () => {
+  const bad: unknown[] = [undefined, null, '', 'CA', 'ca' + 'ab'.repeat(16), 'CA' + 'AB'.repeat(16), 'CA' + 'ab'.repeat(16) + '0', 'CA' + 'ab'.repeat(15), SID + '\nInjected: yes', ' ' + SID, 42, {}, [SID]];
+  for (const x of bad) {
+    const t = build({ textsEnabled: false, emails: 'accept' }); t.h.serve(t.c.transport); t.c.emit({ kind: 'setup', to: DREW, callSid: x }); t.c.emit({ kind: 'utterance', text: 'Testa Invented' });
+    await t.c.hears(/Is that right\? Say yes or no/, 'yes'); speakerDown(t.c); await t.h.idle();
+    assert.equal(notices(t).length, 1, JSON.stringify(x)); assert.deepEqual(sidLines(t), [], 'no SID line: ' + JSON.stringify(x)); allLinesFixed(t); assert.ok(notices(t)[0].text.split('\n').includes('Reason code: SPEAKER_DOWN'));
+  }
+});
+
+test('Call SID, early: the voice fails before the caller-ID check has finished; a valid SID is named, a malformed one is not, and the call is not booked either way', async () => {
+  for (const [sid, want] of [[SID, ['Call SID: ' + SID]], ['CA-not-a-sid', []]] as Array<[string, string[]]>) {
+    const t = build({ textsEnabled: false, emails: 'accept' }); t.h.serve(t.c.transport); t.c.emit({ kind: 'setup', to: DREW, callSid: sid }); t.c.emit({ kind: 'speaker_down' }); t.c.transport.close(1011); await t.h.idle();
+    assert.deepEqual(sidLines(t), want, sid); assert.equal(notices(t).length, 1); assert.equal(t.booked.length, 0); allLinesFixed(t); assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]);
+  }
+});
+
+test('Call SID, other notices unchanged: a declined or unverified booking, a skipped booking after a hang-up, and a caller hang-up never name the call, even though the call has a valid SID', async () => {
+  // M1: an unverified booking, no speaker failure
+  const a = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }) }); await toBooked(a);
+  assert.equal(notices(a).length, 1); assert.deepEqual(sidLines(a), []); assert.ok(!notices(a)[0].text.includes(SID)); allLinesFixed(a);
+  // M2: hang-up with a write in flight, not verified
+  const g = gate<BookingResult>(); const b = build({ textsEnabled: false, emails: 'accept', book: () => g.p }); await toPendingWrite(b); b.c.hangUp(); g.res({ status: 'uncertain', reason: 'NOT_FOUND', writes: 2 }); await b.h.idle();
+  assert.equal(notices(b).length, 1); assert.deepEqual(sidLines(b), []); assert.ok(!notices(b)[0].text.includes(SID)); allLinesFixed(b);
+  // M2: hang-up before the request is sent
+  const hold = gate<void>(); const c = build({ textsEnabled: false, emails: 'accept', busyHold: hold.p });
+  c.h.serve(c.c.transport); await toOffer(c.c); await c.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await c.c.hears(/calling from a number ending in/, 'yes'); await c.c.hears(/To confirm/, 'yes');
+  await c.c.until(() => c.busyCalls() >= 2, 'the last availability check'); c.c.hangUp(); hold.res(); await c.h.idle();
+  assert.equal(notices(c).length, 1); assert.deepEqual(sidLines(c), []); assert.ok(!notices(c)[0].text.includes(SID));
+  // a caller who hangs up with nothing promised sends no notice at all
+  const d = build({ textsEnabled: false, emails: 'accept' }); d.h.serve(d.c.transport); d.c.setup(DREW, SID, 'Testa Invented'); await d.c.hears(/Is that right\? Say yes or no/, 'yes'); d.c.hangUp(); await d.h.idle(); assert.equal(notices(d).length, 0);
 });

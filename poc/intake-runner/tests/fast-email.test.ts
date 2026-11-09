@@ -253,3 +253,15 @@ test('the owner follow-up notice (M1): fixed words, a fixed reason code, the cal
   const extra = followUpEmail({ ...base, customerName: 'Testa Invented', address: '123 Invented Lane', price: 199 } as unknown as FollowUpFacts);
   assert.ok(!/Testa|Invented|199/.test(extra.subject + extra.text));
 });
+
+test('the owner follow-up notice carries the Call SID only when it is exactly a Twilio Call SID, as one fixed line after the time; every other value adds nothing and the rest of the notice is unchanged', () => {
+  const base = { businessName: 'Drew Cleaning', reason: 'SPEAKER_DOWN', whenText: 'Monday, November 2, 2026 at 9:00 AM Central', callbackNumber: '+15550100002', steps: ['CALLER_VERIFIED', 'NAME'], bookingMayExist: false };
+  const plain = followUpEmail(base).text.split('\n'); const sid = 'CA' + '0123456789abcdef'.repeat(2);
+  const withSid = followUpEmail({ ...base, callSid: sid }).text.split('\n');
+  assert.equal(withSid.filter((l) => l.startsWith('Call SID')).length, 1); assert.equal(withSid[withSid.indexOf('Call SID: ' + sid) - 1], 'Call ended: Monday, November 2, 2026 at 9:00 AM Central', 'right after the time');
+  assert.deepEqual(withSid.filter((l) => l !== 'Call SID: ' + sid), plain, 'removing that one line gives exactly the notice without it');
+  assert.equal(followUpEmail({ ...base, callSid: sid }).subject, followUpEmail(base).subject);
+  const bad: unknown[] = [undefined, null, '', 'CA', 'ca' + '0123456789abcdef'.repeat(2), 'CA' + '0123456789ABCDEF'.repeat(2), 'CA' + '0123456789abcdef'.repeat(2) + '0', 'CA' + '0123456789abcdef'.repeat(2).slice(1), 'CA' + 'g'.repeat(32), ' ' + sid, sid + ' ', sid + '\n', sid + '\nInjected: yes', 'AC' + '0123456789abcdef'.repeat(2), 42, {}, [sid], { toString: () => sid }];
+  for (const x of bad) assert.deepEqual(followUpEmail({ ...base, callSid: x as never }).text.split('\n'), plain, 'adds nothing: ' + JSON.stringify(x));
+  assert.ok(!/Call SID/.test(followUpEmail({ ...base, bookingMayExist: true }).text), 'a notice without the field never names a call');
+});

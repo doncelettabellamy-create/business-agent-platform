@@ -60,7 +60,10 @@ export interface FollowUpFacts {
   steps: readonly string[];
   /** True when the booking request had already been sent to Jobber when the call ended: a job may exist even though it was not verified. */
   bookingMayExist: boolean;
+  /** The Twilio Call SID, so the owner can find the call. Shown only when it is exactly `CA` and 32 lower-case hex characters; anything else adds no line at all. Passed only for a speaker failure. */
+  callSid?: string;
 }
+const CALL_SID = /^CA[0-9a-f]{32}$/;
 const CODE = /^[A-Z][A-Z0-9_]{2,47}$/;
 /**
  * The ONE notice the owner gets when the call told the caller that "a person will follow up" (or call): the reason code, the time, the callback number and the steps reached. Fixed words only; no name,
@@ -70,6 +73,7 @@ export function followUpEmail(f: FollowUpFacts): EmailMessage {
   const phone = usPhone(f.callbackNumber);
   const steps = (Array.isArray(f.steps) ? f.steps : []).filter((s): s is string => typeof s === 'string' && CODE.test(s)).slice(0, 40);
   const reason = typeof f.reason === 'string' && CODE.test(f.reason) ? f.reason : 'UNKNOWN';
+  const sid = typeof f.callSid === 'string' && CALL_SID.test(f.callSid) ? f.callSid : undefined;
   return {
     subject: `${clean(f.businessName)} DEMO: call needs a follow-up`,
     text: [
@@ -77,6 +81,7 @@ export function followUpEmail(f: FollowUpFacts): EmailMessage {
       `Reason code: ${reason}`,
       `Callback number: ${phone ?? 'not available'}`,
       `Call ended: ${clean(f.whenText)}`,
+      ...(sid === undefined ? [] : [`Call SID: ${sid}`]),
       `Steps reached: ${steps.length === 0 ? 'none' : steps.join(', ')}`,
       f.bookingMayExist === true ? 'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.' : 'No booking was sent to Jobber.', '',
       'This notice holds no name, address or anything else the caller said.',
