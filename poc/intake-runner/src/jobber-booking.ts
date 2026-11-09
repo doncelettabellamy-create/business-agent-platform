@@ -34,7 +34,7 @@ export interface BookingRequest {
   title: string; service: string; priceDollars: number;
 }
 export type BookingStatus = 'booked_verified' | 'not_booked' | 'uncertain' | 'refused';
-export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED';
+export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST';
 export interface BookingResult {
   status: BookingStatus; reason?: BookingReason;
   /** True when this key had already been booked and nothing new was written. */ duplicate?: boolean;
@@ -161,8 +161,11 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
   try {
     const tokens = await ctx.vault.loadTokens(); if (tokens === undefined) throw new JobberError('NOT_CONNECTED');
     await verifyExpectedAccount(ctx, creds, ctx.allowWrites.expectedAccountName, tokens.account_id);   // the test account, before anything else
-    return await ctx.vault.withLock(`booking-${marker.toLowerCase()}`, async () => {
+    return await ctx.vault.withLock(`booking-${marker.toLowerCase()}`, async (lock) => {
       const ledger = await loadLedger(ctx); const prior = ledger[marker];
+      // Every ledger write and every Jobber write first checks that this call still owns the lock; a call that lost it stops here, before the next write (LOCK_LOST).
+      const save = async (): Promise<void> => { lock.assertHeld(); await saveLedger(ctx, ledger); };
+      const write = (query: string, variables: Record<string, unknown>): ReturnType<typeof mutate> => { lock.assertHeld(); writes++; return mutate(ctx, creds, query, variables); };
       const verify = async (jobId: string, duplicate: boolean): Promise<BookingResult> => {
         const rb = await readBackJob(ctx, creds, jobId, req, marker);
         if (!rb.found) return done('uncertain', { reason: 'NOT_FOUND', jobId, ...(duplicate ? { duplicate } : {}) });
@@ -174,32 +177,30 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
       // 2. Jobber itself is asked whether this key already has a job (a lost ledger, or a crash after the job was created)
       const existing = await findByMarker(ctx, creds, marker);
       if (existing.length > 1) return done('uncertain', { reason: 'DUPLICATE_MARKERS' });
-      if (existing.length === 1) { ledger[marker] = { ...(prior ?? { state: 'created' }), state: 'created', jobId: existing[0] }; await saveLedger(ctx, ledger); return verify(existing[0], true); }
+      if (existing.length === 1) { ledger[marker] = { ...(prior ?? { state: 'created' }), state: 'created', jobId: existing[0] }; await save(); return verify(existing[0], true); }
       // 3. a key left pending with no job in Jobber is not retried blindly
       if (prior?.state === 'pending') return done('uncertain', { reason: 'PENDING_UNRESOLVED' });
       let clientId = prior?.clientId; let propertyId = prior?.propertyId;
       if (prior?.state !== 'client_created' || propertyId === undefined) {
-        ledger[marker] = { state: 'pending' }; await saveLedger(ctx, ledger);   // written BEFORE the write
-        writes++;
-        const c = rec(rec((await mutate(ctx, creds, CREATE_CLIENT, { input: clientInput(req) })).data.clientCreate));
+        ledger[marker] = { state: 'pending' }; await save();   // written BEFORE the write
+        const c = rec(rec((await write(CREATE_CLIENT, { input: clientInput(req) })).data.clientCreate));
         const props = list(rec(rec(c.client).clientProperties).nodes).map(rec);
-        if (userErrorCount(c.userErrors) > 0 || typeof rec(c.client).id !== 'string' || props.length !== 1 || typeof props[0].id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(c.userErrors) }); delete ledger[marker]; await saveLedger(ctx, ledger); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+        if (userErrorCount(c.userErrors) > 0 || typeof rec(c.client).id !== 'string' || props.length !== 1 || typeof props[0].id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(c.userErrors) }); delete ledger[marker]; await save(); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
         clientId = rec(c.client).id as string; propertyId = props[0].id as string;
-        ledger[marker] = { state: 'client_created', clientId, propertyId }; await saveLedger(ctx, ledger);
+        ledger[marker] = { state: 'client_created', clientId, propertyId }; await save();
       }
-      writes++;
-      ledger[marker] = { state: 'pending', clientId, propertyId }; await saveLedger(ctx, ledger);   // written BEFORE the job is created
+      ledger[marker] = { state: 'pending', clientId, propertyId }; await save();   // written BEFORE the job is created
       // An unknown outcome (an error after the request was sent) leaves the key "pending": the next call asks Jobber before doing anything.
-      const jc = rec(rec((await mutate(ctx, creds, CREATE_JOB, { input: jobInput(req, propertyId as string, marker) })).data.jobCreate));
-      if (userErrorCount(jc.userErrors) > 0 || typeof rec(jc.job).id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(jc.userErrors) }); ledger[marker] = { state: 'client_created', clientId, propertyId }; await saveLedger(ctx, ledger); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+      const jc = rec(rec((await write(CREATE_JOB, { input: jobInput(req, propertyId as string, marker) })).data.jobCreate));
+      if (userErrorCount(jc.userErrors) > 0 || typeof rec(jc.job).id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(jc.userErrors) }); ledger[marker] = { state: 'client_created', clientId, propertyId }; await save(); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
       const jobId = rec(jc.job).id as string;
-      ledger[marker] = { state: 'created', clientId, propertyId, jobId }; await saveLedger(ctx, ledger);
+      ledger[marker] = { state: 'created', clientId, propertyId, jobId }; await save();
       ctx.diag('JOBBER_BOOKING_CREATED', { writes });
       return verify(jobId, false);
     });
   } catch (e) {
     const code = e instanceof JobberError ? e.code : 'API_ERROR';
-    const reason: BookingReason = code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : 'API_ERROR';
+    const reason: BookingReason = code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' ? 'LOCK_LOST' : 'API_ERROR';
     ctx.diag('JOBBER_BOOKING_FAILED', { reason });
     // Before any write an error is simply "not booked"; after a write was sent its outcome is unknown, so the status says so.
     return done(writes > 0 ? 'uncertain' : 'not_booked', { reason });

@@ -12,7 +12,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const JOBBER_ENDPOINTS = Object.freeze({ authorize: 'https://api.getjobber.com/api/oauth/authorize', token: 'https://api.getjobber.com/api/oauth/token', graphql: 'https://api.getjobber.com/api/graphql' });
@@ -23,7 +23,7 @@ export const CALLBACK_PATH = '/jobber/callback';
 /** The exact OAuth Callback URL to enter in the Jobber Developer Center for this connector. */
 export const callbackUrlFor = (port: number): string => `http://localhost:${port}${CALLBACK_PATH}`;
 
-export type ConnectorCode = 'NO_CREDENTIALS' | 'NOT_CONNECTED' | 'RECONNECT_REQUIRED' | 'DENIED' | 'EXCHANGE_FAILED' | 'ACCOUNT_MISMATCH' | 'ACCOUNT_UNREADABLE' | 'RATE_LIMITED' | 'API_ERROR' | 'NOT_READ_ONLY' | 'TIMEOUT' | 'BAD_CONFIG' | 'BAD_RESPONSE';
+export type ConnectorCode = 'NO_CREDENTIALS' | 'NOT_CONNECTED' | 'RECONNECT_REQUIRED' | 'DENIED' | 'EXCHANGE_FAILED' | 'ACCOUNT_MISMATCH' | 'ACCOUNT_UNREADABLE' | 'RATE_LIMITED' | 'API_ERROR' | 'NOT_READ_ONLY' | 'TIMEOUT' | 'BAD_CONFIG' | 'BAD_RESPONSE' | 'LOCK_LOST';
 /** An error whose message is a fixed code word only: it can never carry a secret. */
 export class JobberError extends Error { readonly code: ConnectorCode; /** Only for ACCOUNT_MISMATCH: the NAME of the account that answered (a business name, not a secret), so the founder can see which account it was. */ readonly foundAccountName?: string; constructor(code: ConnectorCode, foundAccountName?: string) { super(code); this.code = code; this.name = 'JobberError'; if (foundAccountName !== undefined) this.foundAccountName = foundAccountName; } }
 
@@ -48,7 +48,11 @@ export function pkcePair(random: (n: number) => Buffer = randomBytes): { verifie
 
 // ---------------------------------------------------------------- protected storage
 /** The private folder: credentials and tokens, each protected by the Protector, written atomically. Never inside the repository (the entry point defaults to the user's home folder). */
-export function createVault(dir: string, protector: Protector) {
+/** Handed to the code that runs under a lock. `assertHeld` throws LOCK_LOST unless this holder still owns the lock and its heartbeat is current: call it right before every write that must not overlap another holder's. */
+export interface LockHandle { assertHeld(): void }
+export interface LockTimings { /** how often the holder refreshes its lock file (default 5000 ms) */ heartbeatMs?: number; /** a lock whose file has not been refreshed for this long is abandoned (default 30000 ms) */ staleMs?: number; /** TEST SEAM, never set in production: called once a lock has been judged abandoned and before it is moved aside, so a test can replace it at exactly that moment */ beforeTakeover?: () => void }
+export function createVault(dir: string, protector: Protector, timings: LockTimings = {}) {
+  const heartbeatMs = timings.heartbeatMs ?? 5_000; const staleMs = timings.staleMs ?? 30_000;
   const credFile = join(dir, 'credentials.enc'); const tokFile = join(dir, 'tokens.enc');
   const NAME = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
   const ensure = (): void => { mkdirSync(dir, { recursive: true }); };
@@ -70,19 +74,42 @@ export function createVault(dir: string, protector: Protector) {
     async saveBlob(name: string, text: string): Promise<void> { if (!NAME.test(name)) throw new JobberError('BAD_CONFIG'); atomic(join(dir, `${name}.enc`), await protector.protect(text)); },
     async loadBlob(name: string): Promise<string | undefined> { if (!NAME.test(name)) throw new JobberError('BAD_CONFIG'); const p = join(dir, `${name}.enc`); if (!existsSync(p)) return undefined; try { return await protector.unprotect(readFileSync(p, 'utf8').trim()); } catch { return undefined; } },
     withRefreshLock<T>(fn: () => Promise<T>, waitMs = 8000): Promise<T> { return this.withLock('refresh', fn, waitMs); },
-    /** Runs `fn` while holding the named lock (one holder at a time, even across processes); a lock older than 30 s is treated as abandoned. */
-    async withLock<T>(name: string, fn: () => Promise<T>, waitMs = 8000): Promise<T> {
+    /**
+     * Runs `fn` while holding the named lock (one holder at a time, even across processes). The lock file holds the holder's own random token and is refreshed while the holder lives (the heartbeat); a lock
+     * that has not been refreshed for `staleMs` is abandoned and is taken over. `fn` gets a handle whose `assertHeld` it must call before each write: it throws LOCK_LOST when the file no longer holds this
+     * holder's token or the heartbeat is overdue, so a holder that lost its lock stops before the next write. The lock is released only if it is still this holder's. Limit: a request already in flight when
+     * the lock is lost (a paused process) cannot be recalled; only the next write is stopped.
+     */
+    async withLock<T>(name: string, fn: (lock: LockHandle) => Promise<T>, waitMs = 8000): Promise<T> {
       if (!NAME.test(name)) throw new JobberError('BAD_CONFIG');
       const lockFile = join(dir, `${name}.lock`);
-      ensure(); const until = Date.now() + waitMs;
+      ensure(); const until = Date.now() + waitMs; const token = randomBytes(16).toString('hex');
+      const holds = (): boolean => { try { return readFileSync(lockFile, 'utf8') === token; } catch { return false; } };
       for (;;) {
-        try { closeSync(openSync(lockFile, 'wx')); break; } catch {
-          try { if (Date.now() - statSync(lockFile).mtimeMs > 30_000) rmSync(lockFile, { force: true }); } catch { /* raced */ }
+        try { writeFileSync(lockFile, token, { flag: 'wx', mode: 0o600 }); break; } catch {
+          try {
+            if (Date.now() - statSync(lockFile).mtimeMs > staleMs) {
+              // Move the abandoned file aside (only one waiter can move a given file), and put it back if it turns out to be fresh: it was replaced between the check and the move.
+              const aside = `${lockFile}.${token}.old`;
+              timings.beforeTakeover?.();
+              renameSync(lockFile, aside);
+              if (Date.now() - statSync(aside).mtimeMs <= staleMs) { try { linkSync(aside, lockFile); } catch { /* its holder will notice at its next check */ } }
+              rmSync(aside, { force: true });
+            }
+          } catch { /* raced */ }
           if (Date.now() > until) throw new JobberError('TIMEOUT');
           await new Promise((r) => setTimeout(r, 50));
         }
       }
-      try { return await fn(); } finally { rmSync(lockFile, { force: true }); }
+      let lastBeat = Date.now(); let lost = false;
+      const beat = setInterval(() => {
+        if (lost) return;
+        if (!holds()) { lost = true; return; }
+        try { const t = new Date(); utimesSync(lockFile, t, t); lastBeat = Date.now(); } catch { lost = true; }
+      }, heartbeatMs);
+      beat.unref?.();
+      const handle: LockHandle = { assertHeld(): void { if (lost || Date.now() - lastBeat > staleMs * 0.8 || !holds()) { lost = true; throw new JobberError('LOCK_LOST'); } } };
+      try { return await fn(handle); } finally { clearInterval(beat); try { if (!lost && holds()) rmSync(lockFile, { force: true }); } catch { /* gone */ } }
     },
   };
 }

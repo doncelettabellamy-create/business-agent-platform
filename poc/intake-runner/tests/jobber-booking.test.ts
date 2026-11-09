@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createVault, JobberError, mutate, mutationFields, query, WRITE_ALLOWLIST } from '../src/jobber-connector.ts';
@@ -284,4 +284,83 @@ test('independent read-back of the STATE: the requested state matches as a code 
       assert.ok(!JSON.stringify(res).includes('Texas') && !JSON.stringify(res).includes('Ontario'), 'the field name only, never the value');
     }
   } finally { await r.done(); }
+});
+
+// ================================================================ lock ownership: a booking that has lost its lock stops before the next write
+const lockOf = (r: Rig, req: BookingRequest): string => join(r.dir, 'booking-' + markerFor(req.key).toLowerCase() + '.lock');
+const ledgerOf = async (r: Rig): Promise<Record<string, { state: string; jobId?: string }>> => { const t = await r.ctx.vault.loadBlob('jobber-booking-ledger'); return t === undefined ? {} : (JSON.parse(t) as { entries: Record<string, { state: string; jobId?: string }> }).entries; };
+type FetchInit = { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal };
+/** Runs `act` once, right after the first response to a request whose body matches `when` (the lock is taken away at exactly that moment). */
+const afterResponse = (r: Rig, when: RegExp, act: () => void): void => { const real = r.ctx.fetch; let fired = false; r.ctx.fetch = (async (url: string, init: FetchInit) => { const res = await real(url, init); if (!fired && when.test(String(init.body ?? ''))) { fired = true; act(); } return res; }) as unknown as FetchLike; };
+
+test('lock lost during a booking: after the client is created the lock disappears; the job is NOT created, the result is uncertain with LOCK_LOST, only one mutation was sent, and a later attempt is stopped as unresolved (no second client, no job)', async () => {
+  const r = await rig();
+  try {
+    const real = r.ctx.fetch; afterResponse(r, /clientCreate/, () => rmSync(lockOf(r, REQ), { force: true }));
+    const res = await bookTestVisit(r.ctx, CREDS, REQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'LOCK_LOST', 1]); assert.deepEqual(mutations(r.mock), ['clientCreate'], 'the job was never sent'); assert.equal(r.mock.jobs.size, 0);
+    r.ctx.fetch = real; const again = await bookTestVisit(r.ctx, CREDS, REQ);
+    assert.deepEqual([again.status, again.reason], ['uncertain', 'PENDING_UNRESOLVED']); assert.deepEqual(mutations(r.mock), ['clientCreate'], 'nothing more was sent'); assert.equal(r.mock.jobs.size, 0);
+  } finally { await r.done(); }
+});
+
+test('lock lost before any write: nothing is sent, the result is not_booked with LOCK_LOST and writes 0; the lock of whoever took over is left alone', async () => {
+  const r = await rig();
+  try {
+    afterResponse(r, /FindTestJobs/, () => writeFileSync(lockOf(r, REQ), 'another-holder'));
+    const res = await bookTestVisit(r.ctx, CREDS, REQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'LOCK_LOST', 0]); assert.deepEqual(mutations(r.mock), []); assert.equal(readFileSync(lockOf(r, REQ), 'utf8'), 'another-holder', 'owner-only release');
+  } finally { await r.done(); }
+});
+
+test('lock lost at the final ledger save (the job already exists in Jobber): uncertain with LOCK_LOST and 2 writes, the ledger is still pending; a retry that can see the job verifies that SAME job and sends nothing; a retry that cannot see it is stopped as PENDING_UNRESOLVED and sends nothing', async () => {
+  for (const blind of [false, true]) {
+    const r = await rig();
+    try {
+      const real = r.ctx.fetch; afterResponse(r, /jobCreate/, () => rmSync(lockOf(r, REQ), { force: true }));
+      const res = await bookTestVisit(r.ctx, CREDS, REQ);
+      assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'LOCK_LOST', 2], 'blind=' + blind); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); assert.equal(r.mock.jobs.size, 1, 'the job exists in Jobber');
+      assert.equal((await ledgerOf(r))[markerFor(REQ.key)]?.state, 'pending', 'the ledger was not advanced after the loss');
+      const jobId = [...r.mock.jobs.keys()][0];
+      r.ctx.fetch = real; r.mock.opts.searchBlind = blind;
+      const again = await bookTestVisit(r.ctx, CREDS, REQ);
+      if (!blind) { assert.deepEqual([again.status, again.jobId, again.duplicate, again.writes], ['booked_verified', jobId, true, 0], 'the same job, found by its marker'); const fixed = (await ledgerOf(r))[markerFor(REQ.key)]; assert.deepEqual([fixed?.state, fixed?.jobId], ['created', jobId], 'the ledger is repaired'); }
+      else { assert.deepEqual([again.status, again.reason, again.writes], ['uncertain', 'PENDING_UNRESOLVED', 0], 'a job nobody can see is not booked again'); }
+      assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate'], 'the retry sent no write, blind=' + blind); assert.equal(r.mock.jobs.size, 1, 'still one job, blind=' + blind);
+    } finally { await r.done(); }
+  }
+});
+
+test('lock lost during the read-back (after the job exists and the ledger says created): the booking is still reported as verified, the ledger stays created, and nothing more is sent', async () => {
+  const r = await rig();
+  try {
+    afterResponse(r, /ReadBackJob/, () => rmSync(lockOf(r, REQ), { force: true }));
+    const res = await bookTestVisit(r.ctx, CREDS, REQ); const jobId = [...r.mock.jobs.keys()][0];
+    assert.deepEqual([res.status, res.jobId, res.writes], ['booked_verified', jobId, 2]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+    const entry = (await ledgerOf(r))[markerFor(REQ.key)]; assert.deepEqual([entry?.state, entry?.jobId], ['created', jobId]);
+    const again = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([again.status, again.duplicate, again.writes], ['booked_verified', true, 0]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate'], 'no second job'); assert.equal(r.mock.jobs.size, 1);
+  } finally { await r.done(); }
+});
+
+test('lock ownership, at every check: losing the lock at the k-th check (before each ledger write and each Jobber write) never lets a write follow, never reports booked, and sends at most the writes made before the loss', async () => {
+  let sent = new Set<string>();
+  for (let k = 1; k <= 12; k++) {
+    const r = await rig();
+    try {
+      const real = r.ctx.vault.withLock.bind(r.ctx.vault); let checks = 0; let seenChecks = 0;
+      (r.ctx.vault as { withLock: unknown }).withLock = (name: string, fn: (l: { assertHeld(): void }) => Promise<unknown>, w?: number) => real(name, async (lock) => fn({ assertHeld: () => { seenChecks++; if (++checks >= k) throw new JobberError('LOCK_LOST'); lock.assertHeld(); } }), w);
+      const res = await bookTestVisit(r.ctx, CREDS, REQ);
+      if (res.reason === 'LOCK_LOST') { assert.notEqual(res.status, 'booked_verified', 'k=' + k); assert.ok(mutations(r.mock).length <= 2, 'k=' + k); assert.ok(res.writes === mutations(r.mock).length, 'writes counts only requests that were sent, k=' + k); sent.add(mutations(r.mock).join('+')); }
+      else { assert.equal(res.status, 'booked_verified', 'k=' + k + ': the loss came after the last check'); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); }
+      assert.ok(seenChecks >= 1);
+    } finally { await r.done(); }
+  }
+  assert.ok(sent.has('') && sent.has('clientCreate'), 'both "before any write" and "after the client" were exercised: ' + [...sent].join(' | '));
+});
+
+test('lock source: every Jobber write and every ledger write in the booking goes through a checked helper; no other call to mutate or the ledger save exists inside the lock', () => {
+  const src = readFileSync(new URL('../src/jobber-booking.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.equal([...src.matchAll(/\bmutate\(/g)].length, 1, 'one call to mutate, inside write()'); assert.ok(/const write = \(query: string, variables: Record<string, unknown>\): ReturnType<typeof mutate> => \{ lock\.assertHeld\(\); writes\+\+; return mutate\(ctx, creds, query, variables\); \};/.test(src));
+  assert.equal([...src.matchAll(/saveLedger\(ctx, ledger\)/g)].length, 1, 'one call to the ledger save, inside save()'); assert.ok(/const save = async \(\): Promise<void> => \{ lock\.assertHeld\(\); await saveLedger\(ctx, ledger\); \};/.test(src));
+  assert.ok(/code === 'LOCK_LOST' \? 'LOCK_LOST'/.test(src), 'a lost lock has its own reason');
 });

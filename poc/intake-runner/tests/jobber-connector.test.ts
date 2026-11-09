@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { Server } from 'node:http';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { accessToken, callbackUrlFor, createVault, isReadOnlyDocument, JobberError, pkcePair, query, readBusyIntervals, readSchedule, startAuthorization, verifyExpectedAccount } from '../src/jobber-connector.ts';
@@ -282,4 +284,111 @@ test('busy time: the schedule query asks for UNASSIGNED visits too (Drew\'s own 
     assert.deepEqual(sent.variables.filter, { occursWithin: { startAt: from, endAt: to }, includeUnassigned: true }, 'the window, and unassigned visits included');
     assert.ok(!/title|client|address|property/i.test(sent.query), 'no title, client or address is requested');
   } finally { await r.done(); }
+});
+
+// ================================================================ the lock: a unique owner token, a live heartbeat, owner-only release, and a holder that stops when it has lost the lock
+const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const lockDir = (): string => mkdtempSync(join(tmpdir(), 'jobber-lock-'));
+const lockPath = (dir: string, name: string): string => join(dir, name + '.lock');
+
+test('lock: the lock file holds the holder\'s own random token, two holders have different tokens, and the lock is gone after a normal end and after an error', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector); const seen: string[] = [];
+  await v.withLock('t1', async () => { seen.push(readFileSync(lockPath(dir, 't1'), 'utf8')); });
+  await v.withLock('t1', async () => { seen.push(readFileSync(lockPath(dir, 't1'), 'utf8')); });
+  assert.ok(seen.every((s) => /^[0-9a-f]{32}$/.test(s)), 'a 128-bit random token'); assert.notEqual(seen[0], seen[1], 'a new token every time');
+  assert.equal(existsSync(lockPath(dir, 't1')), false, 'released');
+  await assert.rejects(v.withLock('t1', async () => { throw new Error('boom'); }), /boom/); assert.equal(existsSync(lockPath(dir, 't1')), false, 'released after an error');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock: the heartbeat keeps a live holder\'s lock fresh, so a waiter does NOT take it over however long the holder works, and gets it only after the holder is done', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 800 }); let aDone = 0; let bStarted = 0;
+  const a = v.withLock('t2', async (lock) => { const t0 = statSync(lockPath(dir, 't2')).mtimeMs; await sleepMs(1700); lock.assertHeld(); assert.ok(statSync(lockPath(dir, 't2')).mtimeMs > t0 + 800, 'the file was refreshed while held'); aDone = Date.now(); });
+  await sleepMs(50);
+  await assert.rejects(v.withLock('t2', async () => { bStarted = Date.now(); }, 1200), (e: unknown) => e instanceof JobberError && e.code === 'TIMEOUT');   // 1200 ms is longer than the stale age: without a heartbeat it would be stolen
+  assert.equal(bStarted, 0, 'the waiter never ran while the holder was alive'); assert.equal(aDone, 0, 'and the holder was not interrupted');
+  await a; assert.ok(aDone > 0); await v.withLock('t2', async () => { bStarted = Date.now(); }, 1000); assert.ok(bStarted >= aDone, 'the waiter runs after the holder is done');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock: a lock whose holder died (no heartbeat for staleMs) is taken over, and the new holder gets a lock of its own; a fresh foreign lock is never taken', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 3000 });
+  writeFileSync(lockPath(dir, 't3'), 'dead-holder-token'); const old = new Date(Date.now() - 10_000); utimesSync(lockPath(dir, 't3'), old, old);
+  let ran = false; await v.withLock('t3', async (lock) => { ran = true; lock.assertHeld(); assert.notEqual(readFileSync(lockPath(dir, 't3'), 'utf8'), 'dead-holder-token'); }, 1500); assert.ok(ran, 'the abandoned lock was taken over');
+  writeFileSync(lockPath(dir, 't3'), 'fresh-foreign-token');   // just written: fresh
+  await assert.rejects(v.withLock('t3', async () => undefined, 250), (e: unknown) => e instanceof JobberError && e.code === 'TIMEOUT'); assert.equal(readFileSync(lockPath(dir, 't3'), 'utf8'), 'fresh-foreign-token', 'a fresh foreign lock is left alone');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock: ownership loss is detected before the next write: the lock replaced by another holder, removed, or a heartbeat that cannot run all make assertHeld throw LOCK_LOST, and the loser never removes the other holder\'s lock', async () => {
+  const lost = (fn: () => void): boolean => { try { fn(); return false; } catch (e) { return e instanceof JobberError && e.code === 'LOCK_LOST'; } };
+  // replaced by another holder
+  { const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 300 });
+    await v.withLock('t4', async (lock) => { lock.assertHeld(); writeFileSync(lockPath(dir, 't4'), 'the-new-holder'); assert.ok(lost(() => lock.assertHeld()), 'replaced'); await sleepMs(120); assert.ok(lost(() => lock.assertHeld()), 'and it stays lost even after a heartbeat'); });
+    assert.equal(readFileSync(lockPath(dir, 't4'), 'utf8'), 'the-new-holder', 'owner-only release: the new holder\'s lock is not removed'); rmSync(dir, { recursive: true, force: true }); }
+  // removed
+  { const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 300 });
+    await v.withLock('t5', async (lock) => { rmSync(lockPath(dir, 't5')); assert.ok(lost(() => lock.assertHeld()), 'removed'); }); assert.equal(existsSync(lockPath(dir, 't5')), false); rmSync(dir, { recursive: true, force: true }); }
+  // the heartbeat cannot run (the process is stalled past the limit): the token is still in the file, yet the holder must treat the lock as lost
+  { const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 200 });
+    await v.withLock('t6', async (lock) => { lock.assertHeld(); const end = Date.now() + 260; while (Date.now() < end) { /* a stalled process: no timer can run */ } assert.ok(lost(() => lock.assertHeld()), 'overdue heartbeat'); }); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('lock: a holder whose heartbeat never runs is taken over by a waiter after staleMs, and the old holder then stops at its next check while the new holder\'s lock survives the old holder\'s end', async () => {
+  const dir = lockDir(); const slow = createVault(dir, fakeProtector, { heartbeatMs: 60_000, staleMs: 250 }); const fast = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 250 });
+  let oldStopped = false; let newRan = false; let tokenInside = '';
+  const a = slow.withLock('t7', async (lock) => { await sleepMs(700); try { lock.assertHeld(); } catch (e) { oldStopped = e instanceof JobberError && e.code === 'LOCK_LOST'; } });
+  await sleepMs(30);
+  const b = fast.withLock('t7', async (lock) => { newRan = true; lock.assertHeld(); tokenInside = readFileSync(lockPath(dir, 't7'), 'utf8'); await sleepMs(500); lock.assertHeld(); }, 3000);
+  await Promise.all([a, b]);
+  assert.ok(newRan, 'the waiter took over'); assert.ok(oldStopped, 'the old holder stopped at its next check'); assert.match(tokenInside, /^[0-9a-f]{32}$/);
+  assert.equal(existsSync(lockPath(dir, 't7')), false, 'both ended; nothing is left behind'); rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock: several waiters racing for one abandoned lock never overlap, in-process (at most one holder at any moment, every one runs)', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 30, staleMs: 1500 });
+  writeFileSync(lockPath(dir, 't8'), 'dead'); const old = new Date(Date.now() - 10_000); utimesSync(lockPath(dir, 't8'), old, old);
+  let inside = 0; let max = 0; let ran = 0;
+  await Promise.all(Array.from({ length: 6 }, () => v.withLock('t8', async (lock) => { inside++; max = Math.max(max, inside); lock.assertHeld(); await sleepMs(60); lock.assertHeld(); inside--; ran++; }, 8000)));
+  assert.equal(max, 1, 'never two inside'); assert.equal(ran, 6); assert.equal(existsSync(lockPath(dir, 't8')), false); rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock: four processes taking the same lock twelve times each lose no update and never overlap (a read, a pause, a write)', async () => {
+  const dir = lockDir(); const worker = fileURLToPath(new URL('./helpers/lock-worker.ts', import.meta.url));
+  const run = (): Promise<number> => new Promise((res) => { const p = spawn(process.execPath, [worker, dir, '12', '15', '40', '3000'], { stdio: 'ignore' }); p.on('close', (c) => res(c ?? -1)); });
+  const codes = await Promise.all([run(), run(), run(), run()]);
+  assert.deepEqual(codes, [0, 0, 0, 0], 'no process saw another inside'); assert.equal(Number(readFileSync(join(dir, 'counter.txt'), 'utf8')), 48, 'no increment was lost'); assert.equal(existsSync(lockPath(dir, 'race')), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock source: the defaults are unchanged (5 s heartbeat, 30 s stale), the token is written exclusively, the release is owner-only, and the refresh lock is the same lock', () => {
+  const src = readFileSync(new URL('../src/jobber-connector.ts', import.meta.url), 'utf8');
+  assert.ok(/heartbeatMs = timings\.heartbeatMs \?\? 5_000; const staleMs = timings\.staleMs \?\? 30_000;/.test(src));
+  assert.ok(/writeFileSync\(lockFile, token, \{ flag: 'wx', mode: 0o600 \}\)/.test(src), 'created exclusively with the token');
+  assert.ok(/if \(!lost && holds\(\)\) rmSync\(lockFile/.test(src), 'released only when still the owner');
+  assert.ok(/withRefreshLock<T>\(fn: \(\) => Promise<T>, waitMs = 8000\): Promise<T> \{ return this\.withLock\('refresh', fn, waitMs\); \}/.test(src), 'the token refresh uses it unchanged');
+});
+
+test('lock: a holder whose lock was replaced by another holder stops refreshing the file (the heartbeat notices), so the other holder\'s lock can still go stale and be taken over', async () => {
+  const dir = lockDir(); const v = createVault(dir, fakeProtector, { heartbeatMs: 30, staleMs: 3000 }); const f = lockPath(dir, 't9');
+  await v.withLock('t9', async (lock) => {
+    writeFileSync(f, 'the-new-holder'); const old = new Date(Date.now() - 10_000); utimesSync(f, old, old); const before = statSync(f).mtimeMs;
+    await sleepMs(300);   // about ten heartbeats
+    assert.equal(statSync(f).mtimeMs, before, 'the old holder did not touch the new holder\'s file');
+    assert.throws(() => lock.assertHeld(), (e: unknown) => e instanceof JobberError && e.code === 'LOCK_LOST');
+  });
+  assert.equal(readFileSync(f, 'utf8'), 'the-new-holder', 'and it did not remove it');
+  let ran = false; await v.withLock('t9', async () => { ran = true; }, 1500); assert.ok(ran, 'the other holder\'s lock, never refreshed, went stale and was taken over');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('lock: a lock replaced by a FRESH one between the staleness check and the takeover is put back whole (its holder keeps it, nothing is left behind), and the waiter times out instead of stealing it', async () => {
+  const dir = lockDir(); const f = lockPath(dir, 't10'); let calls = 0;
+  const v = createVault(dir, fakeProtector, { heartbeatMs: 40, staleMs: 3000, beforeTakeover: () => { if (++calls === 1) writeFileSync(f, 'fresh-holder'); } });
+  writeFileSync(f, 'dead-holder'); const old = new Date(Date.now() - 10_000); utimesSync(f, old, old);
+  await assert.rejects(v.withLock('t10', async () => undefined, 400), (e: unknown) => e instanceof JobberError && e.code === 'TIMEOUT');
+  assert.equal(calls, 1, 'the seam ran once, at the takeover of the abandoned lock');
+  assert.equal(existsSync(f), true, 'the fresh lock was put back'); assert.equal(readFileSync(f, 'utf8'), 'fresh-holder', 'unchanged');
+  assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.old')), [], 'no moved-aside file is left behind');
+  rmSync(dir, { recursive: true, force: true });
 });
