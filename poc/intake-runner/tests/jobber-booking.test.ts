@@ -258,7 +258,7 @@ test('privacy and isolation: no name, phone, address or token in any diagnostic 
   const src = join(import.meta.dirname, '..', 'src');
   const importers = readdirSync(src).filter((f) => f.endsWith('.ts') && !/^jobber-/.test(f)).filter((f) => /from '\.\/jobber-(booking|connector|dpapi|browser|connect-main)\.ts'/.test(readFileSync(join(src, f), 'utf8')));
   // Only the fast test call's own modules and the entry points may use the Jobber modules. The call logic, the bridge, the transports and the SIMULATED booking checkpoint never do.
-  assert.deepEqual(importers, ['fast-call-handler.ts', 'fast-test-setup-main.ts', 'founder-voice-entry.ts', 'founder-voice-fast.ts'], 'the call logic and the simulated booking checkpoint do not import any Jobber module');
+  assert.deepEqual(importers, ['booking-identity-setup-main.ts', 'fast-call-handler.ts', 'fast-test-setup-main.ts', 'founder-voice-entry.ts', 'founder-voice-fast.ts'], 'the call logic and the simulated booking checkpoint do not import any Jobber module');
   for (const never of ['simulated-booking.ts', 'relay-handler.ts', 'realtime-bridge.ts', 'realtime-transport.ts', 'call-transport.ts', 'founder-voice-service.ts']) assert.ok(!/from '\.\/jobber-/.test(readFileSync(join(src, never), 'utf8')), `${never} imports no Jobber module`);
   const text = readFileSync(join(src, 'jobber-booking.ts'), 'utf8').replace(/\/\/.*$/gm, '');
   assert.ok(!/node:(http|https|net|child_process|fs)'|contact-vault|process\.env|fetch\(/.test(text), 'no network, file, process, environment or contact-vault access of its own');

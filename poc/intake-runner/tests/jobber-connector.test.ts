@@ -265,7 +265,7 @@ test('Windows DPAPI protector: the stored blob is not the plain text and only th
 test('standalone: nothing in the voice server, call logic, booking checkpoint or any other source file imports the connector, and the connector itself has no mutation, no child process and no network library', () => {
   const src = join(import.meta.dirname, '..', 'src');
   const importers = readdirSync(src).filter((f) => f.endsWith('.ts') && !/^jobber-/.test(f)).filter((f) => /from '\.\/jobber-(connector|dpapi|connect-main)\.ts'/.test(readFileSync(join(src, f), 'utf8')));
-  assert.deepEqual(importers, ['fast-test-setup-main.ts', 'founder-voice-entry.ts', 'founder-voice-fast.ts'], 'only the fast test call\'s modules and the entry points use the connector; the call logic, the transports and the simulated booking checkpoint never do');
+  assert.deepEqual(importers, ['booking-identity-setup-main.ts', 'fast-test-setup-main.ts', 'founder-voice-entry.ts', 'founder-voice-fast.ts'], 'only the fast test call\'s modules and the entry points use the connector; the call logic, the transports and the simulated booking checkpoint never do');
   for (const never of ['simulated-booking.ts', 'relay-handler.ts', 'realtime-bridge.ts', 'realtime-transport.ts', 'call-transport.ts', 'founder-voice-service.ts']) assert.ok(!/from '\.\/jobber-/.test(readFileSync(join(src, never), 'utf8')), `${never} imports no Jobber module`);
   const text = readFileSync(join(src, 'jobber-connector.ts'), 'utf8');
   assert.ok(!/child_process|from 'node:https'|WebSocket/.test(text), 'no child process, no https client library, no WebSocket (the one node:http use is the local callback listener)');
