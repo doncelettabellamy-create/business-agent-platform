@@ -16,7 +16,9 @@
 
 import { createHash } from 'node:crypto';
 import { JobberError, mutate, query, verifyExpectedAccount } from './jobber-connector.ts';
-import type { Credentials, Ctx } from './jobber-connector.ts';
+import type { Credentials, Ctx, LockHandle } from './jobber-connector.ts';
+import { identitiesFor, keyringUnchanged, loadKeyring, normalizeParts } from './booking-identity.ts';
+import type { IdentityParts } from './booking-identity.ts';
 import { stateCodeOf } from './us-state.ts';
 
 export interface BookingGate {
@@ -33,8 +35,10 @@ export interface BookingRequest {
   when: { date: string; startTime: string; endTime: string; utcOffset: string };
   title: string; service: string; priceDollars: number;
 }
+/** A booking identified by WHAT was booked (booking-identity.ts) instead of a caller-chosen key: it carries `identity` and no `key`, and the identity must agree with the request's own phone, date, start time, house number and ZIP. */
+export interface IdentityBookingRequest extends Omit<BookingRequest, 'key'> { key?: undefined; identity: IdentityParts }
 export type BookingStatus = 'booked_verified' | 'not_booked' | 'uncertain' | 'refused';
-export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE';
+export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE' | 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE';
 export interface BookingResult {
   status: BookingStatus; reason?: BookingReason;
   /** True when this key had already been booked and nothing new was written. */ duplicate?: boolean;
@@ -55,11 +59,21 @@ const digitsOf = (s: string): string => s.replace(/\D/g, '').replace(/^1(?=\d{10
 export const markerFor = (key: string): string => `DREWTEST-${createHash('sha256').update(`drew-booking:${key}`).digest('hex').slice(0, 12).toUpperCase()}`;
 const instant = (date: string, clock: string, offset: string): number => Date.parse(`${date}T${clock}:00${offset}`);
 
+/** The identity parts must be the request's own phone, date, start time, house number and ZIP (in their normal spelling): a booking can never be filed under the identity of another one. */
+function identityAgrees(x: IdentityBookingRequest): boolean {
+  try {
+    const a = normalizeParts(x.identity); const b = normalizeParts({ phone: x.client.phone, date: x.when.date, startTime: x.when.startTime, street: x.address.street1, zip: x.address.postalCode });
+    return a.phone === b.phone && a.date === b.date && a.start === b.start && a.house === b.house && a.zip === b.zip;
+  } catch { return false; }
+}
+
 /** What is wrong with a request, as field names only (never a value). */
 export function requestProblems(r: unknown, now: number): string[] {
   const p: string[] = []; const x = r as BookingRequest;
   if (typeof x !== 'object' || x === null) return ['request'];
-  if (typeof x.key !== 'string' || !KEY.test(x.key)) p.push('key');
+  const givenIdentity = (x as { identity?: unknown }).identity !== undefined;
+  if (givenIdentity ? x.key !== undefined : (typeof x.key !== 'string' || !KEY.test(x.key))) p.push('key');   // an identity request has no key of its own: it is derived, so one that is given is refused, never ignored
+  if (givenIdentity && !identityAgrees(x as unknown as IdentityBookingRequest)) p.push('identity');
   if (!(x.gate?.eligibleRecord === true && x.gate?.approvedByPerson === true && x.gate?.callerAgreed === true)) p.push('gate');
   if (!NAME.test(String(x.client?.firstName ?? ''))) p.push('client.firstName');
   if (!NAME.test(String(x.client?.lastName ?? ''))) p.push('client.lastName');
@@ -196,18 +210,23 @@ async function findByMarker(ctx: Ctx, creds: Credentials, marker: string): Promi
 }
 const userErrorCount = (x: unknown): number => list(x).length;
 
-/** Books one TEST visit in the Jobber Developer Test Account, then verifies it independently. Never throws for an expected failure: the status says what happened. */
-export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRequest): Promise<BookingResult> {
+/** The global lock of the booking identity: the same name the founder-run rotation takes (the rotation script's IDENTITY_LOCK; a test keeps the two equal). */
+const IDENTITY_LOCK = 'booking-identity';
+/** The identity could not be established, or changed under a running booking. Only a fixed code; it is never a fall-back to another key. */
+class IdentityFailure extends Error { readonly code: 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE'; constructor(code: 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE') { super(code); this.name = 'IdentityFailure'; this.code = code; } }
+const hasIdentity = (r: BookingRequest | IdentityBookingRequest): r is IdentityBookingRequest => (r as { identity?: unknown }).identity !== undefined;
+
+/** Books one TEST visit in the Jobber Developer Test Account, then verifies it independently. Never throws for an expected failure: the status says what happened.
+ *  A request with a `key` is booked exactly as before. A request with `identity` (and no key) is booked under the HMAC identity of what was booked: the global `booking-identity` lock first, then the per-key lock, the keyring checked again before every write,
+ *  and a booking already made under a RETIRED key is found (ledger and Jobber) and accepted as a duplicate only after the same full read-back; any doubt is uncertain, never a fall-back to the Call-SID key or to a new booking. */
+export async function bookTestVisit(ctx: Ctx, creds: Credentials, input: BookingRequest | IdentityBookingRequest): Promise<BookingResult> {
   let writes = 0;
   const done = (status: BookingStatus, extra: Partial<BookingResult> = {}): BookingResult => ({ status, writes, ...extra });
-  const problems = requestProblems(req, ctx.now());
+  const problems = requestProblems(input, ctx.now());
   if (problems.length > 0) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: problems.includes('gate') ? 'NOT_AUTHORIZED' : 'INVALID_REQUEST', fields: problems.join(',') }); return done('refused', { reason: problems.includes('gate') ? 'NOT_AUTHORIZED' : 'INVALID_REQUEST' }); }
   if (ctx.allowWrites === undefined) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'WRITES_OFF' }); return done('refused', { reason: 'WRITES_OFF' }); }
-  const marker = markerFor(req.key);
-  try {
-    const tokens = await ctx.vault.loadTokens(); if (tokens === undefined) throw new JobberError('NOT_CONNECTED');
-    await verifyExpectedAccount(ctx, creds, ctx.allowWrites.expectedAccountName, tokens.account_id);   // the test account, before anything else
-    return await ctx.vault.withLock(`booking-${marker.toLowerCase()}`, async (lock) => {
+  /** What happens once the key lock is held. `aliasCheck`, when given (identity bookings only), looks for the same booking under retired keys after the key's own state is known and before anything is written. */
+  const locked = async (req: BookingRequest, marker: string, lock: LockHandle, aliasCheck?: (verify: (jobId: string, duplicate: boolean, under?: string) => Promise<BookingResult>) => Promise<BookingResult | undefined>): Promise<BookingResult> => {
       const base = ledgerBase(marker); const loaded = await loadEntry(ctx, marker); let generation = loaded.gen;
       const ledger: Record<string, Entry> = loaded.entry === undefined ? {} : { [marker]: loaded.entry }; const prior = ledger[marker];
       // Every ledger write and every Jobber write first checks that this call still owns the lock; a call that lost it stops here, before the next write (LOCK_LOST).
@@ -219,8 +238,8 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
         generation = next;
       };
       const write = (query: string, variables: Record<string, unknown>): ReturnType<typeof mutate> => { lock.assertHeld(); writes++; return mutate(ctx, creds, query, variables); };
-      const verify = async (jobId: string, duplicate: boolean): Promise<BookingResult> => {
-        const rb = await readBackJob(ctx, creds, jobId, req, marker);
+      const verify = async (jobId: string, duplicate: boolean, under: string = marker): Promise<BookingResult> => {
+        const rb = await readBackJob(ctx, creds, jobId, req, under);
         if (!rb.found) return done('uncertain', { reason: 'NOT_FOUND', jobId, ...(duplicate ? { duplicate } : {}) });
         if (rb.mismatches.length > 0) { ctx.diag('JOBBER_READBACK_MISMATCH', { fields: rb.mismatches.join(',') }); return done('uncertain', { reason: 'READBACK_MISMATCH', jobId, mismatches: rb.mismatches, ...(duplicate ? { duplicate } : {}) }); }
         return done('booked_verified', { jobId, ...(rb.jobNumber === undefined ? {} : { jobNumber: rb.jobNumber }), ...(duplicate ? { duplicate } : {}) });
@@ -233,6 +252,8 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
       if (existing.length === 1) { ledger[marker] = { ...(prior ?? { state: 'created' }), state: 'created', jobId: existing[0] }; await save(); return verify(existing[0], true); }
       // 3. a key left pending with no job in Jobber is not retried blindly
       if (prior?.state === 'pending') return done('uncertain', { reason: 'PENDING_UNRESOLVED' });
+      // 4. (identity bookings only) the same booking under a retired key: found, and then verified in full, or uncertain. The locks and the keyring are checked once more before the answer is used.
+      if (aliasCheck !== undefined) { const found = await aliasCheck(verify); lock.assertHeld(); if (found !== undefined) return found; }
       let clientId = prior?.clientId; let propertyId = prior?.propertyId;
       if (prior?.state !== 'client_created' || propertyId === undefined) {
         ledger[marker] = { state: 'pending' }; await save();   // written BEFORE the write
@@ -250,10 +271,44 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, req: BookingRe
       ledger[marker] = { state: 'created', clientId, propertyId, jobId }; await save();
       ctx.diag('JOBBER_BOOKING_CREATED', { writes });
       return verify(jobId, false);
+  };
+  /** The identity path: global lock, keyring, key and marker from the keyring's current secret, key lock, and one handle that checks BOTH locks and the keyring generation at every write. */
+  const byIdentity = (input: IdentityBookingRequest): Promise<BookingResult> => ctx.vault.withLock(IDENTITY_LOCK, async (outer) => {
+    const keyring = await loadKeyring(ctx.vault);
+    if (!keyring.ok) { ctx.diag('JOBBER_IDENTITY_FAILED', { problem: keyring.problem, ...(keyring.gen === undefined ? {} : { gen: keyring.gen }) }); throw new IdentityFailure('IDENTITY_UNAVAILABLE'); }
+    let ids: { key: string; aliases: string[] }; try { ids = identitiesFor(keyring.keyring, input.identity); } catch { ctx.diag('JOBBER_IDENTITY_FAILED', { problem: 'PARTS' }); throw new IdentityFailure('IDENTITY_UNAVAILABLE'); }
+    const unchanged = (): void => { if (!keyringUnchanged(ctx.vault, keyring.generations)) { ctx.diag('JOBBER_IDENTITY_FAILED', { problem: 'STALE' }); throw new IdentityFailure('IDENTITY_STALE'); } };
+    const req: BookingRequest = { ...input, key: ids.key }; const marker = markerFor(req.key);
+    const aliasCheck = async (verify: (jobId: string, duplicate: boolean, under?: string) => Promise<BookingResult>): Promise<BookingResult | undefined> => {
+      const hits = new Map<string, { marker: string; kid: string }>(); let unresolved = false;
+      for (let i = 0; i < ids.aliases.length; i++) {
+        const am = markerFor(ids.aliases[i]); const { entry } = await loadEntry(ctx, am);   // an unreadable chain throws LEDGER_UNREADABLE: uncertain, nothing written
+        const found = new Set<string>(); if (entry?.state === 'created' && entry.jobId !== undefined) found.add(entry.jobId);
+        for (const id of await findByMarker(ctx, creds, am)) found.add(id);
+        if (entry !== undefined && entry.state !== 'created' && found.size === 0) unresolved = true;   // started under that key, no job to be seen: not known to be unbooked
+        for (const id of found) hits.set(id, { marker: am, kid: keyring.keyring.retired[i].kid });
+      }
+      if (hits.size > 1) return done('uncertain', { reason: 'DUPLICATE_MARKERS' });
+      if (unresolved) return done('uncertain', { reason: 'PENDING_UNRESOLVED' });
+      if (hits.size === 0) return undefined;
+      const [jobId, at] = [...hits][0]; ctx.diag('JOBBER_IDENTITY_ALIAS_HIT', { kid: at.kid });
+      return verify(jobId, true, at.marker);   // the SAME read-back as any booking, against that key's marker: a duplicate only when every field matches
+    };
+    return ctx.vault.withLock(`booking-${marker.toLowerCase()}`, (inner) => {
+      const both: LockHandle = { assertHeld(): void { outer.assertHeld(); inner.assertHeld(); unchanged(); } };
+      return locked(req, marker, both, aliasCheck);
     });
+  });
+  try {
+    const tokens = await ctx.vault.loadTokens(); if (tokens === undefined) throw new JobberError('NOT_CONNECTED');
+    await verifyExpectedAccount(ctx, creds, ctx.allowWrites.expectedAccountName, tokens.account_id);   // the test account, before anything else
+    if (hasIdentity(input)) return await byIdentity(input);
+    const req = input; const marker = markerFor(req.key);
+    return await ctx.vault.withLock(`booking-${marker.toLowerCase()}`, (lock) => locked(req, marker, lock));
   } catch (e) {
+    const identity = e instanceof IdentityFailure ? e.code : undefined;
     const code = e instanceof JobberError ? e.code : 'API_ERROR';
-    const reason: BookingReason = code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' || code === 'LEDGER_UNREADABLE' || code === 'LEDGER_CONFLICT' || code === 'LEDGER_UNAVAILABLE' ? code : 'API_ERROR';
+    const reason: BookingReason = identity ?? (code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' || code === 'LEDGER_UNREADABLE' || code === 'LEDGER_CONFLICT' || code === 'LEDGER_UNAVAILABLE' ? code : 'API_ERROR');
     ctx.diag('JOBBER_BOOKING_FAILED', { reason });
     // Before any write an error is simply "not booked"; after a write was sent its outcome is unknown, so the status says so.
     const unsure = reason === 'LEDGER_UNREADABLE' || reason === 'LEDGER_CONFLICT';   // a ledger that cannot be trusted may be hiding a booking

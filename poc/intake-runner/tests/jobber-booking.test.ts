@@ -8,7 +8,9 @@ import { join } from 'node:path';
 import { createVault, JobberError, mutate, mutationFields, query, WRITE_ALLOWLIST } from '../src/jobber-connector.ts';
 import type { Credentials, Ctx, FetchLike, Protector } from '../src/jobber-connector.ts';
 import { bookTestVisit, clientInput, jobInput, markerFor, requestProblems } from '../src/jobber-booking.ts';
-import type { BookingRequest } from '../src/jobber-booking.ts';
+import type { BookingRequest, IdentityBookingRequest } from '../src/jobber-booking.ts';
+import { bookingIdentity } from '../src/booking-identity.ts';
+import type { IdentityParts } from '../src/booking-identity.ts';
 
 const CREDS: Credentials = { client_id: 'test-client-id-0001', client_secret: 'test-client-secret-ZZZ-9f8e7d6c' };
 const ACCOUNT = { id: 'ACCT-TEST-1', name: 'Test Cleaning Developer Account' };
@@ -625,4 +627,238 @@ test('an undecodable file (the protector itself refuses it, as Windows does for 
       blockedClean(await bookTestVisit(ctx, CREDS, REQ), 'LEDGER_UNREADABLE'); assert.deepEqual(mutations(r.mock), [], where); assert.deepEqual(ledgerFileBytes(r), before, where);
     } finally { await r.done(); }
   }
+});
+
+// ================================================================ Step 3a, slice A: bookings by IDENTITY (global lock, keyring fence, retired-key checks). Offline only; the live handler does not use this path.
+const SECRETS = [1, 2, 3, 4].map((n) => Buffer.alloc(32, n).toString('base64url'));   // made-up secrets of the test, nothing real
+const STAMPED = '2026-11-01T00:00:00.000Z';
+/** Generation n of the keyring: current k<n>, retired k<n-1> ... k1 (each following the one before, as a real rotation writes it). */
+const keyringGen = (n: number): string => { const retired = []; for (let i = n - 1; i >= 1; i--) retired.push({ kid: `k${i}`, secret: SECRETS[i - 1], retired_at: STAMPED }); return JSON.stringify({ version: 1, gen: n, current: { kid: `k${n}`, secret: SECRETS[n - 1] }, retired }); };
+const keyringFile = (r: Rig, n: number): string => join(r.dir, `booking-identity-keys.${n}.enc`);
+const seedKeyring = async (r: Rig, upTo: number, from = 1): Promise<void> => { for (let n = from; n <= upTo; n++) writeFileSync(keyringFile(r, n), await fakeProtector.protect(keyringGen(n))); };
+const IPARTS: IdentityParts = { phone: '(555) 010-4242', date: '2026-11-10', startTime: '09:00', street: '123 Invented Lane', zip: '90210' };
+const { key: _noKey, ...REQ_WITHOUT_KEY } = REQ;
+const IREQ: IdentityBookingRequest = { ...REQ_WITHOUT_KEY, identity: IPARTS };
+const idKey = (n: number, parts: IdentityParts = IPARTS): string => bookingIdentity(SECRETS[n - 1], parts);
+const idMarker = (n: number): string => markerFor(idKey(n));
+const withKey = (n: number): BookingRequest => ({ ...REQ, key: idKey(n) });
+const spyLocks = (r: Rig): string[] => { const names: string[] = []; const v = r.ctx.vault as unknown as { withLock: (name: string, fn: unknown, wait?: number) => unknown }; const real = v.withLock.bind(v); v.withLock = (name, fn, wait) => { names.push(name); return real(name, fn, wait); }; return names; };
+const lockFiles = (r: Rig): string[] => readdirSync(r.dir).filter((f) => f.endsWith('.lock'));
+const ledgerFiles = (r: Rig): string[] => readdirSync(r.dir).filter((f) => f.startsWith('jobber-booking-ledger'));
+const jobList = (r: Rig): Array<Record<string, unknown>> => [...r.mock.jobs.values()];
+const searches = (r: Rig): number => r.mock.ops.filter((o) => o.field === 'jobs').length;
+
+test('IDENTITY booking: the global lock is taken first, then the key lock; both are held while Jobber is asked; the job carries the marker of the CURRENT key; nothing is left locked; no secret or personal detail reaches a log or result', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1); const names = spyLocks(r); const held: string[][] = [];
+    const real = r.ctx.fetch; r.ctx.fetch = (async (url: string, init: FetchInit) => { if (/FindTestJobs/.test(String(init.body ?? ''))) held.push(lockFiles(r)); return real(url, init); }) as unknown as FetchLike;
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.writes, res.duplicate], ['booked_verified', 2, undefined]);
+    assert.deepEqual(names, ['booking-identity', 'booking-' + idMarker(1).toLowerCase()], 'the global lock first, then the key lock');
+    assert.deepEqual(held[0]?.sort(), ['booking-' + idMarker(1).toLowerCase() + '.lock', 'booking-identity.lock'].sort(), 'both locks are held while Jobber is searched');
+    assert.deepEqual(lockFiles(r), [], 'both released');
+    const job = jobList(r)[0]; assert.ok(String(job.title).endsWith(`[${idMarker(1)}]`) && String(job.instructions).includes(idMarker(1)));
+    assert.match(idKey(1), /^fast2-[0-9a-f]{24}$/); assert.deepEqual(Object.keys((await ledgerOf(r, withKey(1)))), [idMarker(1)]);
+    const all = JSON.stringify([r.logs, res]); for (const s of [...SECRETS, 'Testa', 'Invented', '90210', '5550104242']) assert.ok(!all.includes(s), 'not in a log or result');
+  } finally { await r.done(); }
+});
+
+test('IDENTITY booking: the same booking again - from another call, with the phone written another way - is a verified duplicate with no write; a different slot is a different booking', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1);
+    const first = await bookTestVisit(r.ctx, CREDS, IREQ); assert.equal(first.status, 'booked_verified');
+    const again = await bookTestVisit(r.ctx, CREDS, { ...IREQ, client: { ...IREQ.client, phone: '+1 555 010 4242' }, identity: { ...IPARTS, phone: '5550104242' } });
+    assert.deepEqual([again.status, again.duplicate, again.writes, again.jobId], ['booked_verified', true, 0, first.jobId]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+    const other = await bookTestVisit(r.ctx, CREDS, { ...IREQ, when: { ...IREQ.when, startTime: '13:00', endTime: '15:00' }, identity: { ...IPARTS, startTime: '13:00' } });
+    assert.deepEqual([other.status, other.duplicate], ['booked_verified', undefined]); assert.equal(r.mock.jobs.size, 2);
+  } finally { await r.done(); }
+});
+
+test('IDENTITY booking: two identical bookings at once make ONE job (the global lock serializes them); two different ones both book', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1);
+    const [a, b] = await Promise.all([bookTestVisit(r.ctx, CREDS, IREQ), bookTestVisit(r.ctx, CREDS, IREQ)]);
+    assert.deepEqual([a.status, b.status], ['booked_verified', 'booked_verified']); assert.equal([a, b].filter((x) => x.duplicate === true).length, 1); assert.equal(r.mock.jobs.size, 1); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+    const second = { ...IREQ, when: { ...IREQ.when, date: '2026-11-11' }, identity: { ...IPARTS, date: '2026-11-11' } };
+    const [c, d] = await Promise.all([bookTestVisit(r.ctx, CREDS, second), bookTestVisit(r.ctx, CREDS, { ...second, when: { ...second.when, date: '2026-11-12' }, identity: { ...IPARTS, date: '2026-11-12' } })]);
+    assert.deepEqual([c.status, d.status], ['booked_verified', 'booked_verified']); assert.equal(r.mock.jobs.size, 3); assert.deepEqual(lockFiles(r), []);
+  } finally { await r.done(); }
+});
+
+test('IDENTITY booking while a rotation holds the global lock: the booking waits, then reads the NEW keyring and books under the new key; and while a booking runs, a rotation cannot take the lock', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1); const gen2 = await fakeProtector.protect(keyringGen(2)); let entered!: () => void; const inside = new Promise<void>((ok) => { entered = ok; });
+    const rotation = r.ctx.vault.withLock('booking-identity', async () => { entered(); await new Promise((ok) => setTimeout(ok, 400)); writeFileSync(keyringFile(r, 2), gen2); });
+    await inside; const res = await bookTestVisit(r.ctx, CREDS, IREQ); await rotation;
+    assert.equal(res.status, 'booked_verified'); assert.ok(String(jobList(r)[0].title).includes(idMarker(2)) && !String(jobList(r)[0].title).includes(idMarker(1)), 'booked under generation 2, the key the rotation published');
+  } finally { await r.done(); }
+  const r2 = await rig();
+  try {
+    await seedKeyring(r2, 1); let probe = 'not tried'; const real = r2.ctx.fetch;
+    r2.ctx.fetch = (async (url: string, init: FetchInit) => { if (probe === 'not tried' && /FindTestJobs/.test(String(init.body ?? ''))) { probe = 'trying'; try { await r2.ctx.vault.withLock('booking-identity', async () => undefined, 150); probe = 'acquired'; } catch (e) { probe = (e as { code?: string }).code ?? 'error'; } } return real(url, init); }) as unknown as FetchLike;
+    const res = await bookTestVisit(r2.ctx, CREDS, IREQ); assert.equal(res.status, 'booked_verified'); assert.equal(probe, 'TIMEOUT', 'a rotation cannot enter while the booking holds the global lock');
+  } finally { await r2.done(); }
+});
+
+test('IDENTITY unavailable (no keyring, a gap, a malformed or out-of-order generation, an undecodable file): not_booked with IDENTITY_UNAVAILABLE, nothing sent to Jobber except the account check, no ledger file, no lock left, and NEVER a fall-back to the Call-SID key', async () => {
+  const cases: Array<[string, string, (r: Rig) => Promise<void>]> = [
+    ['MISSING', 'MISSING', async () => undefined],
+    ['GAP', 'GAP', async (r) => seedKeyring(r, 2, 2)],
+    ['MALFORMED', 'MALFORMED', async (r) => { await seedKeyring(r, 1); writeFileSync(keyringFile(r, 2), await fakeProtector.protect('not json')); }],
+    ['SUCCESSION', 'SUCCESSION', async (r) => { await seedKeyring(r, 1); writeFileSync(keyringFile(r, 2), await fakeProtector.protect(JSON.stringify({ version: 1, gen: 2, current: { kid: 'k2', secret: SECRETS[2] }, retired: [] }))); }],
+    ['MALFORMED (text)', 'MALFORMED', async (r) => { writeFileSync(keyringFile(r, 1), 'undecodable garbage'); }],
+    ['UNREADABLE', 'UNREADABLE', async (r) => { await seedKeyring(r, 1); const v = r.ctx.vault; const real = v.loadBlob.bind(v); v.loadBlob = async (n: string) => (n.startsWith('booking-identity-keys') ? undefined : real(n)); }],
+  ];
+  for (const [label, problem, setup] of cases) {
+    const r = await rig();
+    try {
+      await setup(r); const names = spyLocks(r); const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+      assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'IDENTITY_UNAVAILABLE', 0], label); assert.deepEqual(mutations(r.mock), [], label); assert.equal(searches(r), 0, label + ': Jobber was not even searched'); assert.equal(r.mock.jobs.size, 0);
+      assert.deepEqual(ledgerFiles(r), [], label + ': no ledger file for any key'); assert.deepEqual(lockFiles(r), [], label); assert.deepEqual(names, ['booking-identity'], label + ': only the global lock was taken');
+      assert.ok(r.logs.some(([c, d]) => c === 'JOBBER_IDENTITY_FAILED' && (d as { problem?: string }).problem === problem), label + ': the fixed reason is logged');
+    } finally { await r.done(); }
+  }
+});
+
+test('IDENTITY request checks: an identity request has no key of its own (one that is given is refused), the identity must be the request\'s own phone, date, start time, house number and ZIP, and writes off still refuses before any lock or keyring read', async () => {
+  const now = NOW;
+  assert.deepEqual(requestProblems(IREQ, now), []); assert.deepEqual(requestProblems(REQ, now), []);
+  assert.deepEqual(requestProblems({ ...IREQ, key: 'call-0123456789abcdef' }, now), ['key'], 'both a key and an identity');
+  for (const [label, parts] of [['phone', { ...IPARTS, phone: '5550109999' }], ['date', { ...IPARTS, date: '2026-11-11' }], ['start', { ...IPARTS, startTime: '10:00' }], ['house', { ...IPARTS, street: '124 Invented Lane' }], ['zip', { ...IPARTS, zip: '90211' }], ['bad parts', { ...IPARTS, zip: 'abc' }]] as Array<[string, IdentityParts]>) assert.deepEqual(requestProblems({ ...IREQ, identity: parts }, now), ['identity'], label);
+  assert.deepEqual(requestProblems({ ...IREQ, identity: { ...IPARTS, street: '123 Another Road' } }, now), [], 'the street NAME is not part of the identity (the read-back compares it)');
+  const r = await rig(false);
+  try { await seedKeyring(r, 1); const names = spyLocks(r); const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes], ['refused', 'WRITES_OFF', 0]); assert.deepEqual(names, []); assert.deepEqual(r.mock.ops, []); } finally { await r.done(); }
+  const r2 = await rig();
+  try { await seedKeyring(r2, 1); const names = spyLocks(r2); const res = await bookTestVisit(r2.ctx, CREDS, { ...IREQ, identity: { ...IPARTS, zip: '90211' } }); assert.deepEqual([res.status, res.reason], ['refused', 'INVALID_REQUEST']); assert.deepEqual(names, []); assert.deepEqual(r2.mock.ops, []); } finally { await r2.done(); }
+});
+
+test('the LEGACY key path is unchanged by a keyring: a request with a key takes only its own key lock, never reads the keyring, and books under its own marker', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 3); const names = spyLocks(r); const reads: string[] = []; const v = r.ctx.vault; const realLoad = v.loadBlob.bind(v); v.loadBlob = async (n: string) => { reads.push(n); return realLoad(n); };
+    const res = await bookTestVisit(r.ctx, CREDS, REQ);
+    assert.deepEqual([res.status, res.writes], ['booked_verified', 2]); assert.deepEqual(names, ['booking-' + markerFor(REQ.key).toLowerCase()]); assert.ok(!reads.some((n) => n.startsWith('booking-identity-keys')), 'the keyring was not read'); assert.ok(String(jobList(r)[0].title).includes(markerFor(REQ.key)));
+  } finally { await r.done(); }
+});
+
+test('FENCE: the keyring changes after it was read but before the first write - nothing is written (IDENTITY_STALE, not_booked); after the client was created - the job is NOT created (uncertain, 1 write), and the retry under the new key is stopped by the old key\'s unresolved ledger', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1); const gen2 = await fakeProtector.protect(keyringGen(2)); afterResponse(r, /FindTestJobs/, () => writeFileSync(keyringFile(r, 2), gen2));
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'IDENTITY_STALE', 0]); assert.deepEqual(mutations(r.mock), []); assert.deepEqual(ledgerFiles(r), []); assert.deepEqual(lockFiles(r), []);
+  } finally { await r.done(); }
+  const r2 = await rig();
+  try {
+    await seedKeyring(r2, 1); const gen2 = await fakeProtector.protect(keyringGen(2)); const real = r2.ctx.fetch; afterResponse(r2, /clientCreate/, () => writeFileSync(keyringFile(r2, 2), gen2));
+    const res = await bookTestVisit(r2.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'IDENTITY_STALE', 1]); assert.deepEqual(mutations(r2.mock), ['clientCreate'], 'the job was never sent'); assert.equal(r2.mock.jobs.size, 0); assert.equal((await ledgerOf(r2, withKey(1)))[idMarker(1)].state, 'pending');
+    r2.ctx.fetch = real; const retry = await bookTestVisit(r2.ctx, CREDS, IREQ);
+    assert.deepEqual([retry.status, retry.reason, retry.writes], ['uncertain', 'PENDING_UNRESOLVED', 0], 'the old key started this booking and cannot say how it ended'); assert.deepEqual(mutations(r2.mock), ['clientCreate'], 'nothing more was sent');
+  } finally { await r2.done(); }
+});
+
+test('FENCE after the retired-key check: a rotation that lands while the old key is being checked turns even a matching duplicate into IDENTITY_STALE (nothing written, nothing claimed from a keyring that is no longer current)', async () => {
+  const r = await rig();
+  try {
+    await bookedThenRotated(r); const gen3 = await fakeProtector.protect(keyringGen(3)); afterResponse(r, /FindTestJobs/, () => writeFileSync(keyringFile(r, 3), gen3));
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.writes, res.duplicate], ['not_booked', 'IDENTITY_STALE', 0, undefined]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+    r.ctx.fetch = globalThis.fetch as unknown as FetchLike; const next = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([next.status, next.duplicate, next.writes], ['booked_verified', true, 0], 'the next call reads the new keyring and still finds the booking under the oldest key');
+  } finally { await r.done(); }
+});
+
+test('GLOBAL LOCK lost: before any write - nothing is sent (not_booked, LOCK_LOST); after the client - the job is not created (uncertain, 1 write); the lock of whoever took over is left alone', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1); afterResponse(r, /FindTestJobs/, () => writeFileSync(join(r.dir, 'booking-identity.lock'), 'another-holder'));
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['not_booked', 'LOCK_LOST', 0]); assert.deepEqual(mutations(r.mock), []); assert.equal(readFileSync(join(r.dir, 'booking-identity.lock'), 'utf8'), 'another-holder');
+  } finally { await r.done(); }
+  const r2 = await rig();
+  try {
+    await seedKeyring(r2, 1); afterResponse(r2, /clientCreate/, () => rmSync(join(r2.dir, 'booking-identity.lock'), { force: true }));
+    const res = await bookTestVisit(r2.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'LOCK_LOST', 1]); assert.deepEqual(mutations(r2.mock), ['clientCreate']); assert.equal(r2.mock.jobs.size, 0);
+  } finally { await r2.done(); }
+});
+
+/** A booking made under generation 1, then the keyring rotated to `upTo` (the old key is now retired). */
+async function bookedThenRotated(r: Rig, upTo = 2): Promise<{ first: Awaited<ReturnType<typeof bookTestVisit>> }> { await seedKeyring(r, 1); const first = await bookTestVisit(r.ctx, CREDS, IREQ); assert.equal(first.status, 'booked_verified'); await seedKeyring(r, upTo, 2); return { first }; }
+
+test('RETIRED KEY: after a rotation the same booking is found under the old key (ledger and Jobber) and is a verified duplicate - same job, no write, nothing filed under the new key, the old key\'s ledger untouched', async () => {
+  const r = await rig();
+  try {
+    const { first } = await bookedThenRotated(r); const before = ledgerFiles(r).map((f) => [f, readFileSync(join(r.dir, f), 'utf8')]);
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.duplicate, res.writes, res.jobId], ['booked_verified', true, 0, first.jobId]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); assert.equal(r.mock.jobs.size, 1);
+    assert.deepEqual(ledgerFiles(r).map((f) => [f, readFileSync(join(r.dir, f), 'utf8')]), before, 'no ledger file written or changed'); assert.deepEqual(Object.keys(await ledgerOf(r, withKey(2))), [], 'nothing under the new key');
+    assert.ok(r.logs.some(([c, d]) => c === 'JOBBER_IDENTITY_ALIAS_HIT' && (d as { kid?: string }).kid === 'k1'), 'the retired key id is logged, never a secret'); assert.ok(!JSON.stringify(r.logs).includes(SECRETS[0]));
+    const alsoBlind = (r.mock.opts.searchBlind = true, await bookTestVisit(r.ctx, CREDS, IREQ)); assert.deepEqual([alsoBlind.status, alsoBlind.duplicate, alsoBlind.writes], ['booked_verified', true, 0], 'the ledger alone is enough when Jobber\'s search cannot see the job');
+    r.mock.opts.searchBlind = false; for (const f of ledgerFiles(r)) rmSync(join(r.dir, f)); const lost = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([lost.status, lost.duplicate, lost.writes, lost.jobId], ['booked_verified', true, 0, first.jobId], 'Jobber alone is enough when the ledger is lost');
+  } finally { await r.done(); }
+});
+
+test('RETIRED KEY with two rotations: the booking made under the oldest key is still found (the newest generation lists both retired keys)', async () => {
+  const r = await rig();
+  try { const { first } = await bookedThenRotated(r, 3); const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.duplicate, res.writes, res.jobId], ['booked_verified', true, 0, first.jobId]); assert.equal(r.mock.jobs.size, 1); } finally { await r.done(); }
+});
+
+test('RETIRED KEY, details differ: a job under the old key is NOT a verified duplicate unless every field matches - another price, street, name, time or phone is uncertain (READBACK_MISMATCH, field names only), nothing is written, nothing is booked', async () => {
+  const variants: Array<[string, Partial<BookingRequest>, string[], Partial<IdentityParts>]> = [
+    ['price', { priceDollars: 250 }, ['price'], {}], ['street name', { address: { ...REQ.address, street1: '123 Other Road' } }, ['address'], { street: '123 Other Road' }],
+    ['client name', { client: { ...REQ.client, lastName: 'Different' } }, ['client_name'], {}], ['end time', { when: { ...REQ.when, endTime: '12:00' } }, ['visit_time'], {}], ['title', { title: 'Deep cleaning' }, ['title'], {}],
+  ];
+  for (const [label, change, fields, parts] of variants) {
+    const r = await rig();
+    try {
+      await bookedThenRotated(r); const res = await bookTestVisit(r.ctx, CREDS, { ...IREQ, ...change, identity: { ...IPARTS, ...parts } } as IdentityBookingRequest);
+      assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'READBACK_MISMATCH', 0], label); assert.deepEqual([...(res.mismatches ?? [])].sort(), fields.sort(), label); assert.notEqual(res.status, 'booked_verified'); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate'], label); assert.equal(r.mock.jobs.size, 1, label);
+    } finally { await r.done(); }
+  }
+  const r = await rig();
+  try {
+    await bookedThenRotated(r); r.mock.opts.shiftVisitMs = 0; const job = jobList(r)[0]; job.jobStatus = 'ARCHIVED';
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.mismatches, res.writes], ['uncertain', 'READBACK_MISMATCH', ['job_status'], 0], 'an archived job is not a booking');
+  } finally { await r.done(); }
+});
+
+test('RETIRED KEY, doubt: a job that cannot be read back (NOT_FOUND), two jobs under old keys, an old key\'s ledger left pending or client_created with no job, and an unreadable old ledger are each uncertain with nothing written', async () => {
+  { const r = await rig(); try { await bookedThenRotated(r); r.mock.jobs.clear(); const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'NOT_FOUND', 0], 'the ledger says created but Jobber has no such job'); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); } finally { await r.done(); } }
+  { const r = await rig(); try {
+    await bookedThenRotated(r, 3); const a = jobList(r)[0]; const m1 = idMarker(1); const m2 = idMarker(2);
+    r.mock.jobs.set('JOB-OTHER', { ...a, id: 'JOB-OTHER', title: String(a.title).replace(m1, m2), instructions: String(a.instructions).replace(m1, m2) });
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'DUPLICATE_MARKERS', 0], 'jobs under two retired keys'); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+  } finally { await r.done(); } }
+  for (const state of ['pending', 'client_created']) {
+    const r = await rig();
+    try {
+      await seedKeyring(r, 2); await seedGen(r, 1, state === 'pending' ? { state: 'pending' } : { state: 'client_created', clientId: 'CLIENT-1', propertyId: 'PROP-1' }, {}, withKey(1));
+      const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'PENDING_UNRESOLVED', 0], state); assert.deepEqual(mutations(r.mock), [], state); assert.deepEqual(ledgerFiles(r), [ledgerName(withKey(1)) + '.1.enc'], state + ': only the seeded file');
+    } finally { await r.done(); }
+  }
+  { const r = await rig(); try {
+    await bookedThenRotated(r); const top = r.ctx.vault.generations(ledgerName(withKey(1))).at(-1) as number; const bad = genPath(r, top, withKey(1)); writeFileSync(bad, 'undecodable'); const res = await bookTestVisit(r.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'LEDGER_UNREADABLE', 0], 'an old ledger that cannot be read may hide a booking'); assert.equal(readFileSync(bad, 'utf8'), 'undecodable'); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+  } finally { await r.done(); } }
+  { const r = await rig(); try {
+    await seedKeyring(r, 2); await seedGen(r, 1, { state: 'pending' }, {}, withKey(1)); const job = { id: 'JOB-OLD', jobNumber: 1, title: 'Standard cleaning [' + idMarker(1) + ']', instructions: 'x ' + idMarker(1), jobStatus: 'UPCOMING', total: 199, client: { firstName: 'Testa', lastName: 'Invented', phones: [{ number: '5550104242' }] }, property: { address: { street1: '123 Invented Lane', city: 'Testville', postalCode: '90210', province: 'ca' } }, visits: { nodes: [{ startAt: '2026-11-10T15:00:00.000Z', endAt: '2026-11-10T17:00:00.000Z' }] } };
+    r.mock.jobs.set('JOB-OLD', job); const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.duplicate, res.writes, res.jobId], ['booked_verified', true, 0, 'JOB-OLD'], 'a pending old ledger whose job IS in Jobber and matches in full');
+  } finally { await r.done(); } }
+});
+
+test('IDENTITY source: global lock before key lock, one shared body for both paths, no environment, file, network or fall-back to the Call-SID key in the identity path, and the lock name is the one the rotation takes', async () => {
+  const src = readFileSync(new URL('../src/jobber-booking.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(src.includes("const IDENTITY_LOCK = 'booking-identity';")); const setup = await import('../src/booking-identity-setup.ts'); assert.equal(setup.IDENTITY_LOCK, 'booking-identity');
+  const identityPath = src.slice(src.indexOf('const byIdentity ='), src.indexOf('  try {\n    const tokens'));
+  assert.ok(identityPath.indexOf('withLock(IDENTITY_LOCK') >= 0 && identityPath.indexOf('withLock(IDENTITY_LOCK') < identityPath.indexOf('withLock(`booking-${marker.toLowerCase()}`'), 'global first');
+  assert.equal([...src.matchAll(/\blocked\(req, marker, /g)].length, 2, 'both paths run the same body'); assert.ok(/locked\(req, marker, both, aliasCheck\)/.test(src) && /locked\(req, marker, lock\)\)/.test(src));
+  assert.ok(/outer\.assertHeld\(\); inner\.assertHeld\(\); unchanged\(\);/.test(identityPath), 'one handle checks both locks and the keyring at every write');
+  assert.ok(!/drew-fast|createHash|callSid|CallSid/.test(identityPath), 'no Call-SID key in the identity path'); assert.ok(!/process\.env|writeFile|rmSync|saveBlob|publishBlob\(/.test(identityPath), 'the identity path writes nothing itself');
+  assert.equal([...src.matchAll(/\bmutate\(/g)].length, 1, 'still one call to mutate'); assert.equal([...src.matchAll(/publishBlob\(/g)].length, 1, 'still one publish');
+  assert.deepEqual([...src.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['node:crypto', './jobber-connector.ts', './jobber-connector.ts', './booking-identity.ts', './booking-identity.ts', './us-state.ts']);
 });
