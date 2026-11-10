@@ -66,7 +66,7 @@ export interface FollowUpFacts {
 const CALL_SID = /^CA[0-9a-f]{32}$/;
 const CODE = /^[A-Z][A-Z0-9_]{2,47}$/;
 /**
- * The ONE notice the owner gets when the call told the caller that "a person will follow up" (or call): the reason code, the time, the callback number and the steps reached. Fixed words only; no name,
+ * The ONE notice the owner gets when a call ended without completing the request and needs a follow-up: the reason code, the time, the callback number and the steps reached. Fixed words only; no name,
  * address, day, price or anything else the caller said (none of it is passed in). PURE: strings only.
  */
 export function followUpEmail(f: FollowUpFacts): EmailMessage {
@@ -77,7 +77,7 @@ export function followUpEmail(f: FollowUpFacts): EmailMessage {
   return {
     subject: `${clean(f.businessName)} DEMO: call needs a follow-up`,
     text: [
-      `A ${clean(f.businessName)} DEMO call told the caller that a person would follow up. Nobody else has been told.`, '',
+      `A ${clean(f.businessName)} DEMO call ended without completing the request, and it needs a follow-up. Nobody else has been told.`, '',
       `Reason code: ${reason}`,
       `Callback number: ${phone ?? 'not available'}`,
       `Call ended: ${clean(f.whenText)}`,

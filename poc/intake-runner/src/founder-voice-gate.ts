@@ -39,9 +39,11 @@ export interface FastTestConfig {
   jobber_account_name: string; timezone: string; hours: Record<string, Array<[string, string]>>; duration_minutes: number;
   price_dollars: number; bedrooms: number; bathrooms: number; service_label: string; standing_approval: boolean;
   state?: string; lead_minutes?: number; step_minutes?: number; buffer_minutes?: number; horizon_days?: number;
+  /** Optional, default false: the owner's statement that someone works the follow-up list. Only then (and only with a stored lead and number) may a failure ending say that a person will follow up. */
+  follow_up_process?: boolean;
 }
 const FAST_KEYS = 'bathrooms,bedrooms,duration_minutes,hours,jobber_account_name,price_dollars,service_label,standing_approval,timezone'.split(',');
-const FAST_OPTIONAL = ['state', 'lead_minutes', 'step_minutes', 'buffer_minutes', 'horizon_days'];
+const FAST_OPTIONAL = ['state', 'lead_minutes', 'step_minutes', 'buffer_minutes', 'horizon_days', 'follow_up_process'];
 export function fastTestProblems(x: unknown): string[] {
   if (!isRecord(x)) return ['fast_test must be an object'];
   const p: string[] = []; const k = Object.keys(x);
@@ -52,6 +54,7 @@ export function fastTestProblems(x: unknown): string[] {
   if (typeof x.service_label !== 'string' || !/^[A-Za-z0-9 .,'&()-]{3,60}$/.test(x.service_label)) p.push('fast_test.service_label must be plain text');
   if (typeof x.standing_approval !== 'boolean') p.push('fast_test.standing_approval must be true or false (true is the standing approval of test bookings)');
   if ('state' in x && !(typeof x.state === 'string' && /^[A-Za-z]{2}$/.test(x.state))) p.push('fast_test.state must be two letters');
+  if ('follow_up_process' in x && typeof x.follow_up_process !== 'boolean') p.push('fast_test.follow_up_process must be true or false (true is the owner\'s statement that someone works the follow-up list)');
   if (availabilityProblems({ timezone: x.timezone, hours: x.hours, durationMinutes: x.duration_minutes, stepMinutes: x.step_minutes, leadMinutes: x.lead_minutes, bufferMinutes: x.buffer_minutes, horizonDays: x.horizon_days }).length > 0) p.push('fast_test needs a valid time zone, open hours (weekday 0 to 6, "HH:MM" pairs) and a cleaning duration of 30 to 480 minutes');
   return p;
 }
@@ -59,7 +62,7 @@ export function fastTestProblems(x: unknown): string[] {
 export function fastSettingsOf(voice: FounderVoiceConfig, businessName: string): FastSettings | undefined {
   const f = voice.fast_test; if (f === undefined) return undefined;
   const availability: AvailabilityConfig = { timezone: f.timezone, hours: f.hours, durationMinutes: f.duration_minutes, ...(f.step_minutes === undefined ? {} : { stepMinutes: f.step_minutes }), ...(f.lead_minutes === undefined ? {} : { leadMinutes: f.lead_minutes }), ...(f.buffer_minutes === undefined ? {} : { bufferMinutes: f.buffer_minutes }), ...(f.horizon_days === undefined ? {} : { horizonDays: f.horizon_days }) };
-  return { businessName, serviceLabel: f.service_label, availability, bedrooms: f.bedrooms, bathrooms: f.bathrooms, priceDollars: f.price_dollars, standingApproval: f.standing_approval, ...(f.state === undefined ? {} : { state: f.state.toUpperCase() }) };
+  return { businessName, serviceLabel: f.service_label, availability, bedrooms: f.bedrooms, bathrooms: f.bathrooms, priceDollars: f.price_dollars, standingApproval: f.standing_approval, ...(f.follow_up_process === true ? { followUpProcess: true } : {}), ...(f.state === undefined ? {} : { state: f.state.toUpperCase() }) };
 }
 
 export interface FounderVoiceConfig {

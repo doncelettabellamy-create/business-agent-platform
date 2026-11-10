@@ -19,6 +19,9 @@ import { mintExecutionContext } from '../src/execution-context.ts';
 import { consentNoticeFor } from '../src/opening.ts';
 import { createOpenAIHttpClient } from '../src/openai-http-client.ts';
 import { createVault } from '../src/jobber-connector.ts';
+import { contactsPathFor, createContactVault } from '../src/contact-vault.ts';
+import { toOwnerView } from '../src/owner-view.ts';
+import { callRefFor } from '../src/intake-record-store.ts';
 import { bookingIdentity } from '../src/booking-identity.ts';
 import { markerFor } from '../src/jobber-booking.ts';
 import type { Protector } from '../src/jobber-connector.ts';
@@ -55,12 +58,13 @@ const HOURS = { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', 
 
 /** A made-up keyring secret of this test (nothing real): the bookings are identified by what is booked, so the private folder needs a keyring. */
 const KEYRING_SECRET = Buffer.alloc(32, 7).toString('base64url');
-async function rig(o: { keyring?: boolean; jobberWrites?: boolean; ownerConsent?: boolean; texts?: boolean; word?: string; msPerChar?: number } = {}) {
+const CONTACT_KEY = Buffer.alloc(32, 9);   // a made-up key of this test (the encrypted contact vault)
+async function rig(o: { contacts?: boolean; followUp?: boolean; keyring?: boolean; jobberWrites?: boolean; ownerConsent?: boolean; texts?: boolean; word?: string; msPerChar?: number } = {}) {
   const dir = mkdtempSync(join(root, 'r-')); const jobber = await mockJobber(); const twilio = await mockTwilio(); closers.push(() => jobber.close(), () => twilio.close());
   const callConfig: FounderCallConfig = { approval_id: 'fast-test', tenant: T, numbers: [DREW], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'], kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
     opening: { business_name: 'Drew Cleaning', greeting: "Thanks for calling Drew Cleaning. I'm Jack. What's your name?" } };
   const voiceConfig: FounderVoiceConfig = { approval_id: 'v1', openai_model: 'gpt-test-model', realtime_model: 'realtime-test-model', transcription_model: 'transcribe-test-model', voice: 'test-voice', max_openai_calls: 5, persona: persona as never,
-    fast_test: { jobber_account_name: ACCOUNT.name, timezone: 'America/Chicago', hours: HOURS, duration_minutes: 120, price_dollars: 199, bedrooms: 2, bathrooms: 2, service_label: 'Standard cleaning', standing_approval: true, state: 'CA', lead_minutes: 60 } };
+    fast_test: { jobber_account_name: ACCOUNT.name, timezone: 'America/Chicago', hours: HOURS, duration_minutes: 120, price_dollars: 199, bedrooms: 2, bathrooms: 2, service_label: 'Standard cleaning', standing_approval: true, state: 'CA', lead_minutes: 60, ...(o.followUp === true ? { follow_up_process: true } : {}) } };
   // the private folder, as the setup scripts leave it (protected; invented values)
   const vault = createVault(dir, fakeProtector);
   await vault.saveCredentials({ client_id: 'test-client-id-0001', client_secret: 'test-client-secret-ZZZ-9f8e7d6c' });
@@ -72,9 +76,11 @@ async function rig(o: { keyring?: boolean; jobberWrites?: boolean; ownerConsent?
   const env = { TWILIO_AUTH_TOKEN: TOKEN, ...(o.texts === false ? (o.word === undefined ? {} : { FAST_TEXTS: o.word }) : { FAST_TEXTS: 'on' }), ...(o.jobberWrites === false ? {} : { JOBBER_ALLOW_WRITES: 'test-account' }) } as Record<string, string>;
   const status = await fastStatus({ vaultDir: dir, protector: fakeProtector, env });
   const logs: Array<{ code: string; detail?: Record<string, unknown> }> = []; const diagLines: Array<{ code: string; [k: string]: unknown }> = []; const outcomes: FastOutcome[] = [];
-  const fast = await buildFastDeps({ config: callConfig, voice: voiceConfig, vaultDir: dir, protector: fakeProtector, env, fetch: globalThis.fetch, now: () => NOW, log: (code, detail) => { logs.push({ code, detail }); }, onOutcome: (x) => { outcomes.push(x); }, jobberEndpoints: jobber.endpoints, twilioOrigin: twilio.origin, textFrom: DREW });
-  fast.answerWaitMs = 20_000; fast.settleMs = 30; fast.holdGraceMs = 30; fast.holdMaxMs = 300;
+  // the durable lead capture: the REAL intake store and (unless switched off) the REAL encrypted contact vault, in this rig's folder
   const store = createIntakeRecordStore({ path: join(dir, 'calls.sqlite') }); closers.push(() => store.close());
+  const contacts = o.contacts === false ? undefined : createContactVault({ path: contactsPathFor(join(dir, 'calls.sqlite')), key: CONTACT_KEY, now: () => Date.now() }); closers.push(() => contacts?.close());
+  const fast = await buildFastDeps({ config: callConfig, voice: voiceConfig, vaultDir: dir, protector: fakeProtector, env, fetch: globalThis.fetch, now: () => NOW, log: (code, detail) => { logs.push({ code, detail }); }, onOutcome: (x) => { outcomes.push(x); }, jobberEndpoints: jobber.endpoints, twilioOrigin: twilio.origin, textFrom: DREW, leads: { store, ...(contacts === undefined ? {} : { contacts }) } });
+  fast.answerWaitMs = 20_000; fast.settleMs = 30; fast.holdGraceMs = 30; fast.holdMaxMs = 300;
   const voices: WireVoice[] = [];
   const service = createFounderVoiceService({
     diag: (code, detail) => { diagLines.push({ code, ...detail }); }, config: callConfig, voice: voiceConfig, fast,
@@ -93,7 +99,7 @@ async function rig(o: { keyring?: boolean; jobberWrites?: boolean; ownerConsent?
   let cursor = 0;
   /** Waits for the next spoken line matching `re` (after the last one matched), then the caller answers. */
   const hears = async (re: RegExp, reply?: string): Promise<string> => { await until(() => (voices[0]?.spoken ?? []).slice(cursor).some((l) => re.test(l)), `a spoken line matching ${re}: ${JSON.stringify((voices[0]?.spoken ?? []).slice(cursor).map((l) => l.slice(0, 40)))}`); const i = voices[0].spoken.findIndex((l, k) => k >= cursor && re.test(l)); cursor = i + 1; const line = voices[0].spoken[i]; await until(() => !voices[0].playing(), 'the line to finish playing'); await pause(10); if (reply !== undefined) voices[0].hear(reply); return line; };
-  return { jobber, twilio, logs, diagLines, outcomes, voices, connect, start, hears, service, dir, status, fast, notice: service.notice };
+  return { jobber, twilio, logs, diagLines, outcomes, voices, connect, start, hears, service, dir, status, fast, store, contacts, notice: service.notice };
 }
 const noPersonal = (x: unknown, extra: string[] = []): void => { const all = JSON.stringify(x); for (const s of ['Testa', 'Invented', 'Testville', '90210', '5550100002', '5550100003', '0100002', FAKE_KEY, TOKEN, 'tok-valid', ...extra]) assert.ok(!all.includes(s), `no ${s} in the diagnostics`); };
 
@@ -162,7 +168,7 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   const sa = await a.connect(); a.start(sa); await until(() => a.voices.length === 1 && a.voices[0].spoken.length >= 1, 'the opening');
   await a.hears(/Thanks for calling/, 'Testa Invented'); await a.hears(/Is that right\? Say yes or no/, 'yes'); await a.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await a.hears(/What day and time/, 'Tuesday at ten'); await a.hears(/bedrooms and bathrooms/, 'two and two');
   await a.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.hears(/calling from/, 'yes'); await a.hears(/May we send you one automated/, 'yes'); await a.hears(/^To confirm/, 'yes');
-  assert.match(await a.hears(/could not confirm the booking/), /a person will follow up/); await sa.closed;
+  assert.match(await a.hears(/could not confirm the booking/), /Your request is recorded/); await sa.closed;
   assert.equal(a.jobber.jobs.size, 0); assert.equal(a.twilio.messages.length, 0); assert.equal(a.outcomes[a.outcomes.length - 1].reason, 'BOOKING_NOT_VERIFIED');
   // 2. the 10 A M slot is busy in Jobber's calendar: a later time is offered instead, never the busy one
   const b = await rig(); b.jobber.opts.scheduled = [{ startAt: new Date(instantOf('2026-11-03', '09:00', 'America/Chicago')).toISOString(), endAt: new Date(instantOf('2026-11-03', '12:00', 'America/Chicago')).toISOString() }];
@@ -174,7 +180,7 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   const c = await rig(); c.jobber.opts.hasMoreScheduled = true;
   const sc = await c.connect(); c.start(sc); await until(() => c.voices.length === 1 && c.voices[0].spoken.length >= 1, 'the opening');
   await c.hears(/Thanks for calling/, 'Testa Invented'); await c.hears(/Is that right\? Say yes or no/, 'yes'); await c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await c.hears(/What day and time/, 'Tuesday at ten'); await c.hears(/bedrooms and bathrooms/, 'two and two');
-  assert.match(await c.hears(/cannot check the schedule/), /a person will call you/); await sc.closed;
+  assert.match(await c.hears(/cannot check the schedule/), /Your request is recorded/); await sc.closed;
   assert.ok(!c.voices[0].spoken.some((l) => /is one hundred ninety-nine dollars/.test(l)), 'no price or time was offered'); assert.equal(c.jobber.jobs.size, 0);
 });
 
@@ -182,13 +188,13 @@ test('JOINED, NO KEYRING AT START: the server does not start - the status says t
   await assert.rejects(rig({ texts: false, ownerConsent: false, keyring: false }), (e: Error) => e instanceof RangeError && /booking identity keyring is not ready \(MISSING\)/.test(e.message) && !e.message.includes(KEYRING_SECRET));
 });
 
-test('JOINED, KEYRING GONE AFTER START: the same call, with the keyring removed after the server started, still fails closed - the caller is told a person will follow up, no client and no job are created, nothing is texted or consented, and the outcome is BOOKING_NOT_VERIFIED', async () => {
+test('JOINED, KEYRING GONE AFTER START: the same call, with the keyring removed after the server started, still fails closed - the caller is told only that the request is recorded, no client and no job are created, nothing is texted or consented, and the outcome is BOOKING_NOT_VERIFIED', async () => {
   const r = await rig({ texts: false, ownerConsent: false }); rmSync(join(r.dir, 'booking-identity-keys.1.enc'));
   const sim = await r.connect(); r.start(sim);
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
   await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
   await r.hears(/What day and time/, 'Tuesday at ten'); await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms'); await r.hears(/is one hundred ninety-nine dollars/, 'yes'); await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'); await r.hears(/^To confirm/, 'yes');
-  assert.equal(await r.hears(/could not confirm the booking/), 'I could not confirm the booking, so a person will follow up. Goodbye.');
+  assert.equal(await r.hears(/could not confirm the booking/), 'I could not confirm the booking. Your request is recorded. Goodbye.');
   await until(() => r.outcomes.some((o) => o.reason === 'BOOKING_NOT_VERIFIED'), 'the outcome');
   assert.equal(r.jobber.clientCount(), 0); assert.equal(r.jobber.jobs.size, 0); assert.ok(!r.jobber.ops.some((x) => x.field === 'clientCreate' || x.field === 'jobCreate'), 'no write of any kind');
   assert.deepEqual(r.twilio.messages, []); assert.ok(!r.voices[0].spoken.some((l) => /You are booked/.test(l)));
@@ -287,4 +293,44 @@ test('JOINED: a caller who talks over a short question is not interrupted (no AD
   await until(() => r.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'), 'the delivery check');
   assert.equal(r.jobber.clientCount(), 1); assert.equal(r.jobber.jobs.size, 1);
   await sim.closed; noPersonal(r.logs); noPersonal(r.diagLines);
+});
+
+// ================================================================ durable lead capture, end to end: the real relay, the real handler, the real intake store and the real encrypted contact vault in this rig's folder
+const CALL_REF = callRefFor(T, CALL);
+/** The whole call up to the read-back, with the keyring removed after the server started, so the booking ends BOOKING_NOT_VERIFIED after the caller confirmed everything. */
+async function failAfterTheCallback(r: Awaited<ReturnType<typeof rig>>): Promise<string> {
+  rmSync(join(r.dir, 'booking-identity-keys.1.enc')); const sim = await r.connect(); r.start(sim);
+  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
+  await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
+  await r.hears(/What day and time/, 'Tuesday at ten'); await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms'); await r.hears(/is one hundred ninety-nine dollars/, 'yes'); await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'); await r.hears(/^To confirm/, 'yes');
+  const line = await r.hears(/could not confirm the booking/); await until(() => r.outcomes.some((o) => o.reason === 'BOOKING_NOT_VERIFIED'), 'the outcome'); return line;
+}
+test('JOINED, LEAD stored: a failure after the caller confirmed everything is saved before the caller hears the ending - the record on the dashboard, the name and number in the encrypted vault - and the caller is told only that the request is recorded; it survives a restart of both files', async () => {
+  const r = await rig({ texts: false, ownerConsent: false });
+  const line = await failAfterTheCallback(r);
+  assert.equal(line, 'I could not confirm the booking. Your request is recorded. Goodbye.'); const last = r.outcomes[r.outcomes.length - 1]; assert.equal(last.lead, 'stored');
+  assert.deepEqual(r.store.list(T).map((x) => [x.call_ref, x.status, x.confirmation]), [[CALL_REF, 'needs-human', 'unconfirmed']]); assert.deepEqual(r.contacts?.get(T, CALL_REF), { name: 'Testa Invented', phone: '5550100002', address_state: 'unconfirmed' });
+  const view = toOwnerView(r.store.list(T), { fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' }); assert.equal(view.summary.needFollowUp, 1);
+  noPersonal(r.diagLines); noPersonal(r.logs); assert.ok(r.logs.some((l) => l.code === 'FAST_LEAD' && (l.detail as { result?: string }).result === 'stored'));
+  assert.equal(r.jobber.clientCount(), 0); assert.deepEqual(r.twilio.messages, []);
+  // a restart: close both files and open them again from disk
+  const dbPath = join(r.dir, 'calls.sqlite'); r.store.close(); r.contacts?.close();
+  const store2 = createIntakeRecordStore({ path: dbPath }); const vault2 = createContactVault({ path: contactsPathFor(dbPath), key: CONTACT_KEY, now: () => Date.now() });
+  try { assert.equal(store2.list(T).length, 1); assert.equal(vault2.get(T, CALL_REF)?.phone, '5550100002'); } finally { store2.close(); vault2.close(); }
+});
+
+test('JOINED, LEAD with the owner\'s attestation: the same call, with fast_test.follow_up_process true, keeps the original words only because the lead AND the number were stored', async () => {
+  const r = await rig({ texts: false, ownerConsent: false, followUp: true });
+  assert.equal(await failAfterTheCallback(r), 'I could not confirm the booking, so a person will follow up. Goodbye.'); assert.equal(r.outcomes[r.outcomes.length - 1].lead, 'stored');
+  const nv = await rig({ texts: false, ownerConsent: false, followUp: true, contacts: false });
+  assert.equal(await failAfterTheCallback(nv), 'I could not confirm the booking. Your request is recorded. Goodbye.', 'attested but no contact vault: no number was stored, so no promise'); assert.equal(nv.outcomes[nv.outcomes.length - 1].lead, 'recorded'); assert.equal(nv.store.list(T).length, 1);
+});
+
+test('JOINED, LEAD recorded before the callback: a home size the line does not book is saved as a record only (the caller ID was never confirmed), the dashboard counts it, and the caller is told only that the request is recorded', async () => {
+  const r = await rig({ texts: false, ownerConsent: false });
+  const sim = await r.connect(); r.start(sim); await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
+  await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await r.hears(/What day and time/, 'Tuesday at ten'); await r.hears(/bedrooms and bathrooms/, 'three bedrooms and two bathrooms');
+  assert.equal(await r.hears(/only book two bedroom/), 'Sorry, on this test line I can only book two bedroom, two bathroom homes. Your request is recorded. Goodbye.'); await until(() => r.outcomes.some((o) => o.reason === 'SIZE_NOT_OFFERED'), 'the outcome');
+  assert.equal(r.outcomes[r.outcomes.length - 1].lead, 'recorded'); assert.equal(r.store.list(T).length, 1); assert.deepEqual(r.contacts?.list(T), []); assert.equal(r.jobber.jobs.size, 0); assert.deepEqual(r.twilio.messages, []);
+  assert.equal(toOwnerView(r.store.list(T), { fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' }).summary.needFollowUp, 1);
 });

@@ -220,3 +220,13 @@ test('voice pin, as a property: any passing voice config (with or without the fa
   }
   assert.equal(passed, 2, 'only Jack passes, with and without the fast test');
 });
+
+test('fast_test.follow_up_process: optional, true or false only (the owner\'s statement that someone works the follow-up list), default off, and part of the approved configuration', () => {
+  const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
+  const withFlag = (v: unknown): object => ({ ...r.voice, fast_test: { ...r.voice.fast_test, follow_up_process: v } });
+  assert.deepEqual(founderVoiceConfigProblems(r.voice), [], 'absent: valid'); assert.equal(fastSettingsOf(r.voice, 'Drew Cleaning')?.followUpProcess, undefined, 'absent: not attested');
+  for (const v of [true, false]) assert.deepEqual(founderVoiceConfigProblems(withFlag(v)), [], String(v));
+  assert.equal(fastSettingsOf(withFlag(true) as typeof r.voice, 'Drew Cleaning')?.followUpProcess, true); assert.equal(fastSettingsOf(withFlag(false) as typeof r.voice, 'Drew Cleaning')?.followUpProcess, undefined, 'false is the same as absent');
+  for (const bad of ['true', 1, 0, null, 'yes', {}]) assert.ok(founderVoiceConfigProblems(withFlag(bad)).some((m) => /follow_up_process must be true or false/.test(m)), JSON.stringify(bad));
+  assert.notEqual(founderVoiceDigest(r.call, r.voice), founderVoiceDigest(r.call, withFlag(true) as typeof r.voice), 'switching the statement on changes the digest, so it needs a new approval');
+});

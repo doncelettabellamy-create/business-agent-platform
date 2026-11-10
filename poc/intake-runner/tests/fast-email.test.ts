@@ -237,7 +237,7 @@ test('the owner follow-up notice (M1): fixed words, a fixed reason code, the cal
   const base = { businessName: 'Drew Cleaning', reason: 'BOOKING_NOT_VERIFIED', whenText: 'Monday, November 2, 2026 at 9:00 AM Central', callbackNumber: '+15550100002', steps: ['CALLER_VERIFIED', 'NAME', 'BOOKING_UNCERTAIN'], bookingMayExist: true };
   const m = followUpEmail(base);
   assert.equal(m.subject, 'Drew Cleaning DEMO: call needs a follow-up');
-  assert.deepEqual(m.text.split('\n'), ['A Drew Cleaning DEMO call told the caller that a person would follow up. Nobody else has been told.', '', 'Reason code: BOOKING_NOT_VERIFIED', 'Callback number: (555) 010-0002', 'Call ended: Monday, November 2, 2026 at 9:00 AM Central', 'Steps reached: CALLER_VERIFIED, NAME, BOOKING_UNCERTAIN',
+  assert.deepEqual(m.text.split('\n'), ['A Drew Cleaning DEMO call ended without completing the request, and it needs a follow-up. Nobody else has been told.', '', 'Reason code: BOOKING_NOT_VERIFIED', 'Callback number: (555) 010-0002', 'Call ended: Monday, November 2, 2026 at 9:00 AM Central', 'Steps reached: CALLER_VERIFIED, NAME, BOOKING_UNCERTAIN',
     'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.', '', 'This notice holds no name, address or anything else the caller said.', `Sent by ${SENDER_LABEL}. This address was approved for this test only.`, '']);
   assert.ok(followUpEmail({ ...base, bookingMayExist: false }).text.includes('No booking was sent to Jobber.'));
   // a reason that is not a fixed code, a number that is not a plain US number, steps that are not codes

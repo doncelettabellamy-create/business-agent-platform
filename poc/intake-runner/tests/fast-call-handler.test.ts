@@ -11,18 +11,24 @@ import { requestProblems } from '../src/jobber-booking.ts';
 import type { Delivery, SendResult } from '../src/twilio-messaging.ts';
 import { cleanDetail } from '../src/call-diag.ts';
 import { fakeCarrier } from './helpers/fake-carrier.ts';
+import { callRefFor, createIntakeRecordStore } from '../src/intake-record-store.ts';
+import { createContactVault } from '../src/contact-vault.ts';
+import { makeLeadSaver } from '../src/fast-lead.ts';
 import { createRealtimeBridge } from '../src/realtime-bridge.ts';
 import { createRealtimeTransport } from '../src/realtime-transport.ts';
 import { createWirePhone, createWireVoice } from './helpers/realtime-wire-sim.ts';
 
 const TZ = 'America/Chicago'; const NOW = Date.parse('2026-11-02T15:00:00Z');   // Monday 9:00 in Chicago
+const TENANT = 'ws-fast-test'; const CONTACT_KEY = Buffer.alloc(32, 7);   // a made-up key of this test
 const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15550100003'; const STRANGER = '+15550100099';
 const SETTINGS: FastSettings = { businessName: 'Drew Cleaning', serviceLabel: 'Standard cleaning', bedrooms: 2, bathrooms: 2, priceDollars: 199, standingApproval: true, state: 'CA',
   availability: { timezone: TZ, hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, durationMinutes: 120, stepMinutes: 30, leadMinutes: 60 } };
 
-function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest | IdentityBookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
+function build(o: { /** The durable lead sink: a REAL intake store and a REAL encrypted contact vault, both in memory ('none': no sink at all; 'record-only': no contact vault). */ leads?: 'none' | 'record-only'; saveLead?: FastDeps['saveLead']; settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest | IdentityBookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
   const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: Array<BookingRequest | IdentityBookingRequest> = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
+  const records = createIntakeRecordStore({ path: ':memory:' }); const vault = createContactVault({ path: ':memory:', key: CONTACT_KEY, now: () => NOW });
   const deps: FastDeps = {
+    ...(o.leads === 'none' ? {} : { saveLead: o.saveLead ?? makeLeadSaver({ store: records, ...(o.leads === 'record-only' ? {} : { contacts: vault }), tenant: TENANT }) }),
     settings: { ...SETTINGS, ...o.settings }, numbers: new Set([DREW]), approvedCallers: new Set([CUSTOMER]), approvedCustomerNumbers: new Set(o.customers ?? [CUSTOMER]), ownerNumber: OWNER, maxCalls: o.maxCalls ?? 5,
     now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; if (o.busyHold !== undefined && busyCalls > 1) await o.busyHold; return (busyCalls > 1 && o.busyLater !== undefined ? o.busyLater : o.busy) ?? { busy: [], complete: true }; },
     book: async (r) => { booked.push(r); return (o.book ?? (() => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2 })))(r); },
@@ -34,7 +40,7 @@ function build(o: { settings?: Partial<FastSettings>; caller?: string | undefine
     ...(o.validate === undefined ? {} : { validateAddress: o.validate as (a: AddressToValidate) => Promise<AddressVerdict> }), ...(o.validateMs === undefined ? {} : { validateMs: o.validateMs }), ...(o.followUpMs === undefined ? {} : { followUpMs: o.followUpMs }), ...(o.slotHoldMs === undefined ? {} : { slotHoldMs: o.slotHoldMs }),
   };
   const h = createFastCallHandler(deps); const c = fakeCarrier();
-  return { h, c, logs, outcomes, mails, booked, texts, consents, busyCalls: () => busyCalls, last: () => outcomes[outcomes.length - 1] };
+  return { h, c, logs, outcomes, mails, booked, texts, consents, records, vault, busyCalls: () => busyCalls, last: () => outcomes[outcomes.length - 1] };
 }
 /** The caller's side of a complete call up to the offer, with the usual answers. */
 async function toOffer(c: ReturnType<typeof fakeCarrier>, when = 'Tuesday at ten'): Promise<void> {
@@ -214,10 +220,10 @@ test('text permission: a no books without a customer text and the owner is still
   assert.equal(c.booked.length, 0); assert.equal(c.last().reason, 'NO_STANDING_APPROVAL'); assert.equal(c.texts.length, 0);
 });
 
-test('honesty: a booking that is not verified sends no text and says a person will follow up; a refused customer text is not claimed; an undelivered or unconfirmed text is reported, not assumed', async () => {
+test('honesty: a booking that is not verified sends no text and says only that the request is recorded; a refused customer text is not claimed; an undelivered or unconfirmed text is reported, not assumed', async () => {
   const a = build({ book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', mismatches: ['visit_time'], writes: 2 }) }); a.h.serve(a.c.transport); await toOffer(a.c);
   await a.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await a.c.hears(/calling from/, 'yes'); await a.c.hears(/May we send you one automated/, 'yes'); await a.c.hears(/To confirm/, 'yes'); await finish(a.c);
-  assert.equal(a.texts.length, 0); assert.equal(a.last().reason, 'BOOKING_NOT_VERIFIED'); assert.equal(a.last().booked, false); assert.match(a.c.lines.at(-1)!, /could not confirm the booking, so a person will follow up/);
+  assert.equal(a.texts.length, 0); assert.equal(a.last().reason, 'BOOKING_NOT_VERIFIED'); assert.equal(a.last().booked, false); assert.equal(a.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.', 'the request was saved and read back, so "recorded" is true; no callback is promised');
   const b = build({ send: (to) => (to === CUSTOMER ? { ok: false, error: 'REFUSED', twilioCode: 21608 } : { ok: true, sid: `SM${'2'.repeat(32)}` }), delivery: 'unconfirmed' }); b.h.serve(b.c.transport); await toOffer(b.c);
   await b.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await b.c.hears(/calling from/, 'yes'); await b.c.hears(/May we send you one automated/, 'yes'); await b.c.hears(/To confirm/, 'yes');
   await b.c.drain(() => b.outcomes.some((o) => o.reason === 'TEXTS_VERIFIED'), 'delivery to be checked');
@@ -672,7 +678,7 @@ test('no state, no booking: two answers that are not a state end the call with a
   assert.equal(t.c.lines.filter((l) => /state is that in/.test(l)).length, 2, 'asked, and once more only because the answer was not understood');
   assert.equal(t.c.lines.filter((l) => /To confirm|What day and time/.test(l)).length, 0, 'nothing after the address was asked or read back');
   assert.equal(t.booked.length, 0); assert.equal(bookingMails(t).length, 0); assert.equal(t.texts.length, 0);
-  assert.equal(t.c.lines.at(-1), 'Sorry, I am having trouble with that, so a person will follow up. Goodbye.');
+  assert.equal(t.c.lines.at(-1), 'Sorry, I am having trouble with that. Your request is recorded. Goodbye.');
   assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_STATE').map(([, v]) => (v as { state: boolean }).state), [false, false]);
   noPersonalDetail(t.logs, ['banana', 'Invented Lane']);
 });
@@ -920,7 +926,7 @@ test('ADDRESS: a no with "never mind" ends as before; a wrong day and time, or a
   assert.equal(a.last().reason, 'DECLINED_AT_READBACK'); assert.match(a.c.lines.at(-1)!, /Nothing was booked/); nothingSent(a);
   for (const said of ['the day and time', 'my name']) {
     const b = build({ emails: 'accept', textsEnabled: false }); await toReadback(b); await b.c.hears(/To confirm/, 'no'); await b.c.hears(/Which part is wrong/, said); await finish(b.c);
-    assert.equal(b.last().reason, 'FIELD_NOT_SUPPORTED', said); assert.match(b.c.lines.at(-1)!, /can only change the address on this call, so nothing was booked and a person will follow up/); nothingSent(b);
+    assert.equal(b.last().reason, 'FIELD_NOT_SUPPORTED', said); assert.equal(b.c.lines.at(-1), 'Sorry, I can only change the address on this call, so nothing was booked. Your request is recorded. Goodbye.'); nothingSent(b);
   }
   const c = build({ emails: 'accept', textsEnabled: false }); await toReadback(c); await c.c.hears(/To confirm/, 'no'); await c.c.hears(/Which part is wrong/, 'hmm');
   await c.c.hears(/^Sorry, which part is wrong/, 'the name and the address'); await finish(c.c);
@@ -949,7 +955,7 @@ test('ADDRESS failure: two no answers to the spelled street, a spelling that giv
   await a.c.hears(/To confirm/, 'no'); await a.c.hears(/Which part is wrong/, 'the address'); await a.c.hears(/^Please say the street address again/, '456 Willin Hills Drive');
   await a.c.hears(/^I have 456 Willin Hills Drive, house number 4 5 6, street spelled/, 'no'); await a.c.hears(/^Please spell the street name/, 'W I L L I N. H I L L S. D R I V E');   // the spelling is the same wrong word
   await a.c.hears(/^I have 456 Willin Hills Drive, house number 4 5 6, street spelled/, 'no'); await finish(a.c);
-  assert.equal(a.last().reason, 'ADDRESS_NOT_CONFIRMED'); assert.match(a.c.lines.at(-1)!, /a person will follow up/); nothingSent(a); assert.equal(a.c.lines.filter((l) => /^To confirm/.test(l)).length, 1, 'no second read-back');
+  assert.equal(a.last().reason, 'ADDRESS_NOT_CONFIRMED'); assert.equal(a.c.lines.at(-1), 'Sorry, I am having trouble with that. Your request is recorded. Goodbye.'); nothingSent(a); assert.equal(a.c.lines.filter((l) => /^To confirm/.test(l)).length, 1, 'no second read-back');
   const b = build({ emails: 'accept', textsEnabled: false, settleMs: 80 }); await toReadback(b);
   await b.c.hears(/To confirm/, 'no'); await b.c.hears(/Which part is wrong/, 'the address'); await b.c.hears(/^Please say the street address again/, '456 Willin Hills Drive'); await b.c.hears(/^I have 456/, 'no');
   await b.c.hears(/^Please spell the street name/, 'not sure'); await b.c.hears(/^Sorry, please spell the street name again/, 'two bedrooms'); await finish(b.c);
@@ -1287,13 +1293,13 @@ test('ADDRESS CHECK (NOT ASKED FOR AN UNUSABLE ADDRESS): an address the shape gu
 
 // ---------------------------------------------------------------- M1: the owner's follow-up notice (an ending that tells the caller "a person will ..." sends the OWNER one fixed email)
 const notices = (t: ReturnType<typeof build>) => t.mails.filter((m) => m.subject === FOLLOW_UP_SUBJECT);
-const FOLLOW_UP_LINES: RegExp[] = [/^A Drew Cleaning DEMO call told the caller that a person would follow up\. Nobody else has been told\.$/, /^$/, /^Reason code: [A-Z][A-Z0-9_]{2,47}$/, /^Callback number: (\(555\) 010-\d{4}|not available)$/, /^Call ended: [A-Za-z0-9:, ]+$/, /^Call SID: CA[0-9a-f]{32}$/,
+const FOLLOW_UP_LINES: RegExp[] = [/^A Drew Cleaning DEMO call ended without completing the request, and it needs a follow-up\. Nobody else has been told\.$/, /^$/, /^Reason code: [A-Z][A-Z0-9_]{2,47}$/, /^Callback number: (\(555\) 010-\d{4}|not available)$/, /^Call ended: [A-Za-z0-9:, ]+$/, /^Call SID: CA[0-9a-f]{32}$/,
   /^Steps reached: ([A-Z][A-Z0-9_]{2,47})(, [A-Z][A-Z0-9_]{2,47})*$|^Steps reached: none$/, /^(Check Jobber \(the Developer Test Account\): the booking request was sent, so a job may exist even though it was not verified\.|No booking was sent to Jobber\.)$/,
   /^This notice holds no name, address or anything else the caller said\.$/, /^Sent by .+\. This address was approved for this test only\.$/];
 
 test('M1: an ending that promised a person sends the owner ONE fixed notice: the reason code, the time, the callback number and the steps reached; nothing else', async () => {
   const t = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }) }); await toBooked(t);
-  assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED'); assert.match(t.c.lines.at(-1)!, /a person will follow up/);
+  assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED'); assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.');
   assert.deepEqual(t.mails.map((m) => [m.role, m.subject]), [['owner', FOLLOW_UP_SUBJECT]], 'one email, to the owner role only, and no booking email');
   const lines = t.mails[0].text.split('\n');
   assert.ok(lines.includes('Reason code: BOOKING_NOT_VERIFIED')); assert.ok(lines.includes('Callback number: (555) 010-0002'));
@@ -1348,7 +1354,7 @@ test('M1: a refused, failing or silent mail server changes nothing about the end
   for (const mode of ['refuse', 'throw', 'hang'] as const) {
     const t = build({ textsEnabled: false, emails: mode, followUpMs: 150, book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }) });
     const began = Date.now(); await toBooked(t); const ended = Date.now() - began;
-    assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED', mode); assert.match(t.c.lines.at(-1)!, /I could not confirm the booking, so a person will follow up\. Goodbye\.$/, mode); assert.equal(t.c.ended, 1, mode); assert.equal(t.c.closed, 1, mode);
+    assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED', mode); assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.', mode); assert.equal(t.c.ended, 1, mode); assert.equal(t.c.closed, 1, mode);
     if (mode === 'hang') { assert.ok(!t.logs.some(([c]) => c === 'FAST_FOLLOWUP'), 'the call ended while the notice was still pending'); assert.ok(ended < 1000, `the call did not wait for the mail (${ended} ms)`); }
     await t.h.idle();
     assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').map(([, d]) => (d as { owner: string }).owner), [mode === 'refuse' || mode === 'throw' ? 'refused' : 'timeout'], mode);
@@ -1389,7 +1395,7 @@ test('M1 source guard: the notice is built from a short fixed list, sent to the 
   assert.ok(/send\('owner', msg\.subject, msg\.text\)/.test(fn) && !/'customer'/.test(fn), 'the owner role only');
   assert.equal([...src.matchAll(/notifyFollowUp\(/g)].length, 3, 'defined once and called from end(): when the call ends and when an ending is reached after a hang-up');
   assert.equal([...src.matchAll(/sendOwnerNotice\(/g)].length, 4, 'defined once and called from the promise check, from the skipped booking and from the speaker failure');
-  assert.ok(/deps\.onOutcome\?\.\(\{ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, \.\.\.extra \}\);\r?\n\s+notifyFollowUp\(reason, line, booked\);/.test(src), 'called from end(), after the outcome');
+  assert.ok(/deps\.onOutcome\?\.\(\{ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, \.\.\.\(lead === undefined \? \{\} : \{ lead \}\), \.\.\.extra \}\);\r?\n\s+notifyFollowUp\(reason, line, booked\);/.test(src), 'called from end(), after the outcome, with the ORIGINAL words (what the ending meant), not the words that were spoken');
 });
 
 // ---------------------------------------------------------------- M2: the caller hangs up while the Jobber booking is pending
@@ -1479,11 +1485,11 @@ const BAD_RESULTS: Array<[string, BookingResult]> = [
   ['IDENTITY_STALE after a write', { status: 'uncertain', reason: 'IDENTITY_STALE', writes: 1 }],
   ['an uncertain retired-key result', { status: 'uncertain', reason: 'DUPLICATE_MARKERS', writes: 0 }],
 ];
-test('only a VERIFIED duplicate with its job id is ALREADY_BOOKED: every uncertain, mismatching, job-less or identity-error result ends BOOKING_NOT_VERIFIED - nothing is texted or confirmed by email, nothing is said that sounds booked, a person follows up', async () => {
+test('only a VERIFIED duplicate with its job id is ALREADY_BOOKED: every uncertain, mismatching, job-less or identity-error result ends BOOKING_NOT_VERIFIED - nothing is texted or confirmed by email, nothing is said that sounds booked, the request is recorded', async () => {
   for (const [label, result] of BAD_RESULTS) {
     const t = build({ textsEnabled: true, emails: 'accept', book: () => result }); await toBookedWithTexts(t); await t.h.idle(); assert.equal(t.consents.length, 1, label + ': the caller did give the text permission');
     assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED', label); assert.equal(t.last().booked, false, label); assert.equal(t.texts.length, 0, label);
-    assert.equal(t.c.lines.at(-1), 'I could not confirm the booking, so a person will follow up. Goodbye.', label);
+    assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.', label);
     assert.ok(!t.mails.some((m) => m.role === 'customer'), label + ': no email to the customer'); assert.ok(!t.logs.some(([c]) => /^FAST_(EMAILS_SENT|TEXTS_SENT|BOOKING_DUPLICATE)$/.test(c)), label);
   }
 });
@@ -1785,4 +1791,103 @@ test('consent-phase speaker failure, end to end through the real transport and b
     assert.deepEqual(outcomes(t), [[reason, false]], how); assert.equal(t.mails.length, mails, how); assert.equal(t.booked.length, 0); assert.equal(t.h.active(), 0);
     if (mails === 1) { assert.deepEqual(sidLines(t), ['Call SID: ' + SIDN]); allLinesFixed(t); nothingPersonal(t); }
   }
+});
+
+// ================================================================ durable lead capture: an ending that would promise a person is SAVED and READ BACK before it is spoken, and says only what was saved
+const LEAD_SID = `CA${'ab'.repeat(16)}`; const LEAD_REF = callRefFor(TENANT, LEAD_SID);
+const LEAD_FAILED = 'Sorry, I could not complete that, and I could not save your request. Please call back later. Goodbye.';
+const UNVERIFIED = (): BookingResult => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 });
+const sizeNotOffered = async (t: ReturnType<typeof build>): Promise<void> => {
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented');
+  await t.c.hears(/Is that right\? Say yes or no/, 'yes'); await t.c.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await t.c.hears(/What day and time/, 'Tuesday at ten'); await t.c.hears(/bedrooms and bathrooms/, 'three bedrooms and two bathrooms'); await finish(t.c);
+};
+const otherNumber = async (t: ReturnType<typeof build>): Promise<void> => {
+  t.h.serve(t.c.transport); await toOffer(t.c); await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from/, 'no');
+  await t.c.hears(/best number/, 'five five five zero one zero zero zero zero four'); await t.c.hears(/I heard/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+};
+type LeadFactsSeen = Parameters<NonNullable<FastDeps['saveLead']>>[0];
+
+test('LEAD stored: a failure after the caller confirmed the name and the number saves the record and the encrypted contact, reads both back, and then says only that the request is recorded; with the owner\'s follow-up attestation the original words stand', async () => {
+  const t = build({ textsEnabled: false, book: UNVERIFIED }); await toBooked(t); await t.h.idle();
+  assert.equal(t.last().lead, 'stored'); assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED');
+  assert.deepEqual(t.records.list(TENANT).map((r) => [r.call_ref, r.status, r.confirmation, r.handed_off]), [[LEAD_REF, 'needs-human', 'unconfirmed', false]]);
+  assert.deepEqual(t.vault.get(TENANT, LEAD_REF), { name: 'Testa Invented', phone: '5550100002', address_state: 'unconfirmed' });
+  assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.'); assert.deepEqual(row(t, 'FAST_LEAD'), { result: 'stored', reason: 'BOOKING_NOT_VERIFIED' });
+  const a = build({ textsEnabled: false, book: UNVERIFIED, settings: { followUpProcess: true } }); await toBooked(a); await a.h.idle();
+  assert.equal(a.last().lead, 'stored'); assert.equal(a.c.lines.at(-1), 'I could not confirm the booking, so a person will follow up. Goodbye.', 'stored AND attested: the original words');
+  const u = build({ textsEnabled: false, book: UNVERIFIED, leads: 'record-only', settings: { followUpProcess: true } }); await toBooked(u); await u.h.idle();
+  assert.equal(u.last().lead, 'recorded'); assert.equal(u.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.', 'an attestation without a stored number promises nothing');
+});
+
+test('LEAD recorded: a failure BEFORE the callback number was confirmed saves the record only - the verified caller ID is known but was never confirmed by the caller, so no number and no name placeholder is kept', async () => {
+  const t = build(); await sizeNotOffered(t);
+  assert.equal(t.last().reason, 'SIZE_NOT_OFFERED'); assert.equal(t.last().lead, 'recorded'); assert.equal(t.records.list(TENANT).length, 1); assert.deepEqual(t.vault.list(TENANT), []);
+  assert.equal(t.c.lines.at(-1), 'Sorry, on this test line I can only book two bedroom, two bathroom homes. Your request is recorded. Goodbye.'); assert.equal(t.booked.length, 0);
+});
+
+test('LEAD facts: only what the caller confirmed reaches the saver - the name after the caller\'s yes, the callback number after the caller\'s yes and only if it is on the approved list; steps are fixed tokens; nothing the caller said', async () => {
+  const seen: LeadFactsSeen[] = []; const spy = (f: LeadFactsSeen) => { seen.push(f); return 'recorded' as const; };
+  const a = build({ saveLead: spy }); await sizeNotOffered(a);
+  const b = build({ saveLead: spy, book: UNVERIFIED, textsEnabled: false }); await toBooked(b);
+  const c = build({ saveLead: spy, book: UNVERIFIED, textsEnabled: false }); await otherNumber(c);                              // a number the caller gave, NOT on the approved list
+  const d = build({ saveLead: spy, book: UNVERIFIED, textsEnabled: false, customers: [CUSTOMER, '+15550100004'] }); await otherNumber(d);   // the same, on the list
+  const e = build({ saveLead: spy, emails: 'accept', settleMs: 80 }); e.h.serve(e.c.transport); e.c.setup(DREW, undefined, 'Done Bellamy');
+  await e.c.hears(/^I have Done, D O N E, Bellamy, B E L L A M Y\./, 'no'); await e.c.hears(/^Sorry\. Please say your first and last name again\.$/, 'Dawn Bellamy'); await e.c.hears(/^I have Dawn, D A W N, Bellamy, B E L L A M Y\./, 'no');
+  await e.c.hears(/^Please spell your first name/, 'D A W N'); await e.c.hears(/^Please spell your last name/, 'B E L L A M Y'); await e.c.hears(/^I have Dawn, D A W N, Bellamy, B E L L A M Y\./, 'no'); await finish(e.c);
+  assert.deepEqual(seen.map((f) => [f.reason, f.name, f.callback]), [
+    ['SIZE_NOT_OFFERED', 'Testa Invented', undefined], ['BOOKING_NOT_VERIFIED', 'Testa Invented', '+15550100002'], ['BOOKING_NOT_VERIFIED', 'Testa Invented', undefined], ['BOOKING_NOT_VERIFIED', 'Testa Invented', '+15550100004'], ['NAME_NOT_CONFIRMED', undefined, undefined],
+  ]);
+  for (const f of seen) { assert.deepEqual(Object.keys(f).filter((k) => f[k as keyof LeadFactsSeen] !== undefined).sort(), ['at', 'callSid', 'reason', ...(f.callback === undefined ? [] : ['callback']), ...(f.name === undefined ? [] : ['name']), 'steps'].sort()); assert.ok(f.steps.every((s) => /^[A-Z][A-Z0-9_]*$/.test(s)), 'steps are fixed tokens'); assert.equal(f.callSid, LEAD_SID); }
+  assert.equal(JSON.stringify(a.logs).includes('Invented'), false); assert.equal(JSON.stringify(b.logs).includes('5550100002'), false, 'no number in a log');
+});
+
+test('LEAD an approved number the caller gave is stored with its own digits; one that is not approved is not (the record alone)', async () => {
+  const ok = build({ book: UNVERIFIED, textsEnabled: false, customers: [CUSTOMER, '+15550100004'] }); await otherNumber(ok);
+  assert.equal(ok.last().lead, 'stored'); assert.deepEqual(ok.vault.get(TENANT, LEAD_REF), { name: 'Testa Invented', phone: '5550100004', address_state: 'unconfirmed' });
+  const no = build({ book: UNVERIFIED, textsEnabled: false }); await otherNumber(no);
+  assert.equal(no.last().lead, 'recorded'); assert.deepEqual(no.vault.list(TENANT), []); assert.equal(no.records.list(TENANT).length, 1);
+});
+
+test('LEAD failed: no sink at all, a saver that throws or rejects, or one that answers anything but "stored" or "recorded" - the ending says that nothing could be saved, never "recorded" and never a promise', async () => {
+  const cases: Array<[string, { leads?: 'none'; saveLead?: FastDeps['saveLead'] }]> = [
+    ['no sink', { leads: 'none' }], ['throws', { saveLead: () => { throw new Error('disk full'); } }], ['rejects', { saveLead: async () => { throw new Error('locked'); } }],
+    ['garbage', { saveLead: (() => 'yes') as unknown as FastDeps['saveLead'] }], ['undefined', { saveLead: (() => undefined) as unknown as FastDeps['saveLead'] }], ['an explicit failure', { saveLead: () => 'failed' }],
+  ];
+  for (const [label, over] of cases) {
+    const t = build({ textsEnabled: false, book: UNVERIFIED, settings: { followUpProcess: true }, ...over }); await toBooked(t); await t.h.idle();
+    assert.equal(t.last().lead, 'failed', label); assert.equal(t.c.lines.at(-1), LEAD_FAILED, label); assert.deepEqual(row(t, 'FAST_LEAD'), { result: 'failed', reason: 'BOOKING_NOT_VERIFIED' }, label);
+  }
+});
+
+test('LEAD order and count: the lead is saved BEFORE the ending is spoken, exactly once per call; a booked ending and ALREADY_BOOKED save nothing', async () => {
+  const calls: Array<{ spoken: number; reason: string }> = [];
+  const t: ReturnType<typeof build> = build({ textsEnabled: false, book: UNVERIFIED, saveLead: async (f) => { calls.push({ spoken: t.c.lines.length, reason: f.reason }); return 'recorded'; } });
+  await toBooked(t); await t.h.idle();
+  assert.equal(calls.length, 1); assert.equal(calls[0].spoken, t.c.lines.length - 1, 'every line but the ending had been spoken'); assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.');
+  let count = 0; const ok = build({ textsEnabled: false, saveLead: () => { count++; return 'stored'; } }); await toBooked(ok); await ok.h.idle();
+  const dup = build({ textsEnabled: false, saveLead: () => { count++; return 'stored'; }, book: () => ({ ...OK_RESULT, writes: 0, duplicate: true }) }); await toBooked(dup); await dup.h.idle();
+  assert.deepEqual([ok.last().reason, dup.last().reason, count], ['BOOKED', 'ALREADY_BOOKED', 0]); assert.equal(ok.last().lead, undefined); assert.equal(ok.records.list(TENANT).length, 0);
+});
+
+test('LEAD after a hang-up: a booking that is not verified once the caller is gone saves the lead once, speaks nothing, and the outcome carries the result', async () => {
+  const g = gate<BookingResult>(); const t = build({ textsEnabled: false, book: () => g.p });
+  await toPendingWrite(t); t.c.hangUp(); g.res(UNVERIFIED()); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_NOT_VERIFIED', false]]); assert.equal(t.last().lead, 'stored'); assert.equal(t.records.list(TENANT).length, 1);
+  assert.equal(t.c.lines.some((l) => /recorded|person will/.test(l)), false, 'nothing is spoken to a caller who has gone'); assert.equal(t.logs.filter(([c]) => c === 'FAST_LEAD').length, 1);
+});
+
+test('LEAD owner notice is unchanged and does not rest on the lead: the owner email still goes once for the ending, and it no longer says what the caller was told', async () => {
+  const t = build({ textsEnabled: false, emails: 'accept', book: UNVERIFIED, leads: 'none' }); await toBooked(t); await t.h.idle();
+  assert.equal(t.last().lead, 'failed'); assert.deepEqual(t.mails.map((m) => m.role), ['owner']); const body = t.mails[0].text.split('\n');
+  assert.equal(body[0], 'A Drew Cleaning DEMO call ended without completing the request, and it needs a follow-up. Nobody else has been told.'); assert.ok(!t.mails[0].text.includes('told the caller'));
+});
+
+test('LEAD source: the lead path sends nothing and keeps no placeholder, only a confirmed name and an approved confirmed number reach it, and the record is written before the contact', () => {
+  const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const fn = /async function saveLeadFor[\s\S]*?\n    \}\n/.exec(src)?.[0] ?? ''; assert.ok(fn.length > 300, 'found');
+  assert.ok(!/sendText|sendEmail|sendOwnerNotice|recordConsent/.test(fn), 'the lead path sends nothing'); assert.ok(/deps\.approvedCustomerNumbers\.has\(callback\)/.test(fn) && /nameOk/.test(fn), 'only a confirmed name and an approved, confirmed number');
+  assert.ok(!/'Name not|\(name not/i.test(src), 'no placeholder name');
+  const lead = readFileSync(new URL('../src/fast-lead.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.deepEqual([...lead.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['./intake-record-store.ts', './intake-record-store.ts', './contact-vault.ts']); assert.ok(!/process\.env|fetch\(|console\.|writeFile|setTimeout|sendText|sendEmail/.test(lead));
+  assert.ok(lead.indexOf('sink.store.put') < lead.indexOf('sink.contacts.put'), 'the record is written before the contact');
 });

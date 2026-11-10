@@ -29,6 +29,7 @@ import type { CallTransport, TransportCloseInfo, TransportEvent } from './call-t
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
 import { customerEmail, followUpEmail, ownerEmail } from './fast-email-copy.ts';
+import type { LeadFacts, LeadResult } from './fast-lead.ts';
 import { CUSTOMER_SCRIPT_ID, MAX_TEXT_CHARS, customerConsentLine, customerText, ownerText, zoneLabelOf } from './fast-sms-copy.ts';
 
 export interface FastSettings {
@@ -38,11 +39,13 @@ export interface FastSettings {
   bedrooms: number; bathrooms: number; priceDollars: number;
   /** The founder's standing approval of test bookings (config-bound). Without it nothing is ever booked. */
   standingApproval: boolean;
+  /** The owner's statement that someone works the follow-up list (the dashboard). Only with it, and only when the lead and the callback number were both stored, may a failure ending still say that a person will follow up. Default: not attested. */
+  followUpProcess?: boolean;
   /** Kept for the config's shape only. The state of a booking is the one the CALLER says (or is asked for, once); this value is never used as a stand-in for it. */
   state?: string;
 }
 export type EmailVerdict = 'accepted' | 'refused' | 'not_sent';
-export interface FastOutcome { reason: string; booked: boolean; customerText: Delivery | 'not_sent' | 'skipped'; ownerText: Delivery | 'not_sent' | 'skipped'; /** Present only when test emails are on: whether the mail server ACCEPTED each (not that it reached an inbox). */ customerEmail?: EmailVerdict; ownerEmail?: EmailVerdict; steps: string[] }
+export interface FastOutcome { reason: string; booked: boolean; customerText: Delivery | 'not_sent' | 'skipped'; ownerText: Delivery | 'not_sent' | 'skipped'; /** Present only when test emails are on: whether the mail server ACCEPTED each (not that it reached an inbox). */ customerEmail?: EmailVerdict; ownerEmail?: EmailVerdict; /** Present only when the ending would have promised a person: what the durable lead capture achieved. */ lead?: LeadResult; steps: string[] }
 export interface FastDeps {
   settings: FastSettings;
   /** The dialed numbers the test line answers on (E.164). */
@@ -75,6 +78,8 @@ export interface FastDeps {
   /** Fixed codes and counts only. */
   log(code: string, detail?: Record<string, string | number | boolean>): void;
   onOutcome?(o: FastOutcome): void;
+  /** Writes the durable lead for a call that ended without a booking, BEFORE the ending is spoken (fast-lead.ts). Absent: the ending is treated as `failed`, never as a promise. */
+  saveLead?(facts: LeadFacts): LeadResult | Promise<LeadResult>;
   /**
    * OPTIONAL independent check that the caller's address exists and fits together (ZIP, city, state, street). Absent = no such check (today's behaviour). When present it is asked before the read-back and again guards the booking: only a `valid` verdict for exactly the address that is booked lets the call go on.
    * Anything else fails closed: a mismatch on the street or house number (or a `corrected` verdict: the checker changed something, which is never booked silently) asks the caller for the street once more; every other verdict, a throw, a malformed answer or a timeout ends the call with nothing booked and a person to follow up.
@@ -158,6 +163,16 @@ export function confirmedMismatches(c: ConfirmedFacts | undefined, req: Omit<Boo
   if (c.street !== req.address.street1) bad.push('street'); if (c.city !== req.address.city) bad.push('city'); if (c.zip !== req.address.postalCode) bad.push('zip'); if (c.state !== req.address.province) bad.push('state');
   if (c.price !== req.priceDollars) bad.push('price');
   return bad;
+}
+/**
+ * What a failure ending may SAY, given what was durably saved. `stored` with the owner's follow-up attestation keeps the original words (a stored number and a working follow-up list back "a person will ..."). `stored` without it, or `recorded`,
+ * drops the promise and says only that the request is recorded (true: the record was written and read back). `failed` says that nothing could be saved and that the caller should call back. Never a callback promise the code cannot carry.
+ */
+export function leadLine(original: string, lead: LeadResult, attested: boolean): string {
+  if (lead === 'failed') return 'Sorry, I could not complete that, and I could not save your request. Please call back later. Goodbye.';
+  if (lead === 'stored' && attested) return original;
+  const core = original.replace(/,?\s*(?:so |and )?a person will [^.]*\./i, '.').replace(/\s*Goodbye\.\s*$/i, '').trim();
+  return `${/request is recorded/i.test(core) ? core : `${core} Your request is recorded.`} Goodbye.`;
 }
 /** A clock time "HH:MM" as minutes since midnight, for the diagnostics (a number, never text). */
 const minutesOf = (hm: string): number => { const [h, m] = hm.split(':').map(Number); return h * 60 + m; };
@@ -259,12 +274,28 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     }
     /** A promised ending (the line said "a person will ...") that is not a booked one notifies the owner. */
     function notifyFollowUp(reason: string, line: string | undefined, booked: boolean): void { if (!booked && line !== undefined && PROMISED.test(line)) sendOwnerNotice(reason, bookSent); }
+    /** The durable lead for an ending that would have promised a person: written and read back BEFORE anything is said. Never throws; no sink, or any problem, is `failed`. */
+    async function saveLeadFor(reason: string): Promise<LeadResult> {
+      let result: LeadResult = 'failed';
+      try {
+        if (deps.saveLead !== undefined) {
+          const confirmedNumber = callback !== '' && deps.approvedCustomerNumbers.has(callback) ? callback : undefined;   // only a number the caller confirmed, and only an approved one
+          const v = await deps.saveLead({ reason, callSid: typeof callSid === 'string' ? callSid : '', ...(nameOk && firstName !== '' ? { name: `${firstName} ${lastName}`.trim() } : {}), ...(confirmedNumber === undefined ? {} : { callback: confirmedNumber }), steps: [...steps], at: deps.now() });
+          result = v === 'stored' || v === 'recorded' ? v : 'failed';
+        }
+      } catch { result = 'failed'; }
+      try { deps.log('FAST_LEAD', { result, reason: /^[A-Z][A-Z0-9_]{2,47}$/.test(reason) ? reason : 'UNKNOWN' }); } catch { /* logging never interrupts */ }
+      return result;
+    }
     async function end(reason: string, line?: string, booked = false, extra: Partial<FastOutcome> = {}): Promise<void> {
-      if (done) { if (hungUp && !lateEnd) { lateEnd = true; deps.log('FAST_END', { reason, booked, late: true }); deps.onOutcome?.({ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, ...extra }); notifyFollowUp(reason, line, booked); } return; }   // the caller hung up before this ending was reached (a booking was still pending): it is recorded and the owner is told, but nothing is spoken
+      const promising = !booked && line !== undefined && PROMISED.test(line);   // decided from the ending's own words, before they are replaced
+      if (done) { if (hungUp && !lateEnd) { lateEnd = true; const lead = promising ? await saveLeadFor(reason) : undefined; deps.log('FAST_END', { reason, booked, late: true }); deps.onOutcome?.({ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, ...(lead === undefined ? {} : { lead }), ...extra }); notifyFollowUp(reason, line, booked); } return; }   // the caller hung up before this ending was reached (a booking was still pending): it is recorded and the owner is told, but nothing is spoken
       done = true; clearTimers(); awaiting = undefined;
-      try { if (line !== undefined) { if (t.speak(line, true)) await t.playbackDone!(playbackMaxMs); } } catch { /* the call is going anyway */ }
+      let spoken = line; let lead: LeadResult | undefined;
+      if (promising) { lead = await saveLeadFor(reason); spoken = leadLine(line!, lead, S.followUpProcess === true); }   // SAVED, READ BACK, and only then spoken
+      try { if (spoken !== undefined) { if (t.speak(spoken, true)) await t.playbackDone!(playbackMaxMs); } } catch { /* the call is going anyway */ }
       deps.log('FAST_END', { reason, booked });
-      deps.onOutcome?.({ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, ...extra });
+      deps.onOutcome?.({ reason, booked, customerText: 'not_sent', ownerText: 'not_sent', steps, ...(lead === undefined ? {} : { lead }), ...extra });
       notifyFollowUp(reason, line, booked);
       contact.dispose(); try { t.endCall(); } catch { /* gone */ }
       setTimeout(() => { try { t.close(1000); } catch { /* gone */ } }, afterSpeechMs).unref?.();

@@ -70,7 +70,7 @@ if (fastCfg === undefined) console.log('Fast test call: OFF (the long cleaning f
 else {
   const days = Object.entries(fastCfg.hours).filter(([, v]) => v.length > 0).map(([d]) => ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][Number(d)]).join(' ');
   console.log(`Fast test call: ON (controlled test: only the approved test caller gets past the opening)   Jobber test account: "${fastCfg.jobber_account_name}"   size ${fastCfg.bedrooms} bed / ${fastCfg.bathrooms} bath at $${fastCfg.price_dollars}   cleaning ${fastCfg.duration_minutes} min   open ${days} (${fastCfg.timezone})   standing test approval: ${fastCfg.standing_approval}`);
-  console.log(`  private pieces: approved test numbers saved: ${fastEnv?.numbersPresent}   TEXTS: ${fastEnv?.textsOn === true ? `ON (owner text consent recorded: ${fastEnv?.ownerConsent})` : 'OFF (no real text can be sent; the call skips texts and says so)'}   Jobber connected: ${fastEnv?.jobberConnected}   Jobber writes switched on (JOBBER_ALLOW_WRITES=test-account): ${fastEnv?.jobberWritesOn}   booking identity keyring ready: ${fastEnv?.keyringReady}${fastEnv?.keyringReady === true ? '' : ` (${fastEnv?.keyringProblem})`}`);
+  console.log(`  private pieces: approved test numbers saved: ${fastEnv?.numbersPresent}   TEXTS: ${fastEnv?.textsOn === true ? `ON (owner text consent recorded: ${fastEnv?.ownerConsent})` : 'OFF (no real text can be sent; the call skips texts and says so)'}   Jobber connected: ${fastEnv?.jobberConnected}   Jobber writes switched on (JOBBER_ALLOW_WRITES=test-account): ${fastEnv?.jobberWritesOn}   lead numbers kept (FOUNDER_CONTACT_KEY set): ${keyFromEnv(process.env.FOUNDER_CONTACT_KEY) !== undefined}   booking identity keyring ready: ${fastEnv?.keyringReady}${fastEnv?.keyringReady === true ? '' : ` (${fastEnv?.keyringProblem})`}`);
   const emailEnv = await emailStatus({ vaultDir: fastDir, protector: windowsProtector(), env: process.env });
   console.log(`  test emails: approved addresses saved: ${emailEnv.emailsSaved}   EMAILS: ${emailEnv.emailsOn ? 'ON (one fixed test email to each approved address after a verified booking)' : 'OFF (no email can be sent)'}`);
   console.log(`  opening the caller hears (exactly): ${consentNoticeFor(config.opening)}`);
@@ -126,8 +126,9 @@ const store = createIntakeRecordStore({ path: config.db_path });
 // The fast test call's pieces (Jobber, Twilio, the approved numbers) are built only here, only after the gate passed. Its outcomes are logged as fixed codes.
 const fast = fastCfg === undefined ? undefined : await buildFastDeps({
   config, voice, vaultDir: fastDir, protector: windowsProtector(), env: process.env, fetch: globalThis.fetch, now: () => Date.now(), log: (code, detail) => sink(code, detail),
+  leads: { store, ...(contacts === undefined ? {} : { contacts }) },
   // The outcome, then its step tokens in order (fixed codes only; logSteps never throws, so logging cannot interrupt the end of a call).
-  onOutcome: (o) => { sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length }); logSteps(sink, o.steps); },
+  onOutcome: (o) => { sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length, ...(o.lead === undefined ? {} : { lead: o.lead }) }); logSteps(sink, o.steps); },
 });
 const service = createFounderVoiceService({
   config, voice, textClient,
