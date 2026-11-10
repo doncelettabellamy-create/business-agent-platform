@@ -19,6 +19,8 @@ import { mintExecutionContext } from '../src/execution-context.ts';
 import { consentNoticeFor } from '../src/opening.ts';
 import { createOpenAIHttpClient } from '../src/openai-http-client.ts';
 import { createVault } from '../src/jobber-connector.ts';
+import { bookingIdentity } from '../src/booking-identity.ts';
+import { markerFor } from '../src/jobber-booking.ts';
 import type { Protector } from '../src/jobber-connector.ts';
 import { buildFastDeps, fastStatus, NUMBERS_BLOB } from '../src/founder-voice-fast.ts';
 import { appendConsent, ownerRef, readConsent } from '../src/fast-consent.ts';
@@ -51,7 +53,9 @@ function wsOver(v: WireVoice): WebSocketLike {
 }
 const HOURS = { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] } as Record<string, Array<[string, string]>>;
 
-async function rig(o: { jobberWrites?: boolean; ownerConsent?: boolean; texts?: boolean; word?: string; msPerChar?: number } = {}) {
+/** A made-up keyring secret of this test (nothing real): the bookings are identified by what is booked, so the private folder needs a keyring. */
+const KEYRING_SECRET = Buffer.alloc(32, 7).toString('base64url');
+async function rig(o: { keyring?: boolean; jobberWrites?: boolean; ownerConsent?: boolean; texts?: boolean; word?: string; msPerChar?: number } = {}) {
   const dir = mkdtempSync(join(root, 'r-')); const jobber = await mockJobber(); const twilio = await mockTwilio(); closers.push(() => jobber.close(), () => twilio.close());
   const callConfig: FounderCallConfig = { approval_id: 'fast-test', tenant: T, numbers: [DREW], model: 'claude-haiku-5-5', max_minutes: 8, max_turns: 30, max_claude_calls: 150, max_calls: 5, expires: '2026-11-20T00:00:00Z', persona_names: ['Sam Example'], kill_file: join(dir, 'stop'), public_wss_url: URL_WSS, db_path: join(dir, 'calls.sqlite'), relay_port: 8788, dashboard_port: 8787, after_speech_ms: 0, skill_config: plumbing,
     opening: { business_name: 'Drew Cleaning', greeting: "Thanks for calling Drew Cleaning. I'm Jack. What's your name?" } };
@@ -62,6 +66,7 @@ async function rig(o: { jobberWrites?: boolean; ownerConsent?: boolean; texts?: 
   await vault.saveCredentials({ client_id: 'test-client-id-0001', client_secret: 'test-client-secret-ZZZ-9f8e7d6c' });
   await vault.saveTokens({ access_token: 'tok-valid-0123456789', refresh_token: 'refresh-0123456789', expires_at: NOW + 3_000_000, account_id: ACCOUNT.id, account_name: ACCOUNT.name });
   await vault.saveBlob(NUMBERS_BLOB, JSON.stringify({ account_sid: SID, customer: CUSTOMER, owner: OWNER }));
+  if (o.keyring !== false) assert.equal(await vault.publishBlob('booking-identity-keys.1', JSON.stringify({ version: 1, gen: 1, current: { kid: 'k1', secret: KEYRING_SECRET }, retired: [] }), () => undefined), 'published');
   // the owner's separately recorded setup consent (protected evidence), unless this rig is the one without it
   if (o.ownerConsent !== false) assert.equal(await appendConsent(vault, { v: 1, role: 'owner', at: new Date(NOW).toISOString(), method: 'private_setup', script: OWNER_SCRIPT_ID, result: 'yes', ref: ownerRef(OWNER) }), true);
   const env = { TWILIO_AUTH_TOKEN: TOKEN, ...(o.texts === false ? (o.word === undefined ? {} : { FAST_TEXTS: o.word }) : { FAST_TEXTS: 'on' }), ...(o.jobberWrites === false ? {} : { JOBBER_ALLOW_WRITES: 'test-account' }) } as Record<string, string>;
@@ -173,6 +178,19 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   assert.ok(!c.voices[0].spoken.some((l) => /is one hundred ninety-nine dollars/.test(l)), 'no price or time was offered'); assert.equal(c.jobber.jobs.size, 0);
 });
 
+test('JOINED, NO KEYRING: the same call with no booking-identity keyring in the private folder fails closed - the caller is told a person will follow up, no client and no job are created, nothing is texted or consented, and the outcome is BOOKING_NOT_VERIFIED', async () => {
+  const r = await rig({ texts: false, ownerConsent: false, keyring: false });
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
+  await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
+  await r.hears(/What day and time/, 'Tuesday at ten'); await r.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms'); await r.hears(/is one hundred ninety-nine dollars/, 'yes'); await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'); await r.hears(/^To confirm/, 'yes');
+  assert.equal(await r.hears(/could not confirm the booking/), 'I could not confirm the booking, so a person will follow up. Goodbye.');
+  await until(() => r.outcomes.some((o) => o.reason === 'BOOKING_NOT_VERIFIED'), 'the outcome');
+  assert.equal(r.jobber.clientCount(), 0); assert.equal(r.jobber.jobs.size, 0); assert.ok(!r.jobber.ops.some((x) => x.field === 'clientCreate' || x.field === 'jobCreate'), 'no write of any kind');
+  assert.deepEqual(r.twilio.messages, []); assert.ok(!r.voices[0].spoken.some((l) => /You are booked/.test(l)));
+  const last = r.outcomes[r.outcomes.length - 1]; assert.deepEqual([last.reason, last.booked], ['BOOKING_NOT_VERIFIED', false]);
+});
+
 test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call and the same real-Jobber booking, no text question, no consent recorded, no request to Twilio\'s message endpoint, and the texts reported as SKIPPED, never delivered', async () => {
   const r = await rig({ texts: false, ownerConsent: false });
   assert.deepEqual(r.status, { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true });
@@ -191,7 +209,8 @@ test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call 
   const spoken = r.voices[0].spoken.join(' | '); assert.ok(!/May we send you|automated booking-details|confirmation text is on its way/.test(spoken), 'no text question, no promise of a text');
   // the real Jobber booking is unchanged: calendar read first, one client, one job, independent read-back by id, $199
   assert.equal(r.jobber.clientCount(), 1); assert.equal(r.jobber.jobs.size, 1);
-  const job = [...r.jobber.jobs.values()][0] as { total: number }; assert.equal(job.total, 199);
+  const job = [...r.jobber.jobs.values()][0] as { total: number; title: string }; assert.equal(job.total, 199);
+  assert.ok(job.title.endsWith(`[${markerFor(bookingIdentity(KEYRING_SECRET, { phone: '5550100002', date: '2026-11-03', startTime: '10:00', street: '123 Invented Lane', zip: '90210' }))}]`), 'the job carries the marker of the booking identity (callback number, date, start time, house number, ZIP), not of the call');
   assert.ok(r.jobber.ops.findIndex((x) => x.field === 'scheduledItems') < r.jobber.ops.findIndex((x) => x.field === 'clientCreate'));
   assert.equal(r.jobber.ops.filter((x) => x.field === 'job').length >= 1, true, 'the booking was read back by id');
   // SMS: nothing sent, nothing consented, nothing claimed

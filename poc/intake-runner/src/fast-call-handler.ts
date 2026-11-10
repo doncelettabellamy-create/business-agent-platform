@@ -16,7 +16,6 @@
 //     fast-availability.ts finds it free in Jobber's own calendar inside the founder's stated hours.
 // Every outside thing is handed in (the clock, Twilio, Jobber, the booking adapter), so this file is tested with stand-ins and never reaches the network itself.
 
-import { createHash } from 'node:crypto';
 import { createContactState, digitRuns, trailingDigitCount } from './call-state.ts';
 import { stateName } from './us-state.ts';
 import type { ContactState } from './call-state.ts';
@@ -25,7 +24,7 @@ import { chooseOffer, lastBookableDate } from './fast-availability.ts';
 import type { AvailabilityConfig, Busy, Offer } from './fast-availability.ts';
 import { countFrom, fieldFrom, instantOf, isAiQuestion, lettersFrom, lettersWordsFrom, nameFromLetters, sayDay, sayDayYear, sayDollars, sayTime, sizeFrom, sizeShape, utcOffsetFor, weekdayOf, whenFrom, yesNo } from './fast-parsers.ts';
 import type { When } from './fast-parsers.ts';
-import type { BookingRequest, BookingResult } from './jobber-booking.ts';
+import type { BookingRequest, BookingResult, IdentityBookingRequest } from './jobber-booking.ts';
 import type { CallTransport, TransportCloseInfo, TransportEvent } from './call-transport.ts';
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
@@ -56,7 +55,7 @@ export interface FastDeps {
   now(): number;
   callerOf(callSid: unknown): Promise<string | undefined>;
   busy(fromIso: string, toIso: string): Promise<{ busy: Busy[]; complete: boolean }>;
-  book(req: BookingRequest): Promise<BookingResult>;
+  book(req: BookingRequest | IdentityBookingRequest): Promise<BookingResult>;
   /** TEXTS ON. False is the voice + real Jobber test mode with every real text disabled (campaign approval pending): the call asks no text question, sends nothing, records no text consent and reports the texts as SKIPPED, never delivered. */
   textsEnabled: boolean;
   sendText(to: string, body: string): Promise<SendResult>;
@@ -151,7 +150,7 @@ export function addressIssues(p: { street: string; city: string; zip: string; st
 /** What the caller confirmed in the read-back, held until the booking is built: the booking must carry exactly these facts. */
 export interface ConfirmedFacts { first: string; last: string; date: string; start: string; end: string; street: string; city: string; zip: string; state: string; price: number }
 /** The NAMES of the facts in the booking request that differ from what the caller confirmed (none = the same). Nothing is booked, and nothing is sent, when any differs or when nothing was confirmed. */
-export function confirmedMismatches(c: ConfirmedFacts | undefined, req: BookingRequest): string[] {
+export function confirmedMismatches(c: ConfirmedFacts | undefined, req: Omit<BookingRequest, 'key'>): string[] {
   if (c === undefined) return ['confirmation'];
   const bad: string[] = [];
   if (c.first !== req.client.firstName) bad.push('first_name'); if (c.last !== req.client.lastName) bad.push('last_name');
@@ -591,8 +590,9 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
           return end(cal.complete ? 'NO_LONGER_AVAILABLE' : 'CALENDAR_UNREADABLE', cal.complete ? 'Sorry, that time is no longer available, so nothing was booked and a person will call you. Goodbye.' : 'Sorry, I cannot check the schedule right now, so nothing was booked and a person will call you. Goodbye.');
         } }
       const digits = callback.replace(/^\+1/, '');
-      const req: BookingRequest = {
-        key: `fast-${createHash('sha256').update(`drew-fast:${String(callSid)}`).digest('hex').slice(0, 24)}`,
+      // The booking is identified by WHAT is booked (the confirmed callback number, the date, the start time, the house number and the ZIP), not by the call: a redial of the same booking is the same booking (booking-identity.ts). No key is made here.
+      const req: IdentityBookingRequest = {
+        identity: { phone: digits, date: o.date, startTime: o.time, street: p.street, zip: p.zip },
         gate: { eligibleRecord: true, approvedByPerson: true, callerAgreed: true },   // read back, measured and confirmed above; the standing test approval is the founder's, from the settings
         client: { firstName, lastName, phone: digits }, address: { street1: p.street, city: p.city, postalCode: p.zip, province: p.state },
         when: { date: o.date, startTime: o.time, endTime: o.endTime, utcOffset: utcOffsetFor(instantOf(o.date, o.time, S.availability.timezone), S.availability.timezone) },
@@ -610,13 +610,18 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       if (res.status === 'refused' && res.writes === 0) bookSent = false;   // refused before any write: no job can exist
       note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }), ...(readBackDiffs === 0 ? {} : { readBackDiffs }) }); if (hungUp) deps.log('FAST_BOOKING_AFTER_HANGUP', { status: res.status, verified: res.status === 'booked_verified' && readBackDiffs === 0 });
       // Jobber's own read-back must have matched in every field: a "verified" result that still names a differing field is not a booking, and nothing is emailed or texted for it.
-      if (res.status !== 'booked_verified' || readBackDiffs > 0) return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');
+      if (res.status !== 'booked_verified' || readBackDiffs > 0 || res.jobId === undefined) return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');   // a verified booking names its job: without one nothing is emailed or texted
+      // A booking that was already made (the same booking, verified in full again) is never announced twice: no text and no email, to the customer or the owner, and the caller is told so.
+      if (res.duplicate === true) {
+        deps.log('FAST_BOOKING_DUPLICATE', { status: res.status }); note('ALREADY_BOOKED');
+        return end('ALREADY_BOOKED', 'That visit is already booked, so nothing new was sent. Goodbye.', true, { customerText: 'skipped', ownerText: 'skipped', ...(deps.emailsEnabled === true ? { customerEmail: 'not_sent', ownerEmail: 'not_sent' } : {}) });
+      }
       // Test emails (default OFF): only now that Jobber's read-back verified the booking, only to the two approved addresses (held behind `sendEmail`), and a failure changes nothing about the booking.
       const mail: { customer: EmailVerdict; owner: EmailVerdict } = { customer: 'not_sent', owner: 'not_sent' };
-      if (deps.emailsEnabled === true && deps.sendEmail !== undefined && (res.duplicate === true || emailedKeys.has(req.key))) {
-        deps.log('FAST_EMAILS_SKIPPED', { reason: res.duplicate === true ? 'DUPLICATE' : 'ALREADY_SENT' }); note('EMAILS_SKIPPED');   // one booking is never emailed twice
+      if (deps.emailsEnabled === true && deps.sendEmail !== undefined && emailedKeys.has(res.jobId)) {
+        deps.log('FAST_EMAILS_SKIPPED', { reason: 'ALREADY_SENT' }); note('EMAILS_SKIPPED');   // one booking (one verified job) is never emailed twice in this process
       } else if (deps.emailsEnabled === true && deps.sendEmail !== undefined) {
-        emailedKeys.add(req.key);
+        emailedKeys.add(res.jobId);
         const tzE = S.availability.timezone;
         const ef = { businessName: S.businessName, serviceLabel: S.serviceLabel, bedrooms: S.bedrooms, bathrooms: S.bathrooms, priceDollars: S.priceDollars, date: o.date, startText: textTime(o.time), endText: textTime(o.endTime), zoneLabel: zoneLabelOf(tzE, instantOf(o.date, o.time, tzE)),
           address: `${p.street}, ${p.city}, ${p.state} ${p.zip}`, customerName: `${firstName} ${lastName}`.trim(), callbackNumber: callback, ...(res.jobNumber === undefined ? {} : { jobNumber: res.jobNumber }) };

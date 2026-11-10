@@ -6,7 +6,8 @@ import { readFileSync } from 'node:fs';
 import { AI_ANSWER, addressIssues, confirmedMismatches, spellHouseNumber, transcriptShape, createFastCallHandler, spellOut, spellStreet } from '../src/fast-call-handler.ts';
 import type { AddressToValidate, AddressVerdict, FastDeps, FastOutcome, FastSettings } from '../src/fast-call-handler.ts';
 import { instantOf } from '../src/fast-parsers.ts';
-import type { BookingRequest, BookingResult } from '../src/jobber-booking.ts';
+import type { BookingRequest, IdentityBookingRequest, BookingResult } from '../src/jobber-booking.ts';
+import { requestProblems } from '../src/jobber-booking.ts';
 import type { Delivery, SendResult } from '../src/twilio-messaging.ts';
 import { cleanDetail } from '../src/call-diag.ts';
 import { fakeCarrier } from './helpers/fake-carrier.ts';
@@ -19,8 +20,8 @@ const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15
 const SETTINGS: FastSettings = { businessName: 'Drew Cleaning', serviceLabel: 'Standard cleaning', bedrooms: 2, bathrooms: 2, priceDollars: 199, standingApproval: true, state: 'CA',
   availability: { timezone: TZ, hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, durationMinutes: 120, stepMinutes: 30, leadMinutes: 60 } };
 
-function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
-  const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: BookingRequest[] = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
+function build(o: { settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest | IdentityBookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
+  const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: Array<BookingRequest | IdentityBookingRequest> = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
   const deps: FastDeps = {
     settings: { ...SETTINGS, ...o.settings }, numbers: new Set([DREW]), approvedCallers: new Set([CUSTOMER]), approvedCustomerNumbers: new Set(o.customers ?? [CUSTOMER]), ownerNumber: OWNER, maxCalls: o.maxCalls ?? 5,
     now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; if (o.busyHold !== undefined && busyCalls > 1) await o.busyHold; return (busyCalls > 1 && o.busyLater !== undefined ? o.busyLater : o.busy) ?? { busy: [], complete: true }; },
@@ -61,7 +62,7 @@ test('the whole call: name, address with city and ZIP, day and time, size, $199 
   assert.equal(t.booked.length, 1);
   const r = t.booked[0];
   assert.deepEqual([r.client, r.address, r.when, r.title, r.priceDollars], [{ firstName: 'Testa', lastName: 'Invented', phone: '5550100002' }, { street1: '123 Invented Lane', city: 'Testville', postalCode: '90210', province: 'CA' }, { date: '2026-11-03', startTime: '10:00', endTime: '12:00', utcOffset: '-06:00' }, 'Standard cleaning', 199]);
-  assert.deepEqual(r.gate, { eligibleRecord: true, approvedByPerson: true, callerAgreed: true }); assert.match(r.key, /^fast-[0-9a-f]{24}$/);
+  assert.deepEqual(r.gate, { eligibleRecord: true, approvedByPerson: true, callerAgreed: true }); assert.equal((r as { key?: string }).key, undefined, 'no key is made from the call'); assert.deepEqual((r as IdentityBookingRequest).identity, { phone: '5550100002', date: '2026-11-03', startTime: '10:00', street: '123 Invented Lane', zip: '90210' }, 'the identity is the booking itself');
   assert.deepEqual(t.texts.map((x) => x.to), [CUSTOMER, OWNER]);
   assert.equal(t.texts[0].body, 'Donceletta Bellamy - Developer Testing: Drew Cleaning DEMO booking confirmed for Tue Nov 3, 10:00 AM-12:00 PM Central, at 123 Invented Lane, Testville, CA 90210. Standard cleaning, 2 bedrooms/2 bathrooms, $199. Test only; no cleaning service will occur. Reply STOP to opt out or HELP for help.');
   assert.equal(t.texts[1].body, 'Donceletta Bellamy - Developer Testing: New Drew Cleaning DEMO booking for Testa Invented, Tue Nov 3, 10:00 AM-12:00 PM Central, at 123 Invented Lane, Testville, CA 90210. Standard cleaning, 2 bedrooms/2 bathrooms, $199. Test only; no cleaning service will occur. Reply STOP to opt out or HELP for help.');
@@ -432,12 +433,13 @@ test('callback number in the OWNER\'s email: the confirmed number (the verified 
   noPersonalDetail(b.logs, ['5550100099', '0100099']);
 });
 
-test('duplicate-email guard: a booking Jobber reports as already made, and a booking key already emailed in this process, send no second email', async () => {
-  const dup = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 0, duplicate: true }) }); await toBooked(dup);
-  assert.equal(dup.mails.length, 0); assert.deepEqual(dup.logs.find(([c]) => c === 'FAST_EMAILS_SKIPPED')?.[1], { reason: 'DUPLICATE' });
-  assert.equal(dup.c.lines.at(-1), 'You are booked for Tuesday, November third, 2026 at 10 A M. Goodbye.', 'no email is promised'); assert.deepEqual([dup.last().customerEmail, dup.last().ownerEmail, dup.last().booked], ['not_sent', 'not_sent', true]);
+test('duplicate guard: a verified duplicate (same job, every field matched) ends ALREADY_BOOKED with no text and no email to anyone, and a booking whose job was already emailed in this process is not emailed twice', async () => {
+  const dup = build({ textsEnabled: true, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 0, duplicate: true }) }); await toBookedWithTexts(dup);
+  assert.equal(dup.mails.length, 0); assert.equal(dup.texts.length, 0); assert.ok(!dup.logs.some(([c]) => /^FAST_(EMAILS_SENT|TEXTS_SENT|TEXTS_VERIFIED)$/.test(c)));
+  assert.equal(dup.c.lines.at(-1), 'That visit is already booked, so nothing new was sent. Goodbye.');
+  assert.deepEqual([dup.last().reason, dup.last().booked, dup.last().customerText, dup.last().ownerText, dup.last().customerEmail, dup.last().ownerEmail], ['ALREADY_BOOKED', true, 'skipped', 'skipped', 'not_sent', 'not_sent']); assert.deepEqual(dup.logs.find(([c]) => c === 'FAST_BOOKING_DUPLICATE')?.[1], { status: 'booked_verified' });
   const t = build({ textsEnabled: false, emails: 'accept' }); await toBooked(t); assert.equal(t.mails.length, 2);
-  const again = fakeCarrier(); t.h.serve(again.transport); again.setup(DREW, undefined, 'Testa Invented');   // the same call id: the same booking key
+  const again = fakeCarrier(); t.h.serve(again.transport); again.setup(DREW, undefined, 'Testa Invented');   // the same booking again (the same verified job)
   await again.hears(/Is that right\? Say yes or no/, 'yes'); await again.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await again.hears(/What day and time/, 'Tuesday at ten'); await again.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
   await again.hears(/is one hundred ninety-nine dollars/, 'yes'); await again.hears(/calling from a number ending in/, 'yes'); await again.hears(/To confirm/, 'yes'); await finish(again);
   assert.equal(t.mails.length, 2, 'the same booking is never emailed twice'); assert.deepEqual(t.logs.filter(([c]) => c === 'FAST_EMAILS_SKIPPED').map(([, d]) => d), [{ reason: 'ALREADY_SENT' }]); assert.equal(t.booked.length, 2);
@@ -1457,7 +1459,59 @@ test('M2 hang-up before the write begins: nothing is written, the owner is told 
 test('M2 duplicate: a result Jobber reports as already booked, after a hang-up, writes nothing new and sends no second email', async () => {
   const g = gate<BookingResult>(); const t = build({ textsEnabled: false, emails: 'accept', book: () => g.p });
   await toPendingWrite(t); t.c.hangUp(); g.res({ ...OK_RESULT, writes: 0, duplicate: true }); await t.h.idle();
-  assert.equal(t.booked.length, 1); assert.equal(t.mails.length, 0); assert.deepEqual(row(t, 'FAST_EMAILS_SKIPPED'), { reason: 'DUPLICATE' }); assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKED', true]]);
+  assert.equal(t.booked.length, 1); assert.equal(t.mails.length, 0); assert.equal(t.texts.length, 0); assert.deepEqual(row(t, 'FAST_BOOKING_DUPLICATE'), { status: 'booked_verified' }); assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['ALREADY_BOOKED', true]]);
+});
+
+// ================================================================ Slice B: the booking identity from the confirmed callback number; duplicates and identity errors
+/** The whole call with texts ON: the caller also says yes to the text permission, so a customer text WOULD be sent unless the ending stops it. */
+async function toBookedWithTexts(t: ReturnType<typeof build>): Promise<void> {
+  t.h.serve(t.c.transport); await toOffer(t.c);
+  await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/May we send you one automated/, 'yes'); await t.c.hears(/To confirm/, 'yes'); await finish(t.c);
+}
+const BAD_RESULTS: Array<[string, BookingResult]> = [
+  ['an uncertain duplicate (the read-back did not match)', { status: 'uncertain', reason: 'READBACK_MISMATCH', mismatches: ['price'], writes: 0, duplicate: true, jobId: 'JOB-1' }],
+  ['an uncertain duplicate (the job cannot be found)', { status: 'uncertain', reason: 'NOT_FOUND', writes: 0, duplicate: true, jobId: 'JOB-1' }],
+  ['a "verified" duplicate that still names a differing field', { status: 'booked_verified', jobId: 'JOB-1', writes: 0, duplicate: true, mismatches: ['visit_time'] }],
+  ['a "verified" duplicate with no job id', { status: 'booked_verified', writes: 0, duplicate: true }],
+  ['a verified booking with no job id', { status: 'booked_verified', writes: 2 }],
+  ['IDENTITY_UNAVAILABLE', { status: 'not_booked', reason: 'IDENTITY_UNAVAILABLE', writes: 0 }],
+  ['IDENTITY_STALE before any write', { status: 'not_booked', reason: 'IDENTITY_STALE', writes: 0 }],
+  ['IDENTITY_STALE after a write', { status: 'uncertain', reason: 'IDENTITY_STALE', writes: 1 }],
+  ['an uncertain retired-key result', { status: 'uncertain', reason: 'DUPLICATE_MARKERS', writes: 0 }],
+];
+test('only a VERIFIED duplicate with its job id is ALREADY_BOOKED: every uncertain, mismatching, job-less or identity-error result ends BOOKING_NOT_VERIFIED - nothing is texted or confirmed by email, nothing is said that sounds booked, a person follows up', async () => {
+  for (const [label, result] of BAD_RESULTS) {
+    const t = build({ textsEnabled: true, emails: 'accept', book: () => result }); await toBookedWithTexts(t); await t.h.idle(); assert.equal(t.consents.length, 1, label + ': the caller did give the text permission');
+    assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED', label); assert.equal(t.last().booked, false, label); assert.equal(t.texts.length, 0, label);
+    assert.equal(t.c.lines.at(-1), 'I could not confirm the booking, so a person will follow up. Goodbye.', label);
+    assert.ok(!t.mails.some((m) => m.role === 'customer'), label + ': no email to the customer'); assert.ok(!t.logs.some(([c]) => /^FAST_(EMAILS_SENT|TEXTS_SENT|BOOKING_DUPLICATE)$/.test(c)), label);
+  }
+});
+
+test('two DIFFERENT bookings in one process are each emailed: the guard is the verified job, not a shared key (no identity request has a key)', async () => {
+  let n = 0; const t = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: `JOB-${++n}`, jobNumber: 1000 + n, writes: 2 }) }); await toBooked(t);
+  assert.equal(t.mails.length, 2);
+  const again = fakeCarrier(); t.h.serve(again.transport); again.setup(DREW, undefined, 'Testa Invented');
+  await again.hears(/Is that right\? Say yes or no/, 'yes'); await again.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await again.hears(/What day and time/, 'Tuesday at ten'); await again.hears(/bedrooms and bathrooms/, 'two bedrooms and two bathrooms');
+  await again.hears(/is one hundred ninety-nine dollars/, 'yes'); await again.hears(/calling from a number ending in/, 'yes'); await again.hears(/To confirm/, 'yes'); await finish(again);
+  assert.equal(t.mails.length, 4, 'the second booking (another job) is emailed too'); assert.ok(!t.logs.some(([c]) => c === 'FAST_EMAILS_SKIPPED'));
+});
+
+test('the identity phone is the CONFIRMED callback number: a different number the caller gave is the booking phone and the identity phone, and the two always agree', async () => {
+  const n = build({ textsEnabled: false }); n.h.serve(n.c.transport); await toOffer(n.c); await n.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await n.c.hears(/calling from/, 'no');
+  await n.c.hears(/best number/, 'five five five zero one zero zero zero zero four'); await n.c.hears(/I heard/, 'yes'); await n.c.hears(/To confirm/, 'yes'); await finish(n.c);
+  const r = n.booked[0] as IdentityBookingRequest; assert.equal(n.booked.length, 1); assert.deepEqual([r.client.phone, r.identity.phone], ['5550100004', '5550100004']);
+  assert.deepEqual(requestProblems(r, NOW), [], 'the real booking module accepts the request the handler built');
+});
+
+test('Slice B source: the handler makes no key and no hash of the Call SID, builds the identity from the booking itself, and keeps the fail-closed gates in front of it', () => {
+  const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(!/createHash|drew-fast|req\.key|node:crypto/.test(src), 'no key from the call');
+  assert.ok(/identity: \{ phone: digits, date: o\.date, startTime: o\.time, street: p\.street, zip: p\.zip \}/.test(src));
+  const at = (x: string): number => src.indexOf(x);
+  assert.ok(at('FAST_ADDRESS_GUARD') < at('FAST_SLOT_RECHECK_FAILED') && at('FAST_SLOT_RECHECK_FAILED') < at('confirmedMismatches(confirmed, req)') && at('confirmedMismatches(confirmed, req)') < at('deps.book(req)'), 'the gates still come first');
+  assert.ok(at("res.jobId === undefined) return end('BOOKING_NOT_VERIFIED'") < at("end('ALREADY_BOOKED'") && at("end('ALREADY_BOOKED'") < at('deps.sendEmail!(role') && at("end('ALREADY_BOOKED'") < at('deps.sendText(callback'), 'the duplicate ends before any email or text');
+  assert.equal([...src.matchAll(/end\('ALREADY_BOOKED'/g)].length, 1);
 });
 
 test('M2 redial protection: while a booking is still being written after a hang-up the line is busy, then it is free again; a booking that never settles frees it after the bound; a normal ending frees it at once', async () => {
