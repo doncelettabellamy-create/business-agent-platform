@@ -125,7 +125,7 @@ test('SOURCE creation is only by explicit command: the setup module and the comm
   for (const word of ['process.env', 'console.', 'rmSync', 'unlinkSync', 'writeFileSync', 'renameSync', 'saveBlob', 'fetch(']) assert.ok(!mod.includes(word), `module: ${word}`);
   assert.deepEqual([...mod.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]).sort(), ['./booking-identity.ts', './booking-identity.ts', 'node:crypto']);
   assert.ok(!/throw new Error\(/.test(mod));
-  assert.deepEqual([...main.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['node:os', 'node:path', './jobber-connector.ts', './jobber-dpapi.ts', './booking-identity-setup.ts']);
+  assert.deepEqual([...main.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['node:os', 'node:path', './jobber-connector.ts', './jobber-dpapi.ts', './jobber-ledger-scan.ts', './booking-identity-setup.ts']);
   assert.ok(!main.includes('createKeyring') && main.includes('runSetup(process.argv.slice(2)'), 'the command file only passes the real folder and the real console to runSetup');
   const importers = readdirSync(new URL('../src/', import.meta.url)).filter((f) => f.endsWith('.ts') && f !== 'booking-identity-setup.ts' && f !== 'booking-identity-setup-main.ts' && /booking-identity-setup/.test(read(`../src/${f}`)));
   assert.deepEqual(importers, [], 'no other source file imports the setup');

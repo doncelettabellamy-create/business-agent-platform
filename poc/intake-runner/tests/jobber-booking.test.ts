@@ -10,6 +10,7 @@ import type { Credentials, Ctx, FetchLike, Protector } from '../src/jobber-conne
 import { bookTestVisit, clientInput, jobInput, markerFor, requestProblems } from '../src/jobber-booking.ts';
 import type { BookingRequest, IdentityBookingRequest } from '../src/jobber-booking.ts';
 import { bookingIdentity } from '../src/booking-identity.ts';
+import { scanLedger } from '../src/jobber-ledger-scan.ts';
 import type { IdentityParts } from '../src/booking-identity.ts';
 
 const CREDS: Credentials = { client_id: 'test-client-id-0001', client_secret: 'test-client-secret-ZZZ-9f8e7d6c' };
@@ -861,4 +862,18 @@ test('IDENTITY source: global lock before key lock, one shared body for both pat
   assert.ok(!/drew-fast|createHash|callSid|CallSid/.test(identityPath), 'no Call-SID key in the identity path'); assert.ok(!/process\.env|writeFile|rmSync|saveBlob|publishBlob\(/.test(identityPath), 'the identity path writes nothing itself');
   assert.equal([...src.matchAll(/\bmutate\(/g)].length, 1, 'still one call to mutate'); assert.equal([...src.matchAll(/publishBlob\(/g)].length, 1, 'still one publish');
   assert.deepEqual([...src.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['node:crypto', './jobber-connector.ts', './jobber-connector.ts', './booking-identity.ts', './booking-identity.ts', './us-state.ts']);
+});
+
+test('the ledger scan agrees with what the booking module really leaves behind: a finished booking is "none"; a booking stopped after the client was created (the lock lost) leaves one unresolved key, and the scan says so; a retry that is stopped as unresolved changes nothing', async () => {
+  const r = await rig();
+  try {
+    assert.equal((await scanLedger(r.ctx.vault)).verdict, 'none', 'nothing booked yet');
+    assert.equal((await bookTestVisit(r.ctx, CREDS, REQ)).status, 'booked_verified');
+    assert.deepEqual(await scanLedger(r.ctx.vault), { chains: 1, created: 1, cleared: 0, pending: 0, clientCreated: 0, unreadable: 0, legacy: 'absent', verdict: 'none' });
+    const other = { ...REQ, key: 'call-fedcba9876543210' };
+    const real = r.ctx.fetch; afterResponse(r, /clientCreate/, () => rmSync(lockOf(r, other), { force: true }));
+    const stopped = await bookTestVisit(r.ctx, CREDS, other); assert.deepEqual([stopped.status, stopped.reason], ['uncertain', 'LOCK_LOST']);
+    const s = await scanLedger(r.ctx.vault); assert.deepEqual([s.verdict, s.pending, s.created, s.chains], ['some', 1, 1, 2], 'the half-finished booking is unresolved');
+    r.ctx.fetch = real; assert.equal((await bookTestVisit(r.ctx, CREDS, other)).reason, 'PENDING_UNRESOLVED'); assert.deepEqual(await scanLedger(r.ctx.vault), s, 'still unresolved, and unchanged');
+  } finally { await r.done(); }
 });

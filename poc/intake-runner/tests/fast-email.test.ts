@@ -141,6 +141,7 @@ async function composition(o: { emailsSaved?: boolean; env?: Record<string, stri
   await vault.saveCredentials({ client_id: 'test-client-id-0001', client_secret: 'test-client-secret-ZZZ-9f8e7d6c' });
   await vault.saveTokens({ access_token: 'tok-valid-0123456789', refresh_token: 'refresh-0123456789', expires_at: NOW + 3_000_000, account_id: ACCOUNT.id, account_name: ACCOUNT.name });
   await vault.saveBlob(NUMBERS_BLOB, JSON.stringify({ account_sid: `AC${'a'.repeat(32)}`, customer: '+15550100002', owner: '+15550100003' }));
+  await vault.publishBlob('booking-identity-keys.1', JSON.stringify({ version: 1, gen: 1, current: { kid: 'k1', secret: Buffer.alloc(32, 5).toString('base64url') }, retired: [] }), () => undefined);   // the booking identity keyring (a made-up secret)
   if (o.emailsSaved !== false) await vault.saveBlob(EMAIL_BLOB, JSON.stringify(OK));
   const config = { approval_id: 'fast-test', tenant: 'ws-founder-fasttest', numbers: ['+15550100001'], max_calls: 5, opening: { business_name: 'Drew Cleaning', greeting: 'x' } } as unknown as FounderCallConfig;
   const voice = { fast_test: { jobber_account_name: ACCOUNT.name, timezone: 'America/Chicago', hours: HOURS, duration_minutes: 120, price_dollars: 199, bedrooms: 2, bathrooms: 2, service_label: 'Standard cleaning', standing_approval: true, state: 'CA', lead_minutes: 60 } } as unknown as FounderVoiceConfig;

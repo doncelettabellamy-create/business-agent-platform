@@ -315,3 +315,4 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, input: Booking
     return done(writes > 0 || unsure ? 'uncertain' : 'not_booked', { reason });
   }
 }
+export { parseGeneration as parseLedgerGeneration, validEntry as validLedgerEntry };   // read-only use by jobber-ledger-scan.ts

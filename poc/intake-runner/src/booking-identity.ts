@@ -126,6 +126,12 @@ export function bookingIdentity(secret: string, parts: IdentityParts): string {
   return `fast2-${mac.slice(0, 24)}`;
 }
 
+/** A retired key may be DROPPED from the keyring only this many days after it was retired. Why that is enough: a booking is only ever made for a visit at most 30 days ahead (jobber-booking.ts, `when`), so every booking made under the key was
+ *  for a visit no later than 30 days after the key was retired; 31 days after that every such visit is in the past, and a request for a past time is refused before any key is used. A test keeps this in step with the 30-day limit. */
+export const RETIRED_KEY_MIN_AGE_DAYS = 31;
+/** True only when the retired key was retired at least RETIRED_KEY_MIN_AGE_DAYS before `nowMs` (a stamp that cannot be read, or one in the future, is not old enough). */
+export function retiredLongEnough(r: RetiredKey, nowMs: number): boolean { const at = Date.parse(r.retired_at); return Number.isFinite(at) && Number.isFinite(nowMs) && nowMs - at >= RETIRED_KEY_MIN_AGE_DAYS * 86_400_000; }
+
 /** The key to book under (the current secret) and the keys the same booking may already be under (each retired secret, in the keyring's order). */
 export function identitiesFor(k: Keyring, parts: IdentityParts): { key: string; aliases: string[] } {
   return { key: bookingIdentity(k.current.secret, parts), aliases: k.retired.map((r) => bookingIdentity(r.secret, parts)) };

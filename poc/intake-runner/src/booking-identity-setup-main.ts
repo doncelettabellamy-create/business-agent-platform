@@ -9,7 +9,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createVault } from './jobber-connector.ts';
 import { windowsProtector } from './jobber-dpapi.ts';
+import { ledgerUnresolved } from './jobber-ledger-scan.ts';
 import { runSetup } from './booking-identity-setup.ts';
 
 const dir = process.env.JOBBER_STORE_DIR ?? join(homedir(), '.drew-jobber');
-runSetup(process.argv.slice(2), { vault: createVault(dir, windowsProtector()), say: (s) => { console.log(s); } }).then((c) => { process.exitCode = c; }, () => { console.error('failed: the setup could not run (nothing was printed from the secret)'); process.exitCode = 1; });
+const vault = createVault(dir, windowsProtector());
+runSetup(process.argv.slice(2), { vault, say: (s) => { console.log(s); }, unresolved: () => ledgerUnresolved(vault) }).then((c) => { process.exitCode = c; }, () => { console.error('failed: the setup could not run (nothing was printed from the secret)'); process.exitCode = 1; });

@@ -8,6 +8,7 @@
 import { createVault, JOBBER_ENDPOINTS, GRAPHQL_VERSION, readBusyIntervals } from './jobber-connector.ts';
 import type { Protector, FetchLike, Ctx as JobberCtx } from './jobber-connector.ts';
 import { bookTestVisit } from './jobber-booking.ts';
+import { loadKeyring } from './booking-identity.ts';
 import { callerOf, E164, sendSms, SID, verifyDelivery } from './twilio-messaging.ts';
 import type { HttpFetch, TwilioCtx } from './twilio-messaging.ts';
 import type { FastDeps } from './fast-call-handler.ts';
@@ -53,10 +54,10 @@ export async function emailStatus(c: Pick<FastComposition, 'vaultDir' | 'protect
 }
 
 /** Presence only, for the gate and the dry run: are the private pieces in place? Nothing is printed and nothing leaves the machine. */
-export async function fastStatus(c: Pick<FastComposition, 'vaultDir' | 'protector' | 'env'>): Promise<{ numbersPresent: boolean; textsOn: boolean; ownerConsent: boolean; jobberConnected: boolean; jobberWritesOn: boolean }> {
-  const vault = createVault(c.vaultDir, c.protector); const nums = await loadTestNumbers(vault);
+export async function fastStatus(c: Pick<FastComposition, 'vaultDir' | 'protector' | 'env'>): Promise<{ numbersPresent: boolean; textsOn: boolean; ownerConsent: boolean; jobberConnected: boolean; jobberWritesOn: boolean; /** The booking identity keyring is present and every generation is valid. */ keyringReady: boolean; /** Only when it is not: the fixed reason (never a secret). */ keyringProblem?: string }> {
+  const vault = createVault(c.vaultDir, c.protector); const nums = await loadTestNumbers(vault); const ring = await loadKeyring(vault);
   const textsOn = c.env.FAST_TEXTS === 'on';   // texts are OFF unless this exact word is set
-  return { numbersPresent: nums !== undefined, textsOn, ownerConsent: nums !== undefined && (await ownerConsentOn(vault, nums.owner)), jobberConnected: (await vault.loadTokens()) !== undefined && (await vault.loadCredentials()) !== undefined, jobberWritesOn: c.env.JOBBER_ALLOW_WRITES === 'test-account' };
+  return { numbersPresent: nums !== undefined, textsOn, ownerConsent: nums !== undefined && (await ownerConsentOn(vault, nums.owner)), jobberConnected: (await vault.loadTokens()) !== undefined && (await vault.loadCredentials()) !== undefined, jobberWritesOn: c.env.JOBBER_ALLOW_WRITES === 'test-account', keyringReady: ring.ok, ...(ring.ok ? {} : { keyringProblem: ring.problem }) };
 }
 
 /** The fast call handler's dependencies, wired to Jobber and Twilio. Throws when a private piece is missing (the gate has already checked, so this is a second line). */
@@ -66,6 +67,7 @@ export async function buildFastDeps(c: FastComposition): Promise<FastDeps> {
   const vault = createVault(c.vaultDir, c.protector);
   const numbers = await loadTestNumbers(vault); const creds = await vault.loadCredentials();
   if (numbers === undefined || creds === undefined || (await vault.loadTokens()) === undefined) throw new RangeError('the approved test numbers or the Jobber connection are missing');
+  const ring = await loadKeyring(vault); if (!ring.ok) throw new RangeError(`the booking identity keyring is not ready (${ring.problem}): bookings are identified by it, so nothing starts without it`);   // a second line behind the gate; nothing about the keyring is printed
   const from = c.textFrom ?? c.config.numbers[0]; const textsEnabled = c.env.FAST_TEXTS === 'on';
   // Test emails: OFF unless FAST_EMAILS is exactly "on". Switched on without the approved addresses saved, nothing starts (it never falls back to anything else).
   const emailsOn = c.env.FAST_EMAILS === 'on'; const emails = emailsOn ? await loadTestEmails(vault) : undefined;

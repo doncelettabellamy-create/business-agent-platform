@@ -52,12 +52,15 @@ test('gate: with fast_test the long ElevenLabs-naming notice is not required, bu
   const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
   const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: founderVoiceDigest(r.call, r.voice), twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true };
   const gate = (call: FounderCallConfig, voice: FounderVoiceConfig, e: object) => founderVoiceGateProblems({ callConfig: call, voiceConfig: voice, nowIso: '2026-11-02T12:00:00Z', env: { ...env, callApprovedDigest: founderConfigDigest(call), voiceApprovedDigest: founderVoiceDigest(call, voice), ...e } });
-  assert.deepEqual(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true } }), []);
+  assert.deepEqual(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true, keyringReady: true } }), []);
   const missing = gate(r.call, r.voice, {}); assert.equal(missing.filter((m) => /numbers|Jobber|JOBBER/.test(m)).length, 3);
-  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: false, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true } }).some((m) => /approved test numbers/.test(m)));
-  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: false, jobberConnected: true, jobberWritesOn: true } }).some((m) => /owner text consent is not recorded/.test(m)), 'no recorded owner consent: the gate refuses');
-  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: false, jobberWritesOn: true } }).some((m) => /not connected/.test(m)));
-  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: false } }).some((m) => /JOBBER_ALLOW_WRITES/.test(m)));
+  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: false, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true, keyringReady: true } }).some((m) => /approved test numbers/.test(m)));
+  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: false, jobberConnected: true, jobberWritesOn: true, keyringReady: true } }).some((m) => /owner text consent is not recorded/.test(m)), 'no recorded owner consent: the gate refuses');
+  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: false, jobberWritesOn: true, keyringReady: true } }).some((m) => /not connected/.test(m)));
+  assert.ok(gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: false, keyringReady: true } }).some((m) => /JOBBER_ALLOW_WRITES/.test(m)));
+  const ring = (x: object) => gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true, ...x } }).filter((m) => /keyring/.test(m));
+  assert.deepEqual(ring({ keyringReady: true }), []); assert.equal(ring({ keyringReady: false, keyringProblem: 'MISSING' }).length, 1); assert.match(ring({ keyringReady: false, keyringProblem: 'MISSING' })[0], /keyring is not ready \(MISSING\): every booking would fail closed/);
+  assert.match(ring({ keyringReady: false, keyringProblem: 'GAP' })[0], /\(GAP\)/); assert.match(ring({ keyringReady: false, keyringProblem: 'a secret?' })[0], /\(UNKNOWN\)/, 'only a fixed reason is ever shown'); assert.equal(ring({}).length, 1, 'a status without the answer is not ready'); assert.equal(gate(r.call, r.voice, {}).filter((m) => /keyring/.test(m)).length, 1);
   // the same short notice WITHOUT fast_test is still refused for the ElevenLabs speaker
   const shortNoFast = { ...r.call }; assert.ok(gate(shortNoFast, VOICE, {}).some((m) => /does not name ElevenLabs/.test(m)));
   // the long notice that names ElevenLabs still passes without fast_test
@@ -69,7 +72,7 @@ test('gate: with fast_test the long ElevenLabs-naming notice is not required, bu
 test('presence checks and wiring: nothing printed, a missing private piece is reported as such, and building the dependencies without them is refused', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fast-cfg-')); try {
     const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
-    assert.deepEqual(await fastStatus({ vaultDir: dir, protector: fakeProtector, env: {} }), { numbersPresent: false, textsOn: false, ownerConsent: false, jobberConnected: false, jobberWritesOn: false });
+    assert.deepEqual(await fastStatus({ vaultDir: dir, protector: fakeProtector, env: {} }), { numbersPresent: false, textsOn: false, ownerConsent: false, jobberConnected: false, jobberWritesOn: false, keyringReady: false, keyringProblem: 'MISSING' });
     await assert.rejects(buildFastDeps({ config: r.call, voice: r.voice, vaultDir: dir, protector: fakeProtector, env: {}, fetch: globalThis.fetch, now: () => 0, log: () => undefined }), RangeError);
     const v = createVault(dir, fakeProtector);
     await v.saveBlob(NUMBERS_BLOB, JSON.stringify({ account_sid: 'AC123', customer: '+15550100002', owner: '+15550100003' }));
@@ -77,7 +80,11 @@ test('presence checks and wiring: nothing printed, a missing private piece is re
     await v.saveBlob(NUMBERS_BLOB, JSON.stringify({ account_sid: `AC${'a1'.repeat(16)}`, customer: '+15550100002', owner: '+15550100002' }));
     assert.equal((await fastStatus({ vaultDir: dir, protector: fakeProtector, env: {} })).numbersPresent, false, 'the customer and owner numbers must differ');
     await v.saveBlob(NUMBERS_BLOB, JSON.stringify({ account_sid: `AC${'a1'.repeat(16)}`, customer: '+15550100002', owner: '+15550100003' }));
-    assert.deepEqual(await fastStatus({ vaultDir: dir, protector: fakeProtector, env: { JOBBER_ALLOW_WRITES: 'test-account' } }), { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: false, jobberWritesOn: true });
+    assert.deepEqual(await fastStatus({ vaultDir: dir, protector: fakeProtector, env: { JOBBER_ALLOW_WRITES: 'test-account' } }), { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: false, jobberWritesOn: true, keyringReady: false, keyringProblem: 'MISSING' });
+    // the keyring: ready only when every generation is valid; every problem is a fixed reason, never a secret
+    const ok1 = JSON.stringify({ version: 1, gen: 1, current: { kid: 'k1', secret: Buffer.alloc(32, 9).toString('base64url') }, retired: [] });
+    assert.equal(await v.publishBlob('booking-identity-keys.1', ok1, () => undefined), 'published'); assert.deepEqual([(await fastStatus({ vaultDir: dir, protector: fakeProtector, env: {} })).keyringReady, (await fastStatus({ vaultDir: dir, protector: fakeProtector, env: {} })).keyringProblem], [true, undefined]);
+    assert.equal(await v.publishBlob('booking-identity-keys.2', 'not a generation', () => undefined), 'published'); const bad = await fastStatus({ vaultDir: dir, protector: fakeProtector, env: {} }); assert.deepEqual([bad.keyringReady, bad.keyringProblem], [false, 'MALFORMED']); assert.ok(!JSON.stringify(bad).includes(Buffer.alloc(32, 9).toString('base64url')));
     assert.equal((await fastStatus({ vaultDir: dir, protector: fakeProtector, env: { JOBBER_ALLOW_WRITES: 'yes' } })).jobberWritesOn, false, 'only the exact word switches writes on');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -105,7 +112,7 @@ test('gate: a greeting opening is refused without the fast_test section, and all
   const gate = (call: FounderCallConfig, voice: FounderVoiceConfig, e: object) => founderVoiceGateProblems({ callConfig: call, voiceConfig: voice, nowIso: '2026-11-02T12:00:00Z', env: { ...env, callApprovedDigest: founderConfigDigest(call), voiceApprovedDigest: founderVoiceDigest(call, voice), ...e } });
   const { fast_test: _drop, ...plainVoice } = r.voice;
   assert.ok(gate(r.call, plainVoice as typeof VOICE, {}).some((m) => /greeting is only for the controlled fast test/.test(m)));
-  assert.ok(!gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true } }).some((m) => /greeting/.test(m)));
+  assert.ok(!gate(r.call, r.voice, { fastTest: { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true, keyringReady: true } }).some((m) => /greeting/.test(m)));
 });
 
 test('typed schedule answers: the approved Drew settings are understood in every natural spelling, and a wrong answer is named, never silently changed', () => {
@@ -148,7 +155,7 @@ test('Jack guard: a voice config with fast_test and NO speaker section is refuse
   const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
   const bare = without(r.voice, 'speaker');
   assert.deepEqual(founderVoiceConfigProblems(bare).filter((m) => /speaker/.test(m)), [NEEDS_SPEAKER], 'exactly one problem about the speaker, in fixed words');
-  const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: 'x', twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true, fastTest: { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true } };
+  const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: 'x', twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true, fastTest: { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true, keyringReady: true } };
   assert.ok(founderVoiceGateProblems({ callConfig: r.call, voiceConfig: bare, nowIso: '2026-11-02T12:00:00Z', env }).includes(NEEDS_SPEAKER), 'the gate refuses too');
   // the setup program will not ADD a fast test to a voice config that has no speaker
   const a = applyFastTest(CALL, without(VOICE, 'speaker'), ANSWERS); assert.equal(a.ok, false);
@@ -194,7 +201,7 @@ test('Jack guard, as a property: over every combination of speaker, fast_test an
 test('voice pin: a different but well-formed voice_id is refused at load, by the config check, the gate and the setup program, with fixed text and no id; Jack passes', () => {
   const r = applyFastTest(CALL, VOICE, ANSWERS); assert.equal(r.ok, true); if (!r.ok) return;
   assert.deepEqual(founderVoiceConfigProblems(r.voice), [], 'Jack passes');
-  const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: 'x', twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true, fastTest: { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true } };
+  const env = { allowLive: 'yes', callApprovedDigest: founderConfigDigest(r.call), voiceApprovedDigest: 'x', twilioTokenPresent: true, openaiKeyPresent: true, elevenlabsKeyPresent: true, fastTest: { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true, keyringReady: true } };
   for (const id of ['aaaaaaaaaaaaaaaaaaaa', 'AAAAAAAAAAAAAAAAAAAA', '7EzWGsX10sAS4c9m9cPg', '7ezwgsx10sas4c9m9cpf', '12345678901234567890']) {
     const wrong = { ...r.voice, speaker: { ...SPEAKER_OK, voice_id: id } };
     const p = founderVoiceConfigProblems(wrong);

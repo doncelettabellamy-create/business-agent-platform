@@ -99,7 +99,7 @@ const noPersonal = (x: unknown, extra: string[] = []): void => { const all = JSO
 
 test('JOINED: the short opening, a yes, name, address with city and ZIP, day and time, size, $199 with a Jobber-supported time, agreement, the verified caller ID as the callback number, text permission, the measured read-back, the Jobber test booking, both texts, delivery checked', async () => {
   const r = await rig();
-  assert.deepEqual(r.status, { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true });
+  assert.deepEqual(r.status, { numbersPresent: true, textsOn: true, ownerConsent: true, jobberConnected: true, jobberWritesOn: true, keyringReady: true });
   assert.equal(r.notice, "Thanks for calling Drew Cleaning. I'm Jack. What's your name?", 'the opening is exactly the greeting: it asks the name and asks for no yes');
   assert.equal(r.notice, consentNoticeFor({ business_name: 'Drew Cleaning', greeting: "Thanks for calling Drew Cleaning. I'm Jack. What's your name?" }));
   const sim = await r.connect(); r.start(sim);
@@ -178,8 +178,12 @@ test('JOINED: Jobber writes switched off, the calendar busy, or the booking not 
   assert.ok(!c.voices[0].spoken.some((l) => /is one hundred ninety-nine dollars/.test(l)), 'no price or time was offered'); assert.equal(c.jobber.jobs.size, 0);
 });
 
-test('JOINED, NO KEYRING: the same call with no booking-identity keyring in the private folder fails closed - the caller is told a person will follow up, no client and no job are created, nothing is texted or consented, and the outcome is BOOKING_NOT_VERIFIED', async () => {
-  const r = await rig({ texts: false, ownerConsent: false, keyring: false });
+test('JOINED, NO KEYRING AT START: the server does not start - the status says the keyring is not ready (a fixed reason, no secret), and building the call dependencies is refused before anything can be opened', async () => {
+  await assert.rejects(rig({ texts: false, ownerConsent: false, keyring: false }), (e: Error) => e instanceof RangeError && /booking identity keyring is not ready \(MISSING\)/.test(e.message) && !e.message.includes(KEYRING_SECRET));
+});
+
+test('JOINED, KEYRING GONE AFTER START: the same call, with the keyring removed after the server started, still fails closed - the caller is told a person will follow up, no client and no job are created, nothing is texted or consented, and the outcome is BOOKING_NOT_VERIFIED', async () => {
+  const r = await rig({ texts: false, ownerConsent: false }); rmSync(join(r.dir, 'booking-identity-keys.1.enc'));
   const sim = await r.connect(); r.start(sim);
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
   await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, '123 Invented Lane, Testville, CA 90210');
@@ -193,7 +197,7 @@ test('JOINED, NO KEYRING: the same call with no booking-identity keyring in the 
 
 test('JOINED, TEXTS OFF (the default, campaign approval pending): the same call and the same real-Jobber booking, no text question, no consent recorded, no request to Twilio\'s message endpoint, and the texts reported as SKIPPED, never delivered', async () => {
   const r = await rig({ texts: false, ownerConsent: false });
-  assert.deepEqual(r.status, { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true });
+  assert.deepEqual(r.status, { numbersPresent: true, textsOn: false, ownerConsent: false, jobberConnected: true, jobberWritesOn: true, keyringReady: true });
   const sim = await r.connect(); r.start(sim);
   await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening');
   await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented');

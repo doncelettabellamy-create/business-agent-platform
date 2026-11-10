@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { bookingIdentity, identitiesFor, KEYRING_BASE, loadKeyring } from '../src/booking-identity.ts';
+import { bookingIdentity, identitiesFor, KEYRING_BASE, loadKeyring, RETIRED_KEY_MIN_AGE_DAYS, retiredLongEnough } from '../src/booking-identity.ts';
 import type { IdentityParts } from '../src/booking-identity.ts';
 import { createKeyring, IDENTITY_LOCK, rotateKeyring, runSetup } from '../src/booking-identity-setup.ts';
 import type { RotateOptions, RotateVault } from '../src/booking-identity-setup.ts';
@@ -154,28 +154,91 @@ test('ROTATE a file that is written but cannot be read back is reported and neve
 
 test('COMMAND rotate needs every confirmation (--confirm, --no-unresolved-bookings, --server-stopped, --expect-generation N); with all of them it rotates once; every line it prints is free of any secret', async () => {
   const { dir, vault } = await made(); const out: string[] = []; const before = snapshot(dir);
-  const run = (...argv: string[]): Promise<number> => runSetup(argv, { vault, say: (s) => out.push(s), random: rnd('s2'), now, lockWaitMs: 2000 });
+  const run = (...argv: string[]): Promise<number> => runSetup(argv, { vault, say: (s) => out.push(s), random: rnd('s2'), now, lockWaitMs: 2000, unresolved: async () => 'none' });
   const ALL = ['--confirm', '--no-unresolved-bookings', '--server-stopped', '--expect-generation', '1'];
   assert.equal(await run('rotate'), 2); assert.match(out.at(-1)!, /Missing: --confirm --no-unresolved-bookings --server-stopped --expect-generation N/);
   for (const flag of ['--confirm', '--no-unresolved-bookings', '--server-stopped']) { assert.equal(await run('rotate', ...ALL.filter((x) => x !== flag)), 2, flag); assert.ok(out.at(-1)!.includes(`Missing: ${flag}`), flag); }
   for (const bad of ['0', 'x', '1000', '-1', '1.5', '']) assert.equal(await run('rotate', '--confirm', '--no-unresolved-bookings', '--server-stopped', '--expect-generation', bad), 2, `expect ${bad}`);
   assert.equal(await run('rotate', '--confirm', '--no-unresolved-bookings', '--server-stopped'), 2); unchanged(dir, before, 'incomplete commands');
   assert.equal(await run('rotate', ...ALL), 0); assert.match(out.at(-1)!, /^rotated: generation 2, new current key k2 \(fingerprint [0-9a-f]{4}\); k1 is retired and kept \(1 retired in all\)\./); assert.match(out.at(-1)!, /Restart the Drew server/);
-  assert.equal(await run('status'), 0); assert.match(out.at(-1)!, /present \(generation 2, current key k2, fingerprint [0-9a-f]{4}, 1 retired\)/);
+  assert.equal(await run('status'), 0); assert.match(out.at(-2)!, /present \(generation 2, current key k2, fingerprint [0-9a-f]{4}, 1 retired\)/);
   assert.equal(await run('rotate', ...ALL), 1); assert.match(out.at(-1)!, /not at the generation you named .*\(STALE_EXPECTATION\)/);
   assert.equal(await run('rotate', ...ALL.slice(0, 4), '2', ...[]), 1, 'generation 2 now: it would rotate again, but the random source gives the current secret'); assert.match(out.at(-1)!, /reuse an earlier key.*\(REUSED_KEY\)/);
   for (const line of out) noSecret(line, ['s1', 's2']);
-  const d2 = fresh(); const lines: string[] = []; assert.equal(await runSetup(['rotate', ...ALL], { vault: createVault(d2, fakeProtector), say: (s) => lines.push(s) }), 1); assert.match(lines[0], /there is no keyring yet \(use create\)/); assert.deepEqual(files(d2), []);
+  const d2 = fresh(); const lines: string[] = []; assert.equal(await runSetup(['rotate', ...ALL], { vault: createVault(d2, fakeProtector), say: (s) => lines.push(s), unresolved: async () => 'none' }), 1); assert.match(lines[0], /there is no keyring yet \(use create\)/); assert.deepEqual(files(d2), []);
   const out3: string[] = []; assert.equal(await runSetup(['rotate', ...ALL.slice(0, 4), '2'], { vault, say: (s) => out3.push(s), unresolved: async () => 'some' }), 1); assert.match(out3[0], /unresolved bookings are not ruled out; nothing was changed \(UNRESOLVED\)/);
   assert.equal(await runSetup([], { vault, say: (s) => out3.push(s) }), 2); assert.match(out3.at(-1)!, /usage: .*rotate --confirm --no-unresolved-bookings --server-stopped --expect-generation N/);
 });
 
-test('SOURCE rotation is only by explicit command and only through the booking-identity lock: it holds no other lock, deletes and overwrites nothing, never logs or reads the environment, and never drops a retired key', () => {
+test('SOURCE rotation is only by explicit command and only through the booking-identity lock: it holds no other lock, deletes and overwrites nothing, never logs or reads the environment, and drops a retired key only in the one checked case', () => {
   const src = readFileSync(new URL('../src/booking-identity-setup.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   for (const word of ['process.env', 'console.', 'rmSync', 'unlinkSync', 'writeFileSync', 'renameSync', 'saveBlob', 'fetch(', 'jobber-connector', 'jobber-booking']) assert.ok(!src.includes(word), word);
   assert.deepEqual([...src.matchAll(/\.withLock\(([^,]+),/g)].map((m) => m[1]), ['IDENTITY_LOCK'], 'the only lock taken is the booking-identity lock');
-  assert.ok(/prev\.retired\.length >= MAX_RETIRED_KEYS\) return \{ ok: false, reason: 'RETENTION_LIMIT' \}/.test(src), 'a full retired list refuses');
-  assert.ok(/retired: \[\{ kid: prev\.current\.kid, secret: prev\.current\.secret, retired_at: [^}]+\}, \.\.\.prev\.retired\]/.test(src), 'the new generation keeps every retired key after the old current key');
-  assert.ok(!/prev\.retired\.(slice|filter|pop|splice|shift)\(/.test(src.slice(src.indexOf('async function rotateLocked'), src.indexOf('/** The command line'))), 'rotation takes nothing out of the retired list');
+  assert.ok(/prev\.retired\.length >= MAX_RETIRED_KEYS\) \{\n    if \(o\.dropOldest !== true\) return \{ ok: false, reason: 'RETENTION_LIMIT' \}/.test(src), 'a full retired list refuses unless the founder asked to drop the oldest'); assert.equal([...src.matchAll(/\.slice\(0, -1\)/g)].length, 1, 'the only place a key can be dropped'); assert.ok(/if \(o\.unresolved === undefined\) return \{ ok: false, reason: 'UNRESOLVED' \}[^\n]*\n    const oldest = prev\.retired\[prev\.retired\.length - 1\];\n    if \(!retiredLongEnough\(oldest, now\)\) return \{ ok: false, reason: 'RETENTION_TOO_RECENT' \}/.test(src), 'a ledger check and the age rule come before any drop');
+  assert.ok(/retired: \[\{ kid: prev\.current\.kid, secret: prev\.current\.secret, retired_at: [^}]+\}, \.\.\.kept\]/.test(src), 'the new generation keeps the retired keys after the old current key'); assert.ok(/let kept = prev\.retired;/.test(src), '`kept` starts as every retired key');
+  assert.deepEqual([...src.slice(src.indexOf('async function rotateLocked'), src.indexOf('/** The command line')).matchAll(/prev\.retired\.(slice|filter|pop|splice|shift)\(([^)]*)\)/g)].map((m) => `${m[1]}(${m[2]})`), ['slice(0, -1)'], 'the only thing ever taken out of the retired list is its last (oldest) entry');
   assert.ok(/publishBlob\(`\$\{KEYRING_BASE\}\.\$\{n\}`, text, \(\) => lock\.assertHeld\(\)\)/.test(src), 'the lock is checked inside the publish, right before the link');
+});
+
+// ================================================================ Slice C: retention (dropping the OLDEST retired key) and the ledger check
+const DAY = 86_400_000;
+/** A chain with five retired keys: rotation n (1..5) is made at NOW + 10n days, so k1 was retired at NOW + 10 days ... k5 at NOW + 50 days. Generation 6, current k6. */
+async function full(): Promise<{ dir: string; vault: ReturnType<typeof createVault> }> { const { dir, vault } = await made(); for (let n = 1; n <= 5; n++) assert.ok((await rotateKeyring(vault, opts(`s${n + 1}`, n, { now: () => NOW + n * 10 * DAY }))).ok, `rotation ${n}`); return { dir, vault }; }
+const NONE = async (): Promise<'none'> => 'none';
+const AT_OLD_ENOUGH = NOW + 10 * DAY + RETIRED_KEY_MIN_AGE_DAYS * DAY;   // k1 was retired at NOW + 10 days
+
+test('DROP is only on request, only with a ledger check that says "none": a full list without the flag, with the flag and no check, or with a check that says some / unknown / fails all refuse and write nothing', async () => {
+  const { dir, vault } = await full(); const before = snapshot(dir);
+  assert.deepEqual(await rotateKeyring(vault, opts('s7', 6, { now: () => AT_OLD_ENOUGH, unresolved: NONE })), { ok: false, reason: 'RETENTION_LIMIT' }, 'no flag');
+  assert.deepEqual(await rotateKeyring(vault, opts('s7', 6, { now: () => AT_OLD_ENOUGH, dropOldest: true })), { ok: false, reason: 'UNRESOLVED' }, 'no ledger check at all');
+  for (const [name, check] of [['some', async () => 'some' as const], ['unknown', async () => 'unknown' as const], ['throws', async (): Promise<'none'> => { throw new Error('boom'); }], ['garbage', (async () => 'yes') as unknown as () => Promise<'none'>]] as const) assert.deepEqual(await rotateKeyring(vault, opts('s7', 6, { now: () => AT_OLD_ENOUGH, dropOldest: true, unresolved: check })), { ok: false, reason: 'UNRESOLVED' }, name);
+  unchanged(dir, before, 'refused drops');
+});
+
+test('DROP age rule: the oldest key is dropped only 31 days after it was retired (a booking is at most 30 days ahead): one millisecond early refuses, the exact moment drops it and only it; the others keep their order and times', async () => {
+  const { dir, vault } = await full(); const before = snapshot(dir);
+  assert.deepEqual(await rotateKeyring(vault, opts('s7', 6, { now: () => AT_OLD_ENOUGH - 1, dropOldest: true, unresolved: NONE })), { ok: false, reason: 'RETENTION_TOO_RECENT' }); unchanged(dir, before, 'one millisecond early');
+  assert.deepEqual(await rotateKeyring(vault, opts('s7', 6, { now: () => NOW - DAY, dropOldest: true, unresolved: NONE })), { ok: false, reason: 'RETENTION_TOO_RECENT' }, 'a clock before the retirement'); unchanged(dir, before, 'a clock in the past');
+  const r = await rotateKeyring(vault, opts('s7', 6, { now: () => AT_OLD_ENOUGH, dropOldest: true, unresolved: NONE })); assert.ok(r.ok);
+  assert.deepEqual([r.gen, r.kid, r.retiredKid, r.retired, r.dropped], [7, 'k7', 'k6', 5, 'k1']);
+  const loaded = await loadKeyring(vault); assert.ok(loaded.ok); assert.deepEqual(loaded.generations, [1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(loaded.keyring.retired.map((x) => x.kid), ['k6', 'k5', 'k4', 'k3', 'k2']); assert.deepEqual(loaded.keyring.retired.map((x) => x.secret), ['s6', 's5', 's4', 's3', 's2'].map(secretOf));
+  assert.deepEqual(loaded.keyring.retired.slice(1).map((x) => x.retired_at), [50, 40, 30, 20].map((d) => new Date(NOW + d * DAY).toISOString()), 'the kept keys keep the time they were retired');
+  assert.ok(!JSON.stringify(loaded.keyring).includes(secretOf('s1')), 'the dropped secret is not in the newest generation'); assert.equal(identitiesFor(loaded.keyring, PARTS).aliases.length, 5);
+  for (const f of keyFiles(dir).slice(0, 6)) assert.equal(readFileSync(join(dir, f), 'utf8'), before[f], `${f} is byte for byte the same (earlier generations are never touched)`);
+  noSecret(r, ['s1', 's2', 's6', 's7']);
+});
+
+test('DROP never brings a dropped key back: a later rotation that would make the dropped secret current again is refused by the whole-chain check, and nothing is written', async () => {
+  const { dir, vault } = await full(); assert.ok((await rotateKeyring(vault, opts('s7', 6, { now: () => AT_OLD_ENOUGH, dropOldest: true, unresolved: NONE }))).ok);
+  const before = snapshot(dir);
+  const r = await rotateKeyring(vault, opts('s1', 7, { now: () => NOW + 60 * DAY, dropOldest: true, unresolved: NONE }));   // k2 (retired at NOW + 20 days) is old enough; the "random" secret is k1's
+  assert.deepEqual(r, { ok: false, reason: 'REUSED_KEY', problem: 'SUCCESSION' }); unchanged(dir, before, 'a dropped secret returning');
+});
+
+test('DROP is not needed with room: the flag on a list that is not full drops nothing and rotates as usual', async () => {
+  const { dir, vault } = await made(); const r = await rotateKeyring(vault, opts('s2', 1, { dropOldest: true, unresolved: NONE })); assert.ok(r.ok); assert.equal(r.dropped, undefined); assert.equal(r.retired, 1);
+  const loaded = await loadKeyring(vault); assert.ok(loaded.ok); assert.deepEqual(loaded.keyring.retired.map((x) => x.kid), ['k1']); assert.deepEqual(keyFiles(dir), [`${KEYRING_BASE}.1.enc`, `${KEYRING_BASE}.2.enc`]);
+});
+
+test('RETENTION age: only a readable stamp at least 31 days old counts; an unreadable stamp or one in the future never does; 31 days is longer than the 30 days a booking can be ahead', () => {
+  const k = (retired_at: string) => ({ kid: 'k1', secret: secretOf('s1'), retired_at });
+  assert.equal(retiredLongEnough(k('2026-10-01T00:00:00.000Z'), Date.parse('2026-11-01T00:00:00.000Z')), true); assert.equal(retiredLongEnough(k('2026-10-01T00:00:00.000Z'), Date.parse('2026-10-31T23:59:59.999Z')), false);
+  for (const bad of ['', 'x', '2026-13-01T00:00:00Z', '2099-01-01T00:00:00.000Z']) assert.equal(retiredLongEnough(k(bad), NOW), false, bad);
+  assert.equal(retiredLongEnough(k('2026-10-01T00:00:00.000Z'), Number.NaN), false);
+  const booking = readFileSync(new URL('../src/jobber-booking.ts', import.meta.url), 'utf8'); assert.ok(booking.includes('s > now + 30 * 86_400_000'), 'the booking horizon this rule rests on is still 30 days'); assert.ok(RETIRED_KEY_MIN_AGE_DAYS > 30);
+});
+
+test('COMMAND: rotate refuses without a ledger check (it cannot rule out unresolved bookings), --drop-oldest-retired is needed to make room and says which key it dropped, status shows the ledger check, and nothing printed holds a secret', async () => {
+  const { dir, vault } = await full(); const out: string[] = []; const before = snapshot(dir);
+  const ALL = ['--confirm', '--no-unresolved-bookings', '--server-stopped', '--expect-generation', '6'];
+  assert.equal(await runSetup(['rotate', ...ALL], { vault, say: (s) => out.push(s), random: rnd('s7'), now: () => AT_OLD_ENOUGH }), 2); assert.match(out.at(-1)!, /no way to check the booking ledger/); unchanged(dir, before, 'no ledger check');
+  const run = (u: () => Promise<'none' | 'some' | 'unknown'>, at: number, ...more: string[]): Promise<number> => runSetup(['rotate', ...ALL, ...more], { vault, say: (s) => out.push(s), random: rnd('s7'), now: () => at, lockWaitMs: 2000, unresolved: u });
+  assert.equal(await run(NONE, AT_OLD_ENOUGH), 1); assert.match(out.at(-1)!, /--drop-oldest-retired.*\(RETENTION_LIMIT\)/);
+  assert.equal(await run(NONE, AT_OLD_ENOUGH - 1, '--drop-oldest-retired'), 1); assert.match(out.at(-1)!, /not old enough to drop yet.*\(RETENTION_TOO_RECENT\)/);
+  assert.equal(await run(async () => 'some', AT_OLD_ENOUGH, '--drop-oldest-retired'), 1); assert.match(out.at(-1)!, /unresolved bookings are not ruled out.*\(UNRESOLVED\)/); unchanged(dir, before, 'refused commands');
+  assert.equal(await run(NONE, AT_OLD_ENOUGH, '--drop-oldest-retired'), 0); assert.match(out.at(-1)!, /^rotated: generation 7, new current key k7 .*; k6 is retired and kept \(5 retired in all\)\. The oldest retired key k1 was dropped/);
+  for (const [u, word] of [[NONE, 'none'], [async () => 'some' as const, 'SOME'], [async () => 'unknown' as const, 'UNKNOWN'], [async (): Promise<'none'> => { throw new Error('x'); }, 'UNKNOWN']] as const) { assert.equal(await runSetup(['status'], { vault, say: (s) => out.push(s), unresolved: u }), 0); assert.ok(out.at(-1)!.includes(`unresolved bookings in the ledger: ${word}`), word); }
+  const lines = out.length; assert.equal(await runSetup(['status'], { vault, say: (s) => out.push(s) }), 0); assert.equal(out.length, lines + 1, 'no ledger line without a check');
+  for (const line of out) noSecret(line, ['s1', 's2', 's3', 's4', 's5', 's6', 's7']);
 });

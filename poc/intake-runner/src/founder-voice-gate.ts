@@ -160,7 +160,7 @@ export interface VoiceGateInput {
   /** What the entry read from the environment: presence and equality only, never a secret's value. */
   env: { allowLive: string | undefined; callApprovedDigest: string | undefined; voiceApprovedDigest: string | undefined; twilioTokenPresent: boolean; openaiKeyPresent: boolean; /** Only asked when the voice config selects the ElevenLabs speaker. */ elevenlabsKeyPresent?: boolean };
   /** Only asked when the voice config has a `fast_test` section: whether the private pieces it needs are in place (presence only). */
-  fastTest?: { numbersPresent: boolean; /** FAST_TEXTS=on. Off (the default) is the no-texts test mode: no text can be sent and no owner consent is needed. */ textsOn: boolean; ownerConsent: boolean; jobberConnected: boolean; jobberWritesOn: boolean };
+  fastTest?: { numbersPresent: boolean; /** FAST_TEXTS=on. Off (the default) is the no-texts test mode: no text can be sent and no owner consent is needed. */ textsOn: boolean; ownerConsent: boolean; jobberConnected: boolean; jobberWritesOn: boolean; /** The booking identity keyring is present and valid. */ keyringReady: boolean; /** Only when it is not ready: the fixed reason. */ keyringProblem?: string };
   nowIso: string;
 }
 /** Empty means a live voice call may start. */
@@ -185,6 +185,7 @@ export function founderVoiceGateProblems(input: VoiceGateInput): string[] {
     if (input.env.fastTest?.textsOn === true && input.env.fastTest?.ownerConsent !== true) p.push('the owner text consent is not recorded (run the private owner-consent step)');
     if (input.env.fastTest?.jobberConnected !== true) p.push('Jobber is not connected (authorize the connector first)');
     if (input.env.fastTest?.jobberWritesOn !== true) p.push('JOBBER_ALLOW_WRITES is not set to test-account (the test booking would be refused)');
+    if (input.env.fastTest?.keyringReady !== true) p.push(`the booking identity keyring is not ready (${/^[A-Z_]{3,20}$/.test(String(input.env.fastTest?.keyringProblem)) ? input.env.fastTest?.keyringProblem : 'UNKNOWN'}): every booking would fail closed (run the private keyring setup: status, then create)`);
   }
   return p;
 }
