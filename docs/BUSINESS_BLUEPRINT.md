@@ -118,7 +118,7 @@ Measured by the acceptance tests in section 15.3. Business-level measures (reten
 | PRD-11 | Processing plans work, retrieves knowledge, and assembles candidate results with evidence | Later | PRC-01, PRC-03, PRC-04, PRC-05 | S-29 to S-33 |
 | PRD-12 | No external delivery without a Quality Control verdict | Later | QC-01, QC-02 | S-34, S-35 |
 | PRD-13 | Risky actions need a named, authorized approver; approval is recorded | Later | FND-07, FND-23, FND-24 | S-10, S-11 |
-| PRD-14 | Work can pause for approval and resume once after a restart | Later | FND-05 | S-12 |
+| PRD-14 | Work can pause for approval and resume once after a restart | Later | FND-05 | S-12 [ANNOTATED 2026-11-10: a platform capability that stays as a capability; it is not required for routine residential-cleaning bookings, which have no per-booking approval (DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking).] |
 | PRD-15 | Reporting produces status reports and alerts from aggregated data, with no personal data | Later | RPT-01, RPT-02 | S-36, S-37 |
 | PRD-16 | Spend caps, quotas, and metering per tenant | Later (MVP uses a per-run cap and a kill switch) | FND-09 | S-15 |
 | PRD-17 | Customer data export and deletion, including vault entries | Later (needed before real customer data) | FND-13 | S-26 |
@@ -157,7 +157,7 @@ Common rules: folder per agent (FC-02); skills are modular; tools are allow-list
 | Skills (placeholder) | `classify-request`, `extract-fields`, `validate-completeness`, `create-work-item` |
 | Tools (allow-list) | Detector service client, vault write, model gateway (structured output), work-item write |
 | Permissions | Read inbound events and tenant rules; write only `work_items`, vault entries, audit events. No outbound messages in the MVP (shadow mode). |
-| Default tier | Assisted. Any customer-facing output is Human-approve (Later). |
+| Default tier | Assisted. Any customer-facing output is Human-approve (Later). [ANNOTATED 2026-11-10: the platform default. For routine residential-cleaning bookings the founder decided on autonomous execution under the owner's standing rules (tier Auto), with no per-booking human approval; see DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking.] |
 | Handoff | To Processing: `work_item.v1` inside the handoff envelope |
 | Escalation | Low confidence, missing required fields, unexpected personal data, parse failure |
 | Tests | AT-05 to AT-20 (section 15.3) |
@@ -174,7 +174,7 @@ Common rules: folder per agent (FC-02); skills are modular; tools are allow-list
 | Outputs | `candidate_result.v1` with evidence references; never written to an external system directly |
 | Skills (placeholder) | `plan-work`, `execute-step`, `enrich-from-knowledge`, `assemble-result` |
 | Tools | Tool adapters (TBD per D-02 and D-01), knowledge retrieval |
-| Permissions | Read work items and knowledge; call only allow-listed adapters; side effects Human-approve |
+| Permissions | Read work items and knowledge; call only allow-listed adapters; side effects Human-approve [ANNOTATED 2026-11-10: the platform default. For routine residential-cleaning bookings the founder decided on autonomous execution under the owner's standing rules (tier Auto), with no per-booking human approval; see DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking.] |
 | Handoff | To Quality Control: `candidate_result.v1` |
 | Register rows / steps | PRC-01, PRC-03..PRC-06 / S-29 to S-33 |
 | MVP status | **Stub only** (a receiver that validates the handoff envelope) |
@@ -426,6 +426,8 @@ flowchart TB
 ```
 
 ### 8.2 Agent pipeline (target)
+
+> **[ANNOTATED 2026-11-10: platform design (Later). The human-approve branch below applies only to an action a business chooses to put on that tier. Routine residential-cleaning bookings run on the Auto tier under the owner's standing rules, with no per-booking human approval (founder decision; DREW_PRODUCT_ROADMAP.md, Product direction). Durable unconfirmed leads and owner-visible exception records are allowed and are not approvals.]**
 
 ```mermaid
 flowchart LR

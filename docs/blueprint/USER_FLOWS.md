@@ -119,6 +119,8 @@ State names are proposals. Every transition writes an audit event (AT-15).
 
 ## 7. F-06 End-to-end pipeline with approval (Later)
 
+> **[ANNOTATED 2026-11-10: platform design (Later). The human-approve branch below applies only to an action a business chooses to put on that tier. Routine residential-cleaning bookings run on the Auto tier under the owner's standing rules, with no per-booking human approval (founder decision; DREW_PRODUCT_ROADMAP.md, Product direction). Durable unconfirmed leads and owner-visible exception records are allowed and are not approvals.]**
+
 ```mermaid
 flowchart LR
   A[Inbound] --> IN[Intake]
@@ -135,6 +137,8 @@ flowchart LR
 ```
 
 ## 8. F-07 Approval and resume (Later)
+
+> **[ANNOTATED 2026-11-10: platform design (Later). The human-approve branch below applies only to an action a business chooses to put on that tier. Routine residential-cleaning bookings run on the Auto tier under the owner's standing rules, with no per-booking human approval (founder decision; DREW_PRODUCT_ROADMAP.md, Product direction). Durable unconfirmed leads and owner-visible exception records are allowed and are not approvals.]**
 
 | Step | Behavior | Reference |
 |---|---|---|

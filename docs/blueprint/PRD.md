@@ -59,7 +59,7 @@ Phase: **MVP** = the smallest Intake pilot, i.e. R1 (see `DEPLOYMENT_TESTING.md`
 | PRD-16 | Processing plans work, retrieves tenant knowledge, and assembles candidate results with evidence | PRC-01, PRC-03, PRC-04, PRC-05 | S-29 to S-33 |
 | PRD-17 | No external delivery without a Quality Control verdict | QC-01, QC-02 | S-34, S-35 |
 | PRD-18 | Risky actions need a named, authorized approver; the approval is recorded with reason and expiry | FND-07, FND-23, FND-24 | S-10, S-11 |
-| PRD-19 | Work can pause for approval and resume once after a restart | FND-05 | S-12 |
+| PRD-19 | Work can pause for approval and resume once after a restart | FND-05 | S-12 [ANNOTATED 2026-11-10: a platform capability that stays as a capability; it is not required for routine residential-cleaning bookings, which have no per-booking approval (DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking).] |
 | PRD-20 | Reporting builds status reports and alerts from aggregated data with no personal data | RPT-01, RPT-02 | S-36, S-37 |
 | PRD-21 | Per-tenant spend caps, quotas, and metering | FND-09 | S-15 |
 | PRD-22 | Customer data export and deletion, including vault entries | FND-13 | S-26 |

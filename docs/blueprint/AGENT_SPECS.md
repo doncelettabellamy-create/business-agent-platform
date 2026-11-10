@@ -32,7 +32,7 @@
 | Purpose | Turn raw inbound requests into validated, masked work items |
 | Inputs | Verified inbound event from the one TBD channel; tenant context |
 | Outputs | `work_item.v1` (masked); audit events; `needs-human` flag when uncertain |
-| Default tier | Assisted. Any customer-facing output is Human-approve (Later). |
+| Default tier | Assisted. Any customer-facing output is Human-approve (Later). [ANNOTATED 2026-11-10: the platform default. For routine residential-cleaning bookings the founder decided on autonomous execution under the owner's standing rules (tier Auto), with no per-booking human approval; see DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking.] |
 | Model class | Small, fast, structured-output capable (TBD, D-14) |
 | Limits (proposed) | Max steps per run, token cap per run, timeout: values TBD |
 | Handoff | To Processing: `work_item.v1` in a handoff envelope |
@@ -81,7 +81,7 @@ Pre-processing steps that are platform code, not skills: signature verification,
 | Purpose | Plan and carry out the work for a work item, producing a candidate result with evidence |
 | Inputs | `work_item.v1`; tenant knowledge (TBD) |
 | Outputs | `candidate_result.v1` with evidence references. Never writes to an external system directly. |
-| Default tier | Assisted; side effects Human-approve |
+| Default tier | Assisted; side effects Human-approve [ANNOTATED 2026-11-10: the platform default. For routine residential-cleaning bookings the founder decided on autonomous execution under the owner's standing rules (tier Auto), with no per-booking human approval; see DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking.] |
 | Handoff | To Quality Control: `candidate_result.v1` |
 | Register rows | PRC-01, PRC-03 to PRC-06 |
 | Steps | S-29 to S-33 |
@@ -89,7 +89,7 @@ Pre-processing steps that are platform code, not skills: signature verification,
 | Skill (placeholder) | Inputs | Outputs | Tools | Tier |
 |---|---|---|---|---|
 | `plan-work` | Work item | Ordered steps | None | Auto |
-| `execute-step` | Step; context | Step result; evidence references | Tool adapters declared per step (TBD, D-01, D-02) | Assisted; side effects Human-approve |
+| `execute-step` | Step; context | Step result; evidence references | Tool adapters declared per step (TBD, D-01, D-02) | Assisted; side effects Human-approve [ANNOTATED 2026-11-10: the platform default. For routine residential-cleaning bookings the founder decided on autonomous execution under the owner's standing rules (tier Auto), with no per-booking human approval; see DREW_PRODUCT_ROADMAP.md, Product direction, the founder decision on autonomous routine booking.] |
 | `enrich-from-knowledge` | Query | Cited passages | Knowledge retrieval (tenant-scoped) | Auto |
 | `assemble-result` | Step results | `candidate_result.v1` | None | Auto |
 
