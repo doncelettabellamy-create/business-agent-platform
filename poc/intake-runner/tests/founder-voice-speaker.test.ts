@@ -4,6 +4,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { isolation, isolationNoStore, isolatedHome } from './helpers/isolated-env.ts';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,7 +165,7 @@ function workdir(over: { call?: Record<string, unknown>; voice?: Record<string, 
 function run(args: string[], env: Record<string, string> = {}) {
   const base: Record<string, string> = { PATH: process.env.PATH ?? '' };
   if (process.env.SystemRoot) base.SystemRoot = process.env.SystemRoot;
-  return spawnSync(process.execPath, ['src/founder-voice-entry.ts', ...args], { cwd: ROOT, env: { ...base, ...env }, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  return spawnSync(process.execPath, ['src/founder-voice-entry.ts', ...args], { cwd: ROOT, env: { ...base, ...isolationNoStore(isolatedHome()), ...env }, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 test('entry, OFF: a dry run with no speaker section says OpenAI speaks and the ElevenLabs speaker is OFF; a fully approved gate does not ask for an ElevenLabs key', () => {
@@ -261,4 +262,15 @@ test('entry, voice pin: a different well-formed voice_id is refused at startup (
   }
   const ok = workdir({ call: { opening }, voice: { fast_test: fast, speaker: SPEAKER } });
   const r = run(ok.args, { JOBBER_STORE_DIR: ok.dir }); assert.equal(r.status, 0, r.stderr.slice(0, 200)); assert.ok(r.stdout.includes('Speaker: ElevenLabs ON'));
+});
+
+test('entry, private folder: a fast test run under a test with NO JOBBER_STORE_DIR (or an empty or relative one) is refused (exit 78, a fixed code) before the folder is read - the real private folder is never the fallback', () => {
+  const { opening, fast } = fastPair(); const w = workdir({ call: { opening }, voice: { fast_test: fast, speaker: SPEAKER } });
+  for (const [label, env, code] of [['unset', {}, 'NOT_SET_UNDER_TEST'], ['empty', { JOBBER_STORE_DIR: '' }, 'EMPTY'], ['relative', { JOBBER_STORE_DIR: 'store' }, 'NOT_ABSOLUTE']] as const) {
+    for (const extra of [[], ['--serve']]) {
+      const r = run([...w.args, ...extra], env);
+      assert.equal(r.status, 78, `${label} ${JSON.stringify(extra)}: ${r.stderr.slice(0, 200)}`); assert.match(r.stderr, new RegExp(`\(PRIVATE_FOLDER_${code}\)`)); assert.ok(!r.stdout.includes('private pieces'), 'it never got as far as reading the private pieces');
+    }
+  }
+  const ok = run(w.args, { JOBBER_STORE_DIR: w.dir }); assert.equal(ok.status, 0, ok.stderr.slice(0, 200));
 });

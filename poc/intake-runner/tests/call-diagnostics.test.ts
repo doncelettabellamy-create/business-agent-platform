@@ -4,6 +4,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { isolation, isolationNoStore, isolatedHome } from './helpers/isolated-env.ts';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -277,7 +278,7 @@ test('entry: serve mode prints no digest and no TwiML (so no console filter is n
   writeFileSync(join(dir, 'c.json'), JSON.stringify({ ...example, public_wss_url: `wss://tunnel.founder-demo.net/relay/${SECRET}`, numbers: ['+15125553377'], expires: soon, kill_file: 'stop', db_path: 'calls.sqlite' }));
   writeFileSync(join(dir, 'v.json'), JSON.stringify({ ...exampleVoice, openai_model: 'gpt-test-model', realtime_model: 'realtime-test-model', transcription_model: 'gpt-live-transcribe', voice: 'test-voice' }));
   const base: Record<string, string> = { PATH: process.env.PATH ?? '' }; if (process.env.SystemRoot) base.SystemRoot = process.env.SystemRoot;
-  const run = (args: string[]) => spawnSync(process.execPath, [join(ROOT, 'src', 'founder-voice-entry.ts'), ...args, '--config', 'c.json', '--voice-config', 'v.json'], { cwd: dir, env: base, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  const run = (args: string[]) => spawnSync(process.execPath, [join(ROOT, 'src', 'founder-voice-entry.ts'), ...args, '--config', 'c.json', '--voice-config', 'v.json'], { cwd: dir, env: { ...base, ...isolationNoStore(isolatedHome()) }, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
   const dry = run([]);
   assert.equal(dry.status, 0, dry.stderr);
   assert.ok(/[0-9a-f]{64}/.test(dry.stdout) && dry.stdout.includes('<Stream url="wss://'), 'the dry run shows the digests and the TwiML (that is its job)');

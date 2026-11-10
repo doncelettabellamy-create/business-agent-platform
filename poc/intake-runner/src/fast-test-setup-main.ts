@@ -9,11 +9,11 @@
 //                                                      READ-ONLY questions to Twilio (needs TWILIO_AUTH_TOKEN in the environment): can the Drew number send texts, and what has been registered for US business
 //                                                      texting. It sends nothing and changes nothing. Prints capability and status words only, never a number or a token.
 //
-// The private folder is JOBBER_STORE_DIR, or ".drew-jobber" in the user's home folder.
+// The private folder is JOBBER_STORE_DIR (absolute), or ".drew-jobber" in the user's home folder; a test run never uses the default (private-folder.ts).
 
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { privateFolder } from './private-folder.ts';
 import { createVault } from './jobber-connector.ts';
 import { windowsProtector } from './jobber-dpapi.ts';
 import { emailStatus, fastStatus, isTestNumbers, loadTestEmails, loadTestNumbers, NUMBERS_BLOB } from './founder-voice-fast.ts';
@@ -26,7 +26,7 @@ import type { HttpFetch } from './twilio-messaging.ts';
 const argv = process.argv.slice(2); const cmd = argv[0];
 const opt = (n: string): string | undefined => { const i = argv.indexOf(`--${n}`); return i >= 0 ? argv[i + 1] : undefined; };
 const say = (s: string): void => { console.log(s); };
-const dir = process.env.JOBBER_STORE_DIR ?? join(homedir(), '.drew-jobber');
+const dir = privateFolder();   // fail-closed: a test run never gets the real folder (private-folder.ts)
 const protector = windowsProtector();
 const readStdin = (): Promise<string> => new Promise((ok) => { const b: Buffer[] = []; process.stdin.on('data', (x) => b.push(x)); process.stdin.on('end', () => ok(Buffer.concat(b).toString('utf8').replace(/^﻿/, ''))); });
 

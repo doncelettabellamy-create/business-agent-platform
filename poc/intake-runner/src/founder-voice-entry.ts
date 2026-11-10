@@ -12,8 +12,8 @@
 // modules; it is never printed, logged or stored. What this file never does: expose an endpoint (the founder's tunnel does that, deliberately), change Twilio, place or buy anything, or log speech.
 
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { privateFolder } from './private-folder.ts';
 import { fileURLToPath } from 'node:url';
 import { mintExecutionContext } from './execution-context.ts';
 import { createIntakeRecordStore } from './intake-record-store.ts';
@@ -64,7 +64,7 @@ console.log(speaker === undefined ? 'Speaker: OpenAI speaks (the default; the El
 const eff = effectiveVoiceSettings(voice);
 // The CONTROLLED fast test call (voice config `fast_test`; off when the section is absent). Only presence and the founder's own business facts are printed: no number, key or token.
 const fastCfg = voice.fast_test;
-const fastDir = process.env.JOBBER_STORE_DIR ?? join(homedir(), '.drew-jobber');
+const fastDir = fastCfg === undefined ? '' : privateFolder();   // only the fast test call uses the private folder; fail-closed: a test run never gets the real one (private-folder.ts)
 const fastEnv = fastCfg === undefined ? undefined : await fastStatus({ vaultDir: fastDir, protector: windowsProtector(), env: process.env });
 if (fastCfg === undefined) console.log('Fast test call: OFF (the long cleaning flow runs, exactly as before)');
 else {

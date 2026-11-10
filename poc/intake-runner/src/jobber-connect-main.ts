@@ -12,8 +12,8 @@
 //
 // The private folder is JOBBER_STORE_DIR, or ".drew-jobber" in the user's home folder (outside the repository). Secrets are never printed.
 
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { privateFolder } from './private-folder.ts';
 import { callbackUrlFor, createVault, DEFAULT_CALLBACK_PORT, GRAPHQL_VERSION, JOBBER_ENDPOINTS, JobberError, query, readAccount, readSchedule, startAuthorization, verifyExpectedAccount } from './jobber-connector.ts';
 import type { Ctx, Credentials, FetchLike } from './jobber-connector.ts';
 import { copyToClipboard, openInEdge } from './jobber-browser.ts';
@@ -25,7 +25,7 @@ const opt = (name: string): string | undefined => { const i = argv.indexOf(`--${
 const port = opt('port') === undefined ? DEFAULT_CALLBACK_PORT : Number(opt('port'));
 const say = (s: string): void => { console.log(s); };
 
-const vault = createVault(process.env.JOBBER_STORE_DIR ?? join(homedir(), '.drew-jobber'), windowsProtector());
+const vault = createVault(privateFolder(), windowsProtector());   // fail-closed: a test run never gets the real folder (private-folder.ts)
 const ctx: Ctx = { vault, endpoints: JOBBER_ENDPOINTS, fetch: globalThis.fetch as unknown as FetchLike, now: () => Date.now(), diag: (code, detail) => { if (process.env.JOBBER_DIAG === '1') console.error(code, detail ?? ''); }, version: process.env.JOBBER_GRAPHQL_VERSION ?? GRAPHQL_VERSION };
 
 const readStdin = (): Promise<string> => new Promise((ok) => { const b: Buffer[] = []; process.stdin.on('data', (x) => b.push(x)); process.stdin.on('end', () => ok(Buffer.concat(b).toString('utf8').replace(/^﻿/, ''))); });   // PowerShell may prefix a byte-order mark

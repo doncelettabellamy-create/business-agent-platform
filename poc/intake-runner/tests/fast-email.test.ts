@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEmailSender, EMAIL_BLOB, emailCheck, emailProblems, isTestEmails, normalizeTestEmails, PROVIDERS } from '../src/fast-email.ts';
 import { spawnSync } from 'node:child_process';
+import { isolation, isolationNoStore, isolatedHome } from './helpers/isolated-env.ts';
 import { existsSync } from 'node:fs';
 import type { TestEmails } from '../src/fast-email.ts';
 import { customerEmail, emailDay, followUpEmail, ownerEmail, sampleEmail } from '../src/fast-email-copy.ts';
@@ -185,13 +186,13 @@ test('validation names WHICH field is not acceptable and never a value; a Yahoo 
 
 test('the setup program: a refused save names the field, never echoes a value, and writes nothing; the old Gmail-only wording is gone and a Yahoo sender is accepted by the checks', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fast-email-setup-')); dirs.push(dir);
-  const run = (j: unknown) => spawnSync('node', ['src/fast-test-setup-main.ts', 'save-emails'], { input: JSON.stringify(j), encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir }, cwd: new URL('..', import.meta.url) });
+  const run = (j: unknown) => spawnSync('node', ['src/fast-test-setup-main.ts', 'save-emails'], { input: JSON.stringify(j), encoding: 'utf8', env: { ...process.env, ...isolation(dir) }, cwd: new URL('..', import.meta.url) });
   const bad = run({ ...OK, app_password: 'abcdEFGH12345678!!', customer: OK.owner });
   assert.equal(bad.status, 2); assert.match(bad.stdout, /^refused: nothing was saved; not acceptable: app password, customer and owner are the same /);
   assert.ok(!/Gmail sender/.test(bad.stdout), 'the outdated Gmail-only wording is gone'); assert.match(bad.stdout, /yahoo\.com or gmail\.com/); noSecrets([bad.stdout, bad.stderr]);
   assert.ok(!existsSync(join(dir, `${EMAIL_BLOB}.enc`)), 'nothing was written');
   const provider = run({ ...OK, sender: 'x@outlook.com' }); assert.match(provider.stdout, /not acceptable: sender provider \(must be yahoo\.com or gmail\.com\)/);
-  const notJson = spawnSync('node', ['src/fast-test-setup-main.ts', 'save-emails'], { input: 'not json', encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir }, cwd: new URL('..', import.meta.url) }); assert.match(notJson.stdout, /^refused: the input was not the expected JSON/);
+  const notJson = spawnSync('node', ['src/fast-test-setup-main.ts', 'save-emails'], { input: 'not json', encoding: 'utf8', env: { ...process.env, ...isolation(dir) }, cwd: new URL('..', import.meta.url) }); assert.match(notJson.stdout, /^refused: the input was not the expected JSON/);
 });
 
 test('the callback number the caller confirmed is in the OWNER\'s email only, formatted, and only when it is a plain US number', () => {
@@ -228,7 +229,7 @@ test('email check: without --send nothing is sent and no connection opens; with 
 test('email check (the real command, no saved settings): it says so, exits non-zero, and sends nothing with or without --send', () => {
   const dir = mkdtempSync(join(tmpdir(), 'fast-email-check-')); dirs.push(dir);
   for (const extra of [[], ['--send']]) {
-    const r = spawnSync('node', ['src/fast-test-setup-main.ts', 'email-check', ...extra], { encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir }, cwd: new URL('..', import.meta.url) });
+    const r = spawnSync('node', ['src/fast-test-setup-main.ts', 'email-check', ...extra], { encoding: 'utf8', env: { ...process.env, ...isolation(dir) }, cwd: new URL('..', import.meta.url) });
     assert.equal(r.status, 1, JSON.stringify(extra)); assert.match(r.stdout, /^not ready: the test email sender and addresses are not saved/); noSecrets([r.stdout, r.stderr]);
   }
 });

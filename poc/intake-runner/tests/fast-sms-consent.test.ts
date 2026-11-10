@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { isolation, isolationNoStore, isolatedHome } from './helpers/isolated-env.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { customerConsentLine, customerText, MAX_TEXT_CHARS, ownerConsentText, ownerText, OWNER_SCRIPT_ID, SENDER_LABEL, zoneLabelOf } from '../src/fast-sms-copy.ts';
@@ -56,7 +57,7 @@ test('setup commands: the owner consent text is shown, a yes or no is recorded o
   const dir = mkdtempSync(join(tmpdir(), 'consent-cli-')); try {
     const vault = createVault(dir, fakeProtector);
     // the real command line uses the Windows protector; this test uses the same module with a stand-in by running the library functions the command uses, and the command itself for the refusal paths
-    const run = (cmd: string, input: string) => spawnSync('node', [join(import.meta.dirname, '..', 'src', 'fast-test-setup-main.ts'), cmd], { input, encoding: 'utf8', env: { ...process.env, JOBBER_STORE_DIR: dir } });
+    const run = (cmd: string, input: string) => spawnSync('node', [join(import.meta.dirname, '..', 'src', 'fast-test-setup-main.ts'), cmd], { input, encoding: 'utf8', env: { ...process.env, ...isolation(dir) } });
     const shown = run('owner-consent-text', ''); assert.equal(shown.status, 0); assert.match(shown.stdout, /May we send you one automated booking-details text per completed test booking, to the owner test number\?/);
     assert.ok(!/\+1\d{10}/.test(shown.stdout));
     assert.equal(run('record-owner-consent', 'not json').status, 2); assert.equal(run('record-owner-consent', JSON.stringify({ answer: 'YES' })).status, 2, 'only yes or no');

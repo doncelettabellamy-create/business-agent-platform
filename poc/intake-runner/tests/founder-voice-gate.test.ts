@@ -3,6 +3,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { isolation, isolationNoStore, isolatedHome } from './helpers/isolated-env.ts';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -151,7 +152,7 @@ function workdir(over: { call?: Record<string, unknown>; voice?: Record<string, 
 function run(args: string[], env: Record<string, string> = {}) {
   const base: Record<string, string> = { PATH: process.env.PATH ?? '' };
   if (process.env.SystemRoot) base.SystemRoot = process.env.SystemRoot;
-  return spawnSync(process.execPath, ['src/founder-voice-entry.ts', ...args], { cwd: ROOT, env: { ...base, ...env }, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
+  return spawnSync(process.execPath, ['src/founder-voice-entry.ts', ...args], { cwd: ROOT, env: { ...base, ...isolationNoStore(isolatedHome()), ...env }, encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 test('command line: a dry run prints both digests, the bounds, the gate, and the stream TwiML for each number, and opens nothing', () => {
