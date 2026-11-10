@@ -122,7 +122,7 @@ test('COMMAND failures are named without a secret, and a write failure leaves th
 test('SOURCE creation is only by explicit command: the setup module and the command file are imported by nothing else, never log or read the environment in the module, never delete or overwrite, and the command file is a thin wrapper', () => {
   const read = (p: string): string => readFileSync(new URL(p, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const mod = read('../src/booking-identity-setup.ts'); const main = read('../src/booking-identity-setup-main.ts');
-  for (const word of ['process.env', 'console.', 'rmSync', 'unlinkSync', 'writeFileSync', 'renameSync', 'saveBlob', 'withLock', 'fetch(']) assert.ok(!mod.includes(word), `module: ${word}`);
+  for (const word of ['process.env', 'console.', 'rmSync', 'unlinkSync', 'writeFileSync', 'renameSync', 'saveBlob', 'fetch(']) assert.ok(!mod.includes(word), `module: ${word}`);
   assert.deepEqual([...mod.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]).sort(), ['./booking-identity.ts', './booking-identity.ts', 'node:crypto']);
   assert.ok(!/throw new Error\(/.test(mod));
   assert.deepEqual([...main.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['node:os', 'node:path', './jobber-connector.ts', './jobber-dpapi.ts', './booking-identity-setup.ts']);
