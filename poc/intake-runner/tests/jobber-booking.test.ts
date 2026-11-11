@@ -25,7 +25,7 @@ const REQ: BookingRequest = {
   title: 'Standard cleaning', service: 'Standard cleaning 2 bed 2 bath', priceDollars: 199,
 };
 
-interface Opts { account: { id: string; name: string }; searchBlind: boolean; jobUserErrors: boolean; clientUserErrors: boolean; shiftVisitMs: number; crashAfterJobCreate: boolean; failJobCreateStatus?: number; /** What the read-back returns for the property's state: a string, null (Jobber has none), or undefined (the property is returned as it was written). */ readProvince?: string | null; /** Set by the stand-in: whether the last read-back query asked for the property's state. */ askedProvince?: boolean }
+interface Opts { account: { id: string; name: string }; searchBlind: boolean; jobUserErrors: boolean; clientUserErrors: boolean; shiftVisitMs: number; crashAfterJobCreate: boolean; /** Answer the client/job write with this body (the stand-in still creates it): an unusable answer. */ clientAnswer?: (id: string, pid: string) => unknown; jobAnswer?: (id: string) => unknown; failJobCreateStatus?: number; /** What the read-back returns for the property's state: a string, null (Jobber has none), or undefined (the property is returned as it was written). */ readProvince?: string | null; /** Set by the stand-in: whether the last read-back query asked for the property's state. */ askedProvince?: boolean }
 interface Mock { endpoints: { authorize: string; token: string; graphql: string }; ops: Array<{ kind: 'query' | 'mutation'; field: string; variables: Record<string, unknown> }>; opts: Opts; jobs: Map<string, Record<string, unknown>>; clients: number; close(): Promise<void> }
 async function mockJobber(): Promise<Mock> {
   const ops: Mock['ops'] = []; const jobs = new Map<string, Record<string, unknown>>(); let clients = 0; let n = 0;
@@ -44,6 +44,7 @@ async function mockJobber(): Promise<Mock> {
         if (opts.clientUserErrors) return data({ clientCreate: { client: null, userErrors: [{ message: 'bad', path: ['x'] }] } });
         const input = (v.input ?? {}) as Record<string, unknown>; clients++; const pid = `PROP-${++n}`;
         props.set(pid, { client: { firstName: input.firstName, lastName: input.lastName, phones: ((input.phones ?? []) as Array<{ number: string }>).map((p) => ({ number: p.number })) }, address: (((input.properties ?? []) as Array<{ address: Record<string, unknown> }>)[0] ?? { address: {} }).address });
+        if (opts.clientAnswer !== undefined) return data({ clientCreate: opts.clientAnswer(`CLIENT-${clients}`, pid) });
         return data({ clientCreate: { client: { id: `CLIENT-${clients}`, clientProperties: { nodes: [{ id: pid }] } }, userErrors: [] } });
       }
       if (/jobCreate/.test(b.query)) {
@@ -55,6 +56,7 @@ async function mockJobber(): Promise<Mock> {
         const s = Date.parse(`${input.timeframe.startAt}T${input.scheduling.startTime}${off}`) + opts.shiftVisitMs; const e = Date.parse(`${input.timeframe.startAt}T${input.scheduling.endTime}${off}`) + opts.shiftVisitMs;
         jobs.set(id, { id, jobNumber: 1000 + n, title: input.title, instructions: input.instructions, jobStatus: 'UPCOMING', total: input.lineItems.reduce((a, l) => a + l.unitPrice * l.quantity, 0), client: p?.client, property: { address: p?.address }, visits: { nodes: [{ startAt: new Date(s).toISOString(), endAt: new Date(e).toISOString() }] } });
         if (opts.crashAfterJobCreate) return send(500, {});
+        if (opts.jobAnswer !== undefined) return data({ jobCreate: opts.jobAnswer(id) });
         return data({ jobCreate: { job: { id, jobNumber: 1000 + n }, userErrors: [] } });
       }
       if (/FindTestJobs/.test(b.query)) { ops.push({ kind: 'query', field: 'jobs', variables: v }); return data({ jobs: { nodes: opts.searchBlind ? [] : [...jobs.values()].filter((j) => String(j.title).includes(String(v.term))).map((j) => ({ id: j.id, title: j.title })) } }); }
@@ -876,4 +878,104 @@ test('the ledger scan agrees with what the booking module really leaves behind: 
     const s = await scanLedger(r.ctx.vault); assert.deepEqual([s.verdict, s.pending, s.created, s.chains], ['some', 1, 1, 2], 'the half-finished booking is unresolved');
     r.ctx.fetch = real; assert.equal((await bookTestVisit(r.ctx, CREDS, other)).reason, 'PENDING_UNRESOLVED'); assert.deepEqual(await scanLedger(r.ctx.vault), s, 'still unresolved, and unchanged');
   } finally { await r.done(); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// MALFORMED ANSWERS. The stand-in still CREATES the client / job on its side and then answers with a different body (`clientAnswer` / `jobAnswer`), which is exactly the unknown outcome: the write may have happened and the answer cannot say.
+// A CONFIRMED refusal (user errors and no object) is the only answer that clears or rolls back the key (the older tests above pin it: `clientUserErrors`, `jobUserErrors`). Every other unusable answer keeps the key `pending`, saves nothing, sends nothing more.
+const CLIENT_BODIES: Array<[string, (id: string, pid: string) => unknown]> = [
+  ['no clientCreate in the answer', () => undefined],
+  ['client null and no user errors', () => ({ client: null, userErrors: [] })],
+  ['client without an id', (_i, pid) => ({ client: { clientProperties: { nodes: [{ id: pid }] } }, userErrors: [] })],
+  ['client id that is not a string', (_i, pid) => ({ client: { id: 12345, clientProperties: { nodes: [{ id: pid }] } }, userErrors: [] })],
+  ['no property', (id) => ({ client: { id, clientProperties: { nodes: [] } }, userErrors: [] })],
+  ['two properties', (id, pid) => ({ client: { id, clientProperties: { nodes: [{ id: pid }, { id: 'PROP-OTHER' }] } }, userErrors: [] })],
+  ['property without an id', (id) => ({ client: { id, clientProperties: { nodes: [{}] } }, userErrors: [] })],
+  ['client id the ledger would refuse to read back', (_i, pid) => ({ client: { id: 'not a valid id!', clientProperties: { nodes: [{ id: pid }] } }, userErrors: [] })],
+  ['property id the ledger would refuse to read back', (id) => ({ client: { id, clientProperties: { nodes: [{ id: 'x' }] } }, userErrors: [] })],
+  ['user errors AND a client (contradiction)', (id, pid) => ({ client: { id, clientProperties: { nodes: [{ id: pid }] } }, userErrors: [{ message: 'x', path: ['y'] }] })],
+];
+const JOB_BODIES: Array<[string, (id: string) => unknown]> = [
+  ['no jobCreate in the answer', () => undefined],
+  ['job null and no user errors', () => ({ job: null, userErrors: [] })],
+  ['job without an id', () => ({ job: { jobNumber: 1 }, userErrors: [] })],
+  ['job id that is not a string', () => ({ job: { id: 7, jobNumber: 1 }, userErrors: [] })],
+  ['job id the ledger would refuse to read back', () => ({ job: { id: 'no good id', jobNumber: 1 }, userErrors: [] })],
+  ['user errors AND a job (contradiction)', (id) => ({ job: { id, jobNumber: 1 }, userErrors: [{ message: 'x', path: ['y'] }] })],
+];
+
+test('MALFORMED clientCreate answer (' + CLIENT_BODIES.length + ' shapes): UNKNOWN outcome - uncertain CLIENT_RESPONSE_UNUSABLE, only the one client write sent, the key stays pending (no cleared generation, no id saved), the ledger stays readable, and a retry is stopped with nothing sent', async () => {
+  for (const [name, body] of CLIENT_BODIES) {
+    const r = await rig();
+    try {
+      r.mock.opts.clientAnswer = body;
+      const res = await bookTestVisit(r.ctx, CREDS, REQ);
+      assert.deepEqual([res.status, res.reason, res.writes, res.jobId], ['uncertain', 'CLIENT_RESPONSE_UNUSABLE', 1, undefined], name);
+      assert.deepEqual(mutations(r.mock), ['clientCreate'], name); assert.equal(r.mock.clients, 1, `${name}: the stand-in did create a client`);
+      assert.deepEqual((await chainOf(r)).map((c) => [c.gen, c.state, c.clientId]), [[1, 'pending', undefined]], `${name}: still the one pending generation`);
+      assert.deepEqual(r.logs.find(([c]) => c === 'JOBBER_BOOKING_UNCERTAIN')?.[1], { reason: 'CLIENT_RESPONSE_UNUSABLE', userErrors: name.includes('contradiction') ? 1 : 0 }, name);
+      r.mock.opts.clientAnswer = undefined;
+      const again = await bookTestVisit(r.ctx, CREDS, REQ);
+      assert.deepEqual([again.status, again.reason, again.writes], ['uncertain', 'PENDING_UNRESOLVED', 0], `${name}: a retry is not booked again`);
+      assert.deepEqual(mutations(r.mock), ['clientCreate'], `${name}: nothing more was sent`); assert.equal(r.mock.clients, 1);
+      const s = await scanLedger(r.ctx.vault); assert.deepEqual([s.verdict, s.pending, s.unreadable], ['some', 1, 0], `${name}: unresolved, and readable`);
+    } finally { await r.done(); }
+  }
+});
+
+test('MALFORMED jobCreate answer (' + JOB_BODIES.length + ' shapes): UNKNOWN outcome - uncertain JOB_RESPONSE_UNUSABLE, both ids kept in a pending key (no rollback to client_created), no second job even when Jobber\'s search cannot see the first, and a retry that can see it adopts that SAME job and verifies it', async () => {
+  for (const [name, body] of JOB_BODIES) {
+    for (const blind of [false, true]) {
+      const r = await rig();
+      try {
+        r.mock.opts.jobAnswer = body;
+        const res = await bookTestVisit(r.ctx, CREDS, REQ);
+        assert.deepEqual([res.status, res.reason, res.writes, res.jobId], ['uncertain', 'JOB_RESPONSE_UNUSABLE', 2, undefined], name);
+        assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate'], name); assert.equal(r.mock.jobs.size, 1, `${name}: the stand-in did create the job`);
+        const chain = await chainOf(r); assert.deepEqual(chain.map((c) => [c.gen, c.state]), [[1, 'pending'], [2, 'client_created'], [3, 'pending']], `${name}: no rollback generation`);
+        assert.ok(chain[2].clientId !== undefined, `${name}: the client and property ids are kept`); assert.equal(chain[2].jobId, undefined);
+        r.mock.opts.jobAnswer = undefined; r.mock.opts.searchBlind = blind;
+        const again = await bookTestVisit(r.ctx, CREDS, REQ);
+        if (blind) {
+          assert.deepEqual([again.status, again.reason, again.writes], ['uncertain', 'PENDING_UNRESOLVED', 0], `${name}: a job nobody can see is not booked again`);
+          assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate'], `${name}: no second job write`); assert.equal(r.mock.jobs.size, 1); assert.equal(r.mock.clients, 1);
+          assert.deepEqual((await scanLedger(r.ctx.vault)).verdict, 'some');
+        } else {
+          assert.deepEqual([again.status, again.writes, again.duplicate], ['booked_verified', 0, true], `${name}: the same job is adopted and verified`);
+          assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate'], `${name}: nothing more was sent`); assert.equal(again.jobId, [...r.mock.jobs.keys()][0]);
+          assert.equal((await chainOf(r)).at(-1)?.state, 'created');
+        }
+      } finally { await r.done(); }
+    }
+  }
+});
+
+test('MALFORMED answers, identity booking: the same unknown outcomes keep the key pending, release both locks, and a retry adopts or is stopped exactly as for a plain key', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1); r.mock.opts.jobAnswer = () => ({ job: null, userErrors: [] });
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'JOB_RESPONSE_UNUSABLE', 2]);
+    assert.deepEqual(lockFiles(r), [], 'both locks released'); assert.deepEqual((await chainOf(r, withKey(1))).map((c) => c.state), ['pending', 'client_created', 'pending']);
+    r.mock.opts.jobAnswer = undefined; r.mock.opts.searchBlind = true;
+    const blocked = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([blocked.status, blocked.reason, blocked.writes], ['uncertain', 'PENDING_UNRESOLVED', 0]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']);
+    r.mock.opts.searchBlind = false;
+    const adopted = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([adopted.status, adopted.writes, adopted.duplicate], ['booked_verified', 0, true]); assert.deepEqual(lockFiles(r), []);
+  } finally { await r.done(); }
+  const c = await rig();
+  try {
+    await seedKeyring(c, 1); c.mock.opts.clientAnswer = () => ({ client: null, userErrors: [] });
+    const res = await bookTestVisit(c.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes], ['uncertain', 'CLIENT_RESPONSE_UNUSABLE', 1]); assert.deepEqual(lockFiles(c), []);
+    assert.deepEqual((await chainOf(c, withKey(1))).map((x) => x.state), ['pending']);
+  } finally { await c.done(); }
+});
+
+test('a CONFIRMED refusal still clears the key (client) or goes back to client_created (job), whatever shape the empty object takes: user errors and the object null, missing or absent', async () => {
+  for (const body of [() => ({ client: null, userErrors: [{ message: 'x', path: ['y'] }] }), () => ({ userErrors: [{ message: 'x', path: ['y'] }] })]) {
+    const r = await rig();
+    try { r.mock.opts.clientAnswer = body; const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason], ['not_booked', 'JOBBER_REFUSED']); assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending', 'none']); } finally { await r.done(); }
+  }
+  for (const body of [() => ({ job: null, userErrors: [{ message: 'x', path: ['y'] }] }), () => ({ userErrors: [{ message: 'x', path: ['y'] }] })]) {
+    const r = await rig();
+    try { r.mock.opts.jobAnswer = body; const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason], ['not_booked', 'JOBBER_REFUSED']); assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending', 'client_created', 'pending', 'client_created']); } finally { await r.done(); }
+  }
 });

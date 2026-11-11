@@ -38,7 +38,7 @@ export interface BookingRequest {
 /** A booking identified by WHAT was booked (booking-identity.ts) instead of a caller-chosen key: it carries `identity` and no `key`, and the identity must agree with the request's own phone, date, start time, house number and ZIP. */
 export interface IdentityBookingRequest extends Omit<BookingRequest, 'key'> { key?: undefined; identity: IdentityParts }
 export type BookingStatus = 'booked_verified' | 'not_booked' | 'uncertain' | 'refused';
-export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE' | 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE';
+export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'CLIENT_RESPONSE_UNUSABLE' | 'JOB_RESPONSE_UNUSABLE' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE' | 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE';
 export interface BookingResult {
   status: BookingStatus; reason?: BookingReason;
   /** True when this key had already been booked and nothing new was written. */ duplicate?: boolean;
@@ -209,6 +209,10 @@ async function findByMarker(ctx: Ctx, creds: Credentials, marker: string): Promi
   return nodes.filter((n) => String(n.title ?? '').includes(marker) && typeof n.id === 'string').map((n) => n.id as string);
 }
 const userErrorCount = (x: unknown): number => list(x).length;
+/** Nothing came back where an object was asked for (null or missing). */
+const absent = (x: unknown): boolean => x === null || x === undefined;
+/** An id that is safe to keep: the same pattern the ledger reader enforces, so a saved id can never make the ledger unreadable. */
+const idOk = (x: unknown): x is string => typeof x === 'string' && JOB_ID.test(x);
 
 /** The global lock of the booking identity: the same name the founder-run rotation takes (the rotation script's IDENTITY_LOCK; a test keeps the two equal). */
 const IDENTITY_LOCK = 'booking-identity';
@@ -259,14 +263,18 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, input: Booking
         ledger[marker] = { state: 'pending' }; await save();   // written BEFORE the write
         const c = rec(rec((await write(CREATE_CLIENT, { input: clientInput(req) })).data.clientCreate));
         const props = list(rec(rec(c.client).clientProperties).nodes).map(rec);
-        if (userErrorCount(c.userErrors) > 0 || typeof rec(c.client).id !== 'string' || props.length !== 1 || typeof props[0].id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(c.userErrors) }); delete ledger[marker]; await save(); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+        // A CONFIRMED refusal (user errors and no client) clears the key. Any other unusable answer is an UNKNOWN outcome: a client may exist, so the key stays `pending` (saved above), nothing is saved or sent, and the next call is stopped as PENDING_UNRESOLVED.
+        if (userErrorCount(c.userErrors) > 0 && absent(c.client)) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(c.userErrors) }); delete ledger[marker]; await save(); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+        if (userErrorCount(c.userErrors) > 0 || !idOk(rec(c.client).id) || props.length !== 1 || !idOk(props[0].id)) { ctx.diag('JOBBER_BOOKING_UNCERTAIN', { reason: 'CLIENT_RESPONSE_UNUSABLE', userErrors: userErrorCount(c.userErrors) }); return done('uncertain', { reason: 'CLIENT_RESPONSE_UNUSABLE' }); }
         clientId = rec(c.client).id as string; propertyId = props[0].id as string;
         ledger[marker] = { state: 'client_created', clientId, propertyId }; await save();
       }
       ledger[marker] = { state: 'pending', clientId, propertyId }; await save();   // written BEFORE the job is created
       // An unknown outcome (an error after the request was sent) leaves the key "pending": the next call asks Jobber before doing anything.
       const jc = rec(rec((await write(CREATE_JOB, { input: jobInput(req, propertyId as string, marker) })).data.jobCreate));
-      if (userErrorCount(jc.userErrors) > 0 || typeof rec(jc.job).id !== 'string') { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(jc.userErrors) }); ledger[marker] = { state: 'client_created', clientId, propertyId }; await save(); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+      // Only a CONFIRMED refusal (user errors and no job) goes back to `client_created`. Any other unusable answer may hide a job: the key stays `pending` with its ids (saved above), nothing more is saved or sent, and the next call asks Jobber for the marker before anything else.
+      if (userErrorCount(jc.userErrors) > 0 && absent(jc.job)) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'JOBBER_REFUSED', userErrors: userErrorCount(jc.userErrors) }); ledger[marker] = { state: 'client_created', clientId, propertyId }; await save(); return done('not_booked', { reason: 'JOBBER_REFUSED' }); }
+      if (userErrorCount(jc.userErrors) > 0 || !idOk(rec(jc.job).id)) { ctx.diag('JOBBER_BOOKING_UNCERTAIN', { reason: 'JOB_RESPONSE_UNUSABLE', userErrors: userErrorCount(jc.userErrors) }); return done('uncertain', { reason: 'JOB_RESPONSE_UNUSABLE' }); }
       const jobId = rec(jc.job).id as string;
       ledger[marker] = { state: 'created', clientId, propertyId, jobId }; await save();
       ctx.diag('JOBBER_BOOKING_CREATED', { writes });
