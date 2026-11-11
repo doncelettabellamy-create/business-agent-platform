@@ -979,3 +979,35 @@ test('a CONFIRMED refusal still clears the key (client) or goes back to client_c
     try { r.mock.opts.jobAnswer = body; const res = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason], ['not_booked', 'JOBBER_REFUSED']); assert.deepEqual((await chainOf(r)).map((c) => c.state), ['pending', 'client_created', 'pending', 'client_created']); } finally { await r.done(); }
   }
 });
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// BOOKING REFERENCE: the marker in the Jobber job's title travels in the result, so the owner can search for an unverified job in Jobber.
+const MARKER = /^DREWTEST-[0-9A-F]{12}$/;
+test('BOOKING REFERENCE: every result after the key is derived carries the marker that is in the Jobber job title (verified, duplicate, mismatch, unusable answers, a failed write, a refusal, an unreadable ledger); the early refusals carry none', async () => {
+  const r = await rig();
+  try {
+    const a = await bookTestVisit(r.ctx, CREDS, REQ); assert.equal(a.status, 'booked_verified'); assert.equal(a.marker, markerFor(REQ.key)); assert.match(a.marker as string, MARKER); assert.ok(String(jobList(r)[0].title).endsWith(`[${a.marker}]`));
+    const b = await bookTestVisit(r.ctx, CREDS, REQ); assert.deepEqual([b.status, b.duplicate, b.marker], ['booked_verified', true, a.marker]);
+  } finally { await r.done(); }
+  const cases: Array<[string, (r: Rig) => void, string, string | undefined]> = [
+    ['a read-back mismatch', (x) => { x.mock.opts.shiftVisitMs = 3_600_000; }, 'uncertain', 'READBACK_MISMATCH'],
+    ['an unusable job answer', (x) => { x.mock.opts.jobAnswer = () => ({ job: null, userErrors: [] }); }, 'uncertain', 'JOB_RESPONSE_UNUSABLE'],
+    ['an unusable client answer', (x) => { x.mock.opts.clientAnswer = () => ({ client: null, userErrors: [] }); }, 'uncertain', 'CLIENT_RESPONSE_UNUSABLE'],
+    ['a failed job write (the job exists)', (x) => { x.mock.opts.crashAfterJobCreate = true; }, 'uncertain', 'API_ERROR'],
+    ['a confirmed refusal', (x) => { x.mock.opts.clientUserErrors = true; }, 'not_booked', 'JOBBER_REFUSED'],
+  ];
+  for (const [name, set, status, reason] of cases) {
+    const x = await rig();
+    try { set(x); const res = await bookTestVisit(x.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason, res.marker], [status, reason, markerFor(REQ.key)], name); if (name.startsWith('a read-back') || name.startsWith('a failed')) assert.ok(String(jobList(x)[0].title).endsWith(`[${res.marker}]`), `${name}: the job in Jobber carries it`); } finally { await x.done(); }
+  }
+  const u = await rig();
+  try { await seedGen(u, 1, { state: 'client_created' }); const res = await bookTestVisit(u.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason, res.writes, res.marker], ['uncertain', 'LEDGER_UNREADABLE', 0, markerFor(REQ.key)]); } finally { await u.done(); }
+  const off = await rig(false);
+  try { const res = await bookTestVisit(off.ctx, CREDS, REQ); assert.deepEqual([res.status, res.reason, res.marker], ['refused', 'WRITES_OFF', undefined]); const bad = await bookTestVisit(off.ctx, CREDS, { ...REQ, key: 'short' }); assert.deepEqual([bad.reason, bad.marker], ['INVALID_REQUEST', undefined]); } finally { await off.done(); }
+  const i = await rig();
+  try {
+    await seedKeyring(i, 1); i.mock.opts.shiftVisitMs = 3_600_000; const res = await bookTestVisit(i.ctx, CREDS, IREQ);
+    assert.deepEqual([res.status, res.reason, res.marker], ['uncertain', 'READBACK_MISMATCH', idMarker(1)]); assert.ok(String(jobList(i)[0].title).endsWith(`[${idMarker(1)}]`));
+    assert.ok(!JSON.stringify([res, i.logs]).match(/Testa|Invented|90210|5550104242/), 'the reference adds no personal detail');
+  } finally { await i.done(); }
+});

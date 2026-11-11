@@ -1295,7 +1295,8 @@ test('ADDRESS CHECK (NOT ASKED FOR AN UNUSABLE ADDRESS): an address the shape gu
 const notices = (t: ReturnType<typeof build>) => t.mails.filter((m) => m.subject === FOLLOW_UP_SUBJECT);
 const FOLLOW_UP_LINES: RegExp[] = [/^A Drew Cleaning DEMO call ended without completing the request, and it needs a follow-up\. Nobody else has been told\.$/, /^$/, /^Reason code: [A-Z][A-Z0-9_]{2,47}$/, /^Callback number: (\(555\) 010-\d{4}|not available)$/, /^Call ended: [A-Za-z0-9:, ]+$/, /^Call SID: CA[0-9a-f]{32}$/,
   /^Steps reached: ([A-Z][A-Z0-9_]{2,47})(, [A-Z][A-Z0-9_]{2,47})*$|^Steps reached: none$/, /^(Check Jobber \(the Developer Test Account\): the booking request was sent, so a job may exist even though it was not verified\.|No booking was sent to Jobber\.)$/,
-  /^This notice holds no name, address or anything else the caller said\.$/, /^Sent by .+\. This address was approved for this test only\.$/];
+  /^This notice holds no name, address or anything else the caller said\.$/, /^Sent by .+\. This address was approved for this test only\.$/,
+  /^Booking reference \(search for it in Jobber\): DREWTEST-[0-9A-F]{12}$/];
 
 test('M1: an ending that promised a person sends the owner ONE fixed notice: the reason code, the time, the callback number and the steps reached; nothing else', async () => {
   const t = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2 }) }); await toBooked(t);
@@ -1890,4 +1891,43 @@ test('LEAD source: the lead path sends nothing and keeps no placeholder, only a 
   const lead = readFileSync(new URL('../src/fast-lead.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.deepEqual([...lead.matchAll(/^import .* from '([^']+)'/gm)].map((m) => m[1]), ['./intake-record-store.ts', './intake-record-store.ts', './contact-vault.ts']); assert.ok(!/process\.env|fetch\(|console\.|writeFile|setTimeout|sendText|sendEmail/.test(lead));
   assert.ok(lead.indexOf('sink.store.put') < lead.indexOf('sink.contacts.put'), 'the record is written before the contact');
+});
+
+// ---------------------------------------------------------------- BOOKING REFERENCE (the marker in the Jobber job's title): in the log row and the owner's follow-up notice only, never spoken, never for a verified booking
+const REF = 'DREWTEST-4F3A9C2B1D7E'; const REF_LINE = `Booking reference (search for it in Jobber): ${REF}`;
+const unverified = (marker?: unknown): (() => BookingResult) => () => ({ status: 'uncertain', reason: 'READBACK_MISMATCH', writes: 2, jobId: 'JOB-1', mismatches: ['visit_time'], ...(marker === undefined ? {} : { marker }) } as BookingResult);
+const bookingRow = (t: ReturnType<typeof build>): Record<string, unknown> | undefined => t.logs.find(([c]) => c === 'FAST_BOOKING')?.[1] as Record<string, unknown> | undefined;
+test('BOOKING REFERENCE: an unverified booking puts its reference in the FAST_BOOKING row (it survives the log sanitizer unchanged) and in the ONE owner notice; the spoken ending, the outcome and the booking request are exactly what they were without it', async () => {
+  const plain = build({ textsEnabled: false, emails: 'accept', book: unverified() }); await toBooked(plain);
+  const t = build({ textsEnabled: false, emails: 'accept', book: unverified(REF) }); await toBooked(t);
+  assert.equal(t.c.lines.at(-1), plain.c.lines.at(-1)); assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.'); assert.deepEqual([t.last().reason, t.last().booked], ['BOOKING_NOT_VERIFIED', false]); assert.equal(t.booked.length, 1);
+  assert.deepEqual(bookingRow(t), { status: 'uncertain', reason: 'READBACK_MISMATCH', readBackDiffs: 1, ref: REF }); assert.deepEqual(cleanDetail(bookingRow(t)), bookingRow(t), 'the sanitizer keeps it as it is');
+  assert.deepEqual(bookingRow(plain), { status: 'uncertain', reason: 'READBACK_MISMATCH', readBackDiffs: 1 });
+  assert.equal(notices(t).length, 1); const lines = notices(t)[0].text.split('\n'); assert.ok(lines.includes(REF_LINE)); assert.equal(lines.filter((l) => l.includes('DREWTEST')).length, 1);
+  assert.deepEqual(lines.filter((l) => !FOLLOW_UP_LINES.some((re) => re.test(l))), [], 'every line of the notice is an allowed line'); assert.ok(!notices(plain)[0].text.includes('DREWTEST'));
+  assert.ok(!JSON.stringify([t.c.lines, t.last()]).includes('DREWTEST'), 'never spoken, never in the outcome'); assert.equal(t.logs.filter(([c]) => c === 'FAST_FOLLOWUP').length, 1);
+});
+
+test('BOOKING REFERENCE, notice off or failing: with test emails off, or a refusing, throwing or silent mail server, the reference is still in the log row, the ending and the outcome are unchanged, nothing is repeated, and the booking request is sent once', async () => {
+  for (const mode of ['off', 'refuse', 'throw', 'hang'] as const) {
+    const t = build({ textsEnabled: false, ...(mode === 'off' ? {} : { emails: mode, followUpMs: 150 }), book: unverified(REF) }); await toBooked(t); await t.h.idle();
+    assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.', mode); assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED', mode); assert.equal(t.booked.length, 1, mode);
+    assert.equal(bookingRow(t)?.ref, REF, `${mode}: the log row always has it`);
+    if (mode === 'off') { assert.equal(t.mails.length, 0); assert.ok(!t.logs.some(([c]) => c === 'FAST_FOLLOWUP')); } else { assert.equal(t.mails.length, 1, mode); assert.ok(t.mails[0].text.includes(REF_LINE), mode); }
+  }
+});
+
+test('BOOKING REFERENCE, only the exact shape: a malformed marker (case, length, characters, a header-injection tail, a non-string) reaches neither the log row nor the notice', async () => {
+  for (const bad of ['drewtest-4F3A9C2B1D7E', 'DREWTEST-4f3a9c2b1d7e', 'DREWTEST-4F3A9C2B1D7', `${REF}\nBcc: x@example.com`, `${REF} `, 'DREWTEST-4F3A9C2B1D7G', '', 42, null]) {
+    const t = build({ textsEnabled: false, emails: 'accept', book: unverified(bad) }); await toBooked(t);
+    assert.ok(!('ref' in (bookingRow(t) ?? {})), JSON.stringify(bad)); assert.ok(!notices(t)[0].text.includes('DREWTEST'), JSON.stringify(bad)); assert.equal(t.c.lines.at(-1), 'I could not confirm the booking. Your request is recorded. Goodbye.');
+  }
+});
+
+test('BOOKING REFERENCE, nothing for a clean booking or a duplicate: a verified booking and a verified duplicate carry no reference in the log row, the duplicate sends nothing and raises no notice, and the booking emails are unchanged', async () => {
+  const ok = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2, marker: REF }) }); await toBooked(ok);
+  assert.deepEqual(bookingRow(ok), { status: 'booked_verified' }); assert.deepEqual(ok.mails.map((m) => m.role).sort(), ['customer', 'owner']); assert.ok(ok.mails.every((m) => !m.text.includes('DREWTEST')), 'the booking emails are unchanged'); assert.equal(notices(ok).length, 0);
+  const dup = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 0, duplicate: true, marker: REF }) }); await toBooked(dup);
+  assert.deepEqual(bookingRow(dup), { status: 'booked_verified' }); assert.equal(dup.mails.length, 0); assert.equal(dup.last().reason, 'ALREADY_BOOKED'); assert.ok(!dup.logs.some(([c]) => c === 'FAST_FOLLOWUP'));
+  assert.equal(dup.c.lines.at(-1), 'That visit is already booked, so nothing new was sent. Goodbye.');
 });

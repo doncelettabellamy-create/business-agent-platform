@@ -432,3 +432,13 @@ test('STEP 5, SCENARIO 7 (failure endings after the lead is saved): writes off a
   assert.equal(cal.outcomes[0].lead, 'recorded'); assert.equal(cal.store.list(T).length, 1); assert.deepEqual(cal.contacts?.list(T), []); assert.equal(cal.jobber.jobs.size, 0);
   for (const x of [off, bad, cal]) { noPersonal(x.diagLines); noPersonal(x.logs); }
 });
+
+test('STEP 5, SCENARIO 7b (booking reference): the unverifiable booking\'s reference is the marker in the stand-in job\'s title and is in the FAST_BOOKING row; the lead is still stored with its unchanged text (the reference never enters the screened record) and the caller hears the same ending', async () => {
+  const r = await newRig(); r.jobber.opts.shiftVisitMs = 3_600_000;
+  assert.equal(await converse(r, { ending: /could not confirm the booking/ }), 'I could not confirm the booking. Your request is recorded. Goodbye.');
+  const ref = (r.logs.find((l) => l.code === 'FAST_BOOKING')?.detail as { ref?: string } | undefined)?.ref;
+  assert.match(ref ?? '', /^DREWTEST-[0-9A-F]{12}$/); assert.equal(marks(r)[0], ref, 'the job in Jobber carries the same reference'); assert.equal(r.jobber.jobs.size, 1);
+  assert.equal(r.outcomes[r.outcomes.length - 1].lead, 'stored'); const rec = r.store.list(T); assert.equal(rec.length, 1);
+  assert.deepEqual(rec[0].fields.map((f) => f.value), ['Cleaning request not completed: the booking could not be confirmed. Check Jobber.']); assert.ok(!JSON.stringify(rec).includes('DREWTEST'));
+  assert.ok(!JSON.stringify(r.voices[0].spoken).includes('DREWTEST'), 'never spoken'); noPersonal(r.logs); noPersonal(r.diagLines);
+});

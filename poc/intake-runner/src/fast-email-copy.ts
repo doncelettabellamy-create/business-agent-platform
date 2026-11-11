@@ -62,9 +62,13 @@ export interface FollowUpFacts {
   bookingMayExist: boolean;
   /** The Twilio Call SID, so the owner can find the call. Shown only when it is exactly `CA` and 32 lower-case hex characters; anything else adds no line at all. Passed only for a speaker failure. */
   callSid?: string;
+  /** The booking's reference, so the owner can search for the job in Jobber. Shown only when it matches BOOKING_REF; anything else adds no line. */
+  bookingRef?: string;
 }
 const CALL_SID = /^CA[0-9a-f]{32}$/;
 const CODE = /^[A-Z][A-Z0-9_]{2,47}$/;
+/** A booking reference: the marker in the Jobber job's title (a truncated hash of the booking key; no personal data). Anything else is never shown. */
+export const BOOKING_REF = /^DREWTEST-[0-9A-F]{12}$/;
 /**
  * The ONE notice the owner gets when a call ended without completing the request and needs a follow-up: the reason code, the time, the callback number and the steps reached. Fixed words only; no name,
  * address, day, price or anything else the caller said (none of it is passed in). PURE: strings only.
@@ -74,6 +78,7 @@ export function followUpEmail(f: FollowUpFacts): EmailMessage {
   const steps = (Array.isArray(f.steps) ? f.steps : []).filter((s): s is string => typeof s === 'string' && CODE.test(s)).slice(0, 40);
   const reason = typeof f.reason === 'string' && CODE.test(f.reason) ? f.reason : 'UNKNOWN';
   const sid = typeof f.callSid === 'string' && CALL_SID.test(f.callSid) ? f.callSid : undefined;
+  const ref = typeof f.bookingRef === 'string' && BOOKING_REF.test(f.bookingRef) ? f.bookingRef : undefined;
   return {
     subject: `${clean(f.businessName)} DEMO: call needs a follow-up`,
     text: [
@@ -82,6 +87,7 @@ export function followUpEmail(f: FollowUpFacts): EmailMessage {
       `Callback number: ${phone ?? 'not available'}`,
       `Call ended: ${clean(f.whenText)}`,
       ...(sid === undefined ? [] : [`Call SID: ${sid}`]),
+      ...(ref === undefined ? [] : [`Booking reference (search for it in Jobber): ${ref}`]),
       `Steps reached: ${steps.length === 0 ? 'none' : steps.join(', ')}`,
       f.bookingMayExist === true ? 'Check Jobber (the Developer Test Account): the booking request was sent, so a job may exist even though it was not verified.' : 'No booking was sent to Jobber.', '',
       'This notice holds no name, address or anything else the caller said.',

@@ -28,7 +28,7 @@ import type { BookingRequest, BookingResult, IdentityBookingRequest } from './jo
 import type { CallTransport, TransportCloseInfo, TransportEvent } from './call-transport.ts';
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
-import { customerEmail, followUpEmail, ownerEmail } from './fast-email-copy.ts';
+import { BOOKING_REF, customerEmail, followUpEmail, ownerEmail } from './fast-email-copy.ts';
 import type { LeadFacts, LeadResult } from './fast-lead.ts';
 import { CUSTOMER_SCRIPT_ID, MAX_TEXT_CHARS, customerConsentLine, customerText, ownerText, zoneLabelOf } from './fast-sms-copy.ts';
 
@@ -194,7 +194,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
     let awaiting: Awaiting | undefined; let answerTimer: ReturnType<typeof setTimeout> | undefined; let settleTimer: ReturnType<typeof setTimeout> | undefined;
     let graceOver = true; let graceTimer: ReturnType<typeof setTimeout> | undefined; let holdTimer: ReturnType<typeof setTimeout> | undefined;
     let settleFn: (() => Promise<void>) | undefined; let speakingSince: number | undefined;   // the pending "ask only what is missing", and when the caller last started speaking
-    let bookSent = false; let hungUp = false; let lateEnd = false; let booking = false; let slotDeferred = false; let slotTimer: ReturnType<typeof setTimeout> | undefined; let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
+    let bookSent = false; let bookingRef: string | undefined; let hungUp = false; let lateEnd = false; let booking = false; let slotDeferred = false; let slotTimer: ReturnType<typeof setTimeout> | undefined; let callSid: unknown; let pref: When = {}; let size: { beds?: number; baths?: number } = {}; let offer: Offer | undefined; const refused: Offer[] = []; let offerTries = 0;
     let caller = ''; let callback = ''; let textsOk = false; let wantsText = false; let firstName = ''; let lastName = ''; let tries = 0;
     let confirmed: ConfirmedFacts | undefined;   // set when the read-back is spoken; the booking must carry exactly these facts
     let nameOk = false; let nameNo = 0; let spellBuf = ''; let spellBad = 0;   // the caller's own yes to the name (nothing is booked without it); how many times they said it was wrong; the letters of a spelling heard so far, and the spellings that gave nothing
@@ -261,7 +261,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       try {
         if (deps.emailsEnabled !== true || deps.sendEmail === undefined) return;
         const tz = S.availability.timezone; const at = deps.now(); const number = callback !== '' ? callback : caller;
-        const msg = followUpEmail({ businessName: S.businessName, reason, whenText: `${new Date(at).toLocaleString('en-US', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' })} ${zoneLabelOf(tz, at)}`, ...(number === '' ? {} : { callbackNumber: number }), steps, bookingMayExist: mayExist, ...(speakerSid === undefined ? {} : { callSid: speakerSid }) });
+        const msg = followUpEmail({ businessName: S.businessName, reason, whenText: `${new Date(at).toLocaleString('en-US', { timeZone: tz, dateStyle: 'full', timeStyle: 'short' })} ${zoneLabelOf(tz, at)}`, ...(number === '' ? {} : { callbackNumber: number }), steps, bookingMayExist: mayExist, ...(speakerSid === undefined ? {} : { callSid: speakerSid }), ...(bookingRef === undefined ? {} : { bookingRef }) });
         const send = deps.sendEmail; let timer: ReturnType<typeof setTimeout> | undefined;
         const late = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), deps.followUpMs ?? 15_000); timer.unref?.(); });
         const job = (async (): Promise<void> => {
@@ -638,8 +638,9 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       let res: BookingResult;
       try { bookSent = true; res = await deps.book(req); } catch { res = { status: 'uncertain', reason: 'API_ERROR', writes: 0 }; }
       const readBackDiffs = res.mismatches?.length ?? 0;
+      if (typeof res.marker === 'string' && BOOKING_REF.test(res.marker)) bookingRef = res.marker;   // kept only in this exact shape; shown to the owner (log row, follow-up email), never to the caller
       if (res.status === 'refused' && res.writes === 0) bookSent = false;   // refused before any write: no job can exist
-      note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }), ...(readBackDiffs === 0 ? {} : { readBackDiffs }) }); if (hungUp) deps.log('FAST_BOOKING_AFTER_HANGUP', { status: res.status, verified: res.status === 'booked_verified' && readBackDiffs === 0 });
+      note(`BOOKING_${res.status.toUpperCase()}`); deps.log('FAST_BOOKING', { status: res.status, ...(res.reason === undefined ? {} : { reason: res.reason }), ...(readBackDiffs === 0 ? {} : { readBackDiffs }), ...(bookingRef === undefined || (res.status === 'booked_verified' && readBackDiffs === 0 && res.jobId !== undefined) ? {} : { ref: bookingRef }) }); if (hungUp) deps.log('FAST_BOOKING_AFTER_HANGUP', { status: res.status, verified: res.status === 'booked_verified' && readBackDiffs === 0 });
       // Jobber's own read-back must have matched in every field: a "verified" result that still names a differing field is not a booking, and nothing is emailed or texted for it.
       if (res.status !== 'booked_verified' || readBackDiffs > 0 || res.jobId === undefined) return end('BOOKING_NOT_VERIFIED', 'I could not confirm the booking, so a person will follow up. Goodbye.');   // a verified booking names its job: without one nothing is emailed or texted
       // A booking that was already made (the same booking, verified in full again) is never announced twice: no text and no email, to the customer or the owner, and the caller is told so.

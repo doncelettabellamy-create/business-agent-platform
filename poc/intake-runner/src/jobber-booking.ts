@@ -45,6 +45,7 @@ export interface BookingResult {
   jobId?: string; jobNumber?: number;
   /** Only the NAMES of the fields that did not match the read-back. */ mismatches?: string[];
   /** How many mutations this call sent. */ writes: number;
+  /** The booking's reference (the marker in the Jobber job's title), present once the booking's key is known: how a person finds the job in Jobber after an unverified result. Not personal data. */ marker?: string;
 }
 
 const KEY = /^[A-Za-z0-9_-]{16,64}$/;
@@ -224,14 +225,14 @@ const hasIdentity = (r: BookingRequest | IdentityBookingRequest): r is IdentityB
  *  A request with a `key` is booked exactly as before. A request with `identity` (and no key) is booked under the HMAC identity of what was booked: the global `booking-identity` lock first, then the per-key lock, the keyring checked again before every write,
  *  and a booking already made under a RETIRED key is found (ledger and Jobber) and accepted as a duplicate only after the same full read-back; any doubt is uncertain, never a fall-back to the Call-SID key or to a new booking. */
 export async function bookTestVisit(ctx: Ctx, creds: Credentials, input: BookingRequest | IdentityBookingRequest): Promise<BookingResult> {
-  let writes = 0;
-  const done = (status: BookingStatus, extra: Partial<BookingResult> = {}): BookingResult => ({ status, writes, ...extra });
+  let writes = 0; let seen: string | undefined;
+  const done = (status: BookingStatus, extra: Partial<BookingResult> = {}): BookingResult => ({ status, writes, ...(seen === undefined ? {} : { marker: seen }), ...extra });
   const problems = requestProblems(input, ctx.now());
   if (problems.length > 0) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: problems.includes('gate') ? 'NOT_AUTHORIZED' : 'INVALID_REQUEST', fields: problems.join(',') }); return done('refused', { reason: problems.includes('gate') ? 'NOT_AUTHORIZED' : 'INVALID_REQUEST' }); }
   if (ctx.allowWrites === undefined) { ctx.diag('JOBBER_BOOKING_REFUSED', { reason: 'WRITES_OFF' }); return done('refused', { reason: 'WRITES_OFF' }); }
   /** What happens once the key lock is held. `aliasCheck`, when given (identity bookings only), looks for the same booking under retired keys after the key's own state is known and before anything is written. */
   const locked = async (req: BookingRequest, marker: string, lock: LockHandle, aliasCheck?: (verify: (jobId: string, duplicate: boolean, under?: string) => Promise<BookingResult>) => Promise<BookingResult | undefined>): Promise<BookingResult> => {
-      const base = ledgerBase(marker); const loaded = await loadEntry(ctx, marker); let generation = loaded.gen;
+      seen = marker; const base = ledgerBase(marker); const loaded = await loadEntry(ctx, marker); let generation = loaded.gen;
       const ledger: Record<string, Entry> = loaded.entry === undefined ? {} : { [marker]: loaded.entry }; const prior = ledger[marker];
       // Every ledger write and every Jobber write first checks that this call still owns the lock; a call that lost it stops here, before the next write (LOCK_LOST).
       const save = async (): Promise<void> => {

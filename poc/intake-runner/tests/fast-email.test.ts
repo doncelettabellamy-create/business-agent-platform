@@ -267,3 +267,14 @@ test('the owner follow-up notice carries the Call SID only when it is exactly a 
   for (const x of bad) assert.deepEqual(followUpEmail({ ...base, callSid: x as never }).text.split('\n'), plain, 'adds nothing: ' + JSON.stringify(x));
   assert.ok(!/Call SID/.test(followUpEmail({ ...base, bookingMayExist: true }).text), 'a notice without the field never names a call');
 });
+
+test('the owner follow-up notice shows the booking reference only in its exact shape, as exactly one extra line; anything else adds nothing and the text is byte-for-byte the same as without it', () => {
+  const base = { businessName: 'Drew Cleaning', reason: 'BOOKING_NOT_VERIFIED', whenText: 'Monday, November 2, 2026 at 9:00 AM Central', callbackNumber: '+15550100002', steps: ['CALLER_VERIFIED', 'NAME', 'BOOKING_UNCERTAIN'], bookingMayExist: true };
+  const ref = 'DREWTEST-4F3A9C2B1D7E'; const line = `Booking reference (search for it in Jobber): ${ref}`;
+  const without = followUpEmail(base); const withRef = followUpEmail({ ...base, bookingRef: ref });
+  assert.equal(withRef.subject, without.subject); assert.equal(withRef.text.split('\n').length, without.text.split('\n').length + 1);
+  assert.deepEqual(withRef.text.split('\n').filter((l) => !without.text.split('\n').includes(l)), [line]);
+  assert.equal(withRef.text.split('\n').filter((l) => l.includes('DREWTEST')).length, 1);
+  assert.equal(followUpEmail({ ...base, bookingRef: undefined }).text, without.text);
+  for (const bad of ['', 'drewtest-4F3A9C2B1D7E', 'DREWTEST-4f3a9c2b1d7e', 'DREWTEST-4F3A9C2B1D7', 'DREWTEST-4F3A9C2B1D7EE', 'DREWTEST-4F3A9C2B1D7G', `${ref}\nBcc: x@example.com`, `${ref}\n`, `${ref} `, ` ${ref}`, `x${ref}`, 42 as unknown as string, null as unknown as string, {} as unknown as string]) assert.equal(followUpEmail({ ...base, bookingRef: bad }).text, without.text, JSON.stringify(bad));
+});
