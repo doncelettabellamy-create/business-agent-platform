@@ -23,7 +23,7 @@ export const CALLBACK_PATH = '/jobber/callback';
 /** The exact OAuth Callback URL to enter in the Jobber Developer Center for this connector. */
 export const callbackUrlFor = (port: number): string => `http://localhost:${port}${CALLBACK_PATH}`;
 
-export type ConnectorCode = 'NO_CREDENTIALS' | 'NOT_CONNECTED' | 'RECONNECT_REQUIRED' | 'DENIED' | 'EXCHANGE_FAILED' | 'ACCOUNT_MISMATCH' | 'ACCOUNT_UNREADABLE' | 'RATE_LIMITED' | 'API_ERROR' | 'NOT_READ_ONLY' | 'TIMEOUT' | 'BAD_CONFIG' | 'BAD_RESPONSE' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE';
+export type ConnectorCode = 'NO_CREDENTIALS' | 'NOT_CONNECTED' | 'RECONNECT_REQUIRED' | 'DENIED' | 'EXCHANGE_FAILED' | 'ACCOUNT_MISMATCH' | 'ACCOUNT_UNREADABLE' | 'RATE_LIMITED' | 'API_ERROR' | 'NOT_READ_ONLY' | 'TIMEOUT' | 'BAD_CONFIG' | 'BAD_RESPONSE' | 'WRITE_NOT_RESENT' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE';
 /** An error whose message is a fixed code word only: it can never carry a secret. */
 export class JobberError extends Error { readonly code: ConnectorCode; /** Only for ACCOUNT_MISMATCH: the NAME of the account that answered (a business name, not a secret), so the founder can see which account it was. */ readonly foundAccountName?: string; constructor(code: ConnectorCode, foundAccountName?: string) { super(code); this.code = code; this.name = 'JobberError'; if (foundAccountName !== undefined) this.foundAccountName = foundAccountName; } }
 
@@ -200,10 +200,12 @@ export async function query(ctx: Ctx, creds: Credentials, doc: string, variables
   if (!isReadOnlyDocument(doc)) throw new JobberError('NOT_READ_ONLY');
   return run(ctx, creds, doc, variables);
 }
-async function run(ctx: Ctx, creds: Credentials, doc: string, variables?: Record<string, unknown>): Promise<GqlResult> {
+/** `write`: this document is a mutation. A mutation is sent ONCE: an HTTP 401 for it is not answered by a refresh and a resend (a write that may or may not have run must never be repeated blindly), it ends here as WRITE_NOT_RESENT and the booking's ledger keeps the key pending. Queries refresh and retry once, as before. */
+async function run(ctx: Ctx, creds: Credentials, doc: string, variables?: Record<string, unknown>, write = false): Promise<GqlResult> {
   let token = ctx.bearer ?? await accessToken(ctx, creds);
   for (let attempt = 0; attempt < 2; attempt++) {
     const r = await send(ctx, ctx.endpoints.graphql, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'X-JOBBER-GRAPHQL-VERSION': ctx.version ?? GRAPHQL_VERSION, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: doc, ...(variables === undefined ? {} : { variables }) }) });
+    if (r.status === 401 && write) { ctx.diag('JOBBER_WRITE_NOT_RESENT', { status: 401 }); throw new JobberError('WRITE_NOT_RESENT'); }
     if (r.status === 401 && attempt === 0 && ctx.bearer === undefined) { token = await accessToken(ctx, creds, true, token); continue; }
     if (r.status === 401) throw new JobberError('RECONNECT_REQUIRED');
     if (r.status === 429) throw new JobberError('RATE_LIMITED');
@@ -254,7 +256,7 @@ export async function mutate(ctx: Ctx, creds: Credentials, doc: string, variable
   const tokens = await ctx.vault.loadTokens(); if (tokens === undefined) throw new JobberError('NOT_CONNECTED');
   await verifyExpectedAccount(ctx, creds, ctx.allowWrites.expectedAccountName, tokens.account_id);
   ctx.diag('JOBBER_WRITE_SENT', { fields: fields.join(',') });
-  return run(ctx, creds, doc, variables);
+  return run(ctx, creds, doc, variables, true);
 }
 
 // ---------------------------------------------------------------- which account, then data

@@ -25,30 +25,33 @@ const REQ: BookingRequest = {
   title: 'Standard cleaning', service: 'Standard cleaning 2 bed 2 bath', priceDollars: 199,
 };
 
-interface Opts { account: { id: string; name: string }; searchBlind: boolean; jobUserErrors: boolean; clientUserErrors: boolean; shiftVisitMs: number; crashAfterJobCreate: boolean; /** Answer the client/job write with this body (the stand-in still creates it): an unusable answer. */ clientAnswer?: (id: string, pid: string) => unknown; jobAnswer?: (id: string) => unknown; failJobCreateStatus?: number; /** What the read-back returns for the property's state: a string, null (Jobber has none), or undefined (the property is returned as it was written). */ readProvince?: string | null; /** Set by the stand-in: whether the last read-back query asked for the property's state. */ askedProvince?: boolean }
-interface Mock { endpoints: { authorize: string; token: string; graphql: string }; ops: Array<{ kind: 'query' | 'mutation'; field: string; variables: Record<string, unknown> }>; opts: Opts; jobs: Map<string, Record<string, unknown>>; clients: number; close(): Promise<void> }
+interface Opts { account: { id: string; name: string }; searchBlind: boolean; jobUserErrors: boolean; clientUserErrors: boolean; shiftVisitMs: number; crashAfterJobCreate: boolean; /** Answer the client/job write with this body (the stand-in still creates it): an unusable answer. */ clientAnswer?: (id: string, pid: string) => unknown; jobAnswer?: (id: string) => unknown; /** Answer this write with HTTP 401 (and, with execute401, only AFTER the stand-in has done it: the worst case). */ status401On?: 'clientCreate' | 'jobCreate'; execute401?: boolean; failJobCreateStatus?: number; /** What the read-back returns for the property's state: a string, null (Jobber has none), or undefined (the property is returned as it was written). */ readProvince?: string | null; /** Set by the stand-in: whether the last read-back query asked for the property's state. */ askedProvince?: boolean }
+interface Mock { strays: string[]; endpoints: { authorize: string; token: string; graphql: string }; ops: Array<{ kind: 'query' | 'mutation'; field: string; variables: Record<string, unknown> }>; opts: Opts; jobs: Map<string, Record<string, unknown>>; clients: number; close(): Promise<void> }
 async function mockJobber(): Promise<Mock> {
-  const ops: Mock['ops'] = []; const jobs = new Map<string, Record<string, unknown>>(); let clients = 0; let n = 0;
+  const strays: string[] = []; const ops: Mock['ops'] = []; const jobs = new Map<string, Record<string, unknown>>(); let clients = 0; let n = 0;
   const opts: Opts = { account: ACCOUNT, searchBlind: false, jobUserErrors: false, clientUserErrors: false, shiftVisitMs: 0, crashAfterJobCreate: false };
   const props = new Map<string, { client: Record<string, unknown>; address: Record<string, unknown> }>();
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []; req.on('data', (c) => chunks.push(c)); req.on('end', () => {
       const send = (s: number, o: unknown): void => { res.writeHead(s, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
-      if (req.method !== 'POST' || req.url !== '/api/graphql') return send(404, {});
+      if (req.method !== 'POST' || req.url !== '/api/graphql') { strays.push(`${req.method} ${req.url}`); return send(404, {}); }
       if (!/^Bearer tok-valid/.test(String(req.headers.authorization ?? ''))) return send(401, {});
       const b = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { query: string; variables?: Record<string, unknown> }; const v = b.variables ?? {};
       const data = (d: unknown) => send(200, { data: d, extensions: { versioning: { version: '2026-09-25' } } });
       if (/\baccount\b/.test(b.query) && !/mutation/.test(b.query)) { ops.push({ kind: 'query', field: 'account', variables: v }); return data({ account: opts.account }); }
       if (/clientCreate/.test(b.query)) {
         ops.push({ kind: 'mutation', field: 'clientCreate', variables: v });
+        if (opts.status401On === 'clientCreate' && opts.execute401 !== true) return send(401, {});
         if (opts.clientUserErrors) return data({ clientCreate: { client: null, userErrors: [{ message: 'bad', path: ['x'] }] } });
         const input = (v.input ?? {}) as Record<string, unknown>; clients++; const pid = `PROP-${++n}`;
         props.set(pid, { client: { firstName: input.firstName, lastName: input.lastName, phones: ((input.phones ?? []) as Array<{ number: string }>).map((p) => ({ number: p.number })) }, address: (((input.properties ?? []) as Array<{ address: Record<string, unknown> }>)[0] ?? { address: {} }).address });
+        if (opts.status401On === 'clientCreate') return send(401, {});   // reached only with execute401: the client exists, the answer is 401
         if (opts.clientAnswer !== undefined) return data({ clientCreate: opts.clientAnswer(`CLIENT-${clients}`, pid) });
         return data({ clientCreate: { client: { id: `CLIENT-${clients}`, clientProperties: { nodes: [{ id: pid }] } }, userErrors: [] } });
       }
       if (/jobCreate/.test(b.query)) {
         ops.push({ kind: 'mutation', field: 'jobCreate', variables: v });
+        if (opts.status401On === 'jobCreate' && opts.execute401 !== true) return send(401, {});
         if (opts.failJobCreateStatus !== undefined) return send(opts.failJobCreateStatus, {});
         if (opts.jobUserErrors) return data({ jobCreate: { job: null, userErrors: [{ message: 'bad', path: ['y'] }] } });
         const input = (v.input ?? {}) as { propertyId: string; title: string; instructions: string; timeframe: { startAt: string }; scheduling: { startTime: string; endTime: string }; lineItems: Array<{ unitPrice: number; quantity: number }> };
@@ -56,6 +59,7 @@ async function mockJobber(): Promise<Mock> {
         const s = Date.parse(`${input.timeframe.startAt}T${input.scheduling.startTime}${off}`) + opts.shiftVisitMs; const e = Date.parse(`${input.timeframe.startAt}T${input.scheduling.endTime}${off}`) + opts.shiftVisitMs;
         jobs.set(id, { id, jobNumber: 1000 + n, title: input.title, instructions: input.instructions, jobStatus: 'UPCOMING', total: input.lineItems.reduce((a, l) => a + l.unitPrice * l.quantity, 0), client: p?.client, property: { address: p?.address }, visits: { nodes: [{ startAt: new Date(s).toISOString(), endAt: new Date(e).toISOString() }] } });
         if (opts.crashAfterJobCreate) return send(500, {});
+        if (opts.status401On === 'jobCreate') return send(401, {});   // reached only with execute401: the job exists, the answer is 401
         if (opts.jobAnswer !== undefined) return data({ jobCreate: opts.jobAnswer(id) });
         return data({ jobCreate: { job: { id, jobNumber: 1000 + n }, userErrors: [] } });
       }
@@ -70,7 +74,7 @@ async function mockJobber(): Promise<Mock> {
   });
   await new Promise<void>((ok) => server.listen(0, '127.0.0.1', () => ok()));
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-  return { endpoints: { authorize: `${origin}/a`, token: `${origin}/t`, graphql: `${origin}/api/graphql` }, ops, opts, jobs, get clients() { return clients; }, close: () => new Promise((ok) => { server.close(() => ok()); server.closeAllConnections(); }) } as Mock;
+  return { strays, endpoints: { authorize: `${origin}/a`, token: `${origin}/t`, graphql: `${origin}/api/graphql` }, ops, opts, jobs, get clients() { return clients; }, close: () => new Promise((ok) => { server.close(() => ok()); server.closeAllConnections(); }) } as Mock;
 }
 interface Rig { mock: Mock; ctx: Ctx; logs: Array<[string, unknown]>; dir: string; done(): Promise<void> }
 async function rig(writes = true): Promise<Rig> {
@@ -1010,4 +1014,50 @@ test('BOOKING REFERENCE: every result after the key is derived carries the marke
     assert.deepEqual([res.status, res.reason, res.marker], ['uncertain', 'READBACK_MISMATCH', idMarker(1)]); assert.ok(String(jobList(i)[0].title).endsWith(`[${idMarker(1)}]`));
     assert.ok(!JSON.stringify([res, i.logs]).match(/Testa|Invented|90210|5550104242/), 'the reference adds no personal detail');
   } finally { await i.done(); }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// HTTP 401 ON A WRITE. A query that gets 401 refreshes the token and is sent once more (jobber-connector.test.ts pins that). A MUTATION is sent once, never again: the 401 may have been sent for a write that did run, so it ends uncertain, the key stays
+// pending, no token is refreshed for it, and a later call asks Jobber for the marker before anything else. `execute401` is the worst case: the stand-in DID do the write and then answered 401.
+test('MUTATION 401 (clientCreate and jobCreate, refused before or after it ran): the write is sent ONCE and never resent, no token is refreshed for it, no read-back, no confirmation, the key stays pending with its ids, and a retry sends nothing more (adopting the one job if it can be seen)', async () => {
+  for (const field of ['clientCreate', 'jobCreate'] as const) {
+    for (const executed of [false, true]) {
+      for (const blind of [false, true]) {
+        const r = await rig(); const name = `${field} executed=${executed} blind=${blind}`;
+        try {
+          r.mock.opts.status401On = field; r.mock.opts.execute401 = executed;
+          const res = await bookTestVisit(r.ctx, CREDS, REQ);
+          assert.deepEqual([res.status, res.reason, res.writes, res.jobId, res.duplicate], ['uncertain', 'WRITE_NOT_RESENT', field === 'clientCreate' ? 1 : 2, undefined, undefined], name);
+          const sent = mutations(r.mock); assert.deepEqual(sent, field === 'clientCreate' ? ['clientCreate'] : ['clientCreate', 'jobCreate'], `${name}: the refused write was sent exactly once`);
+          assert.deepEqual(r.mock.strays, [], `${name}: nothing went to the token endpoint`); assert.ok(!r.logs.some(([c]) => c === 'JOBBER_TOKEN_REFRESHED'), name);
+          assert.equal(r.logs.filter(([c]) => c === 'JOBBER_WRITE_NOT_RESENT').length, 1, name); assert.ok(!r.mock.ops.some((o) => o.field === 'job'), `${name}: no read-back, so nothing is confirmed`);
+          assert.deepEqual((await chainOf(r)).map((c) => c.state), field === 'clientCreate' ? ['pending'] : ['pending', 'client_created', 'pending'], `${name}: the key stays pending`);
+          if (field === 'jobCreate') assert.ok((await chainOf(r)).at(-1)?.clientId !== undefined, `${name}: the client and property ids are kept`);
+          assert.equal(r.mock.jobs.size, field === 'jobCreate' && executed ? 1 : 0, name); assert.equal(r.mock.clients, field === 'clientCreate' && !executed ? 0 : 1, name);
+          r.mock.opts.status401On = undefined; r.mock.opts.execute401 = false; r.mock.opts.searchBlind = blind;
+          const again = await bookTestVisit(r.ctx, CREDS, REQ); const jobSeen = field === 'jobCreate' && executed && !blind;
+          if (jobSeen) { assert.deepEqual([again.status, again.writes, again.duplicate], ['booked_verified', 0, true], `${name}: the one job is adopted and verified`); assert.equal((await chainOf(r)).at(-1)?.state, 'created', name); }
+          else { assert.deepEqual([again.status, again.reason, again.writes], ['uncertain', 'PENDING_UNRESOLVED', 0], `${name}: stopped, not booked again`); assert.deepEqual((await scanLedger(r.ctx.vault)).verdict, 'some', name); }
+          assert.deepEqual(mutations(r.mock), sent, `${name}: the retry sent no write`); assert.ok(r.mock.jobs.size <= 1, `${name}: never a second job`);
+        } finally { await r.done(); }
+      }
+    }
+  }
+});
+
+test('MUTATION 401, identity booking: the same outcome, both locks released, the key pending, and nothing resent', async () => {
+  const r = await rig();
+  try {
+    await seedKeyring(r, 1); r.mock.opts.status401On = 'jobCreate'; r.mock.opts.execute401 = true;
+    const res = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([res.status, res.reason, res.writes, res.marker], ['uncertain', 'WRITE_NOT_RESENT', 2, idMarker(1)]);
+    assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); assert.deepEqual(lockFiles(r), []); assert.deepEqual((await chainOf(r, withKey(1))).map((c) => c.state), ['pending', 'client_created', 'pending']); assert.equal(r.mock.jobs.size, 1);
+    r.mock.opts.status401On = undefined; r.mock.opts.searchBlind = true;
+    const blocked = await bookTestVisit(r.ctx, CREDS, IREQ); assert.deepEqual([blocked.status, blocked.reason, blocked.writes], ['uncertain', 'PENDING_UNRESOLVED', 0]); assert.deepEqual(mutations(r.mock), ['clientCreate', 'jobCreate']); assert.equal(r.mock.jobs.size, 1);
+  } finally { await r.done(); }
+});
+
+test('MUTATION 401, source: only a write is exempt from the refresh-and-resend; queries keep it', () => {
+  const src = readFileSync(new URL('../src/jobber-connector.ts', import.meta.url), 'utf8');
+  assert.equal([...src.matchAll(/return run\(ctx, creds, doc, variables, true\);/g)].length, 1, 'only mutate marks its document as a write'); assert.equal([...src.matchAll(/return run\(ctx, creds, doc, variables\);/g)].length, 1, 'query does not');
+  assert.ok(/if \(r\.status === 401 && write\) \{ ctx\.diag\('JOBBER_WRITE_NOT_RESENT', \{ status: 401 \}\); throw new JobberError\('WRITE_NOT_RESENT'\); \}\s*\n\s*if \(r\.status === 401 && attempt === 0 && ctx\.bearer === undefined\) \{ token = await accessToken\(ctx, creds, true, token\); continue; \}/.test(src), 'the write check comes first and the query refresh is intact');
 });

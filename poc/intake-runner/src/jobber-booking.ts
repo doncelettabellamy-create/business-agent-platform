@@ -38,7 +38,7 @@ export interface BookingRequest {
 /** A booking identified by WHAT was booked (booking-identity.ts) instead of a caller-chosen key: it carries `identity` and no `key`, and the identity must agree with the request's own phone, date, start time, house number and ZIP. */
 export interface IdentityBookingRequest extends Omit<BookingRequest, 'key'> { key?: undefined; identity: IdentityParts }
 export type BookingStatus = 'booked_verified' | 'not_booked' | 'uncertain' | 'refused';
-export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'CLIENT_RESPONSE_UNUSABLE' | 'JOB_RESPONSE_UNUSABLE' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE' | 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE';
+export type BookingReason = 'INVALID_REQUEST' | 'NOT_AUTHORIZED' | 'WRITES_OFF' | 'ACCOUNT_MISMATCH' | 'JOBBER_REFUSED' | 'CLIENT_RESPONSE_UNUSABLE' | 'JOB_RESPONSE_UNUSABLE' | 'WRITE_NOT_RESENT' | 'READBACK_MISMATCH' | 'PENDING_UNRESOLVED' | 'DUPLICATE_MARKERS' | 'NOT_FOUND' | 'API_ERROR' | 'RATE_LIMITED' | 'RECONNECT_REQUIRED' | 'LOCK_LOST' | 'LEDGER_UNREADABLE' | 'LEDGER_CONFLICT' | 'LEDGER_UNAVAILABLE' | 'IDENTITY_UNAVAILABLE' | 'IDENTITY_STALE';
 export interface BookingResult {
   status: BookingStatus; reason?: BookingReason;
   /** True when this key had already been booked and nothing new was written. */ duplicate?: boolean;
@@ -317,7 +317,7 @@ export async function bookTestVisit(ctx: Ctx, creds: Credentials, input: Booking
   } catch (e) {
     const identity = e instanceof IdentityFailure ? e.code : undefined;
     const code = e instanceof JobberError ? e.code : 'API_ERROR';
-    const reason: BookingReason = identity ?? (code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' || code === 'LEDGER_UNREADABLE' || code === 'LEDGER_CONFLICT' || code === 'LEDGER_UNAVAILABLE' ? code : 'API_ERROR');
+    const reason: BookingReason = identity ?? (code === 'WRITE_NOT_RESENT' ? 'WRITE_NOT_RESENT' : code === 'ACCOUNT_MISMATCH' ? 'ACCOUNT_MISMATCH' : code === 'RATE_LIMITED' ? 'RATE_LIMITED' : code === 'RECONNECT_REQUIRED' || code === 'NOT_CONNECTED' ? 'RECONNECT_REQUIRED' : code === 'NOT_READ_ONLY' ? 'WRITES_OFF' : code === 'LOCK_LOST' || code === 'LEDGER_UNREADABLE' || code === 'LEDGER_CONFLICT' || code === 'LEDGER_UNAVAILABLE' ? code : 'API_ERROR');
     ctx.diag('JOBBER_BOOKING_FAILED', { reason });
     // Before any write an error is simply "not booked"; after a write was sent its outcome is unknown, so the status says so.
     const unsure = reason === 'LEDGER_UNREADABLE' || reason === 'LEDGER_CONFLICT';   // a ledger that cannot be trusted may be hiding a booking
