@@ -96,10 +96,12 @@ async function rig(o: { contacts?: boolean; followUp?: boolean; keyring?: boolea
     timer.unref?.(); void sim.closed.then(() => clearInterval(timer)); return sim;
   };
   const start = (sim: Sim, to = DREW) => { sim.send({ event: 'connected', protocol: 'Call', version: '1.0.0' }); sim.send({ event: 'start', sequenceNumber: '1', start: { streamSid: 'MZ1', callSid: CALL, tracks: ['inbound'], customParameters: { to }, mediaFormat: { encoding: 'audio/x-mulaw', sampleRate: 8000, channels: 1 } }, streamSid: 'MZ1' }); };
-  let cursor = 0;
+  let cursor = 0; let active = 0;   // `active`: the index of the call `hears` follows (the first, until nextCall)
   /** Waits for the next spoken line matching `re` (after the last one matched), then the caller answers. */
-  const hears = async (re: RegExp, reply?: string): Promise<string> => { await until(() => (voices[0]?.spoken ?? []).slice(cursor).some((l) => re.test(l)), `a spoken line matching ${re}: ${JSON.stringify((voices[0]?.spoken ?? []).slice(cursor).map((l) => l.slice(0, 40)))}`); const i = voices[0].spoken.findIndex((l, k) => k >= cursor && re.test(l)); cursor = i + 1; const line = voices[0].spoken[i]; await until(() => !voices[0].playing(), 'the line to finish playing'); await pause(10); if (reply !== undefined) voices[0].hear(reply); return line; };
-  return { jobber, twilio, logs, diagLines, outcomes, voices, connect, start, hears, service, dir, status, fast, store, contacts, notice: service.notice };
+  const hears = async (re: RegExp, reply?: string): Promise<string> => { await until(() => (voices[active]?.spoken ?? []).slice(cursor).some((l) => re.test(l)), `a spoken line matching ${re}: ${JSON.stringify((voices[active]?.spoken ?? []).slice(cursor).map((l) => l.slice(0, 40)))}`); const i = voices[active].spoken.findIndex((l, k) => k >= cursor && re.test(l)); cursor = i + 1; const line = voices[active].spoken[i]; await until(() => !voices[active].playing(), 'the line to finish playing'); await pause(10); if (reply !== undefined) voices[active].hear(reply); return line; };
+  /** Before connecting a further call on this rig: `hears` then follows that call's voice. */
+  const nextCall = (): void => { active = voices.length; cursor = 0; };
+  return { jobber, twilio, logs, diagLines, outcomes, voices, connect, start, hears, nextCall, service, dir, status, fast, store, contacts, notice: service.notice };
 }
 const noPersonal = (x: unknown, extra: string[] = []): void => { const all = JSON.stringify(x); for (const s of ['Testa', 'Invented', 'Testville', '90210', '5550100002', '5550100003', '0100002', FAKE_KEY, TOKEN, 'tok-valid', ...extra]) assert.ok(!all.includes(s), `no ${s} in the diagnostics`); };
 
@@ -333,4 +335,100 @@ test('JOINED, LEAD recorded before the callback: a home size the line does not b
   assert.equal(await r.hears(/only book two bedroom/), 'Sorry, on this test line I can only book two bedroom, two bathroom homes. Your request is recorded. Goodbye.'); await until(() => r.outcomes.some((o) => o.reason === 'SIZE_NOT_OFFERED'), 'the outcome');
   assert.equal(r.outcomes[r.outcomes.length - 1].lead, 'recorded'); assert.equal(r.store.list(T).length, 1); assert.deepEqual(r.contacts?.list(T), []); assert.equal(r.jobber.jobs.size, 0); assert.deepEqual(r.twilio.messages, []);
   assert.equal(toOwnerView(r.store.list(T), { fromIso: '2000-01-01T00:00:00Z', toIso: '2100-01-01T00:00:00Z' }).summary.needFollowUp, 1);
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+// STEP 5 (offline; the founder-approved simulated run). Several calls on ONE rig share the same stand-in Jobber, the same private folder and the same keyring, so a redial or a second booking meets the first booking's real
+// records. Invented data, a made-up keyring, texts off (the pilot setting), no network. A pass shows behaviour against stand-ins only. NOTE: this stand-in's calendar does NOT list Drew's own visits (the real Jobber stores them as
+// unassigned visits and returns them); scenarios 2b and 4 put the visit on the calendar the way the real service does.
+type Rig = Awaited<ReturnType<typeof rig>>;
+const newRig = (o: Parameters<typeof rig>[0] = {}) => rig({ texts: false, ownerConsent: false, ...o });
+const BOOKED = /You are booked/;
+const busyUnassigned = (from: string, to: string) => ({ startAt: new Date(instantOf('2026-11-03', from, 'America/Chicago')).toISOString(), endAt: new Date(instantOf('2026-11-03', to, 'America/Chicago')).toISOString(), unassigned: true });
+const writes = (r: Rig): string[] => r.jobber.ops.map((x) => x.field).filter((f) => f === 'clientCreate' || f === 'jobCreate');
+const marks = (r: Rig): string[] => [...r.jobber.jobs.values()].map((j) => /\[(DREWTEST-[0-9A-F]{12})\]$/.exec(String((j as { title: string }).title))?.[1] ?? '?');
+/** One whole call on `r` (the first or a further one). `upTo: 'offer'` hangs up after the offer; otherwise the caller says yes to everything and `ending` must be heard. Returns the last line heard. */
+async function converse(r: Rig, a: { street?: string; when?: string; size?: string; ending?: RegExp; upTo?: 'offer' } = {}): Promise<string> {
+  const n = r.voices.length; const before = r.outcomes.length; r.nextCall();
+  const sim = await r.connect(); r.start(sim);
+  await until(() => r.voices.length === n + 1 && r.voices[n].spoken.length >= 1, 'the opening');
+  await r.hears(/Thanks for calling Drew Cleaning/, 'Testa Invented'); await r.hears(/Is that right\? Say yes or no/, 'yes'); await r.hears(/street address/, a.street ?? '123 Invented Lane, Testville, CA 90210');
+  await r.hears(/What day and time/, a.when ?? 'Tuesday at ten'); await r.hears(/bedrooms and bathrooms/, a.size ?? 'two bedrooms and two bathrooms');
+  if (a.upTo === 'offer') { const offer = await r.hears(/is one hundred ninety-nine dollars/); sim.end(); await pause(50); return offer; }
+  await r.hears(/is one hundred ninety-nine dollars/, 'yes'); await r.hears(/calling from a number ending in 0 0 0 2/, 'yes'); await r.hears(/^To confirm/, 'yes');
+  const line = await r.hears(a.ending ?? BOOKED); await sim.closed; await until(() => r.outcomes.length > before, 'the outcome'); return line;
+}
+
+test('STEP 5, SCENARIO 1 (happy path): one verified Jobber booking, "booked" spoken only after the read-back, texts off, no lead, no duplicate', async () => {
+  const r = await newRig();
+  assert.match(await converse(r), /^You are booked for Tuesday, November third, 2026 at 10 A M\./);
+  assert.deepEqual(writes(r), ['clientCreate', 'jobCreate']); assert.equal(r.jobber.jobs.size, 1); assert.ok(r.jobber.ops.some((x) => x.field === 'job'), 'read back by id');
+  const last = r.outcomes[r.outcomes.length - 1]; assert.deepEqual([last.reason, last.booked, last.customerText, last.ownerText, last.lead], ['BOOKED', true, 'skipped', 'skipped', undefined]);
+  assert.deepEqual(r.twilio.messages, []); assert.equal(r.store.list(T).length, 0, 'a booked call leaves no lead');
+  assert.ok(r.voices[0].spoken.findIndex((l) => BOOKED.test(l)) > r.voices[0].spoken.findIndex((l) => /^To confirm/.test(l)));
+});
+
+test('STEP 5, SCENARIO 2 (redial): the same booking on a second call is ALREADY_BOOKED - one job, no new write, no text, no lead; but on a calendar that lists Drew\'s own visit (as the real Jobber does) the redial is not offered the same time', async () => {
+  const r = await newRig();
+  assert.match(await converse(r), BOOKED); const m1 = marks(r); assert.equal(m1.length, 1);
+  assert.equal(await converse(r, { ending: /already booked/ }), 'That visit is already booked, so nothing new was sent. Goodbye.');
+  assert.equal(r.jobber.jobs.size, 1); assert.deepEqual(writes(r), ['clientCreate', 'jobCreate']); assert.deepEqual(marks(r), m1);
+  const last = r.outcomes[r.outcomes.length - 1]; assert.deepEqual([last.reason, last.booked, last.customerText, last.ownerText, last.lead], ['ALREADY_BOOKED', true, 'skipped', 'skipped', undefined]);
+  assert.deepEqual(r.twilio.messages, []); assert.equal(r.store.list(T).length, 0);
+  // 2b: the realistic calendar
+  const q = await newRig(); assert.match(await converse(q), BOOKED);
+  q.jobber.opts.scheduled = [busyUnassigned('10:00', '12:00')];
+  assert.match(await converse(q, { upTo: 'offer' }), /I do not have 10 A M on Tuesday, November third, 2026. The nearest time I have that day is 12 P M./);
+  assert.equal(q.jobber.jobs.size, 1); assert.deepEqual(writes(q), ['clientCreate', 'jobCreate']); assert.ok(!q.outcomes.some((o) => o.reason === 'ALREADY_BOOKED'), 'the redial never reached the duplicate path');
+});
+
+test('STEP 5, SCENARIO 3 (legitimate second bookings): the same caller with another time, or another house number, is a NEW booking with its own key and job - never a duplicate', async () => {
+  const r = await newRig();
+  assert.match(await converse(r), /at 10 A M\./);
+  assert.match(await converse(r, { when: 'Tuesday at two in the afternoon' }), /^You are booked for Tuesday, November third, 2026 at 2 P M\./);
+  assert.match(await converse(r, { street: '456 Invented Lane, Testville, CA 90210' }), /^You are booked for Tuesday, November third, 2026 at 10 A M\./);
+  assert.equal(r.jobber.jobs.size, 3); assert.equal(new Set(marks(r)).size, 3, 'three different booking keys'); assert.ok(marks(r).every((m) => m !== '?'));
+  assert.deepEqual(writes(r).filter((w) => w === 'jobCreate'), ['jobCreate', 'jobCreate', 'jobCreate']);
+  assert.deepEqual(r.outcomes.map((o) => [o.reason, o.booked]), [['BOOKED', true], ['BOOKED', true], ['BOOKED', true]]); assert.equal(r.store.list(T).length, 0);
+});
+
+test('STEP 5, SCENARIO 4 (same time, other address): when the calendar lists the first visit, a second booking at that time is not offered and nothing is written', async () => {
+  const r = await newRig(); assert.match(await converse(r), BOOKED);
+  r.jobber.opts.scheduled = [busyUnassigned('10:00', '12:00')];
+  assert.match(await converse(r, { street: '456 Invented Lane, Testville, CA 90210', upTo: 'offer' }), /I do not have 10 A M on Tuesday, November third, 2026. The nearest time I have that day is 12 P M./);
+  assert.equal(r.jobber.jobs.size, 1); assert.deepEqual(writes(r), ['clientCreate', 'jobCreate']); assert.ok(!r.outcomes.some((o) => o.reason === 'ALREADY_BOOKED'), 'not called a duplicate');
+});
+
+test('STEP 5, SCENARIO 5 (retired key): a booking made under a retired key is a duplicate only when the full read-back matches; a mismatch is BOOKING_NOT_VERIFIED, with no second job', async () => {
+  const rotate = async (r: Rig) => assert.equal(await createVault(r.dir, fakeProtector).publishBlob('booking-identity-keys.2', JSON.stringify({ version: 1, gen: 2, current: { kid: 'k2', secret: Buffer.alloc(32, 8).toString('base64url') }, retired: [{ kid: 'k1', secret: KEYRING_SECRET, retired_at: new Date(NOW).toISOString() }] }), () => undefined), 'published');
+  const a = await newRig(); assert.match(await converse(a), BOOKED); await rotate(a);
+  assert.equal(await converse(a, { ending: /already booked/ }), 'That visit is already booked, so nothing new was sent. Goodbye.');
+  assert.equal(a.jobber.jobs.size, 1); assert.deepEqual(writes(a), ['clientCreate', 'jobCreate']); assert.equal(a.outcomes[a.outcomes.length - 1].reason, 'ALREADY_BOOKED');
+  const b = await newRig(); assert.match(await converse(b), BOOKED); await rotate(b);
+  const job = [...b.jobber.jobs.values()][0] as { visits: { nodes: Array<{ startAt: string }> } }; job.visits.nodes[0].startAt = new Date(Date.parse(job.visits.nodes[0].startAt) + 3_600_000).toISOString();   // the stored visit no longer matches
+  assert.match(await converse(b, { ending: /could not confirm the booking/ }), /Your request is recorded/);
+  assert.equal(b.jobber.jobs.size, 1); assert.deepEqual(writes(b), ['clientCreate', 'jobCreate']); const last = b.outcomes[b.outcomes.length - 1]; assert.deepEqual([last.reason, last.booked], ['BOOKING_NOT_VERIFIED', false]);
+});
+
+test('STEP 5, SCENARIO 6 (a caller not on the approved list leaves no lead and no Jobber read; the record-only lead for a size not offered is pinned by the existing joined test)', async () => {
+  const r = await newRig(); r.twilio.opts.callerFrom = '+15550100099';
+  const sim = await r.connect(); r.start(sim); await until(() => r.voices.length === 1 && r.voices[0].spoken.length >= 1, 'the opening'); await r.hears(/Thanks for calling Drew Cleaning/); await r.hears(/private test line/); await sim.closed; await until(() => r.outcomes.length > 0, 'the outcome');
+  assert.deepEqual([r.outcomes[0].reason, r.outcomes[0].lead], ['NOT_APPROVED', undefined]); assert.equal(r.store.list(T).length, 0); assert.deepEqual(r.contacts?.list(T), []); assert.equal(r.jobber.ops.length, 0);
+  // the size-not-offered record-only lead is pinned by the existing joined test 'JOINED, LEAD recorded before the callback'
+});
+
+test('STEP 5, SCENARIO 7 (failure endings after the lead is saved): writes off and an unverifiable booking save the record AND the contact; an unreadable calendar saves a record only; the caller never hears "booked"', async () => {
+  const off = await newRig({ jobberWrites: false });
+  assert.match(await converse(off, { ending: /could not confirm the booking/ }), /Your request is recorded/);
+  assert.equal(off.outcomes[off.outcomes.length - 1].lead, 'stored'); assert.equal(off.store.list(T).length, 1); assert.equal(off.contacts?.list(T).length, 1); assert.equal(off.jobber.jobs.size, 0); assert.deepEqual(off.twilio.messages, []);
+  const bad = await newRig(); bad.jobber.opts.shiftVisitMs = 3_600_000;   // Jobber stores a different time than asked: the read-back differs
+  assert.match(await converse(bad, { ending: /could not confirm the booking/ }), /Your request is recorded/);
+  assert.deepEqual([bad.outcomes[bad.outcomes.length - 1].reason, bad.outcomes[bad.outcomes.length - 1].booked, bad.outcomes[bad.outcomes.length - 1].lead], ['BOOKING_NOT_VERIFIED', false, 'stored']); assert.equal(bad.store.list(T).length, 1); assert.equal(bad.contacts?.list(T).length, 1);
+  assert.ok(![...bad.voices[0].spoken].some((l) => BOOKED.test(l))); assert.deepEqual(bad.twilio.messages, []);
+  const cal = await newRig(); cal.jobber.opts.hasMoreScheduled = true;
+  const sim = await cal.connect(); cal.start(sim); await until(() => cal.voices.length === 1 && cal.voices[0].spoken.length >= 1, 'the opening');
+  await cal.hears(/Thanks for calling/, 'Testa Invented'); await cal.hears(/Is that right\? Say yes or no/, 'yes'); await cal.hears(/street address/, '123 Invented Lane, Testville, CA 90210'); await cal.hears(/What day and time/, 'Tuesday at ten'); await cal.hears(/bedrooms and bathrooms/, 'two and two');
+  assert.match(await cal.hears(/cannot check the schedule/), /Your request is recorded/); await sim.closed; await until(() => cal.outcomes.length > 0, 'the outcome');
+  assert.equal(cal.outcomes[0].lead, 'recorded'); assert.equal(cal.store.list(T).length, 1); assert.deepEqual(cal.contacts?.list(T), []); assert.equal(cal.jobber.jobs.size, 0);
+  for (const x of [off, bad, cal]) { noPersonal(x.diagLines); noPersonal(x.logs); }
 });
