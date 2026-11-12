@@ -13,7 +13,7 @@ import { cleanDetail } from '../src/call-diag.ts';
 import { fakeCarrier } from './helpers/fake-carrier.ts';
 import { callRefFor, createIntakeRecordStore } from '../src/intake-record-store.ts';
 import { createContactVault } from '../src/contact-vault.ts';
-import { makeLeadSaver } from '../src/fast-lead.ts';
+import { makeLeadSaver, makeNoticeFailureSaver, noticeSentence } from '../src/fast-lead.ts';
 import { createRealtimeBridge } from '../src/realtime-bridge.ts';
 import { createRealtimeTransport } from '../src/realtime-transport.ts';
 import { createWirePhone, createWireVoice } from './helpers/realtime-wire-sim.ts';
@@ -24,11 +24,12 @@ const DREW = '+15550100001'; const CUSTOMER = '+15550100002'; const OWNER = '+15
 const SETTINGS: FastSettings = { businessName: 'Drew Cleaning', serviceLabel: 'Standard cleaning', bedrooms: 2, bathrooms: 2, priceDollars: 199, standingApproval: true, state: 'CA',
   availability: { timezone: TZ, hours: { 1: [['09:00', '17:00']], 2: [['09:00', '17:00']], 3: [['09:00', '17:00']], 4: [['09:00', '17:00']], 5: [['09:00', '17:00']] }, durationMinutes: 120, stepMinutes: 30, leadMinutes: 60 } };
 
-function build(o: { /** The durable lead sink: a REAL intake store and a REAL encrypted contact vault, both in memory ('none': no sink at all; 'record-only': no contact vault). */ leads?: 'none' | 'record-only'; saveLead?: FastDeps['saveLead']; settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest | IdentityBookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
+function build(o: { /** The durable lead sink: a REAL intake store and a REAL encrypted contact vault, both in memory ('none': no sink at all; 'record-only': no contact vault). */ leads?: 'none' | 'record-only'; saveLead?: FastDeps['saveLead']; /** The append-only owner-notice-failure sink: 'real' = the real saver over the in-memory store; a function = a stand-in; absent = no sink. */ saveNotice?: 'real' | FastDeps['saveNoticeFailure']; settings?: Partial<FastSettings>; caller?: string | undefined; busy?: { busy: Array<{ start: number; end: number }>; complete: boolean }; book?: (r: BookingRequest | IdentityBookingRequest) => BookingResult | Promise<BookingResult>; busyHold?: Promise<void>; slotHoldMs?: number; send?: (to: string, body: string) => SendResult; delivery?: Delivery; customers?: string[]; textsEnabled?: boolean; ownerConsent?: boolean; consentOk?: boolean; answerWaitMs?: number; settleMs?: number | null; busyLater?: { busy: Array<{ start: number; end: number }>; complete: boolean }; emails?: 'accept' | 'refuse' | 'throw' | 'hang'; followUpMs?: number; emailsOff?: boolean; holdGraceMs?: number; holdMaxMs?: number; maxCalls?: number; validate?: (a: AddressToValidate) => Promise<unknown>; validateMs?: number } = {}) {
   const logs: Array<[string, unknown]> = []; const outcomes: FastOutcome[] = []; const mails: Array<{ role: string; subject: string; text: string }> = []; const booked: Array<BookingRequest | IdentityBookingRequest> = []; const texts: Array<{ to: string; body: string }> = []; const consents: Array<{ result: string; script: string; ref: string }> = []; let busyCalls = 0;
   const records = createIntakeRecordStore({ path: ':memory:' }); const vault = createContactVault({ path: ':memory:', key: CONTACT_KEY, now: () => NOW });
   const deps: FastDeps = {
     ...(o.leads === 'none' ? {} : { saveLead: o.saveLead ?? makeLeadSaver({ store: records, ...(o.leads === 'record-only' ? {} : { contacts: vault }), tenant: TENANT }) }),
+    ...(o.saveNotice === undefined ? {} : { saveNoticeFailure: o.saveNotice === 'real' ? makeNoticeFailureSaver({ store: records, tenant: TENANT }) : o.saveNotice }),
     settings: { ...SETTINGS, ...o.settings }, numbers: new Set([DREW]), approvedCallers: new Set([CUSTOMER]), approvedCustomerNumbers: new Set(o.customers ?? [CUSTOMER]), ownerNumber: OWNER, maxCalls: o.maxCalls ?? 5,
     now: () => NOW, callerOf: async () => ('caller' in o ? o.caller : CUSTOMER), busy: async () => { busyCalls++; if (o.busyHold !== undefined && busyCalls > 1) await o.busyHold; return (busyCalls > 1 && o.busyLater !== undefined ? o.busyLater : o.busy) ?? { busy: [], complete: true }; },
     book: async (r) => { booked.push(r); return (o.book ?? (() => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2 })))(r); },
@@ -1657,7 +1658,7 @@ test('speaker down source guard: the failure sets the hang-up flag before it end
   const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\s\/\/ .*$/gm, '');
   assert.equal([...src.matchAll(/ev\.kind === 'speaker_down'/g)].length, 1);
   assert.ok(/if \(ev\.kind === 'speaker_down'\) \{ speakerFailed\(callSid\); return; \}/.test(src), 'the live event calls the one function');
-  assert.ok(/function speakerFailed\(sid: unknown\): void \{ hungUp = true; speakerSid = sidOf\(sid\) \?\? sidOf\(callSid\); if \(!booking\) sendOwnerNotice\('SPEAKER_DOWN', bookSent\); void end\('SPEAKER_DOWN'\); \}/.test(src), 'flag, the validated SID, then the guarded notice, then the end');
+  assert.ok(/function speakerFailed\(sid: unknown\): void \{ hungUp = true; speakerSid = sidOf\(sid\) \?\? sidOf\(callSid\); if \(!booking\) \{ sendOwnerNotice\('SPEAKER_DOWN', bookSent\); saveInterruptedLead\('SPEAKER_DOWN'\); \} void end\('SPEAKER_DOWN'\); \}/.test(src), 'flag, the validated SID, then the guarded notice and the guarded durable lead, then the end');
   assert.equal([...src.matchAll(/speakerSid = /g)].length, 1, 'the SID is set in the speaker-failure function only (behavior is pinned by the Call SID tests)');
   assert.equal([...src.matchAll(/speakerFailed\(/g)].length, 3, 'defined once, called from the live event and from the close that says the notice failed');
   assert.ok(/function sendOwnerNotice\(reason: string, mayExist: boolean\): void \{\r?\n\s+if \(noticed\) return; noticed = true;/.test(src), 'the once-per-call guard is the first statement');
@@ -1930,4 +1931,138 @@ test('BOOKING REFERENCE, nothing for a clean booking or a duplicate: a verified 
   const dup = build({ textsEnabled: false, emails: 'accept', book: () => ({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 0, duplicate: true, marker: REF }) }); await toBooked(dup);
   assert.deepEqual(bookingRow(dup), { status: 'booked_verified' }); assert.equal(dup.mails.length, 0); assert.equal(dup.last().reason, 'ALREADY_BOOKED'); assert.ok(!dup.logs.some(([c]) => c === 'FAST_FOLLOWUP'));
   assert.equal(dup.c.lines.at(-1), 'That visit is already booked, so nothing new was sent. Goodbye.');
+});
+
+// ---------------------------------------------------------------- INTERRUPTED CALLS (Stage 1 Owner Exceptions, G1/G2): a caller who was VERIFIED and then hung up, or a voice that failed, leaves the same durable lead as a spoken "a person will" ending
+const HUNG_SUMMARY = 'Cleaning request not completed: the caller hung up before the call was finished.';
+const verifiedMidCall = async (t: ReturnType<typeof build>): Promise<void> => {
+  t.h.serve(t.c.transport); t.c.setup(DREW, undefined, 'Testa Invented'); await t.c.hears(/Is that right\? Say yes or no/, 'yes'); await t.c.hears(/street address/, undefined);
+};
+const leadRows = (t: ReturnType<typeof build>): unknown[] => t.logs.filter(([c]) => c === 'FAST_LEAD').map(([, d]) => d);
+
+test('INTERRUPTED hang-up after the caller was verified saves ONE durable lead (the record only: nothing was confirmed), speaks nothing, and the outcome, the slot and the (absent) hang-up email are unchanged', async () => {
+  const t = build({ emails: 'accept' }); await verifiedMidCall(t); const spoken = t.c.lines.length; t.c.hangUp(); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false]]); assert.equal(t.c.lines.length, spoken, 'nothing is spoken to a caller who has gone'); assert.equal(t.h.active(), 0);
+  const rs = t.records.list(TENANT); assert.equal(rs.length, 1);
+  assert.deepEqual([rs[0].call_ref, rs[0].status, rs[0].confirmation, rs[0].handed_off], [LEAD_REF, 'needs-human', 'unconfirmed', false]); assert.equal(rs[0].fields[0].value, HUNG_SUMMARY);
+  assert.deepEqual(t.vault.list(TENANT), [], 'no number or name was confirmed, so no contact is kept'); assert.deepEqual(leadRows(t), [{ result: 'recorded', reason: 'CALLER_HUNG_UP' }]);
+  assert.equal(t.mails.length, 0, 'a plain hang-up still sends no email'); assert.equal(JSON.stringify([rs, t.logs]).includes('Invented'), false, 'nothing the caller said is kept'); assert.equal(JSON.stringify(rs).includes('5550100002'), false);
+});
+
+test('INTERRUPTED speaker failure mid-call saves ONE durable lead and keeps the one owner notice exactly as it was', async () => {
+  const t = build({ emails: 'accept' }); await verifiedMidCall(t); t.c.emit({ kind: 'speaker_down' }); await t.c.drain(() => t.c.ended > 0); t.c.hangUp(); await t.h.idle();
+  assert.deepEqual(outcomes(t), [['SPEAKER_DOWN', false]]); assert.equal(t.booked.length, 0); assert.equal(t.h.active(), 0);
+  const rs = t.records.list(TENANT); assert.equal(rs.length, 1); assert.equal(rs[0].call_ref, LEAD_REF); assert.equal(rs[0].fields[0].value, "Cleaning request not completed: the call's voice failed before the call was finished.");
+  assert.deepEqual(leadRows(t), [{ result: 'recorded', reason: 'SPEAKER_DOWN' }]); assert.equal(notices(t).length, 1); assert.deepEqual(row(t, 'FAST_FOLLOWUP'), { owner: 'accepted', reason: 'SPEAKER_DOWN' }); nothingPersonal(t);
+});
+
+test('INTERRUPTED not eligible: a refused caller, a hang-up or a speaker failure before the caller was verified, and a call with no sink save nothing (and no sink is not an error)', async () => {
+  const refused = build({ caller: STRANGER }); refused.h.serve(refused.c.transport); refused.c.setup(DREW); await refused.c.drain(() => refused.outcomes.length > 0, 'the refusal'); refused.c.hangUp(); await refused.h.idle();
+  assert.equal(refused.records.list(TENANT).length, 0); assert.deepEqual(leadRows(refused), []);
+  const early = build({ emails: 'accept' }); early.h.serve(early.c.transport); early.c.hangUp(); await early.h.idle();
+  assert.deepEqual(outcomes(early), [['CALLER_HUNG_UP', false]]); assert.equal(early.records.list(TENANT).length, 0); assert.deepEqual(leadRows(early), []);
+  const consent = build({ emails: 'accept' }); consent.h.serve(consent.c.transport); noticeFailedClose(consent.c, SIDN); await consent.h.idle();
+  assert.deepEqual(outcomes(consent), [['SPEAKER_DOWN', false]]); assert.equal(consent.records.list(TENANT).length, 0); assert.deepEqual(leadRows(consent), []); assert.equal(notices(consent).length, 1, 'the notice is unchanged');
+  const none = build({ leads: 'none' }); await verifiedMidCall(none); none.c.hangUp(); await none.h.idle();
+  assert.deepEqual(outcomes(none), [['CALLER_HUNG_UP', false]]); assert.deepEqual(leadRows(none), [], 'no sink: nothing to save and nothing logged'); assert.equal(none.h.active(), 0);
+});
+
+test('INTERRUPTED never twice: repeated signals, the close after a speaker failure, a hang-up after a spoken ending and a hang-up after a lead already saved all make at most one save per call', async () => {
+  let n = 0; const count: FastDeps['saveLead'] = () => { n++; return 'recorded'; };
+  const a = build({ saveLead: count }); await verifiedMidCall(a); a.c.emit({ kind: 'speaker_down' }); a.c.emit({ kind: 'speaker_down' }); a.c.hangUp(); a.c.hangUp(); await a.h.idle(); assert.equal(n, 1, 'speaker failure, repeated, then the close');
+  n = 0; const b = build({ saveLead: count }); await verifiedMidCall(b); b.c.hangUp(); b.c.hangUp(); await b.h.idle(); assert.equal(n, 1, 'a repeated close');
+  n = 0; const c = build({ textsEnabled: false, book: UNVERIFIED, saveLead: count }); await toBooked(c); await c.h.idle(); c.c.hangUp(); c.c.emit({ kind: 'speaker_down' }); await c.h.idle(); assert.equal(n, 1, 'the spoken ending saved the lead; the hang-up after it adds none');
+  n = 0; const d = build({ textsEnabled: false, saveLead: count }); await toBooked(d); await d.h.idle(); d.c.hangUp(); await d.h.idle(); assert.equal(n, 0, 'a booked call is not an exception');
+  const real = build(); await verifiedMidCall(real); real.c.hangUp(); real.c.hangUp(); await real.h.idle(); assert.equal(real.records.list(TENANT).length, 1, 'the real store holds one record');
+});
+
+test('INTERRUPTED failed save: a saver that throws, rejects or answers anything but stored/recorded is logged as failed, never interrupts the end, never frees the slot early, and leaves the owner notice as it was', async () => {
+  const cases: Array<[string, FastDeps['saveLead']]> = [['throws', () => { throw new Error('disk full'); }], ['rejects', async () => { throw new Error('locked'); }], ['garbage', (() => 'yes') as unknown as FastDeps['saveLead']], ['explicit failure', () => 'failed']];
+  for (const [label, saveLead] of cases) {
+    const h = build({ saveLead }); await verifiedMidCall(h); h.c.hangUp(); await h.h.idle();
+    assert.deepEqual(outcomes(h), [['CALLER_HUNG_UP', false]], label); assert.deepEqual(leadRows(h), [{ result: 'failed', reason: 'CALLER_HUNG_UP' }], label); assert.equal(h.h.active(), 0, label); assert.equal(h.mails.length, 0, label);
+    const s = build({ saveLead, emails: 'accept' }); await verifiedMidCall(s); s.c.emit({ kind: 'speaker_down' }); await s.c.drain(() => s.c.ended > 0); s.c.hangUp(); await s.h.idle();
+    assert.deepEqual(outcomes(s), [['SPEAKER_DOWN', false]], label); assert.deepEqual(leadRows(s), [{ result: 'failed', reason: 'SPEAKER_DOWN' }], label); assert.equal(notices(s).length, 1, label + ': the notice does not rest on the lead'); assert.equal(s.h.active(), 0, label);
+  }
+});
+
+test('INTERRUPTED with a booking in flight: the booking handling is unchanged - a hang-up while the write is pending saves no lead if the booking is verified, one lead if it is not; a hang-up that stops the booking before it is sent saves one lead', async () => {
+  const g = gate<BookingResult>(); const ok = build({ textsEnabled: false, book: () => g.p }); await toPendingWrite(ok); ok.c.hangUp(); assert.equal(ok.records.list(TENANT).length, 0, 'nothing is saved while the write is in flight'); g.res({ status: 'booked_verified', jobId: 'JOB-1', jobNumber: 1001, writes: 2 }); await ok.h.idle();
+  assert.deepEqual(outcomes(ok), [['CALLER_HUNG_UP', false], ['BOOKED', true]]); assert.equal(ok.records.list(TENANT).length, 0, 'a booking that was verified is not an exception'); assert.deepEqual(leadRows(ok), []);
+  let n = 0; const g2 = gate<BookingResult>(); const bad = build({ textsEnabled: false, book: () => g2.p, saveLead: () => { n++; return 'stored'; } }); await toPendingWrite(bad); bad.c.hangUp(); g2.res(UNVERIFIED()); await bad.h.idle();
+  assert.deepEqual(outcomes(bad), [['CALLER_HUNG_UP', false], ['BOOKING_NOT_VERIFIED', false]]); assert.equal(n, 1, 'only the not-verified ending saves');
+  const hold = gate<void>(); const t = build({ textsEnabled: false, emails: 'accept', busyHold: hold.p });
+  t.h.serve(t.c.transport); await toOffer(t.c); await t.c.hears(/is one hundred ninety-nine dollars/, 'yes'); await t.c.hears(/calling from a number ending in/, 'yes'); await t.c.hears(/To confirm/, 'yes');
+  await t.c.until(() => t.busyCalls() >= 2, 'the last availability check'); t.c.hangUp(); assert.equal(t.records.list(TENANT).length, 0, 'nothing is saved until the booking step decides'); hold.res(); await t.h.idle();
+  assert.equal(t.booked.length, 0); assert.deepEqual(outcomes(t), [['CALLER_HUNG_UP', false], ['BOOKING_SKIPPED_HUNG_UP', false]]);
+  const rs = t.records.list(TENANT); assert.equal(rs.length, 1); assert.equal(rs[0].fields[0].value, 'Cleaning request not completed: the caller hung up before the booking was sent. Nothing was booked.');
+  assert.deepEqual(leadRows(t), [{ result: 'stored', reason: 'BOOKING_SKIPPED_HUNG_UP' }]); assert.equal(notices(t).length, 1, 'the owner notice is unchanged');
+});
+
+test('INTERRUPTED source guard: the interrupted-call save is one guarded function that speaks and sends nothing, and it is reached from exactly the three interrupted endings', () => {
+  const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const fn = /function saveInterruptedLead[\s\S]*?\n    \}\n/.exec(src)?.[0] ?? ''; assert.ok(fn.length > 150, 'found');
+  assert.ok(!/speak|sendText|sendEmail|sendOwnerNotice|endCall|end\(/.test(fn), 'it speaks and sends nothing'); assert.ok(/leadTried/.test(fn) && /CALLER_VERIFIED/.test(fn) && /deps\.saveLead === undefined/.test(fn), 'once per call, verified caller, a sink');
+  assert.deepEqual([...src.matchAll(/saveInterruptedLead\('([A-Z_]+)'\)/g)].map((m) => m[1]).sort(), ['BOOKING_SKIPPED_HUNG_UP', 'CALLER_HUNG_UP', 'SPEAKER_DOWN']);
+  assert.ok(/if \(!booking\) saveInterruptedLead\('CALLER_HUNG_UP'\)/.test(src), 'a hang-up with a booking in flight leaves the decision to the booking ending');
+});
+
+// ---------------------------------------------------------------- OWNER-NOTICE FAILURE (Stage 1, G3): a refused, failed or timed-out owner email notice leaves one append-only, privacy-safe record linked to its call; an accepted or disabled notice leaves none
+const noticeRecords = (t: ReturnType<typeof build>) => t.records.list(TENANT).filter((r) => r.category === 'owner-notice');
+const noticeRows = (t: ReturnType<typeof build>): unknown[] => t.logs.filter(([c]) => c === 'FAST_NOTICE_RECORD').map(([, d]) => d);
+
+test('NOTICE FAILURE outcomes: refused, failed (an error) and timeout (it may still arrive) each write ONE record with their own sentence, linked to the lead, with nothing personal in it; the lead and the FAST_FOLLOWUP row are unchanged', async () => {
+  for (const [mode, followUp, verdict] of [['refuse', 'refused', 'refused'], ['throw', 'refused', 'failed'], ['hang', 'timeout', 'timeout']] as const) {
+    const t = build({ textsEnabled: false, book: UNVERIFIED, emails: mode, followUpMs: mode === 'hang' ? 30 : undefined, saveNotice: 'real' }); await toBooked(t); await t.h.idle();
+    assert.equal(t.mails.length, 1, mode + ': one attempt'); assert.deepEqual(row(t, 'FAST_FOLLOWUP'), { owner: followUp, reason: 'BOOKING_NOT_VERIFIED' }, mode);
+    const all = t.records.list(TENANT); assert.equal(all.length, 2, mode + ': the lead and the notice record'); assert.equal(t.last().lead, 'stored', mode);
+    const n = noticeRecords(t); assert.equal(n.length, 1, mode); const r = n[0];
+    assert.deepEqual([r.status, r.confirmation, r.handed_off, r.reasons[0], r.item_id], ['needs-human', 'unconfirmed', false, `notice_${verdict}`, `fast-notice-${LEAD_REF}`], mode);
+    assert.notEqual(r.call_ref, LEAD_REF, 'its own call reference'); assert.equal(r.fields[0].value, noticeSentence(verdict), mode);
+    assert.deepEqual(noticeRows(t), [{ result: 'recorded', verdict }], mode);
+    const text = JSON.stringify([r, t.logs]); for (const s of ['Invented', '5550100002', 'Testville', LEAD_SID, '123 ']) assert.equal(text.includes(s), false, mode + ': no ' + s);
+    assert.equal(t.h.active(), 0, mode);
+  }
+  assert.notEqual(noticeSentence('refused'), noticeSentence('failed')); assert.notEqual(noticeSentence('failed'), noticeSentence('timeout')); assert.match(noticeSentence('timeout'), /may not have been delivered/);
+});
+
+test('NOTICE FAILURE none when nothing failed: an accepted notice, a disabled notice (emails off) and a call with no notice-failure sink record nothing and log nothing', async () => {
+  const ok = build({ textsEnabled: false, book: UNVERIFIED, emails: 'accept', saveNotice: 'real' }); await toBooked(ok); await ok.h.idle();
+  assert.equal(noticeRecords(ok).length, 0); assert.deepEqual(noticeRows(ok), []); assert.equal(ok.records.list(TENANT).length, 1, 'the lead only');
+  const off = build({ textsEnabled: false, book: UNVERIFIED, saveNotice: 'real' }); await toBooked(off); await off.h.idle();
+  assert.equal(off.mails.length, 0); assert.equal(noticeRecords(off).length, 0, 'emails off is a configured state, shown on the dashboard, not a record per call'); assert.deepEqual(noticeRows(off), []); assert.equal(off.last().lead, 'stored');
+  const off2 = build({ textsEnabled: false, book: UNVERIFIED, emails: 'refuse', emailsOff: true, saveNotice: 'real' }); await toBooked(off2); await off2.h.idle();
+  assert.equal(off2.mails.length, 0); assert.equal(noticeRecords(off2).length, 0);
+  const none = build({ textsEnabled: false, book: UNVERIFIED, emails: 'refuse' }); await toBooked(none); await none.h.idle();
+  assert.equal(none.mails.length, 1); assert.deepEqual(row(none, 'FAST_FOLLOWUP'), { owner: 'refused', reason: 'BOOKING_NOT_VERIFIED' }); assert.deepEqual(noticeRows(none), [], 'no sink: nothing recorded and nothing logged'); assert.equal(none.records.list(TENANT).length, 1);
+});
+
+test('NOTICE FAILURE never twice: later signals (a hang-up, a repeated speaker failure) after the notice add no second record; the saver is asked once, and a repeat of the same write is a safe duplicate', async () => {
+  let n = 0; const count: FastDeps['saveNoticeFailure'] = () => { n++; return 'recorded'; };
+  const t = build({ textsEnabled: false, book: UNVERIFIED, emails: 'refuse', saveNotice: count }); await toBooked(t); await t.h.idle(); t.c.hangUp(); t.c.emit({ kind: 'speaker_down' }); t.c.hangUp(); await t.h.idle();
+  assert.equal(n, 1); assert.equal(t.mails.length, 1);
+  const s = build({ emails: 'refuse', saveNotice: 'real' }); await verifiedMidCall(s); s.c.emit({ kind: 'speaker_down' }); s.c.emit({ kind: 'speaker_down' }); await s.c.drain(() => s.c.ended > 0); s.c.hangUp(); s.c.hangUp(); await s.h.idle();
+  assert.equal(s.mails.length, 1); assert.equal(noticeRecords(s).length, 1); assert.equal(s.records.list(TENANT).length, 2, 'the interrupted-call lead and the notice record'); assert.deepEqual(noticeRows(s), [{ result: 'recorded', verdict: 'refused' }]);
+  const store = createIntakeRecordStore({ path: ':memory:' }); const save = makeNoticeFailureSaver({ store, tenant: TENANT });
+  assert.equal(save({ callSid: LEAD_SID, verdict: 'refused', at: NOW }), 'recorded'); assert.equal(save({ callSid: LEAD_SID, verdict: 'refused', at: NOW }), 'recorded'); assert.equal(store.list(TENANT).length, 1);
+  assert.equal(save({ callSid: LEAD_SID, verdict: 'timeout', at: NOW }), 'failed', 'a different outcome for the same call never overwrites the first, and never claims to be recorded'); assert.equal(store.list(TENANT).length, 1); store.close();
+});
+
+test('NOTICE FAILURE failed save: a saver that throws, rejects or answers anything but "recorded" is logged as failed; the call still ends, the slot is freed, the lead and the notice attempt are as before', async () => {
+  const cases: Array<[string, FastDeps['saveNoticeFailure']]> = [['throws', () => { throw new Error('disk full'); }], ['rejects', async () => { throw new Error('locked'); }], ['garbage', (() => 'yes') as unknown as FastDeps['saveNoticeFailure']], ['explicit failure', () => 'failed']];
+  for (const [label, saveNotice] of cases) {
+    const t = build({ textsEnabled: false, book: UNVERIFIED, emails: 'refuse', saveNotice }); await toBooked(t); await t.h.idle();
+    assert.deepEqual(noticeRows(t), [{ result: 'failed', verdict: 'refused' }], label); assert.equal(t.last().reason, 'BOOKING_NOT_VERIFIED', label); assert.equal(t.last().lead, 'stored', label); assert.equal(t.mails.length, 1, label); assert.equal(t.h.active(), 0, label);
+  }
+  const noSid = build({ emails: 'refuse', saveNotice: 'real' }); await verifiedMidCall(noSid); noSid.c.emit({ kind: 'speaker_down' }); await noSid.c.drain(() => noSid.c.ended > 0); noSid.c.hangUp(); await noSid.h.idle();
+  assert.deepEqual(noticeRows(noSid), [{ result: 'recorded', verdict: 'refused' }], 'a valid Call SID is needed, and the call has one');
+});
+
+test('NOTICE FAILURE source guard: the record path speaks and sends nothing, is reached only after a notice that was not accepted, and the saver imports nothing new and never touches the network or the environment', () => {
+  const src = readFileSync(new URL('../src/fast-call-handler.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const fn = /async function recordNoticeFailure[\s\S]*?\n    \}\n/.exec(src)?.[0] ?? ''; assert.ok(fn.length > 200, 'found');
+  assert.ok(!/\.speak\(|sendText|sendEmail|sendOwnerNotice|endCall|\bend\(|saveLead/.test(fn), 'it speaks and sends nothing'); assert.equal([...src.matchAll(/recordNoticeFailure\(/g)].length, 3, 'defined once; called after a refused, timed-out or thrown send, and when the message cannot be built');
+  assert.ok(/if \(verdict === 'timeout' \|\| verdict === 'refused'\) recorded = verdict/.test(src) && /catch \{ verdict = 'refused'; recorded = 'failed'; \}/.test(src), 'only a send that was not accepted is recorded');
+  const lead = readFileSync(new URL('../src/fast-lead.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const saver = /export function makeNoticeFailureSaver[\s\S]*?\n}\n/.exec(lead)?.[0] ?? ''; assert.ok(saver.length > 300, 'found'); assert.ok(!/process\.env|fetch\(|console\.|writeFile|setTimeout|sendText|sendEmail|contacts/.test(saver), 'record only: no contact, no network, no environment');
 });

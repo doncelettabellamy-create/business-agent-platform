@@ -35,6 +35,9 @@ export function leadSummary(reason: string): string {
   if (/^NAME_/.test(reason)) return `${head}: the name was not confirmed.`;
   if (/^(WHEN_UNCLEAR|NO_OPENING|NO_LONGER_AVAILABLE|CALENDAR_UNREADABLE)$/.test(reason)) return `${head}: no time could be set.`;
   if (/^SIZE_/.test(reason)) return `${head}: the home size is not one this line books.`;
+  if (reason === 'CALLER_HUNG_UP') return `${head}: the caller hung up before the call was finished.`;
+  if (reason === 'SPEAKER_DOWN') return `${head}: the call's voice failed before the call was finished.`;
+  if (reason === 'BOOKING_SKIPPED_HUNG_UP') return `${head}: the caller hung up before the booking was sent. Nothing was booked.`;
   if (reason === 'NUMBER_UNCLEAR') return `${head}: the callback number was not confirmed.`;
   if (reason === 'BOOKING_NOT_VERIFIED' || reason === 'BOOKING_CHANGED') return `${head}: the booking could not be confirmed. Check Jobber.`;
   return `${head}.`;
@@ -52,6 +55,47 @@ export function leadRecord(tenant: string, callRef: string, f: LeadFacts): Intak
     fields: [{ name: 'request', value: leadSummary(code), confidence: null, found: true }],
     pii_summary: [], confidence: null, versions: { skill: 'fast-test', model: 'scripted', prompt: 'fast-lead-v1' },
     handed_off: false, turns: Math.min(f.steps.length, 1000), confirmation: 'unconfirmed', address_status: 'none',
+  };
+}
+
+// ---------------------------------------------------------------- OWNER-NOTICE FAILURE (Stage 1, G3)
+// When the owner's email notice for a call that needs follow-up is REFUSED by the mail server, FAILED (an error), or did not finish in time (TIMEOUT: it may still arrive), the owner is told on the dashboard by one more append-only record.
+// The lead for the call is already saved and cannot be changed (the store refuses updates), so this is a SEPARATE record: its own call reference (a hash of the Call SID plus a fixed suffix, so it cannot be mistaken for the lead's), and an item id that ends with the LEAD's call reference (`fast-notice-<lead ref>`), which links the two without showing the SID.
+// It holds no name, number, address, SID or reason code: a fixed sentence per outcome. The owner view lists it under "Need follow-up" and never counts it as an intake. At most one per call (the unique references make a second write a duplicate). A disabled notice (emails off) is a configured state, shown once on the dashboard, and is not recorded here.
+export type NoticeVerdict = 'refused' | 'failed' | 'timeout';
+export type NoticeResult = 'recorded' | 'failed';
+export interface NoticeFacts { callSid: string; verdict: NoticeVerdict; at: number }
+export const NOTICE_CATEGORY = 'owner-notice';
+export const NOTICE_REASON = /^notice_(refused|failed|timeout)$/;
+const NOTICE_SENTENCE: Readonly<Record<NoticeVerdict, string>> = Object.freeze({
+  refused: 'The email notice to you was refused by the mail server, so you were not emailed about a call that needs follow-up. Check the other items on this page.',
+  failed: 'The email notice to you could not be sent because of an error, so you were not emailed about a call that needs follow-up. Check the other items on this page.',
+  timeout: 'The email notice to you did not finish in time and may not have been delivered. Check the other items on this page.',
+});
+export const noticeSentence = (v: NoticeVerdict): string => NOTICE_SENTENCE[v];
+
+/** The record for one undelivered owner notice. */
+export function noticeRecord(tenant: string, leadRef: string, noticeRef: string, f: NoticeFacts): IntakeRecord {
+  return {
+    item_id: `fast-notice-${leadRef}`, workspace_id: tenant, call_ref: noticeRef, received_at: iso(f.at), category: NOTICE_CATEGORY,
+    status: 'needs-human', reasons: [`notice_${f.verdict}`, NOT_CONFIRMED], missing_fields: [],
+    fields: [{ name: 'request', value: NOTICE_SENTENCE[f.verdict], confidence: null, found: true }],
+    pii_summary: [], confidence: null, versions: { skill: 'fast-test', model: 'scripted', prompt: 'fast-notice-v1' },
+    handed_off: false, turns: 0, confirmation: 'unconfirmed', address_status: 'none',
+  };
+}
+
+/** The saver for one server: the record is written and read back exactly. Never throws; anything else is `failed`. */
+export function makeNoticeFailureSaver(sink: { store: IntakeRecordStore; tenant: string }): (facts: NoticeFacts) => NoticeResult {
+  return (facts) => {
+    try {
+      if (typeof facts.callSid !== 'string' || !CALL_SID.test(facts.callSid) || !(facts.verdict in NOTICE_SENTENCE)) return 'failed';
+      const leadRef = callRefFor(sink.tenant, facts.callSid); const noticeRef = callRefFor(sink.tenant, `${facts.callSid}:notice`);
+      const record = noticeRecord(sink.tenant, leadRef, noticeRef, facts);
+      try { sink.store.put(sink.tenant, record); } catch { return 'failed'; }   // 'duplicate' is not an error: what is stored is compared below
+      const back = sink.store.list(sink.tenant).find((r) => r.call_ref === noticeRef);
+      return back !== undefined && canon(back) === canon(record) ? 'recorded' : 'failed';
+    } catch { return 'failed'; }
   };
 }
 

@@ -21,7 +21,7 @@ const NO_ADDRESS: Partial<IntakeRecord> = { fields: [f('Job description', 'burst
 const UNCONFIRMED: Partial<IntakeRecord> = { confirmation: 'unconfirmed', status: 'needs-human', handed_off: false, reasons: ['not_confirmed'] };
 const DAY: DayBounds = { fromIso: '2026-10-26T07:00:00Z', toIso: '2026-10-27T07:00:00Z' };
 
-const CALL_KEYS = ['addressGiven', 'at', 'details', 'needsFollowUp', 'nextActions', 'request', 'requestedTime', 'statusText', 'summary'];
+const CALL_KEYS = ['addressGiven', 'at', 'details', 'kind', 'needsFollowUp', 'nextActions', 'request', 'requestedTime', 'statusText', 'summary'];
 const SUMMARY_KEYS = ['confirmedByCaller', 'intakesReceivedToday', 'intakesReceivedTotal', 'needFollowUp', 'withRequestedTime'];
 
 test('exact keys: the owner call, the summary and the view carry only the allowed fields', () => {
@@ -188,7 +188,7 @@ test('bad input is refused, never guessed at', () => {
 test('inventory: the module is pure (no I/O, no clock, no environment, no network) and imports only the personal-data screen and a type', () => {
   const code = readFileSync(new URL('../src/owner-view.ts', import.meta.url), 'utf8');
   const imports = [...code.matchAll(/^import (?:type )?[^;]*from '([^']+)';/gm)].map((m) => m[1]);
-  assert.deepEqual(imports.sort(), ['./intake-record-store.ts', './pii-screen.ts']);
+  assert.deepEqual(imports.sort(), ['./followup-marker.ts', './intake-record-store.ts', './pii-screen.ts']);   // the pure follow-up marker rules (src/followup-marker.ts): no I/O, no clock
   assert.ok(/^import type \{ IntakeRecord \}/m.test(code), 'the store is imported as a type only');
   for (const banned of [/node:/, /\bprocess\b/, /\bfetch\(/, /Date\.now/, /new Date\(/, /Math\.random/, /\bfs\b/, /readFile/, /writeFile/, /\bsetTimeout\b/, /\brequire\(/]) {
     assert.ok(!banned.test(code.replace(/\/\/.*$/gm, '')), String(banned));

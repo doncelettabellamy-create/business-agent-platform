@@ -156,7 +156,7 @@ const service = createFounderVoiceService({
   log: (code, detail) => sink(code, detail),
 });
 const staticDir = fileURLToPath(new URL('../../../prototype/intake-work-items', import.meta.url));
-const dashboard = createDashboardServer({ store, tenant, staticDir, ...(pendingSnapshot === undefined ? {} : { pending: pendingSnapshot }) });
+const dashboard = createDashboardServer({ store, tenant, staticDir, ...(pendingSnapshot === undefined ? {} : { pending: pendingSnapshot }), ...(fastCfg === undefined ? {} : { emailNotices: process.env.FAST_EMAILS === 'on' ? 'on' as const : 'off' as const }) });   // the same switch the fast call's email sender uses (founder-voice-fast.ts); the page shows a banner when it is OFF
 const relay = createRelayWsServer({ path: relayPathFor(config.public_wss_url), authToken: twilioToken as string, urls: signedUrlCandidates(config.public_wss_url), maxConnections: 2, onConnection: (c) => service.handleStream(c), onRefuse: (status) => sink('WS_HANDSHAKE_REFUSED', { status }) });
 await dashboard.listen(config.dashboard_port);
 await relay.listen(config.relay_port);

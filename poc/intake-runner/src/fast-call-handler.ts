@@ -29,7 +29,7 @@ import type { CallTransport, TransportCloseInfo, TransportEvent } from './call-t
 import type { Delivery, SendResult } from './twilio-messaging.ts';
 import { callRef } from './fast-consent.ts';
 import { BOOKING_REF, customerEmail, followUpEmail, ownerEmail } from './fast-email-copy.ts';
-import type { LeadFacts, LeadResult } from './fast-lead.ts';
+import type { LeadFacts, LeadResult, NoticeFacts, NoticeResult, NoticeVerdict } from './fast-lead.ts';
 import { CUSTOMER_SCRIPT_ID, MAX_TEXT_CHARS, customerConsentLine, customerText, ownerText, zoneLabelOf } from './fast-sms-copy.ts';
 
 export interface FastSettings {
@@ -80,6 +80,8 @@ export interface FastDeps {
   onOutcome?(o: FastOutcome): void;
   /** Writes the durable lead for a call that ended without a booking, BEFORE the ending is spoken (fast-lead.ts). Absent: the ending is treated as `failed`, never as a promise. */
   saveLead?(facts: LeadFacts): LeadResult | Promise<LeadResult>;
+  /** Writes the append-only owner-notice-failure record when the owner's email notice was refused, failed or timed out (fast-lead.ts). Absent: nothing is recorded (the failure is still logged as before). */
+  saveNoticeFailure?(facts: NoticeFacts): NoticeResult | Promise<NoticeResult>;
   /**
    * OPTIONAL independent check that the caller's address exists and fits together (ZIP, city, state, street). Absent = no such check (today's behaviour). When present it is asked before the read-back and again guards the booking: only a `valid` verdict for exactly the address that is booked lets the call go on.
    * Anything else fails closed: a mismatch on the street or house number (or a `corrected` verdict: the checker changed something, which is never booked silently) asks the caller for the street once more; every other verdict, a throw, a malformed answer or a timeout ends the call with nothing booked and a person to follow up.
@@ -265,17 +267,28 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
         const send = deps.sendEmail; let timer: ReturnType<typeof setTimeout> | undefined;
         const late = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), deps.followUpMs ?? 15_000); timer.unref?.(); });
         const job = (async (): Promise<void> => {
-          let verdict = 'refused';
-          try { const r = await Promise.race([send('owner', msg.subject, msg.text), late]); verdict = r === 'timeout' ? 'timeout' : r.ok === true ? 'accepted' : 'refused'; } catch { verdict = 'refused'; } finally { if (timer !== undefined) clearTimeout(timer); }
+          let verdict = 'refused'; let recorded: NoticeVerdict | undefined;   // `recorded`: the outcome the dashboard is told about (refused: the mail server said no; failed: an error; timeout: it may still arrive)
+          try { const r = await Promise.race([send('owner', msg.subject, msg.text), late]); verdict = r === 'timeout' ? 'timeout' : r.ok === true ? 'accepted' : 'refused'; if (verdict === 'timeout' || verdict === 'refused') recorded = verdict; } catch { verdict = 'refused'; recorded = 'failed'; } finally { if (timer !== undefined) clearTimeout(timer); }
           try { deps.log('FAST_FOLLOWUP', { owner: verdict, reason: /^[A-Z][A-Z0-9_]{2,47}$/.test(reason) ? reason : 'UNKNOWN' }); } catch { /* logging never interrupts */ }
+          if (recorded !== undefined) await recordNoticeFailure(recorded);
         })();
         work.add(job); void job.finally(() => work.delete(job));
-      } catch { /* the notice is best effort: it must never interrupt the end of a call */ }
+      } catch { try { const job = recordNoticeFailure('failed'); work.add(job); void job.finally(() => work.delete(job)); } catch { /* the notice is best effort: it must never interrupt the end of a call */ } }   // the message could not even be built: the owner is told on the dashboard
+    }
+    /** An owner notice that was refused, failed or timed out is recorded (append-only, privacy-safe; fast-lead.ts) so the dashboard shows it. Never throws; no sink: nothing is recorded. At most once per call (the notice is sent once, and the references are unique). */
+    async function recordNoticeFailure(verdict: NoticeVerdict): Promise<void> {
+      try {
+        if (deps.saveNoticeFailure === undefined) return;
+        let result: NoticeResult = 'failed';
+        try { const v = await deps.saveNoticeFailure({ callSid: speakerSid ?? (typeof callSid === 'string' ? callSid : ''), verdict, at: deps.now() }); result = v === 'recorded' ? 'recorded' : 'failed'; } catch { result = 'failed'; }
+        deps.log('FAST_NOTICE_RECORD', { result, verdict });
+      } catch { /* logging never interrupts */ }
     }
     /** A promised ending (the line said "a person will ...") that is not a booked one notifies the owner. */
     function notifyFollowUp(reason: string, line: string | undefined, booked: boolean): void { if (!booked && line !== undefined && PROMISED.test(line)) sendOwnerNotice(reason, bookSent); }
     /** The durable lead for an ending that would have promised a person: written and read back BEFORE anything is said. Never throws; no sink, or any problem, is `failed`. */
     async function saveLeadFor(reason: string): Promise<LeadResult> {
+      leadTried = true;
       let result: LeadResult = 'failed';
       try {
         if (deps.saveLead !== undefined) {
@@ -286,6 +299,15 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       } catch { result = 'failed'; }
       try { deps.log('FAST_LEAD', { result, reason: /^[A-Z][A-Z0-9_]{2,47}$/.test(reason) ? reason : 'UNKNOWN' }); } catch { /* logging never interrupts */ }
       return result;
+    }
+    /** An INTERRUPTED call (the caller hung up, the voice failed, or a hang-up stopped the booking before it was sent) leaves the same durable lead as a spoken "a person will" ending, so the owner's dashboard shows it and it does not depend on an email. Nothing is spoken (the line is gone).
+     *  Only a call whose caller was VERIFIED (a wrong number or a refused caller leaves nothing); at most one attempt per call (`leadTried`, also set by `saveLeadFor`), so a second signal, the close after a speaker failure, or a late ending cannot write a second record; never while a booking is in flight (its own ending decides: booked needs no lead). Never throws, never delays the end; no sink means nothing to persist. */
+    let leadTried = false;
+    function saveInterruptedLead(reason: string): void {
+      try {
+        if (leadTried || deps.saveLead === undefined || !steps.includes('CALLER_VERIFIED')) return;
+        const job = saveLeadFor(reason); work.add(job); void job.finally(() => work.delete(job));
+      } catch { /* the lead is best effort here: it must never interrupt the end of a call */ }
     }
     async function end(reason: string, line?: string, booked = false, extra: Partial<FastOutcome> = {}): Promise<void> {
       const promising = !booked && line !== undefined && PROMISED.test(line);   // decided from the ending's own words, before they are replaced
@@ -633,7 +655,7 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
       const drift = confirmedMismatches(confirmed, req);
       if (drift.length > 0) { deps.log('FAST_BOOKING_GUARD', { ok: false, count: drift.length, field: drift[0] }); return end('BOOKING_CHANGED', 'I could not confirm the booking, so a person will follow up. Goodbye.'); }   // the field NAME only, never its value
       deps.log('FAST_BOOKING_GUARD', { ok: true, count: 0, startMin: minutesOf(req.when.startTime), sameAsOffer: req.when.date === o.date && req.when.startTime === o.time && req.when.endTime === o.endTime });
-      if (hungUp) { deps.log('FAST_BOOKING_SKIPPED', { reason: 'CALLER_HUNG_UP' }); note('BOOKING_SKIPPED_HUNG_UP'); sendOwnerNotice('BOOKING_SKIPPED_HUNG_UP', false); return end('BOOKING_SKIPPED_HUNG_UP'); }   // fail closed: the caller hung up before the request was sent, so nothing is written; the owner is told
+      if (hungUp) { deps.log('FAST_BOOKING_SKIPPED', { reason: 'CALLER_HUNG_UP' }); note('BOOKING_SKIPPED_HUNG_UP'); sendOwnerNotice('BOOKING_SKIPPED_HUNG_UP', false); saveInterruptedLead('BOOKING_SKIPPED_HUNG_UP'); return end('BOOKING_SKIPPED_HUNG_UP'); }   // fail closed: the caller hung up before the request was sent, so nothing is written; the owner is told
       void say('Booking that now.');
       let res: BookingResult;
       try { bookSent = true; res = await deps.book(req); } catch { res = { status: 'uncertain', reason: 'API_ERROR', writes: 0 }; }
@@ -688,8 +710,8 @@ export function createFastCallHandler(deps: FastDeps): FastHandler {
 
     // ---------------------------------------------------------------- events
     /** The voice is gone, during the call (`speaker_down`) or during the consent notice (the close says so, and the SID is the carrier's raw one). */
-    function speakerFailed(sid: unknown): void { hungUp = true; speakerSid = sidOf(sid) ?? sidOf(callSid); if (!booking) sendOwnerNotice('SPEAKER_DOWN', bookSent); void end('SPEAKER_DOWN'); }
-    t.onClose = (info?: TransportCloseInfo) => { if (!done && info?.speakerDown === true) speakerFailed(info.callSid); if (!done) { done = true; hungUp = true; deps.log('FAST_END', { reason: 'CALLER_HUNG_UP', booked: false }); deps.onOutcome?.({ reason: 'CALLER_HUNG_UP', booked: false, customerText: 'not_sent', ownerText: 'not_sent', steps }); } clearTimers(); contact.dispose(); if (booking && hungUp) { if (!slotDeferred) { slotDeferred = true; slotTimer = setTimeout(releaseSlot, deps.slotHoldMs ?? 60_000); slotTimer.unref?.(); } } else active = Math.max(0, active - 1); };
+    function speakerFailed(sid: unknown): void { hungUp = true; speakerSid = sidOf(sid) ?? sidOf(callSid); if (!booking) { sendOwnerNotice('SPEAKER_DOWN', bookSent); saveInterruptedLead('SPEAKER_DOWN'); } void end('SPEAKER_DOWN'); }
+    t.onClose = (info?: TransportCloseInfo) => { if (!done && info?.speakerDown === true) speakerFailed(info.callSid); if (!done) { done = true; hungUp = true; deps.log('FAST_END', { reason: 'CALLER_HUNG_UP', booked: false }); deps.onOutcome?.({ reason: 'CALLER_HUNG_UP', booked: false, customerText: 'not_sent', ownerText: 'not_sent', steps }); if (!booking) saveInterruptedLead('CALLER_HUNG_UP'); } clearTimers(); contact.dispose(); if (booking && hungUp) { if (!slotDeferred) { slotDeferred = true; slotTimer = setTimeout(releaseSlot, deps.slotHoldMs ?? 60_000); slotTimer.unref?.(); } } else active = Math.max(0, active - 1); };
     t.onEvent = (ev: TransportEvent): void => {
       if (done) return;
       if (ev.kind === 'setup') {

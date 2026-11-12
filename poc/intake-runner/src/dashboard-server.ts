@@ -45,7 +45,7 @@ const HEADERS = {
   'Content-Security-Policy': PAGE_CSP,
 } as const;
 /** Pure: the whole `/data.js` file, from the owner view. JSON is escaped so no record value can end the script or inject markup. */
-export function dataScriptFor(view: OwnerView): string {
+export function dataScriptFor(view: OwnerView & { notices?: { email: 'on' | 'off' } }): string {
   const json = JSON.stringify(view).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
   return `/* Live intakes from the phone assistant. Generated from the saved records; personal details are masked and never sent. */\nwindow.PROTO_DATA = ${json};\n`;
 }
@@ -80,6 +80,8 @@ export interface DashboardConfig {
   now?: () => number;
   /** Optional. The cached snapshot of unresolved bookings (src/pending-snapshot.ts). With it, `GET /api/pending` answers from memory (never a scan, never the ledger); without it that path does not exist (404), exactly as before. */
   pending?: { view(): unknown };
+  /** Optional. Whether the owner's email notices are switched ON or OFF for this run. With it, `/api/owner` and `/data.js` carry `notices: { email }` and the page shows a plain banner when it is OFF; without it they are exactly as before. A word only: no address, no setting. */
+  emailNotices?: 'on' | 'off';
 }
 export interface DashboardServer {
   listen(port: number): Promise<number>;
@@ -94,6 +96,8 @@ export function createDashboardServer(config: DashboardConfig): DashboardServer 
   if (typeof store?.list !== 'function') throw new RangeError('store must have list');
   if (typeof staticDir !== 'string' || staticDir.length === 0) throw new RangeError('staticDir must be a path');
   if (typeof clock !== 'function') throw new RangeError('now must be a function');
+  if (config.emailNotices !== undefined && config.emailNotices !== 'on' && config.emailNotices !== 'off') throw new RangeError('emailNotices must be on or off');
+  const ownerBody = (): OwnerView & { notices?: { email: 'on' | 'off' } } => { const v = toOwnerView(store.list(tenant), localDayBounds(clock())); return config.emailNotices === undefined ? v : { ...v, notices: { email: config.emailNotices } }; };
   let port = 0;
 
   const server = createServer((req, res) => {
@@ -112,8 +116,8 @@ export function createDashboardServer(config: DashboardConfig): DashboardServer 
         const s = STATIC[raw];
         return send(200, s.type, readFileSync(`${staticDir}/${s.file}`, 'utf8'));
       }
-      if (raw === '/data.js') return send(200, 'text/javascript; charset=utf-8', dataScriptFor(toOwnerView(store.list(tenant), localDayBounds(clock()))));
-      if (raw === '/api/owner') return send(200, 'application/json; charset=utf-8', JSON.stringify(toOwnerView(store.list(tenant), localDayBounds(clock()))));
+      if (raw === '/data.js') return send(200, 'text/javascript; charset=utf-8', dataScriptFor(ownerBody()));
+      if (raw === '/api/owner') return send(200, 'application/json; charset=utf-8', JSON.stringify(ownerBody()));
       if (raw === '/api/pending' && config.pending !== undefined) return send(200, 'application/json; charset=utf-8', pendingBodyFor(config.pending));
       return fail(404, 'NOT_FOUND');
     } catch {

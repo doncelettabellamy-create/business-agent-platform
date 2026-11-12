@@ -201,5 +201,5 @@ test('SPOKEN OUTCOME source guard: every line in the handler that promises a per
   for (const l of lines) assert.ok(known.has(l), `a promising line is covered by the table: ${l}`);
   const endBody = src.slice(src.indexOf('async function end('), src.indexOf('const giveUp'));
   assert.ok(endBody.indexOf('saveLeadFor(reason)') >= 0 && endBody.indexOf('saveLeadFor(reason)') < endBody.indexOf('t.speak('), 'saved first, then spoken');
-  assert.equal([...src.matchAll(/saveLeadFor\(/g)].length, 3, 'defined once, called from the late ending and from the ending that is spoken');
+  assert.equal([...src.matchAll(/saveLeadFor\(/g)].length, 4, 'defined once, called from the late ending, from the ending that is spoken, and from the one guarded interrupted-call save (saveInterruptedLead)');
 });

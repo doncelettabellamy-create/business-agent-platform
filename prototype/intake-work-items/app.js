@@ -200,6 +200,9 @@
   }
 
   function showBanner(text) { banner.hidden = text === null; banner.textContent = text === null ? '' : text; }
+  /* Owner email notices: the server says only "on" or "off". When they are OFF a failed call sends no email, so this page is where it shows up; nothing is shown when they are on or the server does not say. */
+  var NOTICES_OFF = 'Email notices to you are OFF. If a call needs follow-up you will not be emailed, so check this page.';
+  function noticeBanner(d) { return d && d.notices && d.notices.email === 'off' ? NOTICES_OFF : null; }
 
   function queueRefresh() {
     if (state.timer !== null) { window.clearTimeout(state.timer); }
@@ -217,7 +220,7 @@
       .then(function (data) {
         if (!validShape(data)) { throw new Error('shape'); }
         state.data = data;
-        showBanner(null);
+        showBanner(noticeBanner(data));
         updated.textContent = 'Updated ' + new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
         render();
       })
@@ -230,7 +233,7 @@
   }
 
   /* ---------- start ---------- */
-  if (validShape(window.PROTO_DATA)) { state.data = window.PROTO_DATA; }
+  if (validShape(window.PROTO_DATA)) { state.data = window.PROTO_DATA; showBanner(noticeBanner(state.data)); }
   if (window.PROTO_SAMPLE === true) { showBanner('These are sample intakes, not real calls.'); }
   refreshBtn.addEventListener('click', function () { refresh(); });
   window.addEventListener('hashchange', render);

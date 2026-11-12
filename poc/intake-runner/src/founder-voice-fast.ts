@@ -9,7 +9,7 @@ import { createVault, JOBBER_ENDPOINTS, GRAPHQL_VERSION, readBusyIntervals } fro
 import type { Protector, FetchLike, Ctx as JobberCtx } from './jobber-connector.ts';
 import { bookTestVisit } from './jobber-booking.ts';
 import { loadKeyring } from './booking-identity.ts';
-import { makeLeadSaver } from './fast-lead.ts';
+import { makeLeadSaver, makeNoticeFailureSaver } from './fast-lead.ts';
 import type { IntakeRecordStore } from './intake-record-store.ts';
 import type { ContactVault } from './contact-vault.ts';
 import { callerOf, E164, sendSms, SID, verifyDelivery } from './twilio-messaging.ts';
@@ -83,7 +83,7 @@ export async function buildFastDeps(c: FastComposition): Promise<FastDeps> {
   return {
     settings, numbers: new Set(c.config.numbers), approvedCallers: new Set([numbers.customer]), approvedCustomerNumbers: new Set([numbers.customer]), ownerNumber: numbers.owner, maxCalls: c.config.max_calls,
     now: c.now, log: c.log, ...(c.onOutcome === undefined ? {} : { onOutcome: c.onOutcome }),
-    ...(c.leads === undefined ? {} : { saveLead: makeLeadSaver({ store: c.leads.store, ...(c.leads.contacts === undefined ? {} : { contacts: c.leads.contacts }), tenant: c.config.tenant }) }),
+    ...(c.leads === undefined ? {} : { saveLead: makeLeadSaver({ store: c.leads.store, ...(c.leads.contacts === undefined ? {} : { contacts: c.leads.contacts }), tenant: c.config.tenant }), saveNoticeFailure: makeNoticeFailureSaver({ store: c.leads.store, tenant: c.config.tenant }) }),
     callerOf: (sid) => callerOf(twilio, sid),
     busy: (fromIso, toIso) => readBusyIntervals(jobber, creds, fromIso, toIso),
     book: (req) => bookTestVisit(jobber, creds, req),

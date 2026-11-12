@@ -12,6 +12,7 @@
 
 import type { IntakeRecord } from './intake-record-store.ts';
 import { piiProblems } from './pii-screen.ts';
+import { followUpState, MARKER_CATEGORY } from './followup-marker.ts';
 
 export const OWNER_LABELS = Object.freeze({
   requestedTime: 'Requested time (not booked)',
@@ -34,10 +35,18 @@ export const OWNER_TEXT = Object.freeze({
   decideKind: 'Decide what kind of request this is.',
   review: 'A person should review this request.',
   ready: 'Ready for follow-up.',
+  /** An owner email notice that was not delivered (src/fast-lead.ts): shown under "Need follow-up", never counted as an intake. */
+  noticeRequest: 'Email notice to you not delivered',
+  noticeStatus: 'Notice not delivered',
+  noticeAction: 'Check the other items on this page: an email about a call that needs follow-up did not reach you.',
+  /** A follow-up the owner marked handled (src/followup-marker.ts): it stays in "All", is not open, and returns to open if the owner reopens it. */
+  handled: 'Marked handled by the owner.',
 });
 
 export interface OwnerDetail { label: string; value: string }
 export interface OwnerCall {
+  /** 'notice': an owner email notice that was not delivered. It needs follow-up but is NOT an intake: the intake counts leave it out. */
+  kind: 'intake' | 'notice';
   /** When the call was saved, as an ISO UTC time. The page shows it in the viewer's own time zone. */
   at: string;
   /** The kind of request in plain words. */
@@ -107,9 +116,20 @@ function actionsFor(r: IntakeRecord): { actions: string[]; needsFollowUp: boolea
   return { actions, needsFollowUp: true };
 }
 
+/** An undelivered-owner-notice record (src/fast-lead.ts writes it): its own category AND one of its three fixed reasons. Kept here as two literals so this file imports nothing from the voice code (a test pins that they match). */
+const NOTICE_CATEGORY = 'owner-notice'; const NOTICE_REASON = /^notice_(refused|failed|timeout)$/;
+const isNotice = (r: IntakeRecord): boolean => r.category === NOTICE_CATEGORY && r.reasons.some((x) => NOTICE_REASON.test(x));
+
 /** One record in the owner's shape. Throws RangeError for anything that is not a record. */
 export function toOwnerCall(record: IntakeRecord): OwnerCall {
   checkRecord(record);
+  if (isNotice(record)) {
+    const field = record.fields.find((f) => f.found && f.value !== null && f.name === 'request');
+    return Object.freeze({
+      kind: 'notice' as const, at: record.received_at, request: OWNER_TEXT.noticeRequest, summary: showable(field?.value ?? null), requestedTime: null, details: Object.freeze([]) as OwnerDetail[],
+      statusText: OWNER_TEXT.noticeStatus, needsFollowUp: true, nextActions: Object.freeze([OWNER_TEXT.noticeAction]) as string[], addressGiven: false,
+    });
+  }
   let summary: string | null = null;
   let requestedTime: string | null = null;
   const details: OwnerDetail[] = [];
@@ -127,7 +147,7 @@ export function toOwnerCall(record: IntakeRecord): OwnerCall {
   const { actions, needsFollowUp } = actionsFor(record);
   const category = record.category === 'unknown' ? null : showable(record.category, 80);
   return Object.freeze({
-    at: record.received_at,
+    kind: 'intake' as const, at: record.received_at,
     request: category ?? OWNER_TEXT.unknownRequest,
     summary, requestedTime,
     details: Object.freeze(details) as OwnerDetail[],
@@ -142,18 +162,24 @@ export function toOwnerCall(record: IntakeRecord): OwnerCall {
 export function ownerSummary(calls: readonly OwnerCall[], day: DayBounds): OwnerSummary {
   if (!isIso(day?.fromIso) || !isIso(day?.toIso) || !(Date.parse(day.fromIso) < Date.parse(day.toIso))) throw new RangeError('the day must be two ISO UTC times, from before to');
   const from = Date.parse(day.fromIso); const to = Date.parse(day.toIso);
+  const intakes = calls.filter((c) => c.kind !== 'notice');   // an undelivered-notice item needs follow-up but is not a call that was received
   return Object.freeze({
-    intakesReceivedToday: calls.filter((c) => { const t = Date.parse(c.at); return t >= from && t < to; }).length,
-    intakesReceivedTotal: calls.length,
+    intakesReceivedToday: intakes.filter((c) => { const t = Date.parse(c.at); return t >= from && t < to; }).length,
+    intakesReceivedTotal: intakes.length,
     needFollowUp: calls.filter((c) => c.needsFollowUp).length,
-    withRequestedTime: calls.filter((c) => c.requestedTime !== null).length,
-    confirmedByCaller: calls.filter((c) => c.statusText === OWNER_TEXT.confirmed).length,
+    withRequestedTime: intakes.filter((c) => c.requestedTime !== null).length,
+    confirmedByCaller: intakes.filter((c) => c.statusText === OWNER_TEXT.confirmed).length,
   });
 }
 
 /** Everything the owner's page needs: the calls, newest first, and the counts. */
 export function toOwnerView(records: readonly IntakeRecord[], day: DayBounds): OwnerView {
   if (!Array.isArray(records)) throw new RangeError('records must be a list');
-  const calls = records.map(toOwnerCall).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  // Markers are the owner's "handled" / "reopened" notes (src/followup-marker.ts). They are never calls: any record in the marker category is left out, and only a marker that parses exactly can change a state.
+  const state = followUpState(records);
+  const calls = records.filter((r) => r?.category !== MARKER_CATEGORY).map((r) => {
+    const c = toOwnerCall(r);
+    return c.needsFollowUp && state.get(r.call_ref)?.handled === true ? Object.freeze({ ...c, needsFollowUp: false, nextActions: Object.freeze([OWNER_TEXT.handled]) as string[] }) : c;   // handled: shown in All, not open, not counted as needing follow-up
+  }).sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
   return Object.freeze({ calls, summary: ownerSummary(calls, day) });
 }

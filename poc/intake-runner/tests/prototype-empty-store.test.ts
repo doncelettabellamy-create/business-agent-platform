@@ -245,7 +245,7 @@ test('sample: the file opened on its own shows invented intakes under a clear no
   const data = (() => { const w: Record<string, any> = {}; runInNewContext(SAMPLE, { window: w }); return w; })();
   assert.equal(data.PROTO_SAMPLE, true);
   assert.deepEqual(Object.keys(data.PROTO_DATA).sort(), ['calls', 'summary']);
-  for (const c of data.PROTO_DATA.calls) assert.deepEqual(Object.keys(c).sort(), ['addressGiven', 'at', 'details', 'needsFollowUp', 'nextActions', 'request', 'requestedTime', 'statusText', 'summary']);
+  for (const c of data.PROTO_DATA.calls) assert.deepEqual(Object.keys(c).sort(), ['addressGiven', 'at', 'details', 'kind', 'needsFollowUp', 'nextActions', 'request', 'requestedTime', 'statusText', 'summary']);
   const plain = JSON.parse(JSON.stringify(data.PROTO_DATA));
   assert.deepEqual(plain.summary, ownerSummary(plain.calls, DAY), 'the sample\'s counts are the true counts of the sample');
   const leaves = (x: unknown): string[] => (typeof x === 'string' ? [x] : x !== null && typeof x === 'object' ? Object.values(x).flatMap(leaves) : []);
@@ -299,7 +299,7 @@ test('files: the script writes only text, loads nothing from elsewhere, asks onl
   assert.ok(used.length >= 5);
   for (const id of used) assert.ok(HTML.includes(`id="${id}"`), `index.html is missing id "${id}"`);
   assert.match(HTML, /<html lang="en">/); assert.match(HTML, /<title>Phone intakes<\/title>/); assert.match(HTML, /name="viewport" content="width=device-width, initial-scale=1"/);
-  assert.deepEqual([...HTML.matchAll(/<script[^>]*>/g)].map((m) => m[0]), ['<script src="data.js">', '<script src="app.js">', '<script src="pending.js">']);   // pending.js: the small "Bookings needing a person" panel (tests/pending-dashboard.test.ts); app.js is unchanged and still asks only for /api/owner (line above)
+  assert.deepEqual([...HTML.matchAll(/<script[^>]*>/g)].map((m) => m[0]), ['<script src="data.js">', '<script src="app.js">', '<script src="pending.js">']);   // pending.js: the small "Bookings needing a person" panel (tests/pending-dashboard.test.ts); app.js still asks only for /api/owner (line above); its one addition is the OFF banner for owner email notices (tests/owner-notice.test.ts)
   assert.ok(!/<style|style=|\son[a-z]+=|https?:\/\//i.test(HTML));
   const css = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
   assert.ok(!/@import|url\(|\/\/[a-z]/i.test(css));

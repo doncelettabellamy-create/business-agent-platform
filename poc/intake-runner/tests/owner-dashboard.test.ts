@@ -75,7 +75,7 @@ test('owner data: only the allow-listed shape, only this tenant, and the counts 
   assert.deepEqual(Object.keys(body).sort(), ['calls', 'summary']);
   assert.deepEqual(body.summary, { intakesReceivedToday: 2, intakesReceivedTotal: 3, needFollowUp: 2, withRequestedTime: 2, confirmedByCaller: 2 });
   assert.equal(body.calls.length, 3);
-  for (const c of body.calls) assert.deepEqual(Object.keys(c).sort(), ['addressGiven', 'at', 'details', 'needsFollowUp', 'nextActions', 'request', 'requestedTime', 'statusText', 'summary']);
+  for (const c of body.calls) assert.deepEqual(Object.keys(c).sort(), ['addressGiven', 'at', 'details', 'kind', 'needsFollowUp', 'nextActions', 'request', 'requestedTime', 'statusText', 'summary']);
   assert.deepEqual(body.calls.map((c: any) => c.at), [TODAY_LATE, TODAY_AM, YESTERDAY], 'newest first');
   assert.ok(!JSON.stringify(body).includes('OTHER-TENANT-CANARY'), 'another tenant\'s record never appears');
   assert.ok(leaves(body).join(' ').includes('replace a tap'), 'this tenant\'s own request is there');
