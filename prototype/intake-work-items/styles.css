@@ -109,6 +109,8 @@ h2 { font-size: 1.125rem; }
 .panel { padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
 .panel-title { font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 6px; }
 .panel p { overflow-wrap: anywhere; }
+#pending { margin-top: 16px; border-color: var(--attention-line); }
+#pending[hidden] { display: none; }
 .facts { display: grid; gap: 6px; }
 .fact { display: flex; flex-wrap: wrap; gap: 4px 10px; }
 .fact dt { color: var(--muted); font-size: 0.875rem; min-width: 11rem; }

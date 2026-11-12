@@ -35,6 +35,7 @@ const STATIC: Readonly<Record<string, { file: string; type: string }>> = Object.
   '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
   '/styles.css': { file: 'styles.css', type: 'text/css; charset=utf-8' },
   '/app.js': { file: 'app.js', type: 'text/javascript; charset=utf-8' },
+  '/pending.js': { file: 'pending.js', type: 'text/javascript; charset=utf-8' },   // the small "Bookings needing a person" panel; it asks only for GET /api/pending
 });
 const HEADERS = {
   'Cache-Control': 'no-store',
@@ -49,6 +50,26 @@ export function dataScriptFor(view: OwnerView): string {
   return `/* Live intakes from the phone assistant. Generated from the saved records; personal details are masked and never sent. */\nwindow.PROTO_DATA = ${json};\n`;
 }
 
+/** What `/api/pending` is allowed to say, and the ONLY thing it says: a status, the time of the last good scan, and for each unresolved booking its reference and one state word. Rebuilt field by field from whatever the snapshot hands over, so nothing else can pass through; anything doubtful is `unknown`, never `none`. Pure. */
+export function pendingBodyFor(src: { view(): unknown } | undefined): string {
+  const unknown = { status: 'unknown', asOf: null, items: [] };
+  try {
+    if (src === undefined) return JSON.stringify(unknown);
+    const v = src.view() as { status?: unknown; asOf?: unknown; items?: unknown };
+    const status = v?.status; const asOf = v?.asOf;
+    if (status !== 'none' && status !== 'some' && status !== 'unknown') return JSON.stringify(unknown);
+    if (asOf !== null && !(typeof asOf === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(asOf))) return JSON.stringify(unknown);
+    if (!Array.isArray(v.items) || v.items.length > 200) return JSON.stringify(unknown);
+    const items: Array<{ ref: string; state: string }> = [];
+    for (const i of v.items as Array<{ ref?: unknown; state?: unknown }>) {
+      if (typeof i !== 'object' || i === null || typeof i.ref !== 'string' || !/^DREWTEST-[0-9A-F]{12}$/.test(i.ref) || (i.state !== 'pending' && i.state !== 'client_created')) return JSON.stringify(unknown);
+      items.push({ ref: i.ref, state: i.state });
+    }
+    if (status !== 'some' && items.length > 0) return JSON.stringify(unknown);   // "none" or "unknown" with a booking listed contradicts itself
+    return JSON.stringify({ status, asOf, items });
+  } catch { return JSON.stringify(unknown); }
+}
+
 export interface DashboardConfig {
   store: IntakeRecordStore;
   /** The one tenant this dashboard shows. Fixed here; no request can change it. */
@@ -57,6 +78,8 @@ export interface DashboardConfig {
   staticDir: string;
   /** The clock, in milliseconds since the epoch (the owner's "today" comes from it). */
   now?: () => number;
+  /** Optional. The cached snapshot of unresolved bookings (src/pending-snapshot.ts). With it, `GET /api/pending` answers from memory (never a scan, never the ledger); without it that path does not exist (404), exactly as before. */
+  pending?: { view(): unknown };
 }
 export interface DashboardServer {
   listen(port: number): Promise<number>;
@@ -91,6 +114,7 @@ export function createDashboardServer(config: DashboardConfig): DashboardServer 
       }
       if (raw === '/data.js') return send(200, 'text/javascript; charset=utf-8', dataScriptFor(toOwnerView(store.list(tenant), localDayBounds(clock()))));
       if (raw === '/api/owner') return send(200, 'application/json; charset=utf-8', JSON.stringify(toOwnerView(store.list(tenant), localDayBounds(clock()))));
+      if (raw === '/api/pending' && config.pending !== undefined) return send(200, 'application/json; charset=utf-8', pendingBodyFor(config.pending));
       return fail(404, 'NOT_FOUND');
     } catch {
       try { fail(503, 'UNAVAILABLE'); } catch { /* connection already gone */ }

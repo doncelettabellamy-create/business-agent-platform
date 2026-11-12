@@ -299,7 +299,7 @@ test('files: the script writes only text, loads nothing from elsewhere, asks onl
   assert.ok(used.length >= 5);
   for (const id of used) assert.ok(HTML.includes(`id="${id}"`), `index.html is missing id "${id}"`);
   assert.match(HTML, /<html lang="en">/); assert.match(HTML, /<title>Phone intakes<\/title>/); assert.match(HTML, /name="viewport" content="width=device-width, initial-scale=1"/);
-  assert.deepEqual([...HTML.matchAll(/<script[^>]*>/g)].map((m) => m[0]), ['<script src="data.js">', '<script src="app.js">']);
+  assert.deepEqual([...HTML.matchAll(/<script[^>]*>/g)].map((m) => m[0]), ['<script src="data.js">', '<script src="app.js">', '<script src="pending.js">']);   // pending.js: the small "Bookings needing a person" panel (tests/pending-dashboard.test.ts); app.js is unchanged and still asks only for /api/owner (line above)
   assert.ok(!/<style|style=|\son[a-z]+=|https?:\/\//i.test(HTML));
   const css = CSS.replace(/\/\*[\s\S]*?\*\//g, '');
   assert.ok(!/@import|url\(|\/\/[a-z]/i.test(css));

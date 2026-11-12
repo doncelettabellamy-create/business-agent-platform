@@ -18,6 +18,9 @@ import { fileURLToPath } from 'node:url';
 import { mintExecutionContext } from './execution-context.ts';
 import { createIntakeRecordStore } from './intake-record-store.ts';
 import { createDashboardServer } from './dashboard-server.ts';
+import { createPendingSnapshot } from './pending-snapshot.ts';
+import { pendingReport } from './jobber-ledger-scan.ts';
+import { createVault } from './jobber-connector.ts';
 import { createRelayWsServer } from './ws-server.ts';
 import { founderConfigDigest, founderConfigProblems, relayPathFor, signedUrlCandidates } from './founder-call-gate.ts';
 import type { FounderCallConfig } from './founder-call-gate.ts';
@@ -123,12 +126,16 @@ catch { console.error('serve refused: the contact vault could not be opened (wro
 console.log(`Contact capture (name, callback number, service address; encrypted, 30-day retention): ${contacts === undefined ? 'OFF (no FOUNDER_CONTACT_KEY)' : 'ON'}`);
 
 const store = createIntakeRecordStore({ path: config.db_path });
+// The owner dashboard's "Bookings needing a person" panel (Stage 1): a cached, read-only snapshot of the unresolved bookings in the booking ledger (src/pending-snapshot.ts). Fast test call only (it is the only thing that books).
+// Refreshed at startup, every 60 seconds and after each call outcome; a failed, stale or unreadable scan shows as unknown, never as none. It changes no booking, Jobber, voice or email behavior.
+const pendingSnapshot = fastCfg === undefined ? undefined : createPendingSnapshot({ read: () => pendingReport(createVault(fastDir, windowsProtector())) });
+const refreshPending = (): void => { try { void pendingSnapshot?.refresh(); } catch { /* the panel never interrupts a call */ } };
 // The fast test call's pieces (Jobber, Twilio, the approved numbers) are built only here, only after the gate passed. Its outcomes are logged as fixed codes.
 const fast = fastCfg === undefined ? undefined : await buildFastDeps({
   config, voice, vaultDir: fastDir, protector: windowsProtector(), env: process.env, fetch: globalThis.fetch, now: () => Date.now(), log: (code, detail) => sink(code, detail),
   leads: { store, ...(contacts === undefined ? {} : { contacts }) },
   // The outcome, then its step tokens in order (fixed codes only; logSteps never throws, so logging cannot interrupt the end of a call).
-  onOutcome: (o) => { sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length, ...(o.lead === undefined ? {} : { lead: o.lead }) }); logSteps(sink, o.steps); },
+  onOutcome: (o) => { sink('FAST_OUTCOME', { reason: o.reason, booked: o.booked, customerText: o.customerText, ownerText: o.ownerText, steps: o.steps.length, ...(o.lead === undefined ? {} : { lead: o.lead }) }); logSteps(sink, o.steps); refreshPending(); },
 });
 const service = createFounderVoiceService({
   config, voice, textClient,
@@ -149,11 +156,12 @@ const service = createFounderVoiceService({
   log: (code, detail) => sink(code, detail),
 });
 const staticDir = fileURLToPath(new URL('../../../prototype/intake-work-items', import.meta.url));
-const dashboard = createDashboardServer({ store, tenant, staticDir });
+const dashboard = createDashboardServer({ store, tenant, staticDir, ...(pendingSnapshot === undefined ? {} : { pending: pendingSnapshot }) });
 const relay = createRelayWsServer({ path: relayPathFor(config.public_wss_url), authToken: twilioToken as string, urls: signedUrlCandidates(config.public_wss_url), maxConnections: 2, onConnection: (c) => service.handleStream(c), onRefuse: (status) => sink('WS_HANDSHAKE_REFUSED', { status }) });
 await dashboard.listen(config.dashboard_port);
 await relay.listen(config.relay_port);
+pendingSnapshot?.start();
 console.log(`\nServing (OpenAI voice route). Owner dashboard: http://127.0.0.1:${config.dashboard_port}/   Stream endpoint (local): 127.0.0.1:${config.relay_port}${relayPathFor(config.public_wss_url).replace(/[A-Za-z0-9_-]{32,64}$/, '<secret>')}`);
 console.log(`Kill switch: create the file "${config.kill_file}" to end calls. Stop everything with Ctrl+C.`);
 console.log(`Diagnostics (fixed codes and numbers only) are also saved to ${DIAG_FILE}.`);
-process.on('SIGINT', () => { void (async () => { sink('SERVER_STOP'); await relay.close(); await dashboard.close(); store.close(); contacts?.close(); process.exit(0); })(); });
+process.on('SIGINT', () => { void (async () => { sink('SERVER_STOP'); pendingSnapshot?.stop(); await relay.close(); await dashboard.close(); store.close(); contacts?.close(); process.exit(0); })(); });

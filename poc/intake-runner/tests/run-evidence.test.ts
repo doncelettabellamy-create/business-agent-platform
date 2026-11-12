@@ -74,7 +74,7 @@ test('the entry: SERVER_START carries the commit only through headCommit, FAST_S
   const src = readFileSync(new URL('../src/founder-voice-entry.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.ok(/import \{ headCommit, logSteps \} from '\.\/run-evidence\.ts'/.test(src));
   assert.ok(/const commit = headCommit\(/.test(src) && /sink\('SERVER_START', \{[^}]*\.\.\.\(commit === undefined \? \{\} : \{ commit \}\)/.test(src), 'the commit is optional on SERVER_START');
-  assert.ok(/onOutcome: \(o\) => \{ sink\('FAST_OUTCOME'[^;]*\); logSteps\(sink, o\.steps\); \}/.test(src), 'logSteps follows FAST_OUTCOME');
+  assert.ok(/onOutcome: \(o\) => \{ sink\('FAST_OUTCOME'[^;]*\); logSteps\(sink, o\.steps\);( refreshPending\(\);)? \}/.test(src), 'logSteps follows FAST_OUTCOME');   // refreshPending(): the dashboard's pending-booking snapshot refresh (tests/pending-dashboard.test.ts); it comes after the step log and can never throw
   assert.equal([...src.matchAll(/appendFileSync\(/g)].length, 1, 'the only thing the entry writes is its log'); assert.ok(!/writeFileSync|createWriteStream|writeFile\(|child_process|execSync|spawn/.test(src), 'no process is started and nothing else is written');
   const mod = readFileSync(new URL('../src/run-evidence.ts', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
   assert.ok(!/\bimport\b|process\.env|child_process|fetch\(|writeFile|appendFile|require\(/.test(mod), 'the module imports nothing, reads no environment and writes nothing');
