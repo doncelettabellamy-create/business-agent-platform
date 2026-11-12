@@ -99,9 +99,33 @@ async function rotateLocked(vault: RotateVault, lock: LockLike, o: RotateOptions
   return { ok: true, gen: n, kid, retiredKid: prev.current.kid, retired: back.keyring.retired.length, fingerprint: describe(back.keyring).fingerprint, ...(dropped === undefined ? {} : { dropped }) };
 }
 
-/** The command line, as a function (the command file only passes the real folder and the real console in): `status` (read-only), `create --confirm` and `rotate`. Prints words, key ids and a fingerprint: never a secret. Returns the exit code. */
-export async function runSetup(argv: string[], deps: { vault: RotateVault; say: (s: string) => void; random?: (n: number) => Buffer; now?: () => number; unresolved?: () => Promise<'none' | 'some' | 'unknown'>; lockWaitMs?: number }): Promise<number> {
+/** What the pending-booking report needs from the ledger scan (src/jobber-ledger-scan.ts `PendingReport` has exactly this shape). Declared here so this module keeps importing nothing from the booking code. */
+export interface PendingReport {
+  scan: { verdict: 'none' | 'some' | 'unknown'; created: number; cleared: number; unreadable: number; legacy: 'absent' | 'resolved' | 'unresolved' | 'unreadable' };
+  items: ReadonlyArray<{ ref: string; state: 'pending' | 'client_created'; step: number; clientHeld: boolean; jobHeld: boolean }>;
+}
+
+/** The PENDING-BOOKING REPORT as words: for each unresolved booking its reference (search for it in Jobber), state, step, and whether Jobber ids are held (yes or no, never an id). Pure. It decides nothing: it never says what happened to a booking and offers no retry, resolve or clear. */
+export function pendingLines(r: PendingReport): string[] {
+  const s = r.scan; const out = ['pending-booking report (read-only: nothing is changed, retried, resolved or cleared)'];
+  const legacy = s.legacy === 'unresolved' ? 1 : 0;
+  out.push(`ledger verdict: ${s.verdict === 'none' ? 'none unresolved' : s.verdict === 'some' ? 'SOME UNRESOLVED' : 'UNKNOWN (part of the ledger could not be read)'}`);
+  out.push(`unresolved bookings listed: ${r.items.length}; finished: ${s.created} created, ${s.cleared} cleared; unreadable ledger entries: ${s.unreadable}; older single-file ledger: ${s.legacy}${legacy === 1 ? ' (it holds unresolved entries that cannot be listed here)' : ''}`);
+  r.items.forEach((i, n) => out.push(`  ${n + 1}. ${i.ref}   state: ${i.state}   ledger step: ${i.step}   client and property ids held: ${i.clientHeld ? 'yes' : 'no'}   job id held: ${i.jobHeld ? 'yes' : 'no'}`));
+  if (r.items.length > 0) out.push('To look: search for the reference in the Jobber test account. This report does not say whether a job exists, and nothing here retries, resolves or clears a booking.');
+  if (s.verdict === 'unknown') out.push('Unreadable entries are NOT listed and are NOT assumed finished: a person must look at the private folder.');
+  return out;
+}
+
+/** The command line, as a function (the command file only passes the real folder and the real console in): `status` (read-only), `pending` (read-only report), `create --confirm` and `rotate`. Prints words, key ids and a fingerprint: never a secret. Returns the exit code. */
+export async function runSetup(argv: string[], deps: { vault: RotateVault; say: (s: string) => void; random?: (n: number) => Buffer; now?: () => number; unresolved?: () => Promise<'none' | 'some' | 'unknown'>; pending?: () => Promise<PendingReport>; lockWaitMs?: number }): Promise<number> {
   const { vault, say } = deps; const cmd = argv[0];
+  if (cmd === 'pending') {
+    if (deps.pending === undefined) { say('refused: this command has no way to read the booking ledger (nothing was read or changed)'); return 2; }
+    let r: PendingReport; try { r = await deps.pending(); } catch { say('failed: the ledger could not be scanned (nothing was changed)'); return 1; }
+    for (const l of pendingLines(r)) say(l);
+    return r.scan.verdict === 'none' ? 0 : 1;
+  }
   if (cmd === 'status') {
     const r = await loadKeyring(vault);
     if (r.ok) { const d = describe(r.keyring); say(`booking identity keyring: present (generation ${d.gen}, current key ${d.current}, fingerprint ${d.fingerprint}, ${d.retired.length} retired)`);
@@ -136,5 +160,5 @@ export async function runSetup(argv: string[], deps: { vault: RotateVault; say: 
     };
     say(`refused: ${why[r.reason]}; ${r.reason === 'VERIFY_FAILED' ? 'a file may exist' : 'nothing was changed'} (${r.reason}${r.problem === undefined ? '' : `: ${r.problem}`})`); return 1;
   }
-  say('usage: status | create --confirm | rotate --confirm --no-unresolved-bookings --server-stopped --expect-generation N [--drop-oldest-retired]'); return 2;
+  say('usage: status | pending | create --confirm | rotate --confirm --no-unresolved-bookings --server-stopped --expect-generation N [--drop-oldest-retired]'); return 2;
 }

@@ -16,13 +16,19 @@ export interface LedgerScan {
   /** 'none' only when every key is finished and nothing was unreadable. */ verdict: 'none' | 'some' | 'unknown';
 }
 
+/** One unresolved key, as the founder's pending-booking report shows it: the booking reference (the marker in the Jobber job's title and instructions, to search for in Jobber), its state, how many ledger steps it has, and whether Jobber ids are HELD (yes or no only: never an id). No name, address, number or key. */
+export interface PendingItem { ref: string; state: 'pending' | 'client_created'; step: number; clientHeld: boolean; jobHeld: boolean }
+/** The scan plus the unresolved keys listed one by one (sorted by reference). */
+export interface PendingReport { scan: LedgerScan; items: PendingItem[] }
+
 const PREFIX = 'jobber-booking-ledger-'; const LEGACY = 'jobber-booking-ledger';
 const CHAIN_FILE = /^jobber-booking-ledger-(drewtest-[0-9a-f]{12})\.(0|[1-9][0-9]{0,2})\.enc$/;
 const MAX_GENERATION = 99;
 
-export async function scanLedger(vault: LedgerVault): Promise<LedgerScan> {
+async function scanDetailed(vault: LedgerVault): Promise<PendingReport> {
+  const items: PendingItem[] = [];
   const s: LedgerScan = { chains: 0, created: 0, cleared: 0, pending: 0, clientCreated: 0, unreadable: 0, legacy: 'absent', verdict: 'unknown' };
-  let names: string[]; try { names = readdirSync(vault.dir); } catch { s.unreadable++; return s; }   // a folder that cannot be listed is unknown, never empty
+  let names: string[]; try { names = readdirSync(vault.dir); } catch { s.unreadable++; return { scan: s, items }; }   // a folder that cannot be listed is unknown, never empty
   const bases = new Set<string>();
   for (const f of names) {
     if (!f.startsWith(PREFIX) || f.endsWith('.tmp')) continue;   // an unfinished temporary file never became a state
@@ -36,7 +42,11 @@ export async function scanLedger(vault: LedgerVault): Promise<LedgerScan> {
     let text: string | undefined; try { text = await vault.loadBlob(`${base}.${top}`); } catch { text = undefined; }
     const entry = parseLedgerGeneration(text, marker, top);
     if (entry === undefined) s.unreadable++;
-    else if (entry.state === 'created') s.created++; else if (entry.state === 'none') s.cleared++; else if (entry.state === 'pending') s.pending++; else s.clientCreated++;
+    else if (entry.state === 'created') s.created++; else if (entry.state === 'none') s.cleared++;
+    else {
+      if (entry.state === 'pending') s.pending++; else s.clientCreated++;
+      items.push({ ref: marker, state: entry.state, step: top, clientHeld: entry.clientId !== undefined && entry.propertyId !== undefined, jobHeld: entry.jobId !== undefined });   // listed, never changed
+    }
   }
   if (vault.hasBlob(LEGACY)) {
     s.legacy = 'unreadable';
@@ -53,7 +63,16 @@ export async function scanLedger(vault: LedgerVault): Promise<LedgerScan> {
     if (s.legacy === 'unreadable') s.unreadable++;
   }
   s.verdict = s.pending + s.clientCreated > 0 || s.legacy === 'unresolved' ? 'some' : s.unreadable > 0 ? 'unknown' : 'none';
-  return s;
+  return { scan: s, items };
+}
+
+/** The scan the keyring commands rely on: counts and a verdict only (its shape is unchanged). */
+export async function scanLedger(vault: LedgerVault): Promise<LedgerScan> { return (await scanDetailed(vault)).scan; }
+
+/** The founder's PENDING-BOOKING REPORT: the same read-only scan, with each unresolved key listed (reference, state, step, whether ids are held). It writes nothing, retries nothing, resolves nothing and clears nothing; a scan that fails is `unknown` with no items. */
+export async function pendingReport(vault: LedgerVault): Promise<PendingReport> {
+  try { return await scanDetailed(vault); }   // the scan visits the keys in sorted order, so the items are sorted by reference
+  catch { return { scan: { chains: 0, created: 0, cleared: 0, pending: 0, clientCreated: 0, unreadable: 1, legacy: 'absent', verdict: 'unknown' }, items: [] }; }
 }
 
 /** The answer the keyring rotation asks for: anything but 'none' refuses it (and a scan that fails is 'unknown'). */
